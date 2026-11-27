@@ -158,6 +158,9 @@ def _stub_v4_runtime_imports():
         "CommonAttentionBuilder",
     ):
         setattr(backends, name, type(name, (), {}))
+    # The V4 class extends this set at import time. Transfer tests do not
+    # publish H2D metadata, so the stub needs no publication groups of its own.
+    backends.CommonAttentionBuilder.mixed_prefill_groups = frozenset()
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     for name in (
@@ -843,6 +846,9 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _coalesce_blocks=coalesce,
         _trace_transfers=False,
         _num_local_layers=4,

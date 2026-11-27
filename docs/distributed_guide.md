@@ -37,7 +37,7 @@ ATOM provides parallel linear layer classes in `atom/model_ops/linear.py`:
 
 ### Process Group Initialization
 
-In `ModelRunner.__init__()`, the distributed environment is set up via AITER:
+In `init_model_env()` (`atom/model_engine/model_setup.py`, called from `ModelRunner.__init__()`), the distributed environment is set up via AITER:
 
 ```python
 from aiter import init_dist_env
@@ -109,16 +109,15 @@ The `stateless_init_dp_group()` method (in `ParallelConfig`) calls `stateless_in
 
 ### Synchronized busy loop
 
-The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks before each step. The `_sync_dp_state()` method packs four signals into an int64 tensor and performs a single `AllReduce(MAX)`:
+The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks: every round by default, every N paired rounds after a busy sync with `ATOM_DP_SYNC_INTERVAL` (see [DP state sync interval](#dp-state-sync-interval)). The `_sync_dp_state()` method packs three signals into an int64 tensor and performs a single `AllReduce(MAX)`:
 
 ```python
-# State synced: [is_prefill, num_tokens, has_unfinished, shutdown]
+# State synced: [has_unfinished, shutdown, held]
 state_tensor = torch.tensor(
     [
-        1 if local_is_prefill else 0,
-        local_num_tokens,
         1 if local_has_unfinished else 0,
         1 if local_shutdown else 0,
+        1 if local_held else 0,
     ],
     dtype=torch.int64, device="cpu",
 )
@@ -128,27 +127,27 @@ torch.distributed.all_reduce(
 ```
 
 This ensures:
-- **All ranks agree on the batch type** (prefill vs. decode). Since MORI requires all DP ranks to execute the same phase, a rank that has no prefill work must run a dummy prefill when any other rank does prefill.
+- **All ranks run a step together**: when any rank has unfinished work, every rank steps, an idle one with a dummy batch. The step's phase and padded shape are agreed per step by `ForwardMode.decide`.
 - **Graceful shutdown**: all ranks must agree before exiting.
-- **Token count alignment**: the maximum token count across ranks is used for padding.
+- **One hold holds the group**: a rank paused, offloaded or fenced for a weight sync holds every rank, so their forwards stay paired.
 
 ### Dummy batch execution
 
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
-- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a batch with no request, through the model, triggering AllReduce and MORI collectives so other ranks are not blocked. `ForwardMode.decide` gives it the group's phase (prefill when any peer prefills) and its width: the group's `running_bs` / `running_tokens` on a decode or a token-graph prefill, one running token on a ragged step (two under TBO, so it splits). Its rows have batch id -1, slot -1 and position 0. It runs everything its peers run, the LM head included (its collective under the DP-sharded head), and samples nothing: `postprocess` cuts the logits to its zero scheduled rows. A pass where no rank has a request runs nothing: the busy loop skips it. A step that reaches the runner with no rank scheduling a request (requests exist but none could be scheduled) runs the same way on every rank, at the smallest captured `running_bs` (one request with none captured).
+- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a batch with no request, through the model, triggering AllReduce and MORI collectives so other ranks are not blocked. `ForwardMode.decide` gives it the group's phase (prefill when any peer prefills) and its width: the group's `running_bs` / `running_tokens` on a decode or a token-graph prefill, one running token on a ragged step (two under TBO, so it splits). Its rows have batch id -1, slot -1 and position 0. It runs everything its peers run, the LM head included (its collective under the DP-sharded head), and samples nothing: `postprocess` cuts the head output (the logits, or the greedy ids under `ATOM_DP_LM_HEAD_MODE=argmax`) to its zero scheduled rows. A pass where no rank has a request runs nothing: the busy loop skips it (every round by default; with `ATOM_DP_SYNC_INTERVAL=N`, up to N-1 dummy rounds still run after a drain, see [DP state sync interval](#dp-state-sync-interval)). A step that reaches the runner with no rank scheduling a request (requests exist but none could be scheduled) runs the same way on every rank, at the smallest captured `running_bs` (one request with none captured).
 - **Yielding a decode** — when prefill token graphs are recorded, a peer prefills and the group's prefill delayer (not a rank-local one) lets it, a decoding rank skips its own decode and runs the dummy too (`Scheduler._schedule`, on `_group_prefill_tick`). Its dummy brings back the tokens its last decode sampled (deferred output), which `_execute_dummy_batch` postprocesses like any step's whenever the rank has running requests. `ForwardMode._pad_to_token_graph` raises every rank to the bucket the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
 
-When DP is enabled on a single node, each DP rank uses a different set of GPUs. The device mapping in `ModelRunner.__init__()` is:
+When DP is enabled on a single node, each DP rank uses a different set of GPUs. `init_model_env()` (`atom/model_engine/model_setup.py`) takes the device from `local_device_index()` (`atom/config.py`):
 
 ```python
-local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
+local_device_rank = local_device_index(config, rank)
 device = torch.device(f"cuda:{local_device_rank}")
 ```
 
-For example, with DP=2 and TP=4:
+With DP and TP only, that is `dp_rank_local * tensor_parallel_size + rank`. For example, with DP=2 and TP=4:
 - DP rank 0: GPUs 0, 1, 2, 3
 - DP rank 1: GPUs 4, 5, 6, 7
 
@@ -193,7 +192,7 @@ if config.enable_dp_attention:
 ### DP request load balancing
 
 Because the DP busy loop is **lockstep** (all ranks `AllReduce` `has_unfinished`
-each step, and an idle rank runs `_execute_dummy_batch()` when any other rank is
+every round by default, see [DP state sync interval](#dp-state-sync-interval), and an idle rank runs `_execute_dummy_batch()` when any other rank is
 busy), an unbalanced request distribution directly wastes GPU: the step time is
 bounded by the busiest rank while lighter ranks burn cycles on dummy batches.
 `CoreManager` therefore routes each request to the *least-loaded* rank rather
@@ -268,7 +267,7 @@ The compressed prefix index stores consecutive chained-hash intervals, retaining
 
 **Index budget trade-off and how to see it.** The index is bounded (`PrefixSpreadRouter.CAP` tokens of unique intervals; how many hash blocks that is depends on the hash block size, which is `block_size` times the DCP size), and over that budget the router sheds finished history oldest interval first, shortening an interval from its tail when the overage is small. To see whether it runs, read `atom:dp_prefix_index_events_total` (or the Python dict `LLMEngine.get_metrics_statistics()["dp_router"]["prefix_index"]`; there is no HTTP JSON endpoint for it): `tail_trim` and `leaf_evict` both 0 and `atom:dp_prefix_index_tokens` well under `CAP` mean the trade-off never applied. Nonzero counters mean old history was shed, not that hot prefixes were lost -- cold one-shot history is shed the same way; a rising `tail_trim` / `leaf_evict` rate together with a falling `atom:dp_prefix_route_total{decision="owner"}` share and `atom:dp_prefix_moved_tokens_total` is the pattern to look into. `blocked` rising means the index is still over budget after eviction ran out of evictable history: what is left is still-prefilling history and the finished ancestors of it, which cannot be shed while they have children. If it matters, raise `PrefixSpreadRouter.CAP` (there is no environment variable).
 
-With one routable engine or pipeline parallelism, `prefix_spread` has no effect and its routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
+With one routable engine, pipeline parallelism or RapidServe, `prefix_spread` and `share_cache` have no effect and their routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
 
 When `prefix_spread` or `share_cache` is active, Mooncake Store must expose one shared `(master, metadata)` pair to all DP ranks. Per-NIC aliases in `mooncake_store.pools` are accepted only when every alias names that same pair. Distinct per-NIC pools are rejected at router startup because a worker can load only from its selected NIC's pool; a scheduler lookup across pools does not make those prefixes transferable. Distinct pools remain available with other routing policies, or when neither router is active.
 
@@ -567,7 +566,8 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/utils/envs.py` | `ATOM_DP_*` environment variables (lazy evaluation) |
 | `atom/model_engine/engine_core.py` | `EngineCore`, `DPEngineCoreProc` (DP busy loop, sync, dummy batches) |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` (multi-process DP orchestration, ZMQ IPC) |
-| `atom/model_engine/model_runner.py` | `ModelRunner` (`init_dist_env`, device assignment, `DPMetadata` usage) |
+| `atom/model_engine/model_setup.py` | `init_model_env` (`init_dist_env`, device assignment) |
+| `atom/model_engine/model_runner.py` | `ModelRunner` (`DPMetadata` usage) |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions |
 | `atom/utils/distributed/utils.py` | `stateless_init_torch_distributed_process_group()` (Gloo PG creation) |
 | `atom/utils/forward_context.py` | `DPMetadata`, `ForwardContext` (per-step DP token metadata) |
@@ -632,6 +632,31 @@ start at 0 and index its own GPUs; the global rank identifies the engine within
 the whole group. Conflating the two is the classic multi-node bug — global ranks
 drive process groups and expert sharding, local ranks drive GPU index, NUMA
 binding, and MoRI's `gpu_per_node`.
+
+### DP state sync interval
+
+`ATOM_DP_SYNC_INTERVAL=N` reduces CPU Gloo state synchronization to once per
+N paired engine rounds after a sync that found unfinished work in the DP
+group. It applies to every DP > 1 run, single-node included; pipeline parallel
+uses its own stage loops and does not read it. A rank with no local batch
+completes a dummy step alongside its peers. The default `1` keeps per-round
+synchronization; `0` and negative values also mean `1`.
+
+Set the same value on every node before starting the engines. One startup
+collective checks the minimum and maximum interval and any invalid input.
+Every rank raises on a mismatch, a non-integer value or a value above 16 before
+entering the busy loop. Restart to change the interval.
+
+The rounds after such a sync run paired without looking at the group's state,
+so once the group drains every rank still runs up to N-1 dummy rounds before
+the next sync sees it idle; only then do idle and held phases synchronize every
+round. Utility commands are applied on sync rounds, so a command queued just
+after a sync can wait through the next N-1 paired rounds. That includes
+`abort_request`: an aborted request keeps decoding and holding its KV until
+then. This is a bound in engine rounds, not seconds, and includes the time to
+finish the current forward. Shutdown is observed on a sync round and still
+drains unfinished work before exit. Validate command latency and multi-node
+correctness before selecting N.
 
 ### Ports
 
@@ -698,3 +723,56 @@ python atom/benchmarks/internode_dp_ep_smoke.py \
 
 Expect both nodes to report an EP group spanning all global ranks and an
 `ep_all_reduce_sum` equal to the sum of those ranks.
+
+## 10. Tensor parallelism across nodes
+
+One TP group may span nodes, for a model too large for one node's GPUs at the
+TP size it needs. The node that runs TP rank 0 runs the engine, the API server
+and its own ranks' workers; every other node runs only its workers
+(`atom/model_engine/tp_multinode.py`). The engine reaches them through the same
+broadcast queue and reply channels as local ranks, over TCP, and finds them
+through the model-runner TCPStore on `--data-parallel-master-ip` /
+`--data-parallel-base-port`.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--tensor-parallel-size-local` | TP ranks on **this** node (default: `-tp`) |
+| `--tensor-parallel-rank` | First TP rank this node owns; a multiple of the local size |
+| `--data-parallel-master-ip` | Address of the node that runs TP rank 0 |
+| `--data-parallel-base-port` | Model-runner rendezvous port, the same nonzero value on every node |
+
+### Example — TP8 over 2 nodes of 4 GPUs
+
+```bash
+# Node 0 (10.0.0.1): engine, API server, TP ranks 0-3
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 0 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+
+# Node 1: TP ranks 4-7 only
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 4 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+```
+
+Start the nodes in either order. Every node must set `AITER_MLA_DECODE_PS1_FLYDSL`
+alike; a worker node refuses a mismatch. A failed worker on either side stops
+the whole group.
+
+### Timeouts
+
+- `ATOM_MULTINODE_TP_TIMEOUT_S` (1800): startup waits, e.g. a worker node for
+  the engine's endpoints and the engine for every remote rank to subscribe.
+- `ATOM_MULTINODE_PG_TIMEOUT_S` (7200): floor for the process groups' gloo and
+  NCCL timeouts, so a slow node's weight load does not time them out.
+
+### Restrictions
+
+- Rejected with a `ValueError`: DP, `--enable-dp-attention`, PP, prefill
+  context parallelism, `--fake-eplb`, RapidServe.
+- Mono decode is refused (its peer memory is HIP IPC, which cannot reach another
+  node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
+- The custom all-reduce is node-local, so collectives between nodes go through
+  RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.

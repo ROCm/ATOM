@@ -32,6 +32,8 @@ pub(crate) struct RequestMetrics {
     error: Option<&'static str>,
     detector: FirstOutputSse,
     usage: UsageObserver,
+    /// Pool that computed the prompt, and the router's expected hit ratio there.
+    reconcile: Option<(&'static str, Option<f64>)>,
 }
 impl RequestMetrics {
     pub fn new(
@@ -66,7 +68,14 @@ impl RequestMetrics {
             error: Some("canceled"),
             detector: FirstOutputSse::default(),
             usage: UsageObserver::default(),
+            reconcile: None,
         }
+    }
+    /// Records the cached tokens the response reports against `pool`, the pool
+    /// that computed the prompt, and compares them with `estimated_hit_ratio`.
+    pub fn reconcile(mut self, pool: &'static str, estimated_hit_ratio: Option<f64>) -> Self {
+        self.reconcile = Some((pool, estimated_hit_ratio));
+        self
     }
     #[cfg(feature = "ext-proc")]
     pub fn started_at(mut self, started: Instant) -> Self {
@@ -140,10 +149,17 @@ impl Drop for RequestMetrics {
                 error,
             );
         }
-        if let Some((prompt, completion)) = self.usage.usage(self.streaming) {
+        if let Some(usage) = self.usage.usage(self.streaming) {
+            if let (Some((pool, estimate)), Some(cached)) = (self.reconcile, usage.cached) {
+                MeshMetrics::record_route_cache_tokens(pool, usage.prompt, cached);
+                if let Some(ratio) = estimate {
+                    let estimated = (ratio * usage.prompt as f64).round() as u64;
+                    MeshMetrics::record_route_cache_estimate(pool, usage.prompt, estimated, cached);
+                }
+            }
             for (kind, token_type, count) in [
-                ("prompt", metrics_labels::TOKEN_INPUT, prompt),
-                ("completion", metrics_labels::TOKEN_OUTPUT, completion),
+                ("prompt", metrics_labels::TOKEN_INPUT, usage.prompt),
+                ("completion", metrics_labels::TOKEN_OUTPUT, usage.completion),
             ] {
                 MeshMetrics::record_router_tokens(
                     self.router,
@@ -246,6 +262,53 @@ mod tests {
             1.0,
             "{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn reported_cached_tokens_are_reconciled_on_the_prompt_pool() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let body = |prompt: u64, cached: &str| {
+            format!(r#"{{"usage":{{"prompt_tokens":{prompt},"completion_tokens":1{cached}}}}}"#)
+        };
+        let cached =
+            |tokens: u64| format!(r#","prompt_tokens_details":{{"cached_tokens":{tokens}}}"#);
+        let cases = [
+            ("http", Some(0.5), body(100, &cached(40))),
+            ("http", None, body(100, &cached(40))),
+            // No report, and a prompt of 0 tokens, which has no error ratio.
+            ("http", Some(0.5), body(100, "")),
+            ("http", Some(0.5), body(0, &cached(0))),
+            // Not reconciled by its router.
+            ("ext_proc", None, body(100, &cached(40))),
+        ];
+        for (ingress, estimate, body) in cases {
+            let observation =
+                RequestMetrics::new(ingress, "pd", "m", "/v1/chat/completions", false);
+            let observation = if ingress == "http" {
+                observation.reconcile(metrics_labels::WORKER_PREFILL, estimate)
+            } else {
+                observation
+            };
+            let response = observation.wrap_response(Response::new(Body::from(body)));
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+        }
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="prompt"} 200"#,
+            r#"mesh_route_cache_tokens_total{pool="prefill",kind="cached"} 80"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="prompt"} 100"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 50"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 40"#,
+            r#"mesh_route_cache_estimate_error_ratio_sum{pool="prefill"} 0.1"#,
+            r#"mesh_route_cache_estimate_error_ratio_count{pool="prefill"} 1"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
     }
 
     #[tokio::test]

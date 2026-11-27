@@ -1,26 +1,41 @@
 //! A partition of the index: the ranks of one model, pool and block size, each on a lane,
-//! and the writer thread that alone applies their admitted batches, in order.
+//! and the writer thread that alone applies their admitted batches, in order. The prompts
+//! routed to each worker are predictions on lanes of a second index, kept apart from the
+//! events. A predicted block matches until the first sweep after a TTL from its last
+//! routing, so for up to TTL + TTL/8.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+    time::Duration,
 };
 
 use parking_lot::Mutex;
 use tokio::{
     runtime::Handle,
     sync::mpsc::{self, error::TrySendError},
+    time::Instant,
 };
+use tracing::warn;
 
 use super::{
     hash,
-    index::{HolderTable, PrefixIndex},
-    HolderId,
+    index::{find_matches, HolderTable, Op, PrefixIndex},
+    HolderId, PrefixHash,
 };
 use crate::kv_events::{model::KvEvent, SourceStatus};
 
 /// Admitted batches a partition's writer may fall behind by before its ranks wait.
 const QUEUED_BATCHES: usize = 1024;
+/// Routed prompts the writer may fall behind by before more are dropped.
+const QUEUED_PREDICTIONS: usize = 256;
+/// Their tokens, 4 bytes each, the writer may fall behind by: 64 MB.
+const QUEUED_PREDICTION_TOKENS: usize = 1 << 24;
+/// Blocks one worker's predictions may hold, as many as a rank's events.
+const MAX_PREDICTED_BLOCKS: usize = 1 << 22;
 
 pub(crate) struct Partition {
     block_size: u32,
@@ -28,8 +43,18 @@ pub(crate) struct Partition {
     /// Lanes taken, by bit.
     lanes: Mutex<u64>,
     writes: mpsc::Sender<Write>,
-    /// Where a release waits for room in `writes`.
+    /// Where a release waits for room in its queue.
     runtime: Handle,
+    pub(super) predicted: PrefixIndex,
+    predicting: Mutex<u64>,
+    /// Set once a worker found no prediction lane left.
+    crowded: AtomicBool,
+    /// Set once a routed prompt was dropped as the writer was behind.
+    behind: AtomicBool,
+    /// Apart from `writes`, so that routing never delays a rank's batches.
+    predictions: mpsc::Sender<Write>,
+    /// Tokens of the prompts queued in `predictions`.
+    queued_tokens: AtomicUsize,
 }
 
 enum Write {
@@ -42,42 +67,78 @@ enum Write {
     },
     /// The rank is no longer followed: its blocks leave the index and its lane is free.
     Release(HolderId),
+    /// The tokens of a prompt routed to the worker on the prediction lane.
+    Predict(HolderId, Vec<u32>),
+    /// The worker's predictions leave the index and its lane is free.
+    Unpredict(HolderId),
 }
 
 impl Partition {
-    /// A partition whose ranks write from `runtime`. The writer has its own thread, as it
-    /// waits for walks to leave the shards and then lets them run, and ends with the
-    /// partition.
-    pub(crate) fn start(block_size: u32, runtime: &Handle) -> Arc<Self> {
+    /// A partition whose ranks write from `runtime`, and whose writer keeps predictions for
+    /// `ttl`. The writer has its own thread, as it waits for walks to leave the shards and
+    /// then lets them run, and ends with the partition.
+    pub(crate) fn start(block_size: u32, ttl: Duration, runtime: &Handle) -> Arc<Self> {
         let (writes, batches) = mpsc::channel(QUEUED_BATCHES);
+        let (predictions, routed) = mpsc::channel(QUEUED_PREDICTIONS);
         let partition = Arc::new(Self {
             block_size,
             index: PrefixIndex::default(),
             lanes: Mutex::new(0),
             writes,
             runtime: runtime.clone(),
+            predicted: PrefixIndex::default(),
+            predicting: Mutex::new(0),
+            crowded: AtomicBool::new(false),
+            behind: AtomicBool::new(false),
+            predictions,
+            queued_tokens: AtomicUsize::new(0),
         });
         let writer = Arc::downgrade(&partition);
         std::thread::Builder::new()
             .name("kv-index-writer".into())
-            .spawn(move || write(writer, batches))
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("the KV index writer's runtime starts")
+                    .block_on(write(writer, batches, routed, ttl))
+            })
             .expect("the KV index writer thread starts");
         partition
     }
 
     /// A lane for a rank whose batches `status` counts; None once all 64 are taken.
     pub(crate) fn hold(self: &Arc<Self>, status: Arc<Mutex<SourceStatus>>) -> Option<Holder> {
-        let mut lanes = self.lanes.lock();
-        let free = lanes.trailing_ones();
-        (free < 64).then(|| {
-            *lanes |= 1 << free;
-            Holder {
-                id: HolderId(free as u8),
-                partition: self.clone(),
-                status,
-            }
+        take(&self.lanes).map(|id| Holder {
+            id,
+            partition: self.clone(),
+            status,
         })
     }
+
+    /// A prediction lane for `worker`; None once all 64 are taken, which warns once.
+    pub(crate) fn predict(self: &Arc<Self>, worker: &str) -> Option<Predictor> {
+        let predictor = take(&self.predicting).map(|id| Predictor {
+            id,
+            partition: self.clone(),
+        });
+        if predictor.is_none() && !self.crowded.swap(true, Ordering::Relaxed) {
+            warn!(
+                worker,
+                "Not predicting the worker's cache: the 64 prediction lanes of its model and pool are taken"
+            );
+        }
+        predictor
+    }
+}
+
+fn take(lanes: &Mutex<u64>) -> Option<HolderId> {
+    let mut lanes = lanes.lock();
+    let free = lanes.trailing_ones();
+    (free < 64).then(|| {
+        *lanes |= 1 << free;
+        HolderId(free as u8)
+    })
 }
 
 /// A rank's lane, held while the rank is followed.
@@ -109,24 +170,116 @@ impl Holder {
 /// has removed the rank's blocks, so a rank given the lane next starts empty.
 impl Drop for Holder {
     fn drop(&mut self) {
-        let writes = &self.partition.writes;
-        match writes.try_send(Write::Release(self.id)) {
-            Err(TrySendError::Full(release)) => {
-                let writes = writes.clone();
-                self.partition
-                    .runtime
-                    .spawn(async move { writes.send(release).await });
-            }
-            // The writer ends with the partition, which this holder keeps, or by panicking.
-            Ok(()) | Err(TrySendError::Closed(_)) => {}
-        }
+        let partition = &self.partition;
+        release(
+            &partition.runtime,
+            &partition.writes,
+            Write::Release(self.id),
+        );
     }
 }
 
-fn write(partition: Weak<Partition>, mut writes: mpsc::Receiver<Write>) {
+/// A worker's prediction lane, held while it may be routed to.
+pub(crate) struct Predictor {
+    id: HolderId,
+    partition: Arc<Partition>,
+}
+
+impl Predictor {
+    pub(crate) fn lane(&self) -> (Arc<Partition>, HolderId) {
+        (self.partition.clone(), self.id)
+    }
+
+    pub(crate) fn is_in(&self, partition: &Arc<Partition>) -> bool {
+        Arc::ptr_eq(&self.partition, partition)
+    }
+
+    /// Predicts the full blocks of a prompt routed to the worker, which the writer hashes;
+    /// false, the prompt dropped, while the writer is behind, so that routing never waits
+    /// for it.
+    pub(crate) fn record(&self, tokens: &[u32]) -> bool {
+        let partition = &self.partition;
+        let queued = partition
+            .queued_tokens
+            .fetch_add(tokens.len(), Ordering::Relaxed);
+        let sent = queued + tokens.len() <= QUEUED_PREDICTION_TOKENS
+            && partition
+                .predictions
+                .try_send(Write::Predict(self.id, tokens.to_vec()))
+                .is_ok();
+        if !sent {
+            partition
+                .queued_tokens
+                .fetch_sub(tokens.len(), Ordering::Relaxed);
+        }
+        sent
+    }
+
+    /// Marks the partition as having dropped a prompt; true the first time.
+    pub(crate) fn first_drop(&self) -> bool {
+        !self.partition.behind.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// Like a holder's, the lane stays taken until its predictions are gone.
+impl Drop for Predictor {
+    fn drop(&mut self) {
+        let partition = &self.partition;
+        release(
+            &partition.runtime,
+            &partition.predictions,
+            Write::Unpredict(self.id),
+        );
+    }
+}
+
+/// Queues a lane's release, waiting on `runtime` while the queue is full.
+fn release(runtime: &Handle, writes: &mpsc::Sender<Write>, release: Write) {
+    match writes.try_send(release) {
+        Err(TrySendError::Full(release)) => {
+            let writes = writes.clone();
+            runtime.spawn(async move { writes.send(release).await });
+        }
+        // The writer ends with the partition, which the lane keeps, or by panicking.
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+    }
+}
+
+/// Applies the ranks' batches before any prediction. Expired predictions leave at the next
+/// sweep, due every eighth of the TTL, and the first sweep after the partition ends the
+/// writer.
+async fn write(
+    partition: Weak<Partition>,
+    mut writes: mpsc::Receiver<Write>,
+    mut predictions: mpsc::Receiver<Write>,
+    ttl: Duration,
+) {
     let mut tables: HashMap<HolderId, HolderTable> = HashMap::new();
+    let mut predicted: HashMap<HolderId, HashMap<PrefixHash, Instant>> = HashMap::new();
+    let mut sweeps = tokio::time::interval(ttl / 8);
     let mut ops = Vec::new();
-    while let Some(write) = writes.blocking_recv() {
+    loop {
+        let write = tokio::select! {
+            biased;
+            Some(write) = writes.recv() => write,
+            Some(prediction) = predictions.recv() => prediction,
+            now = sweeps.tick() => {
+                let Some(partition) = partition.upgrade() else {
+                    return;
+                };
+                for (&lane, blocks) in &mut predicted {
+                    blocks.retain(|&hash, &mut until| {
+                        let live = until > now;
+                        if !live {
+                            ops.push(Op::Remove(hash));
+                        }
+                        live
+                    });
+                    partition.predicted.apply(lane, &mut ops);
+                }
+                continue;
+            }
+        };
         let Some(partition) = partition.upgrade() else {
             return;
         };
@@ -159,36 +312,71 @@ fn write(partition: Weak<Partition>, mut writes: mpsc::Receiver<Write>) {
                 }
                 *partition.lanes.lock() &= !(1 << holder.0);
             }
+            Write::Predict(lane, tokens) => {
+                partition
+                    .queued_tokens
+                    .fetch_sub(tokens.len(), Ordering::Relaxed);
+                let until = Instant::now() + ttl;
+                let blocks = predicted.entry(lane).or_default();
+                for hash in hash::prefix_hashes(&tokens, partition.block_size) {
+                    if let Some(last) = blocks.get_mut(&hash) {
+                        *last = until;
+                    } else if blocks.len() < MAX_PREDICTED_BLOCKS {
+                        blocks.insert(hash, until);
+                        ops.push(Op::Store(hash));
+                    }
+                }
+                partition.predicted.apply(lane, &mut ops);
+            }
+            Write::Unpredict(lane) => {
+                if let Some(blocks) = predicted.remove(&lane) {
+                    ops.extend(blocks.into_keys().map(Op::Remove));
+                    partition.predicted.apply(lane, &mut ops);
+                }
+                *partition.predicting.lock() &= !(1 << lane.0);
+            }
         }
     }
 }
 
-/// The leading tokens of `tokens` each lane holds, in their order; one walk per partition.
-pub(crate) fn match_holders(
+/// A rank's lane in the events of its partition, or a worker's in the predictions.
+pub(crate) type Lane = (Arc<Partition>, HolderId);
+
+/// The leading tokens of `tokens` each worker holds, the more of what its rank's events
+/// and its predictions hold, in the order of the lanes: one hashing and one walk of both
+/// indexes per partition.
+pub(crate) fn match_lanes(
     tokens: &[u32],
-    lanes: &[Option<(Arc<Partition>, HolderId)>],
+    events: &[Option<Lane>],
+    predicted: &[Option<Lane>],
 ) -> Vec<Option<u32>> {
-    let mut hits = vec![None; lanes.len()];
-    for (i, lane) in lanes.iter().enumerate() {
-        let Some((partition, _)) = lane.as_ref().filter(|_| hits[i].is_none()) else {
+    let mut hits = vec![None; events.len().max(predicted.len())];
+    let mut walked: Vec<&Arc<Partition>> = Vec::new();
+    for (partition, _) in events.iter().chain(predicted).flatten() {
+        if walked.iter().any(|walked| Arc::ptr_eq(walked, partition)) {
             continue;
+        }
+        walked.push(partition);
+        let here = |lanes: &[Option<Lane>], j: usize| match lanes.get(j) {
+            Some(Some((other, id))) if Arc::ptr_eq(other, partition) => Some(*id),
+            _ => None,
         };
-        let walk: Vec<(usize, HolderId)> = lanes
-            .iter()
-            .enumerate()
-            .skip(i)
-            .filter_map(|(j, lane)| match lane {
-                Some((other, id)) if Arc::ptr_eq(other, partition) => Some((j, *id)),
-                _ => None,
-            })
-            .collect();
-        let ids: Vec<HolderId> = walk.iter().map(|&(_, id)| id).collect();
-        let prefix = hash::prefix_hashes(tokens, partition.block_size);
-        for ((j, _), blocks) in walk
-            .into_iter()
-            .zip(partition.index.find_matches(&prefix, &ids))
-        {
-            hits[j] = Some(blocks * partition.block_size);
+        let (workers, lanes): (Vec<usize>, Vec<_>) = (0..hits.len())
+            .map(|j| (j, [here(events, j), here(predicted, j)]))
+            .filter(|(_, lanes)| lanes != &[None, None])
+            .unzip();
+        // The engine computes the block of the prompt's last token, so it never reports
+        // that block as cached.
+        let reusable = &tokens[..tokens.len().saturating_sub(1)];
+        let prefix = hash::prefix_hashes(reusable, partition.block_size);
+        let found = if lanes.iter().all(|[_, predicted]| predicted.is_none()) {
+            let holders: Vec<_> = lanes.iter().filter_map(|[events, _]| *events).collect();
+            partition.index.find_matches(&prefix, &holders)
+        } else {
+            find_matches([&partition.index, &partition.predicted], &lanes, &prefix)
+        };
+        for (j, blocks) in workers.into_iter().zip(found) {
+            hits[j] = hits[j].max(Some(blocks * partition.block_size));
         }
     }
     hits
@@ -206,7 +394,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let partition = Partition::start(16, runtime.handle());
+        let partition = Partition::start(16, Duration::from_secs(3600), runtime.handle());
         let writes = partition.writes.clone();
         drop(partition);
         writes.blocking_send(Write::Release(HolderId(0))).unwrap();
@@ -218,5 +406,22 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A prompt the writer has no room for is dropped, and gives its room back.
+    #[tokio::test]
+    async fn prompts_are_dropped_while_the_writer_is_behind() {
+        let partition = Partition::start(4, Duration::from_secs(3600), &Handle::current());
+        let predictor = partition.predict("w").unwrap();
+        let queued = || partition.queued_tokens.load(Ordering::Relaxed);
+        partition
+            .queued_tokens
+            .store(QUEUED_PREDICTION_TOKENS, Ordering::Relaxed);
+        assert!(!predictor.record(&[1, 2, 3, 4]));
+        assert_eq!(queued(), QUEUED_PREDICTION_TOKENS);
+        assert!(predictor.first_drop());
+        assert!(!predictor.first_drop());
+        partition.queued_tokens.store(0, Ordering::Relaxed);
+        assert!(predictor.record(&[1, 2, 3, 4]));
     }
 }

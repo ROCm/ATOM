@@ -25,6 +25,7 @@ use crate::{
     routers::{
         comm::error::IngressError,
         ingress::{read_body, InferenceEnvelope},
+        prepare::fast_tokenizer::TokenizeLimits,
     },
     tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry},
 };
@@ -128,16 +129,16 @@ pub async fn tokenize(context: &Arc<AppContext>, request: Request) -> Response {
         Err(error) => return ingress_error_response(error),
     };
     let registry = context.tokenizer_registry.clone();
-    let max_tokenize_bytes = context.router_config.resolved_max_tokenize_bytes();
+    let limits = context.tokenize_limits;
     run_on_prepare_pool(context, move |_| {
-        tokenize_body(&registry, max_tokenize_bytes, &body).unwrap_or_else(ingress_error_response)
+        tokenize_body(&registry, limits, &body).unwrap_or_else(ingress_error_response)
     })
     .await
 }
 
 fn tokenize_body(
     registry: &TokenizerRegistry,
-    max_tokenize_bytes: usize,
+    limits: TokenizeLimits,
     body: &[u8],
 ) -> Result<Response, IngressError> {
     let request: TokenizeRequest = parse_body(body)?;
@@ -150,7 +151,7 @@ fn tokenize_body(
         .as_strings()
         .iter()
         .try_fold(0usize, |size, text| size.checked_add(text.len()));
-    if input_bytes.is_none_or(|size| size > max_tokenize_bytes) {
+    if input_bytes.is_none_or(|size| size > limits.of(&*entry.tokenizer)) {
         return Err(IngressError::tokenizer_input_too_large());
     }
 
@@ -361,6 +362,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
 
     if let Some(entry) = removed {
         crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
+        context.chat_controls.write().remove(&entry.id);
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,

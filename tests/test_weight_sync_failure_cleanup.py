@@ -7,8 +7,10 @@ from multiprocessing import shared_memory
 
 import pytest
 import torch
+from conftest import atom_config_double
 
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 
 class _Runner(WeightUpdaterMixin):
@@ -16,8 +18,12 @@ class _Runner(WeightUpdaterMixin):
     label = "test"
     rank = 0
     world_size = 1
+    config = atom_config_double()
+    attn_family = Family.MHA
 
     def __init__(self):
+        self._init_weight_updater()
+        self.model = torch.nn.Module()
         self._ipc_buffer = torch.zeros(1, dtype=torch.uint8)
         self._packed_weight_accum = {"old": object()}
         self._expert_relayout_pending = {"old": object()}
@@ -27,9 +33,11 @@ class _Runner(WeightUpdaterMixin):
 
 
 @pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
-def test_a_failed_update_discards_scratch_but_keeps_layout_recovery_state(path):
-    """IPC mappings and FP8 packed shards cannot cross syncs. An expert already
-    written row-major still needs its pending relayout entry to survive."""
+def test_a_failed_update_leaves_nothing_for_a_later_sync(path):
+    """IPC mappings and FP8 packed shards cannot cross syncs, nor can expert
+    slices awaiting relayout: a later sync's shard would complete one whose
+    other shard came from the failed sync. The engine stays fenced until a
+    sync rewrites every parameter, and every expert with it."""
     runner = _Runner()
     shm = None
     try:
@@ -48,4 +56,5 @@ def test_a_failed_update_discards_scratch_but_keeps_layout_recovery_state(path):
 
     assert runner._ipc_buffer is None
     assert runner._packed_weight_accum == {}
-    assert set(runner._expert_relayout_pending) == {"old"}
+    assert runner._expert_relayout_pending == {}
+    assert runner._sync is None

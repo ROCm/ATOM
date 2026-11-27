@@ -80,6 +80,7 @@ from atom.model_ops.embed_head import (
 # Side-effect import: registers `torch.ops.aiter.sparse_attn_indexer`, the op
 # `Indexer.forward_impl` runs.
 from atom.model_ops.indexer import indexer_forward as _indexer_forward  # noqa: F401
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -475,6 +476,7 @@ def _fused_rms_fp8_quant_fake(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -494,7 +496,11 @@ def _fused_rms_fp8_quant_fake(
         out1_bs = torch.empty((m, 1), dtype=torch.float32, device=x1.device)
     else:
         num_bs_cols = (n1 + group_size - 1) // group_size
-        out1_bs = torch.empty((m, num_bs_cols), dtype=torch.float32, device=x1.device)
+        out1_bs = torch.empty(
+            (m, num_bs_cols),
+            dtype=dtypes.fp8_e8m0 if e8m0_scale else torch.float32,
+            device=x1.device,
+        )
     out1_unquantized = torch.empty_like(x1) if output_unquantized_inp1 else None
     out2 = None
     if x2 is not None:
@@ -544,7 +550,9 @@ def _fuse_rmsnorm_fp4_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake)
+# Its outputs are fresh tensors: as a mutating op, Inductor could not remove the
+# auto_functionalized_v2 around it once it returns an E8M0 scale.
+@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake, mutates_args=[])
 def _fused_rms_fp8_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -558,6 +566,7 @@ def _fused_rms_fp8_quant(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -579,6 +588,7 @@ def _fused_rms_fp8_quant(
             quant_type,
             output_unquantized_inp1,
             transpose_scale,
+            e8m0_scale,
         )
     )
 
@@ -623,6 +633,7 @@ def _fuse_rmsnorm_quant(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    e8m0_scale: bool = False,
 ):
     if dtype_quant == dtypes.fp4x2:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
@@ -654,6 +665,7 @@ def _fuse_rmsnorm_quant(
                 quant_type=quant_type,
                 output_unquantized_inp1=output_unquantized_inp1,
                 transpose_scale=transpose_scale,
+                e8m0_scale=e8m0_scale,
             )
         )
     else:
@@ -1138,6 +1150,8 @@ class DeepseekV2MoE(nn.Module):
         # computation using a separate CUDA stream. Registered as a custom op
         # (dual_stream_moe_forward) so it is opaque to torch.compile/Dynamo.
         self._use_dual_stream = False
+        self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         self.alt_stream = alt_stream
         self.prefix = prefix
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
@@ -1152,7 +1166,11 @@ class DeepseekV2MoE(nn.Module):
             and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             tbo_active = get_current_atom_config().enable_tbo
-            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not tbo_active
+                and self.experts.allows_concurrent_shared_stream
+            ):
                 self._use_dual_stream = True
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekV2MLP(
@@ -1268,6 +1286,10 @@ class DeepseekV32IndexerCache(nn.Module):
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
+        # Warmup compiles the OPUS custom op before the KV pool is bound.
+        # Keep a tensor input so rebinding the real scale plane after warmup
+        # cannot freeze a constant None into the level-3 compiled graph.
+        self.kv_cache_scale: torch.Tensor | None = torch.empty(0, dtype=torch.uint8)
         self.head_dim = head_dim
         self.prefix = prefix
         self.cache_config = cache_config
@@ -1525,11 +1547,32 @@ class Indexer(nn.Module):
         self._indexer_fp4 = sparse_indexer_fp4_enabled(
             atom_config.index_cache_dtype, config
         )
+        self._index_cache_layout = (
+            (atom_config.index_cache_layout or PRESHUFFLE)
+            if self._indexer_fp4
+            else PRESHUFFLE
+        )
+        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == MFMA
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
+        if self._indexer_opus:
+            if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
+                raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            connector = KVConnectorFactory.connector_name(
+                atom_config.kv_transfer_config
+            )
+            if atom_config.plugin_config or (
+                atom_config.kv_transfer_config and connector != "lmcache_mp"
+            ):
+                raise ValueError(
+                    "OPUS DSA FP4 supports only standalone lmcache_mp cache transfer; "
+                    "other connectors and plugin routes are not yet supported"
+                )
         # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
         # rotary lanes and uses a different Q scale policy. Under DCP every
         # rank still projects all Q rows; the writer skips negative K slots.
@@ -1543,6 +1586,7 @@ class Indexer(nn.Module):
         # the q latent it is handed comes quantized with a scale (the owner's
         # fused q norm + quant for q_b_proj); set by the owning attention
         self.quantized_q = False
+        self.exchange_stream = None
         if external_k_weights and pcp_is_enabled():
             raise ValueError(
                 "External indexer projections require PCP1: the PCP op "
@@ -1602,7 +1646,7 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
-                fused_writer=self.use_qk_rope_cache_fusion,
+                packed_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
                 prefill_context_parallel=pcp_is_enabled(),
             )
 
@@ -1721,7 +1765,7 @@ class Indexer(nn.Module):
         # for padded rows, and only the owner rank writes K cache.
         unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
-        if self.use_nope_cache_fusion:
+        if self.use_nope_cache_fusion or self._indexer_opus:
             # The custom op publishes the normalized K and folds Q scales into
             # head weights in one launch. Pass the unnormalized BF16 projections.
             q_input = q
@@ -1795,6 +1839,11 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style if self.rope_dim else False,
             not unfused_qk_rope,
             self.stable_topk,
+            **(
+                {"kv_cache_scale": self.k_cache.kv_cache_scale}
+                if self._indexer_opus
+                else {}
+            ),
         )
 
 

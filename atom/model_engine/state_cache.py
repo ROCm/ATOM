@@ -5,6 +5,11 @@ from typing import Protocol, runtime_checkable
 
 from atom.model_engine.sequence import Sequence
 
+# `StateCache.decode_keep`.
+KEEP_SETTLED = "settled"
+KEEP_SNAPSHOT = "snapshot"
+KEEP_NONE = "none"
+
 
 @runtime_checkable
 class StateCache(Protocol):
@@ -76,6 +81,11 @@ class StateCache(Protocol):
     #: can a copying one, so neither implies the other.
     readable_midstep: bool
 
+    #: What a decode boundary keeps: the slot as it stands, which holds the
+    #: boundary at any verify step (`KEEP_SETTLED`); the step's image, built
+    #: from the slot (`KEEP_SNAPSHOT`); or nothing (`KEEP_NONE`).
+    decode_keep: str
+
     def applies(self, seq: Sequence) -> bool:
         """Whether this class gates or checkpoints anything for `seq`."""
         ...
@@ -90,8 +100,8 @@ class StateCache(Protocol):
         error — for a class that is not `readable_midstep`, so the call site
         needs no branch.
 
-        Best-effort and order-preserving: reservations stop at the first one
-        capacity cannot fill, so the earliest position survives a shortage.
+        Best-effort: each implementation chooses which positions survive a
+        shortage. Returned reservations are ordered by position.
         """
         ...
 
@@ -135,12 +145,17 @@ class StateCache(Protocol):
         """
         ...
 
-    def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+    def checkpoint(
+        self, seq: Sequence, boundary_blocks: int, h: int, step: int = -1
+    ) -> None:
         """Keep `seq`'s state as of `boundary_blocks`, filed under hash `h`.
 
         Called only at a ladder position `BlockManager` has already vetted
         against `successor_room`. Best-effort: a class out of room keeps
         nothing, and the hit it later declines is the only consequence.
+
+        `step` is the boundary's step in the slot's last verify window for a
+        decode boundary, -1 for one a prefill wrote whole.
         """
         ...
 

@@ -90,7 +90,7 @@ def test_topology_gate_reasons_are_human_readable():
 @pytest.mark.parametrize("kv_dtype", ["fp4", "bf16"])  # the MXFP4 index, with / without
 def test_mxfp4_caches_keep_the_cp_scorer(monkeypatch, caplog, kv_dtype):
     """The MXFP4 index, alone or with the MXFP4 KV, keeps the CP flag: its decode
-    scorer takes the shard (`indexer_context_scores_mxfp4`)."""
+    scorer takes the shard (`indexer_context_scores_fp4`)."""
     from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
 
     with caplog.at_level("INFO", logger="atom"):
@@ -134,6 +134,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         sequence_parallel_size=1,
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
+        enable_mixed_prefill_decode=False,
         index_cache_dtype="fp8",
         kv_cache_dtype="fp8",
         index_cache_layout=None,

@@ -477,12 +477,7 @@ class GatedDeltaNet(nn.Module):
                 h_snap = ssm_state.new_empty((ckpt["num_snaps"], *ssm_state.shape[1:]))
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
-            if (
-                flydsl_policy is not None
-                and flydsl_policy.prefill
-                and not use_replayssm
-                and h_snap is None
-            ):
+            if flydsl_policy is not None and flydsl_policy.prefill and h_snap is None:
                 from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
                     prefill_supported,

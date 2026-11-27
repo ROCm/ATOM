@@ -21,6 +21,26 @@ def reference():
 
 
 @pytest.fixture
+def linear_modules(monkeypatch):
+    """ATOM's real linear module, on a fake 4-rank TP group a test resizes."""
+    pytest.importorskip("aiter")
+    from atom.model_ops import linear
+
+    group = SimpleNamespace(rank_in_group=0, world_size=4)
+    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
+    return linear, group
+
+
+@pytest.fixture
+def per_channel_config(linear_modules):
+    """The quant config of FP4PTPC's converted linears, through the
+    production spec (`layers.converted_linear_config`)."""
+    from atom.models.deepseek_v41.layers import converted_linear_config
+
+    return converted_linear_config(SimpleNamespace(fp4ptpc=True))
+
+
+@pytest.fixture
 def single_rank(monkeypatch):
     # Every module patched here reaches AITER, so a test that asks for this
     # fixture cannot run without it; say so as a skip rather than letting the
@@ -93,6 +113,7 @@ def unallocated_moe(monkeypatch):
         self.alt_stream = alt_stream
         self.n_routed_experts = args.n_routed_experts
         self.n_activated_experts = args.n_activated_experts
+        self._fuse_shared_into_routed = True
 
     monkeypatch.setattr(V4MoE, "__init__", capture_v4)
 
@@ -102,7 +123,7 @@ def unallocated_moe(monkeypatch):
 
 
 @pytest.fixture
-def build_v41(unallocated_moe):
+def build_v41(unallocated_moe, monkeypatch):
     """Build one V4.1 entry point by name, on the meta device.
 
     All three are here because the model is reachable three ways and each
@@ -113,6 +134,15 @@ def build_v41(unallocated_moe):
 
     from atom.config import DSparkConfig
     from atom.models.deepseek_v41 import dspark, model, runtime
+
+    # ForCausalLM.__init__ reads the engine config to decide whether to
+    # register the fused-indexer cos|sin table. These builds have no engine.
+    # Only NATURAL allocates it, so an unset layout skips the table.
+    monkeypatch.setattr(
+        model,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(index_cache_layout=None),
+    )
 
     hf = unallocated_moe
 

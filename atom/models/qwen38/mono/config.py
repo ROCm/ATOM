@@ -16,6 +16,7 @@ caches.
 
 import torch
 
+from atom.model_ops.qwen4_exp.qsa_cache_rules import normalize_qsa_cache_formats
 from atom.models.qwen38.mono.kernels.geometry import REPLAY_MAX
 from atom.mono.plan.shard import Shard
 from atom.mono.runtime.deployment import (
@@ -32,7 +33,8 @@ HEAD_ROWS = (2, 4)
 KV_BLOCK = 64
 SUPPORTED_TP = (1,)
 # KV connectors served beside the programs: LMCache CPU offload's transfers are bounded gather / scatter kernels and
-# host copies on its own streams, fenced by events, that never wait on the model
+# host copies on its own streams, fenced by events, that never wait on the model. They can still contend with the
+# resident programs (ROCm/ATOM#3369); the polling backoff only mitigates that.
 OFFLOAD_CONNECTORS = ("lmcache_offload",)
 
 LAYERS = 48
@@ -133,17 +135,10 @@ def _quark_mxfp4(atom_config) -> bool:
     return {"*linear_attn.*", "*self_attn.*"} <= fp8 or (not fp8 and acts == "fp4")
 
 
-def _cache_formats(atom_config) -> tuple[str, str]:
-    """(K / V, index) cache formats as ATOM's QSA resolves them (``qwen4_exp.ops.qsa.qsa_cache_formats``)."""
-    kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
-    kv = "bf16" if kv in ("auto", "bfloat16") else kv
-    index = getattr(atom_config, "index_cache_dtype", None) or kv
-    return kv, "bf16" if index in ("auto", "bfloat16") else index
-
-
 def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
     """The checkpoint, parallelism, speculative decode and cache format Mono serves."""
     spec = getattr(atom_config, "speculative_config", None)
+    formats = normalize_qsa_cache_formats(atom_config)
     checks = common_refusals(atom_config, Shard, SUPPORTED_TP)
     # every program's CTAs are resident, one a CU, and spin on each other
     checks += resident_grid_refusals(atom_config, connectors=OFFLOAD_CONNECTORS)
@@ -154,8 +149,8 @@ def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
             "not MTP3 speculative decode",
         ),
         (
-            _cache_formats(atom_config) == ("fp8", "bf16"),
-            f"KV / index caches {_cache_formats(atom_config)}",
+            formats == ("fp8", "bf16"),
+            f"KV / index caches {formats}",
         ),
         (
             atom_config.kv_cache_block_size == KV_BLOCK,

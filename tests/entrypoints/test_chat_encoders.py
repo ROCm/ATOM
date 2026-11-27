@@ -8,7 +8,7 @@ import pathlib
 import pytest
 from jinja2 import TemplateError
 
-from atom.entrypoints.atomesh import atom_standalone_service
+from atom.entrypoints.atomesh import token_bridge
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
@@ -22,6 +22,7 @@ from atom.entrypoints.openai.chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
     template_needs_tool_call_argument_strings,
+    template_takes_mid_system,
 )
 from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
@@ -207,7 +208,7 @@ class TestChatTemplateSource:
         """Both entry points asked `getattr(tokenizer, "chat_template", None)`
         directly, which is the shape that answers False for a whole class of
         model. Neither body is reachable from a unit test."""
-        for module in (api_server, atom_standalone_service):
+        for module in (api_server, token_bridge):
             src = pathlib.Path(module.__file__).read_text()
             assert "template_opens_reasoning_implicitly(" in src
             assert "chat_template_source(" in src, f"{module.__name__} reads it raw"
@@ -387,8 +388,9 @@ class TestAModelWithNoChatTemplateStillBoots:
             (lambda t: resolve_reasoning_toggle(t, None), None),
             (lambda t: resolve_tool_call_parser(None, t, None), None),
             (lambda t: template_needs_tool_call_argument_strings(t, None), False),
+            (lambda t: template_takes_mid_system(t, None), False),
         ],
-        ids=["reasoning", "tool-parser", "tool-call-arguments"],
+        ids=["reasoning", "tool-parser", "tool-call-arguments", "mid-system"],
     )
     def test_no_startup_probe_raises(self, probe, expected):
         assert probe(self.NoTemplate()) is expected
@@ -454,7 +456,53 @@ class TestToolCallArgumentStrings:
         out = apply_chat_template(tok, None, [msg], preserve_tool_call_arguments=True)
         assert '{"a": 1}' in out
 
-    def test_a_custom_encoder_is_not_probed(self):
-        assert not template_needs_tool_call_argument_strings(
-            self.Tok(self.CONCAT), object()
+    @pytest.mark.parametrize(
+        "module_name, model_type, strings",
+        [
+            ("encoding_dsv32", None, True),
+            ("encoding_dsv4", None, True),
+            ("encoding", "deepseek_v41", False),
+            ("encoding", None, False),
+        ],
+    )
+    def test_a_custom_encoder_is_not_probed_but_its_adapter_says(
+        self, module_name, model_type, strings
+    ):
+        """DeepSeek-V3.2's and V4's encoders read the string (V3.2's
+        ``json.loads`` it, V4's renders a mapping as one ``arguments``
+        parameter); V4.1's takes either form."""
+        adapter = build_message_encoder_adapter(
+            module_name, lambda messages, **kw: "", model_type=model_type
         )
+        assert (
+            template_needs_tool_call_argument_strings(self.Tok(self.ITERATE), adapter)
+            is strings
+        )
+
+    def test_a_v32_history_tool_call_reaches_its_encoder_as_sent(self):
+        """With the adapter's answer as the server applies it, V3.2's encoder
+        (which ``json.loads`` the arguments) renders a turn after a tool call
+        instead of raising."""
+        import json
+
+        def encode(messages, **kw):
+            calls = [c for m in messages for c in m.get("tool_calls", [])]
+            return "|".join(str(json.loads(c["function"]["arguments"])) for c in calls)
+
+        adapter = build_message_encoder_adapter("encoding_dsv32", encode)
+        msg = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": '{"a": 1}'},
+                }
+            ],
+        )
+        preserve = template_needs_tool_call_argument_strings(None, adapter)
+        out = apply_chat_template(
+            None, adapter, [msg], preserve_tool_call_arguments=preserve
+        )
+        assert out == "{'a': 1}"

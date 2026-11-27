@@ -4,6 +4,7 @@
 import logging
 
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 
@@ -40,7 +41,14 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.layernorm import DualRMSNormMXFP8, RMSNorm
+from atom.model_ops.indexer.layout import _MAX_FUSED_PROJECT_ROWS, NATURAL
+from atom.model_ops.indexer.query import project_query_fp4
+from atom.model_ops.layernorm import (
+    DualRMSNormBF16,
+    DualRMSNormMXFP8,
+    DualRMSNormPerToken,
+    RMSNorm,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedReplicatedLinear,
@@ -53,7 +61,7 @@ from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
-from .layers import native_quant_config
+from .layers import converted_linear_config, native_quant_config
 
 logger = logging.getLogger("atom")
 
@@ -97,9 +105,12 @@ class Indexer(nn.Module):
         self.wq_b = ReplicatedLinear(
             config.q_lora_rank,
             self.heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
+        # Read the fuse flag once: `project` runs it under `@eager_region`, so
+        # an `os.getenv` there would cost ~1.5us every step.
+        self.fuse_weights_proj = envs.ATOM_DSV41_FUSE_WEIGHTS_PROJ
         if spec.mode == AttentionMode.FULL:
             self.wk = ReplicatedLinear(config.head_dim, self.head_dim, bias=False)
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
@@ -135,9 +146,10 @@ class Indexer(nn.Module):
         The query is left on the grid its reader rounds it to. The published
         model FP4-rounds both sides whatever it holds; the FP8 scorer quantizes
         the query itself, so rounding first would round twice, and on the FP4
-        plane one kernel rotates and quantizes it (`quantize_query_fp4`). `qr`
-        arrives quantized, so this GEMM reuses that pair rather than quantizing
-        the tensor a second time.
+        plane one kernel rotates and quantizes it (`quantize_query_fp4`, or
+        `project_query_fp4` on the gfx1250 NATURAL plane, which also folds in
+        the `weights_proj` projection). `qr` arrives quantized, so this GEMM
+        reuses that pair rather than quantizing the tensor a second time.
 
         Apart from `score` so that a compressor's join has somewhere to sit
         that is neither before this nor after the plane is read.
@@ -146,13 +158,30 @@ class Indexer(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        weights = self.weights_proj(hidden)[0]
         if cache.geometry.index_fp4:
             units = cache.index_units[self.spec.kv_owner]
+            # `query.shape` is read only after the layout test. MFMA and
+            # PRESHUFFLE never fuse, and that Size read is measurable on every
+            # FP4 step. `fuse_weights_proj` is set once in `__init__`.
+            if (
+                self.fuse_weights_proj
+                and units.layout == NATURAL
+                and 0 < query.shape[1] <= _MAX_FUSED_PROJECT_ROWS
+            ):
+                # The query's RoPE + MXFP4 quant launch also projects the head
+                # weights, folding `weights_proj` into it rather than running it
+                # as a separate GEMM. The scorer still folds `weights_scale`
+                # (see score_quantized), so the fused weights stay raw
+                # (weights_scale=1.0 here).
+                return project_query_fp4(
+                    query[0], rope, positions, hidden[0], self.weights_proj.weight
+                )
+            weights = self.weights_proj(hidden)[0]
             return (
                 quantize_query_fp4(query[0], rope, positions, layout=units.layout),
                 weights,
             )
+        weights = self.weights_proj(hidden)[0]
         return rope(query, positions)[0], weights
 
     def score(self, query, weights, cache, step):
@@ -276,7 +305,7 @@ class Attention(nn.Module):
             config.hidden_size,
             [config.q_lora_rank, self.head_dim],
             bias=False,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         # Fused: the norm emits `(qr, qr_scale)` in the one launch, and both
         # readers of `qr` -- this layer's `wq_b` and the indexer's -- take that
@@ -290,22 +319,30 @@ class Attention(nn.Module):
         self.wq_b = ColumnParallelLinear(
             config.q_lora_rank,
             config.num_attention_heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
-        self.qk_norm = DualRMSNormMXFP8(
-            self.q_norm,
-            self.kv_norm,
-            f"layers.{spec.layer_id}.qk_norm",
-            amax_floor=AMAX_FLOOR.value,
-        )
-        # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
-        # quantized ColumnParallelLinear so both tensors load through the
-        # standard FP8 path; the grouped GEMM reads them in place, the weight
-        # in the 16x16 layout `LinearBase` shuffles it into, at load and after
-        # a weight sync alike.
+        # Q in the format wq_b and indexer.wq_b take, quantized once for both:
+        # per token for per-channel GEMMs; for native group32 ones MXFP8, or
+        # BF16 where those run in BF16.
+        name = f"layers.{spec.layer_id}.qk_norm"
+        if self.wq_b.quant_type.value == QuantType.per_Token.value:
+            self.qk_norm = DualRMSNormPerToken(
+                self.q_norm, self.kv_norm, name, quant_dtype=self.wq_b.params_dtype
+            )
+        elif self.wq_b.runs_bf16:
+            self.qk_norm = DualRMSNormBF16(self.q_norm, self.kv_norm, name)
+        else:
+            self.qk_norm = DualRMSNormMXFP8(
+                self.q_norm, self.kv_norm, name, amax_floor=AMAX_FLOOR.value
+            )
+        # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale in the checkpoint.
+        # Allocated as a quantized ColumnParallelLinear so both tensors load
+        # through the standard FP8 path; the grouped GEMM reads them in place,
+        # the weight in the 16x16 layout `LinearBase` shuffles it into, at load
+        # and after a weight sync alike. With `runs_bf16` it is BF16 after load.
         self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim // config.o_groups,
             config.o_groups * self.o_rank,
@@ -316,7 +353,7 @@ class Attention(nn.Module):
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
             reduce_results=True,
         )
         # Set in `process_weights_after_loading`, once wo_a's shape is known.
@@ -389,11 +426,13 @@ class Attention(nn.Module):
             self._fuse_woa_quant = False
             _log_woa_quant_path(False, "weight or scale empty", final=False)
             return
+        # The fused pair is the per-1x32 FP8 a native group32 FP8 wo_b reads.
+        if self.wo_b.native_a8_group_rows is None or self.wo_b.runs_bf16:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "wo_b is not a group32 FP8 GEMM")
+            return
         wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
         k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
-        # The gate checks wo_a only. The fused pair is the per-1x32 FP8 that
-        # wo_b reads because wo_b is fixed to native_quant_config(); a
-        # configurable wo_b quant would make this output the wrong layout.
         self._fuse_woa_quant = (
             batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
                 tuple(wo_a_ws.shape), self.o_rank, k
@@ -406,10 +445,27 @@ class Attention(nn.Module):
 
     def _project_out(self, output, rope, positions):
         """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
-        `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
-        order of `output`'s leading dims.
+        `wo_a` GEMM and `wo_b`. Where `wo_a.runs_bf16` (no group32 FP8 GEMM),
+        the inverse RoPE runs in place in BF16 and `wo_a` is one bmm written
+        through a strided view straight into `wo_b`'s input. `positions` are
+        the rows' positions, in the order of `output`'s leading dims.
         """
         rows = output.shape[:-2].numel()
+        if self.wo_a.runs_bf16:
+            x = rope(
+                output.reshape(1, rows, self.heads, self.head_dim).contiguous(),
+                positions.flatten(),
+                inverse=True,
+            )
+            # The bmm writes through y's [groups, rows, o_rank] view, so y is
+            # already wo_b's [rows, groups * o_rank] input: no transpose copy.
+            w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+            x = x.view(rows, self.groups, -1)
+            y = torch.empty(
+                rows, self.groups, self.o_rank, dtype=output.dtype, device=output.device
+            )
+            torch.bmm(x.transpose(0, 1), w.transpose(1, 2), out=y.transpose(0, 1))
+            return self.wo_b(y.view(*output.shape[:-2], -1))
         x_fp8, x_scale = inverse_rope_group_quant(
             output.reshape(rows, self.heads, self.head_dim),
             positions.flatten(),

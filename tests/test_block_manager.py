@@ -480,29 +480,29 @@ class TestHashChainGapSkip:
         bm.hash_blocks(seq, 16)  # must not IndexError
 
 
-# ── can_append / may_append ────────────────────────────────────────────────
+# ── append room / may_append ────────────────────────────────────────────────
 
 
-class TestCanAppend:
-    def test_can_append_within_block(self, block_manager, seq_factory):
+class TestAppendRoom:
+    def test_append_room_within_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3])
         block_manager.allocate(seq)
         seq.append_token(4)
-        assert block_manager.can_append(seq)
+        assert block_manager._has_page_units(block_manager.append_blocks_needed(seq))
 
-    def test_can_append_needs_new_block(self, block_manager, seq_factory):
+    def test_append_room_needs_new_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         block_manager.allocate(seq)
         seq.append_token(5)
-        assert block_manager.can_append(seq)
+        assert block_manager._has_page_units(block_manager.append_blocks_needed(seq))
 
-    def test_cannot_append_no_free(self, seq_factory):
+    def test_append_room_refuses_no_free(self, seq_factory):
         cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
         bm = BlockManager(cfg)
         seq = seq_factory([1, 2, 3, 4])
         bm.allocate(seq)
         seq.append_token(5)
-        assert not bm.can_append(seq)
+        assert not bm._has_page_units(bm.append_blocks_needed(seq))
 
 
 class TestMayAppend:
@@ -611,19 +611,21 @@ class TestHashTableCleanup:
         assert bm.kv.num_indexed <= cfg.num_kvcache_blocks
 
 
-# ── can_append with multi-token decode (speculative decoding) ────────────
+# ── append room with multi-token decode (speculative decoding) ────────────
 
 
-class TestCanAppendMultiToken:
-    def test_can_append_multi_token_within_block(self, block_manager, seq_factory):
+class TestAppendRoomMultiToken:
+    def test_append_room_multi_token_within_block(self, block_manager, seq_factory):
         """Appending 3 tokens that stay within the current block."""
         seq = seq_factory([1])
         block_manager.allocate(seq)
         seq.append_token(2)
         seq.append_token(3)
-        assert block_manager.can_append(seq, num_new_tokens=3)
+        assert block_manager._has_page_units(
+            block_manager.append_blocks_needed(seq, num_new_tokens=3)
+        )
 
-    def test_can_append_multi_token_crossing_boundary(self, seq_factory):
+    def test_append_room_multi_token_crossing_boundary(self, seq_factory):
         """block_size=4, seq_len=14 (3.5 blocks=4 blocks allocated),
         appending 5 tokens crosses into block 5 — needs 1 new block."""
         cfg = MockConfig(num_kvcache_blocks=6, kv_cache_block_size=4)
@@ -633,9 +635,9 @@ class TestCanAppendMultiToken:
         # seq_len=14, 4 blocks. Appending 5 tokens: positions 14..18 → need block 5
         for t in range(14, 19):
             seq.append_token(t)
-        assert bm.can_append(seq, num_new_tokens=5)
+        assert bm._has_page_units(bm.append_blocks_needed(seq, num_new_tokens=5))
 
-    def test_cannot_append_multi_token_no_free(self, seq_factory):
+    def test_append_room_refuses_multi_token_no_free(self, seq_factory):
         """block_size=4, 4 blocks total, seq fills 4 blocks (16 tokens),
         appending 5 tokens needs 2 new blocks but only 0 free."""
         cfg = MockConfig(num_kvcache_blocks=4, kv_cache_block_size=4)
@@ -644,7 +646,7 @@ class TestCanAppendMultiToken:
         bm.allocate(seq)
         for t in range(14, 19):
             seq.append_token(t)
-        assert not bm.can_append(seq, num_new_tokens=5)
+        assert not bm._has_page_units(bm.append_blocks_needed(seq, num_new_tokens=5))
 
 
 # ── Prefix caching + preemption ──────────────────────────────────────────
@@ -744,7 +746,7 @@ class TestDecodeBlockHashing:
         for token in generated:
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
 
     def test_followup_turn_reuses_the_generated_blocks(self, seq_factory):
         bm = self._bm()
@@ -788,7 +790,7 @@ class TestDecodeBlockHashing:
             seq.append_token(token)
             bm.may_append(seq)
         # Commit only the first generated block; the rest is still in flight.
-        bm.hash_decode_blocks(seq, 12)
+        bm.hash_decode_blocks(seq, 12, snapshot_step=0)
         assert seq.num_hashed_tokens == 12
 
         followup = seq_factory(prompt + list(range(100, 112)))
@@ -806,7 +808,7 @@ class TestDecodeBlockHashing:
         for token in range(100, 106):
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
         assert seq.num_hashed_tokens == 16
 
     def test_deallocate_clears_the_watermark(self, seq_factory):
@@ -828,7 +830,7 @@ class TestDecodeBlockHashing:
         for token in range(100, 108):
             seq.append_token(token)
             bm.may_append(seq)
-        bm.hash_decode_blocks(seq, seq.num_tokens)
+        bm.hash_decode_blocks(seq, seq.num_tokens, snapshot_step=0)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
 
@@ -1096,7 +1098,7 @@ def test_pp_stages_split_the_state_budget_by_image(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
     spec = PagedStateCheckpointSpec(
         1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20
-    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20, 2 << 20)
+    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20)
     cfg = MockConfig(
         enable_prefix_caching=True,
         kv_transfer_config=_OFFLOAD_KVC,

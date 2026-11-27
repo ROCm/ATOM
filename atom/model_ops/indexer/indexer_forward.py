@@ -5,8 +5,9 @@
 
 It writes the step's index keys, scores its rows (`score_topk`) and hands the
 selection to sparse MLA as KV slots: through the DCP candidate exchange on a
-DCP decode, the owned-slot filter on a DCP prefill, a request-to-global
-conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
+DCP decode, the owned-slot filter on a "q" DCP prefill, rows of the gathered
+KV at the global indptr on a "kv" DCP prefill, a request-to-global conversion
+otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
@@ -24,21 +25,25 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
+    triton_dcp_sparse_prefill_kv_index,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from atom.utils.tbo.ubatching import tbo_active
 
+from .layout import MFMA, PRESHUFFLE, fp4_scale_byte
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
-from .score import score_topk
+from .score import _gather_split, score_topk
 
 
 def _dcp_stage_indexer_fp4_prefill(
     kv_cache: torch.Tensor,
     kv_cache_scale: torch.Tensor,
     prefill_metadata,
+    layout=PRESHUFFLE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stage the whole key set's FP4 index planes into pages of this rank's own.
 
@@ -49,12 +54,36 @@ def _dcp_stage_indexer_fp4_prefill(
     from a page of their own, which `dcp_indexer_fp4_block_tables` lists as
     the request's own block table does its cache pages.
 
-    The two planes disagree on their row axis, so both the read and the write
-    bend through `fp4_index_scale_rows`; see it for what goes wrong otherwise.
+    In PRESHUFFLE the two planes disagree on their row axis, so the scale
+    read and write use `fp4_index_scale_rows`. MFMA instead gathers each
+    logical row's four scale bytes through `fp4_scale_byte` and scatters
+    that OPUS permutation into the staged scale plane after the all-gather.
+    `layout` selects the matching data and scale addressing for both.
     """
     # Built once per forward by the metadata builder.
     page = prefill_metadata.dcp_indexer_fp4_read_page
     row = prefill_metadata.dcp_indexer_fp4_read_row
+    if layout == MFMA:
+        # Scales cannot be indexed by the data plane's row axis. Gather
+        # each logical row's four bytes explicitly, then scatter the same
+        # OPUS permutation after the DCP all-gather.
+        g = torch.arange(4, device=kv_cache.device)
+        scale_at = fp4_scale_byte(row[:, None], g[None, :])
+        data = kv_cache[page, :, row, :]
+        scale = kv_cache_scale.view(-1, 256)[page[:, None], scale_at]
+        group = get_dcp_group()
+        gather_index = prefill_metadata.dcp_indexer_gather_index
+        data = group.all_gather(data, dim=0).index_select(0, gather_index)
+        scale = group.all_gather(scale, dim=0).index_select(0, gather_index)
+        page = prefill_metadata.dcp_indexer_fp4_stage_page
+        row = prefill_metadata.dcp_indexer_fp4_stage_row
+        pages = prefill_metadata.dcp_indexer_fp4_stage_pages
+        staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
+        staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
+        staged[page, :, row, :] = data
+        scale_at = fp4_scale_byte(row[:, None], g[None, :])
+        staged_scale.view(-1, 256)[page[:, None], scale_at] = scale
+        return staged, staged_scale
     data = kv_cache[page, :, :, row, :]
     scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
 
@@ -100,6 +129,7 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
+    kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
@@ -148,7 +178,50 @@ def sparse_attn_indexer(
         k = k[:n_real]
         if positions is not None:
             positions = positions[:n_real]
-    if indexer_fp4:
+    if indexer_fp4 and indexer_module._index_cache_layout == MFMA:
+        if kv_cache_scale is None:
+            raise ValueError(
+                "OPUS DSA FP4 requires its mutated scale plane as an op argument"
+            )
+        q_quant = torch.empty(
+            (*q_input.shape[:-1], head_dim // 2),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        q_fp4_scale = torch.empty(
+            fp4_q_scale_shape(
+                q_input.shape[0], q_input.shape[1], head_dim, layout=MFMA
+            ),
+            device=q_input.device,
+            dtype=torch.uint8,
+        )
+        weights_mqa = torch.empty(
+            weights.shape, device=weights.device, dtype=weights.dtype
+        )
+        indexer_qk_rope_quant_and_cache(
+            q_input,
+            q_quant,
+            weights,
+            weights_mqa,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            FP4_QUANT_BLOCK_SIZE,
+            scale_fmt,
+            weights_scale,
+            is_neox=is_neox_style,
+            q_scale_out=q_fp4_scale,
+            kv_cache_scale=kv_cache_scale,
+            scale_layout="opus",
+            rope_dim=indexer_module.rope_dim,
+        )
+    elif indexer_fp4:
         # `weights_out` comes back unscaled in q's dtype: the FP4 mqa-logits
         # kernels apply the per-group q scale inside the MFMA and take
         # `weights_scale` as their own fp32 scalar, so either folded in here
@@ -271,11 +344,36 @@ def sparse_attn_indexer(
             q_scale=q_fp4_scale,
             kv_scale=indexer_module.k_cache.kv_cache_scale if indexer_fp4 else None,
             weights_scale=weights_scale,
+            cache_layout=indexer_module._index_cache_layout,
         )
         return
     rows = attn_metadata.index_rows
+    if (
+        indexer_module.exchange_stream is not None
+        and context.is_prefill
+        and get_dcp_world_size() > 1
+        and attn_metadata.dcp_sparse_prefill_kv is None
+        and rows.passes is None
+        and (exchange := _exchange_stream(indexer_module.exchange_stream)) is not None
+    ):
+        return _dcp_prefill_exchange(
+            exchange,
+            indexer_module,
+            q_quant,
+            q_fp4_scale,
+            weights_mqa,
+            kv_cache,
+            attn_metadata,
+            topk_indices,
+            topk_tokens,
+            weights_scale,
+            stable_topk,
+            runner_block_size,
+            cp_kv_cache_interleave_size,
+        )
     # A single-rank prefill's slot conversion subtracts concat rows' request
-    # base itself; decode and the DCP filter read request-local ids.
+    # base itself; decode, the DCP filter and the "kv" index read request-local
+    # ids.
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
     topk_indices = score_topk(
         ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),
@@ -309,27 +407,42 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=attn_metadata.sparse_kv_indices,
             )
-    elif get_dcp_world_size() > 1:
-        # Keep only the positions this rank owns, mapped through the
-        # round-robin virtual-block layout and compacted to the front -- the
-        # decode exchange's treatment, a query token for a request. Handed the
-        # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
-        # slice would copy what the in-place gather avoided moving, and its
-        # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
-        triton_filter_and_convert_dcp_index_prefill(
-            attn_metadata.sparse_kv_indptr,
-            attn_metadata.batch_id_per_q_token,
-            topk_indices,
-            attn_metadata.block_tables,
-            get_dcp_rank(),
-            get_dcp_world_size(),
-            runner_block_size,
-            out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
-            owned_counts=attn_metadata.dcp_owned_counts,
-            NUM_TOPK_TOKENS=topk_tokens,
-            out=attn_metadata.sparse_kv_indices,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-        )
+    elif not single_rank_prefill:
+        dcp_kv_plan = attn_metadata.dcp_sparse_prefill_kv
+        if dcp_kv_plan is not None:
+            # "kv" transport: every candidate, as a row of the gathered KV, at the
+            # global offsets; the attention reads it as the dcp=1 prefill does.
+            triton_dcp_sparse_prefill_kv_index(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.batch_id_per_q_token,
+                topk_indices,
+                dcp_kv_plan,
+                get_dcp_world_size(),
+                out=attn_metadata.sparse_kv_indices,
+                NUM_TOPK_TOKENS=topk_tokens,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
+        else:
+            # Keep only the positions this rank owns, mapped through the
+            # round-robin virtual-block layout and compacted to the front -- the
+            # decode exchange's treatment, a query token for a request. Handed the
+            # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
+            # slice would copy what the in-place gather avoided moving, and its
+            # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
+            triton_filter_and_convert_dcp_index_prefill(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.batch_id_per_q_token,
+                topk_indices,
+                attn_metadata.block_tables,
+                get_dcp_rank(),
+                get_dcp_world_size(),
+                runner_block_size,
+                out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+                owned_counts=attn_metadata.dcp_owned_counts,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=attn_metadata.sparse_kv_indices,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
     else:
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -345,6 +458,69 @@ def sparse_attn_indexer(
         )
 
 
+def _dcp_prefill_exchange(
+    exchange,
+    indexer,
+    query,
+    query_scale,
+    weights,
+    kv_cache,
+    metadata,
+    topk_indices,
+    topk,
+    weight_scale,
+    stable,
+    block_size,
+    interleave_size,
+):
+    """Score the local rows, then gather and filter on the assigned side stream."""
+    rows = metadata.index_rows
+    # Native DCP prefill uses contiguous row shares, not rank-major stripes.
+    assert not rows.split.stripe
+    local_rows = rows._replace(split=rows.split._replace(world=1))
+    topk_indices = score_topk(
+        (
+            (query.unsqueeze(1), query_scale.unsqueeze(1))
+            if indexer._indexer_fp4
+            else query
+        ),
+        weights,
+        _index_cache(indexer, kv_cache, metadata, True),
+        local_rows,
+        topk=topk,
+        weight_scale=weight_scale,
+        stable=stable,
+        out=topk_indices[: rows.out_rows],
+    )
+    exchange.wait_stream(torch.cuda.current_stream())
+    topk_indices.record_stream(exchange)
+    with torch.cuda.stream(exchange):
+        _gather_split(topk_indices, rows.split)
+        triton_filter_and_convert_dcp_index_prefill(
+            metadata.sparse_kv_indptr,
+            metadata.batch_id_per_q_token,
+            topk_indices,
+            metadata.block_tables,
+            get_dcp_rank(),
+            get_dcp_world_size(),
+            block_size,
+            out_kv_indptr=metadata.dcp_sparse_kv_indptr,
+            owned_counts=metadata.dcp_owned_counts,
+            NUM_TOPK_TOKENS=topk,
+            out=metadata.sparse_kv_indices,
+            cp_kv_cache_interleave_size=interleave_size,
+        )
+    metadata.index_exchange_done = exchange.record_event()
+
+
+def _exchange_stream(stream):
+    """Use an eligible DCP prefill's side stream outside graph capture and TBO.
+    The caller excludes decode, DCP=1, packed passes and absent streams."""
+    if torch.cuda.is_current_stream_capturing() or tbo_active():
+        return None
+    return stream
+
+
 def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
     """The keys an indexer layer scores against: its own index cache -- but
     under DCP a prefill's FP4 keys from every rank's shard, staged."""
@@ -352,11 +528,12 @@ def _index_cache(indexer, kv_cache, attn_metadata, is_prefill) -> IndexCache:
     if not indexer._indexer_fp4:
         return IndexCache(kv_cache, None, block)
     scales = indexer.k_cache.kv_cache_scale
+    layout = indexer._index_cache_layout
     if is_prefill and get_dcp_world_size() > 1:
         kv_cache, scales = _dcp_stage_indexer_fp4_prefill(
-            kv_cache, scales, attn_metadata
+            kv_cache, scales, attn_metadata, layout
         )
-    return IndexCache(kv_cache, scales, block)
+    return IndexCache(kv_cache, scales, block, layout)
 
 
 # The selection buffers are declared mutated so a compiled graph orders the
@@ -367,6 +544,7 @@ direct_register_custom_op(
     op_func=sparse_attn_indexer,
     mutates_args=[
         "kv_cache",
+        "kv_cache_scale",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",

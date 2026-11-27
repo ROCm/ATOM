@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """V4.1 DSpark math and checkpoint layout; context storage is caller-owned."""
 
 import logging
 from copy import copy
-from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
@@ -21,6 +23,7 @@ from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotat
 from atom.model_ops.deepseek_v41.dspark import (
     DraftSrcBuffers,
     build_block_state,
+    build_peer_block_state,
     draft_attention,
     draft_attention_fp8,
     draft_src_indices,
@@ -34,28 +37,39 @@ from atom.model_ops.dspark_markov_argmax import (
     dspark_markov_argmax_tp,
     markov_weights_unsupported,
 )
+from atom.model_ops.embed_head import VocabParallelEmbedding, masked_embedding
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.peer_embedding import PeerEmbedding, shared_peer_embedding
 from atom.models.deepseek_v4 import make_v4_quant_config
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
     _DSparkInner,
 )
-from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.dspark_draft import DSparkDraftModel, VocabShard
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils import envs
 
 from .attention import Attention
-from .config import build_attention_topology
-from .layers import native_quant_config
+from .config import FP4PTPC_RECIPE, build_attention_topology
+from .layers import (
+    converted_linear_spec,
+    native_quant_config,
+    routed_experts_are_ptpc,
+)
 from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wkv_shard = None  # built by `wkv_shard` on first use
+
     def context_keys(self, kv_normed, positions, rope, *, packed=False):
         """The context row alone, for a caller with no query to rotate with it.
 
@@ -70,18 +84,20 @@ class DraftAttention(Attention):
     @property
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
-        view = self.__dict__.get("_wkv_shard")
-        if view is None:
-            view = self._wkv_shard = self.wqkv_a.shard_view(1)
-        return view
+        if self._wkv_shard is None:
+            # A view of `wqkv_a`, not a submodule: kept out of `_modules`.
+            object.__setattr__(self, "_wkv_shard", self.wqkv_a.shard_view(1))
+        return self._wkv_shard
 
     def project_context(self, hidden, positions, rope, *, packed=False):
-        """Target keys alone; the query half is computed and dropped.
-
-        As V4's draft does, and only on the unfused path -- when the stages
-        fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
+        """Target keys alone, only on the unfused path -- when the stages
+        fuse, `write_context_kv` reads `wkv_shard`. A BF16 `wqkv_a` projects
+        only the KV rows; an FP8 one computes the query half and drops it.
         """
-        _, kv_pre = self.project_qkv(hidden)
+        if self.wqkv_a.runs_bf16:
+            kv_pre = self.wkv_shard(hidden)
+        else:
+            _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
     def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
@@ -226,10 +242,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        # An FP4PTPC checkpoint converts only the backbone's linears; the
+        # draft's stay native.
+        draft.fp4ptpc = False
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=converted_linear_spec(draft),
+            online_routed_experts=True,
         )
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
+        self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
+        if args.fp4ptpc and not all(
+            routed_experts_are_ptpc(self.moe_quant_config, f"mtp.{i}.ffn.experts")
+            for i in range(len(topology))
+        ):
+            # The draft's FP4 experts run only converted, as the backbone's.
+            raise ValueError(f"mtp: {FP4PTPC_RECIPE}")
         # The backbone's, handed down: the two models never run at once, so a
         # stream of its own would buy nothing. Absent when built offline,
         # which is also where nothing is fast enough to care.
@@ -255,23 +286,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             args.qk_rope_head_dim, capacity + self.block_size, base=args.rope_theta
         )
         self.embed = self.head = None
-        # Stage 0's main_norm, as a fused RMSNorm + MXFP8 quant. Outside the
-        # module tree so the loader looks for no new weight; it holds
-        # main_norm's own weight tensor, so loads and weight syncs reach it.
-        self._build_main_norm_quant()
-
-    def _build_main_norm_quant(self):
-        main = self.mtp[0].main_norm
-        norm = RMSNorm(
-            main.dim,
-            main.eps,
-            fused_quant=True,
-            quant_config=native_quant_config(),
-        )
-        norm.weight = main.weight
-        # A plain object, not a child module: assigning the RMSNorm itself
-        # would register it and make the loader look for a second weight.
-        self._main_norm_quant_holder = SimpleNamespace(norm=norm)
+        self._unbind_embedding()
 
     @property
     def model(self):
@@ -300,6 +315,61 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
+        self._unbind_embedding()
+
+    def _unbind_embedding(self) -> None:
+        self._embedding_bound = False
+        self._embed_peer: PeerEmbedding | None = None
+        self._noise_row: torch.Tensor | None = None
+
+    @torch.no_grad()
+    def _bind_embedding(self) -> None:
+        """Where the draft reads the shared embedding's rows, and the noise
+        row, resolved once on the first draft step outside a graph capture
+        (a warmup forward), as `LazyRunner` binds mono.
+
+        A vocab-parallel bf16 table is read from its owner ranks' shards
+        (`shared_peer_embedding`, the mapping mono's draft also reads):
+        the anchors in `build_peer_block_state`, no lookup and no all-reduce.
+        The noise row is one fixed row every draft path reuses (this block,
+        hi's, mono's without the peer read); it is never taken through the
+        custom all-reduce, which returns zeros during a graph warmup.
+        """
+        if self._embedding_bound:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "V4.1 DSpark binds its embedding on an eager draft step, "
+                "not under graph capture"
+            )
+        embed = self.embed
+        sharded = isinstance(embed, VocabParallelEmbedding) and embed.tp_size > 1
+        if sharded and embed.weight.dtype == torch.bfloat16:
+            try:
+                self._embed_peer = shared_peer_embedding(
+                    embed, get_tp_group().cpu_group
+                )
+            except MonoUnsupported as why:
+                logger.warning("V4.1 DSpark: peer embedding off: %s", why)
+        ids = torch.full(
+            (1,),
+            self.config.dspark_noise_token_id,
+            dtype=torch.long,
+            device=embed.weight.device,
+        )
+        if self._embed_peer is not None:
+            row = self._embed_peer(
+                ids, embed.weight.new_empty(1, embed.weight.shape[1])
+            )
+        elif sharded:
+            row = masked_embedding(
+                ids, embed.weight, embed.vocab_start_idx, embed.vocab_end_idx
+            )
+            dist.all_reduce(row, group=get_tp_group().device_group)
+        else:
+            row = embed(ids)
+        self._noise_row = row.flatten()
+        self._embedding_bound = True
 
     def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an
@@ -314,46 +384,31 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def _target_layer_input(inputs, block):
         # Settled, because a pre-hook runs before the fold: the block ahead of
         # this one leaves its FFN post owed, and `residual` is by definition
-        # the value before it. The block pays the same post again into its own
-        # pre, which is the one seam where the draft costs the target a kernel.
-        residual = inputs[0].settle().residual
-        return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
+        # the value before it. The block still pays that post into its own pre;
+        # the tap reads it with the mean (`stream_mean`), in one launch where
+        # `post_reduce_supported` holds, without writing the settled residual.
+        state = inputs[0]
+        return state.stream_mean().reshape(-1, state.residual.shape[-1])
 
     def project_context(self, taps):
         """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
         return self.mtp[0].main_norm(self._project_taps(taps))
 
-    def project_context_quant(self, taps):
-        """`project_context`, emitted as the fused KV GEMM's quantized input.
-
-        Returns E4M3 values and their row-major group-32 UE8M0 scales, the
-        `(x, x_scale)` pair `native_quant_linear` would otherwise make itself
-        with `quantize_fp8`, from one RMSNorm + MXFP8 launch.
-
-        Not bit-identical to `project_context` followed by that quantize: the
-        fused kernel quantizes the fp32 normalized value, where the chain
-        rounds it to bf16 first and quantizes the rounded value, so an element
-        near an E4M3 code boundary can land on the other code. It also has no
-        `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
-        keeps the chain when that is set.
-        """
-        return self._main_norm_quant()(self._project_taps(taps))
-
     def _project_taps(self, taps):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
-        `main_proj` quantizes its input with `quantize_fp8`; the taps are
-        quantized where they lie instead, to the same fp8 rows and scales,
+        An FP8 `main_proj` quantizes its input with `quantize_fp8`; the taps
+        are quantized where they lie instead, to the same fp8 rows and scales,
         minus the concatenated copy. `quantize_fp8_taps` joins them itself for
         a shape its kernel does not take, and passes a single joined block
-        (a PP relay) through as it is.
+        (a PP relay) through as it is. A BF16 `main_proj` (no group32 FP8
+        GEMM) takes the joined taps unquantized.
         """
+        main_proj = self.mtp[0].main_proj
+        if main_proj.runs_bf16:
+            return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
-        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
-
-    def _main_norm_quant(self):
-        """The fused norm built in ``__init__``."""
-        return self._main_norm_quant_holder.norm
+        return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     @property
     def context_layers(self):
@@ -393,20 +448,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
-        weight, weight_scale, group_rows, width, preshuffled = fused
-        if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
-            hidden, hidden_scale = self.project_context(taps), None
-        else:
-            # The norm emits the GEMM's quantized input, so the GEMM does not
-            # run its own quantize_fp8 on the bf16 norm output.
-            hidden, hidden_scale = self.project_context_quant(taps)
+        weight, weight_scale, group_rows, width = fused
+        # main_norm lands in bf16 and the GEMM quantizes that, as the original
+        # model rounds.
         kv = native_quant_linear(
-            hidden,
+            self.project_context(taps),
             weight,
             weight_scale,
             weight_group_rows=group_rows,
-            weight_preshuffled=preshuffled,
-            x_scale=hidden_scale,
+            weight_preshuffled=weight.is_shuffled,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:
@@ -429,8 +479,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
-            # deleted, each program writing its row straight to its stage slot.
+            # deleted, each program writing its row straight to its stage slot,
+            # or, when the stages' fp8 windows share a ring, to its window.
             norm_weight, eps = tail
+            window = cache.window_target([a.spec.layer_id for a in layers], step)
             keys = fused_draft_kv_tail(
                 kv,
                 norm_weight,
@@ -439,7 +491,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 self.rope.sin_cache,
                 eps,
                 packed=cache.window_fp8,
+                window=window,
+                step=step,
             )
+            if window is not None:
+                return
         for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
@@ -503,15 +559,25 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
+        bf16 = any(s.runs_bf16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
+            weight = torch.cat([s.weight for s in shards])
+            # the concatenation is a new tensor in the stages' layout: it
+            # carries their layout flag, as every loaded weight does
+            weight.is_shuffled = preshuffled
             fused = (
-                torch.cat([s.weight for s in shards]),
+                weight,
                 torch.cat([s.weight_scale for s in shards]),
                 group_rows,
                 width,
-                preshuffled,
             )
         self._context_kv_fused = fused
         return fused
@@ -583,27 +649,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
             self._context_ids = ids
         return ids
 
-    def _noise_embedding(self):
-        """The noise token's embedding row, embedded once and kept.
-
-        Every draft column past the anchor carries `dspark_noise_token_id`, and
-        the embedding is a TP all-reduce: embedding it per step per column put
-        `width` identical rows through the collective for no reason. The table
-        is fixed once the checkpoint is loaded, so the row is too -- resolved on
-        the first drafting step rather than at construction, which is when the
-        shared target embedding has actually been attached.
-        """
-        row = self.__dict__.get("_noise_row")
-        if row is None:
-            ids = torch.full(
-                (1,),
-                self.config.dspark_noise_token_id,
-                dtype=torch.long,
-                device=self.embed.weight.device,
-            )
-            row = self.embed(ids).flatten()
-            self._noise_row = row
-        return row
+    def _noise_embedding(self) -> torch.Tensor:
+        """The noise token's embedding row (`_bind_embedding`)."""
+        self._bind_embedding()
+        return self._noise_row
 
     def block_backbone(self, input_ids, positions, num_draft):
         from atom.utils.forward_context import get_forward_context
@@ -688,19 +737,17 @@ class DeepseekV41DSpark(DSparkDraftModel):
         width = self.block_size if num_draft is None else num_draft
         if not 1 <= width <= self.block_size:
             raise ValueError("Draft width must fit the published DSpark block")
-        # Only the anchors are embedded: every other column of the block is the
-        # same noise token, whose row never changes, so it is embedded once and
-        # kept. That takes `width` out of the embedding's TP all-reduce, and
-        # the block state is then written straight out rather than broadcast
-        # and copied. See `build_block_state`.
-        state = SinglePassHCState(
-            *build_block_state(
-                self.embed(anchor_ids),
-                self._noise_embedding(),
-                width,
-                self.config.hc_mult,
+        # Every column past the anchor is the same noise token, whose row is
+        # kept (`_bind_embedding`); only the anchors are read per step.
+        noise = self._noise_embedding()
+        hc_mult = self.config.hc_mult
+        if self._embed_peer is not None:
+            block = build_peer_block_state(
+                self._embed_peer, anchor_ids.reshape(-1), noise, width, hc_mult
             )
-        )
+        else:
+            block = build_block_state(self.embed(anchor_ids), noise, width, hc_mult)
+        state = SinglePassHCState(*block)
         if step is None:
             step = draft_step(context_positions, anchors, width, self.window_size)
         for layer in self.mtp:
@@ -715,11 +762,50 @@ class DeepseekV41DSpark(DSparkDraftModel):
     _head_and_sample = _DSparkInner.head_and_sample
     forward_head = _DSparkInner.forward_head
 
-    def head_and_sample(self, out, anchor_ids, num_draft):
+    # `head_and_sample` draws the block through the bound `draft_sampling`, so
+    # `DSparkProposer` may arm lossless sampling here; its drafts are verified
+    # as one block.
+    supports_lossless_draft = True
+    lossless_block_verify = True
+
+    @property
+    def markov_head(self):
+        """The last stage's Markov head, the one the block is sampled with."""
+        return self.mtp[-1].markov_head
+
+    def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        if self.draft_sampling is not None and not greedy:
+            return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
+        """The lossless block: each x_k drawn from, and its q published to,
+        the bound `draft_sampling` (`DSparkMarkovHead.sample_block`). Where the
+        greedy block keeps the LM head sharded (`_sharded_markov_sample`), so
+        does this one: the ranks exchange tile partials, histograms and their
+        share of the stored entries rather than the logits, and store and
+        draw what the whole vocab would (`dspark_markov_sample_tp`)."""
+        B, T, _ = hc_hidden.shape
+        head, markov = self.head, self.mtp[-1].markov_head
+        shard = None
+        if self._sharded_markov_sample():
+            base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
+            shard = VocabShard(
+                head.vocab_start_idx, get_tp_group(), envs.ATOM_USE_CUSTOM_ALL_GATHER
+            )
+        else:
+            base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+        out_ids = markov.sample_block(
+            base_logits, anchor_ids, self.draft_sampling, shard
+        )
+        # The confidence head reads W1[x_{k-1}], which the greedy op hands over
+        # and the sampled one does not.
+        prev_ids = torch.cat([anchor_ids[:, None], out_ids[:, :-1]], dim=1)
+        confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
+        return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.

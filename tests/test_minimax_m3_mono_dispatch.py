@@ -29,6 +29,7 @@ def _atom_config(**overrides):
         "tensor_parallel_size": 4,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_expert_parallel": False,
         "enable_dp_attention": False,
         "decode_context_parallel_size": 1,
@@ -55,6 +56,21 @@ def native(monkeypatch):
 
 def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
+
+
+def test_nvfp4_caches_are_supported_together_only(native):
+    nv = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4"}
+    assert dispatch._config_refusal(_atom_config(**nv)) is None
+    assert (
+        dispatch._config_refusal(_atom_config(**{**nv, "index_cache_dtype": None}))
+        is None
+    )
+    assert "index cache fp8 with kv cache nvfp4" in dispatch._config_refusal(
+        _atom_config(kv_cache_dtype="nvfp4")
+    )
+    assert "index cache nvfp4 with kv cache fp8" in dispatch._config_refusal(
+        _atom_config(index_cache_dtype="nvfp4")
+    )
 
 
 @pytest.mark.parametrize(

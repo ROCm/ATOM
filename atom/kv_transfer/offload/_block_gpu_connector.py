@@ -79,6 +79,10 @@ class BlockByteCodec(Protocol):
     @property
     def has_fused_chunk_major_staging(self) -> bool: ...
 
+    # Whether the codec can restore a padded run of Store slots in place
+    # (``chunk_major_strided_buffer_to_gpu_prepared``).
+    supports_strided_restore: bool
+
     def gpu_to_chunk_major_device_buffer(
         self,
         device_buf: torch.Tensor,

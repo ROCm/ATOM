@@ -45,12 +45,26 @@ def stubbed_aiter(*extra: str):
     dependency, but it was dropped anyway, so pickling an enum member
     re-imported the module, got a different class, and raised
     ``PicklingError``.
+
+    A stand-in another test module left in ``sys.modules`` -- no file, no
+    ``__getattr__`` -- holds only what that module needed: ``test_pd_pp``
+    leaves ``aiter.dist.parallel_state`` with two functions, for connectors
+    that look them up at call time. It is kept, and for the duration also
+    serves every other name, as the stubs here do; a ``from ... import`` of
+    one it lacks raised ImportError at collection otherwise.
     """
     before = set(sys.modules)
     installed = []
+    served = []
     # every object the stubs handed out, by identity: a module that bound one
     # is poisoned, a module that bound none is not.
     handed_out = []
+
+    def _stub_attr(_attr, _sink=handed_out):
+        mock = MagicMock()
+        _sink.append(mock)
+        return mock
+
     for name in (
         "aiter",
         "aiter.dist",
@@ -62,14 +76,14 @@ def stubbed_aiter(*extra: str):
         *extra,
     ):
         if name in sys.modules:
+            stand_in = sys.modules[name]
+            if getattr(stand_in, "__file__", None) is None and (
+                "__getattr__" not in vars(stand_in)
+            ):
+                stand_in.__getattr__ = _stub_attr
+                served.append(stand_in)
             continue
         module = types.ModuleType(name)
-
-        def _stub_attr(_attr, _sink=handed_out):
-            mock = MagicMock()
-            _sink.append(mock)
-            return mock
-
         module.__getattr__ = _stub_attr
         sys.modules[name] = module
         installed.append(name)
@@ -79,10 +93,12 @@ def stubbed_aiter(*extra: str):
     finally:
         for name in installed:
             _drop(name)
+        for stand_in in served:
+            del stand_in.__getattr__
         # Only when this context actually stubbed something: with a real AITER
         # present nothing was poisoned, and dropping modules the caller still
         # holds references to is how two copies of one class appear.
-        if installed:
+        if installed or served:
             handed = {id(obj) for obj in handed_out}
             fresh = {
                 name
@@ -226,8 +242,8 @@ class _ExternalModuleLoader(importlib.abc.Loader):
 
 class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname in {"aiter", "triton"} or fullname.startswith(
-            ("aiter.", "triton.")
+        if fullname in {"aiter", "triton", "flydsl"} or fullname.startswith(
+            ("aiter.", "triton.", "flydsl.")
         ):
             return importlib.util.spec_from_loader(
                 fullname, _ExternalModuleLoader(), is_package=True
@@ -237,17 +253,18 @@ class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
 
 @contextmanager
 def stubbed_external_kernel_modules():
-    """Serve every `aiter` / `triton` import from a stand-in: the names in
+    """Serve external AITER, Triton and FlyDSL kernel imports from stand-ins: the names in
     `_external_module_attributes` are real, any other attribute is a MagicMock."""
     # Torch imports its own optional Triton integration lazily. Resolve that
     # first so this test's deliberately small Triton stub cannot affect it.
     importlib.import_module("torch._dynamo.config")
+    importlib.import_module("torch._inductor.compile_fx")
 
-    prefixes = ("aiter", "triton")
+    prefixes = ("aiter", "triton", "flydsl")
     saved = {
         name: module
         for name, module in sys.modules.items()
-        if name in prefixes or name.startswith(("aiter.", "triton."))
+        if name in prefixes or name.startswith(("aiter.", "triton.", "flydsl."))
     }
     for name in saved:
         sys.modules.pop(name, None)
@@ -259,7 +276,7 @@ def stubbed_external_kernel_modules():
     finally:
         sys.meta_path.remove(finder)
         for name in list(sys.modules):
-            if name in prefixes or name.startswith(("aiter.", "triton.")):
+            if name in prefixes or name.startswith(("aiter.", "triton.", "flydsl.")):
                 sys.modules.pop(name, None)
         sys.modules.update(saved)
 
@@ -293,12 +310,23 @@ def atom_under_stubs():
 
 @contextmanager
 def atom_without_aiter():
-    """`importlib.import_module`, against the stand-ins only where AITER is
-    not installed (the CPU job); a GPU host keeps the real kernels."""
+    """`importlib.import_module`, against the stand-ins only where AITER
+    cannot run here (the CPU job); a GPU host keeps the real kernels.
+
+    `import aiter` alone does not answer that: an AITER build on a host with
+    no GPU still imports, because its arch probe is deferred, and the
+    submodule that binds a kernel then fails on the missing device. An ATOM
+    module whose import chain reaches that submodule needs the stand-ins
+    there too. `gpu_stack_import` in tests/conftest.py draws the same line.
+    """
     try:
         import aiter  # noqa: F401
     except ImportError:
+        usable = False
+    else:
+        usable = torch.cuda.is_available()
+    if usable:
+        yield importlib.import_module
+    else:
         with atom_under_stubs() as load:
             yield load
-    else:
-        yield importlib.import_module

@@ -880,11 +880,18 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
 
 def _kv_events_engine(
-    monkeypatch, parallel=None, *, enable_dp_attention=False, tp=1, **events
+    monkeypatch,
+    parallel=None,
+    *,
+    enable_dp_attention=False,
+    tp=1,
+    kv_transfer_config=None,
+    **events,
 ):
     """An engine with KV events configured as `events`, by default DP=2 on one
     node, serving the sources its CoreManager builds."""
     from atom.config import KVEventsConfig, ParallelConfig
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.model_engine.engine_core_mgr import kv_event_sources
 
     config = SimpleNamespace(
@@ -892,9 +899,16 @@ def _kv_events_engine(
         parallel_config=parallel or ParallelConfig(data_parallel_size=2),
         enable_dp_attention=enable_dp_attention,
         tensor_parallel_size=tp,
+        pipeline_parallel_size=1,
         kv_cache_block_size=16,
         decode_context_parallel_size=2,
+        kv_transfer_config=kv_transfer_config,
+        hf_config=SimpleNamespace(num_hidden_layers=4, model_type="glm_moe_dsa"),
+        model="test-model",
+        kv_cache_dtype="fp8",
+        speculative_config=None,
     )
+    config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(
         api_server,
@@ -904,6 +918,7 @@ def _kv_events_engine(
             core_mgr=SimpleNamespace(kv_event_sources=kv_event_sources(config)),
         ),
     )
+    return config
 
 
 def _tcp_sources(ports):
@@ -971,12 +986,95 @@ def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
     }
 
 
+def test_kv_event_sources_offsets_the_replay_endpoint_per_rank(monkeypatch):
+    _kv_events_engine(
+        monkeypatch,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+        replay_endpoint="tcp://*:5600",
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    expected["0"]["replay_endpoint"] = "tcp://*:5600"
+    expected["1"]["replay_endpoint"] = "tcp://*:5601"
+    assert sources == expected
+
+
 @pytest.mark.parametrize(
     "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
 )
 def test_kv_event_sources_is_empty_without_a_publisher(monkeypatch, events):
     _kv_events_engine(monkeypatch, **events)
     assert asyncio.run(api_server.kv_event_sources()) == {}
+
+
+@pytest.fixture
+def fake_aiter(monkeypatch):
+    """AITER's fp8 and arch as on gfx950: the Store namespace asks for both."""
+    import torch
+
+    package = types.ModuleType("aiter")
+    package.dtypes = SimpleNamespace(d_dtypes={"fp8": torch.float8_e4m3fn})
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx = lambda: "gfx950"
+    for name, module in (
+        ("aiter", package),
+        ("aiter.jit", types.ModuleType("aiter.jit")),
+        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
+        ("aiter.jit.utils.chip_info", chip_info),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize(
+    "min_load, reported", [(None, 512), ("1024", 1024)], ids=["store-default", "env"]
+)
+def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
+    monkeypatch, fake_aiter, min_load, reported
+):
+    from atom.kv_transfer.offload.mooncake_store import keys
+
+    if min_load is None:
+        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", min_load)
+    pools = {
+        "rdma0": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.1:8080"},
+        "rdma1": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.9:8080"},
+        "rdma2": {"master": "10.0.0.3:50051", "metadata": "http://10.0.0.3:8080"},
+    }
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {
+            "mooncake_store.pools": pools,
+            "mooncake_store.local_hostname": "10.0.0.2",
+            "mooncake_store.chunk_tokens": 64,
+        },
+    }
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    config = _kv_events_engine(
+        monkeypatch,
+        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    # The Store connector's own view of the config under `multi`.
+    leaf = SimpleNamespace(**vars(config) | {"kv_transfer_config": store})
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    for source in expected.values():
+        source["offload"] = {
+            "backend": "mooncake_store",
+            "masters": ["10.0.0.1:50051", "10.0.0.3:50051"],
+            "namespace": keys.store_namespace(leaf, 64),
+            "chunk_tokens": 64,
+            "world": 1,
+            "min_load_tokens": reported,
+            "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
+        }
+    assert asyncio.run(api_server.kv_event_sources()) == expected
 
 
 # ---- --api-server-count: the worker side of api_server ----
@@ -996,7 +1094,51 @@ def test_engine_routes_are_the_management_endpoints():
         "/server_info",
         "/start_profile",
         "/stop_profile",
+        "/offload/lookups",
     }
+
+
+_APPLIED = {"applied": True, "enabled": False}
+
+
+@pytest.mark.parametrize(
+    "ranks,body,expected",
+    [
+        (None, {"enabled": False}, 503),
+        ([_APPLIED] * 2, b"not json", 400),
+        ([_APPLIED] * 2, {"enabled": "no"}, 400),
+        (RuntimeError("rank 3 did not answer"), {"enabled": False}, 500),
+        ([_APPLIED] * 2, {"enabled": False}, 200),
+        ([_APPLIED, {"applied": False, "enabled": False}], {"enabled": False}, 409),
+        ([_APPLIED, {"applied": True, "enabled": True}], {"enabled": False}, 409),
+    ],
+)
+def test_offload_lookups_succeeds_only_when_every_rank_applied_it(
+    monkeypatch, ranks, body, expected
+):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def switch(enabled):
+        calls.append(enabled)
+        if isinstance(ranks, Exception):
+            raise ranks
+        return ranks
+
+    engine = None if ranks is None else SimpleNamespace(set_offload_lookups=switch)
+    monkeypatch.setattr(api_server, "engine", engine)
+    client = TestClient(api_server.app)
+    if isinstance(body, bytes):
+        reply = client.post("/offload/lookups", content=body)
+    else:
+        reply = client.post("/offload/lookups", json=body)
+    assert reply.status_code == expected
+    assert calls == ([False] if expected in (200, 409, 500) else [])
+    if expected == 200:
+        assert reply.json() == {"status": "success", "enabled": False, "ranks": ranks}
+    if expected == 409:
+        assert reply.json()["detail"] == {"enabled": False, "ranks": ranks}
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
@@ -1114,8 +1256,8 @@ def test_relay_answers_503_while_the_hub_is_not_serving(monkeypatch, tmp_path):
 
 
 class TestPreparePrompt:
-    """`_prepare_prompt`: render, tokenize the engine's way, cut to the
-    context, on the executor, for /v1/messages and /v1/responses."""
+    """`_prepare_prompt`: render and tokenize the engine's way, on the
+    executor, for /v1/messages and /v1/responses. Never cut to the context."""
 
     @pytest.fixture
     def prepare(self, monkeypatch):
@@ -1136,59 +1278,33 @@ class TestPreparePrompt:
                 io_processor=SimpleNamespace(encode_prompt=encode_prompt),
             ),
         )
-        monkeypatch.setattr(
-            api_server,
-            "tokenizer",
-            SimpleNamespace(decode=lambda ids, **_kw: "k" * len(ids)),
-        )
         monkeypatch.setattr(api_server, "custom_message_encoder", None)
-        rendered = {}
         monkeypatch.setattr(
             api_server,
             "apply_chat_template",
-            lambda _tok, _enc, messages, **kwargs: rendered.setdefault(
-                "text", messages
-            ),
+            lambda _tok, _enc, messages, **kwargs: messages,
         )
 
-        def run(prompt, max_tokens, chain=False, kv=None):
+        def run(prompt, chain=False):
             encoded["chain"] = chain
-            rendered.clear()
             return api_server._prepare_prompt(
-                prompt,
-                {},
-                tools=None,
-                preserve_tool_call_arguments=False,
-                max_tokens=max_tokens,
-                kv_transfer_params=kv,
+                prompt, {}, tools=None, preserve_tool_call_arguments=False
             )
 
         return run
 
-    def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
-        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+    def test_a_prompt_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, chain=True)
         # The engine's own encoding, chain included, so preprocess reuses it.
         assert engine_input.token_ids == list(range(50))
         assert engine_input.block_hashes == "chain"
         assert text == "x" * 50
 
-    def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
-        # 100-token context, 10 reserved for output: 90 kept.
-        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
-        assert engine_input == list(range(90))
-        assert text == "k" * 90
-
-    @pytest.mark.parametrize("max_tokens", [100, 1024])
-    def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
-        with pytest.raises(ValueError, match="no room for a prompt"):
-            prepare("x" * 5, max_tokens=max_tokens)
-
-    def test_an_empty_cut_is_refused(self, prepare, monkeypatch):
-        monkeypatch.setattr(
-            api_server, "tokenizer", SimpleNamespace(decode=lambda ids, **_kw: "")
-        )
-        with pytest.raises(ValueError, match="empty after truncation"):
-            prepare("x" * 150, max_tokens=10)
+    def test_an_over_long_prompt_is_not_cut(self, prepare):
+        # 100-token context: the prompt is left whole for admission to refuse.
+        engine_input, text = prepare("x" * 150)
+        assert engine_input == list(range(150))
+        assert text == "x" * 150
 
 
 class TestDeploymentDefaultOutputCap:
@@ -1263,6 +1379,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "tool_call_parser_cls",
         "preserve_tool_call_arguments",
         "required_tool_channel",
+        "mid_system_supported",
     )
     for name in names:
         monkeypatch.setattr(api_server, name, "unset", raising=False)
@@ -1277,6 +1394,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "template_keeps_tool_call_arguments": lambda *_a: keeps,
         "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
+        "template_takes_mid_system": lambda *_a: False,
     }
     for name, stub in stubs.items():
         monkeypatch.setattr(api_server, name, stub)
@@ -1293,3 +1411,4 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
+    assert api_server.mid_system_supported is False

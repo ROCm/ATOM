@@ -1,6 +1,6 @@
 name: ATOM SGLang Accuracy Validation
 # Scheduled MI355 and MI308 nights are separate runs; the title tells
-# atom-sglang-nightly-deadline.yaml which ones to stop at 09:00 Beijing time.
+# atom-nightly-deadline.yaml which ones to stop at 09:00 Beijing time.
 run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled {1})', github.workflow, github.event.schedule == '0 16 * * *' && 'MI308' || 'MI355') || github.workflow }}"
 
 on:

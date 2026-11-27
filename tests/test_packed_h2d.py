@@ -248,3 +248,58 @@ def test_direct_member_preserves_an_in_flight_packed_arena():
     assert [value.cpu().tolist() for value in observed] == [
         [11 + i] * 8 for i in range(5)
     ]
+
+
+def test_word_copy_matches_the_bytes_at_any_alignment_and_count():
+    """Members of every unit, odd byte tails and unaligned destinations (the
+    byte path): each destination gets exactly its count's bytes and nothing
+    past them, whether its member takes the int64 word copy or not."""
+    import random
+    from types import SimpleNamespace
+
+    from atom.utils.packed_h2d import PackedCopy
+
+    rng = random.Random(0)
+    for _ in range(30):
+        members = []
+        for _ in range(rng.randint(2, 12)):
+            unit = rng.choice([1, 2, 4, 8, 12, 16, 4096])
+            count = rng.randint(1, 3000 if unit < 4096 else 40)
+            size = unit * count
+            offset = rng.choice([0, 0, 16, 1, 3, 8, 4])
+            source = torch.randint(0, 255, (size,), dtype=torch.uint8).pin_memory()
+            backing = torch.full((size + 64,), 0xAB, dtype=torch.uint8, device="cuda")
+            destination = backing[offset : offset + size]
+            members.append(
+                SimpleNamespace(
+                    source=source,
+                    destination=destination,
+                    capacity=count,
+                    bytes_per_count=unit,
+                    backing=backing,
+                    offset=offset,
+                    _copy=lambda c, s=source, d=destination, u=unit: d[: c * u].copy_(
+                        s[: c * u], non_blocking=True
+                    ),
+                )
+            )
+        packed, why = PackedCopy.create(members, torch.device("cuda"))
+        assert packed is not None, why
+        assert packed.wide.tolist() == [
+            int(m.destination.data_ptr() % 16 == 0) for m in members
+        ]
+        for _ in range(3):
+            counts = [
+                rng.choice([None, 0, m.capacity, rng.randint(0, m.capacity)])
+                for m in members
+            ]
+            for m in members:
+                m.backing.fill_(0xAB)
+            torch.cuda.synchronize()
+            packed.submit(counts)
+            torch.cuda.synchronize()
+            for m, count in zip(members, counts):
+                n = (count or 0) * m.bytes_per_count
+                got = m.backing.cpu()[m.offset : m.offset + m.destination.numel()]
+                assert torch.equal(got[:n], m.source[:n])
+                assert (got[n:] == 0xAB).all()

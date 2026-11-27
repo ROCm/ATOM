@@ -513,6 +513,38 @@ impl MeshMetrics {
         .increment(1);
     }
 
+    /// Record the prompt and engine-reported cached tokens of a routed request.
+    pub fn record_route_cache_tokens(pool: &'static str, prompt: u64, cached: u64) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_CACHED, cached),
+        ] {
+            counter!(names::ROUTE_CACHE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+    }
+
+    /// Reconcile the router's cached-token estimate with the engine's report.
+    pub fn record_route_cache_estimate(
+        pool: &'static str,
+        prompt: u64,
+        estimated: u64,
+        actual: u64,
+    ) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_ESTIMATED, estimated),
+            (metrics_labels::CACHE_ACTUAL, actual),
+        ] {
+            counter!(names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+        if prompt > 0 {
+            histogram!(names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO, "pool" => pool)
+                .record((estimated as f64 - actual as f64) / prompt as f64);
+        }
+    }
+
     /// Set running requests per worker.
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
@@ -521,6 +553,16 @@ impl MeshMetrics {
             "worker" => worker_interned
         )
         .set(count as f64);
+    }
+
+    /// Set in-flight prefill tokens per worker.
+    pub fn set_worker_prefill_tokens(worker: &str, tokens: usize) {
+        let worker_interned = intern_string(worker);
+        gauge!(
+            names::WORKER_PREFILL_TOKENS,
+            "worker" => worker_interned
+        )
+        .set(tokens as f64);
     }
 
     /// Set active routing keys per worker.
@@ -729,6 +771,7 @@ impl MeshMetrics {
         gauge!(names::WORKER_CB_CONSECUTIVE_FAILURES, "worker" => Arc::clone(&worker)).set(0.0);
         gauge!(names::WORKER_CB_CONSECUTIVE_SUCCESSES, "worker" => Arc::clone(&worker)).set(0.0);
         gauge!(names::WORKER_REQUESTS_ACTIVE, "worker" => Arc::clone(&worker)).set(0.0);
+        gauge!(names::WORKER_PREFILL_TOKENS, "worker" => Arc::clone(&worker)).set(0.0);
 
         // Zero for these metrics have special valid meaning, so mark removed
         // workers with -1 until metrics-rs supports deleting label sets.

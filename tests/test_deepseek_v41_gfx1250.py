@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """The gfx1250 DeepSeek-V4.1 single-launch decode step on the CPU (no GPU):
 - which deployments and which steps it takes (needs aiter, skipped without it);
 - its kernel's per-step arithmetic (kernels/index_plan.py, moe_plan.py) and counter / LDS layout (layout.py), run on
@@ -43,6 +44,7 @@ def atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": NS(level=0),
@@ -172,6 +174,15 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
     assert out is inner
 
 
+def test_lossless_sampling_keeps_the_model(monkeypatch):
+    """The single launch drafts and verifies inside the kernel and publishes
+    no q, so an armed lossless drafter keeps the production model."""
+    monkeypatch.setattr(dispatch, "refusal", lambda cfg: None)
+    inner = nn.Linear(1, 1)
+    drafter = NS(lossless=object())
+    assert dispatch.install_single_step(inner, atom_config(), drafter) is inner
+
+
 @needs_aiter
 def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
     monkeypatch.setattr(gfx1250, "enabled", lambda: True)
@@ -183,7 +194,9 @@ def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
 
     monkeypatch.setattr(dispatch, "install_single_step", install)
     cfg = atom_config()
-    assert mono_dispatch.install_mono_decode("m", cfg, "d") == "single"
+    assert mono_dispatch.install_mono_decode("m", cfg, "d", metadata_builder=None) == (
+        "single"
+    )
     assert seen["args"] == ("m", cfg, "d")
 
 
@@ -608,9 +621,6 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
-    monkeypatch.setenv(
-        "FLYDSL_RUNTIME_ENABLE_CACHE", "0"
-    )  # a cached build is not traced
     from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
     from atom.models.deepseek_v41.mono.gfx1250.kernels import step
     from atom.mono.runtime.compile import compile_only

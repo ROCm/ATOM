@@ -417,8 +417,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             )
 
             # A compiled piece is graphed with the rest of the forward: a
-            # `TokenGraph` records it inline, breaking only at the split ops
-            # declared `eager_region`.
+            # `TokenGraph` records it inline, breaking only where a split op
+            # calls an `eager_region`.
             self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
@@ -460,9 +460,10 @@ def _hash_traced_files(files) -> str:
     content = []
     for filepath in files:
         content.append(filepath)
-        if filepath == "<string>" or filepath == "<frozen os>":
-            # This means the function was dynamically generated, with
-            # e.g. exec() or frozen os module. We can't actually check these.
+        if filepath.startswith("<"):
+            # Not a file: the function was dynamically generated (exec()'s
+            # "<string>") or lives in a frozen stdlib module ("<frozen os>",
+            # "<frozen genericpath>", ...). We can't actually check these.
             continue
         with open(filepath) as f:
             content.append(f.read())

@@ -18,5 +18,5 @@ both are cited rather than replaced.
   triage to find a target when the PR ships no test of its own.
 
 This lives here rather than in `SKILL.md` because `SKILL.md` is injected into every review
-prompt and is held to a 500-line budget; provenance a reviewer reads once does not need to
+prompt and is held to a 505-line budget; provenance a reviewer reads once does not need to
 cost attention on every run.

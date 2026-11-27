@@ -90,6 +90,7 @@ def _served_tp4_fp8_config(*, speculative_config, compilation_config=None):
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
         pipeline_parallel_size=1,
+        is_multinode_tp=False,
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,

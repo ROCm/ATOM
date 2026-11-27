@@ -1,4 +1,9 @@
-"""Guard against prompt / SKILL.md drift.
+"""Guard the prompts and the wiring the review runs on.
+
+Drift is two of the checks below; the rest assert the fail classes, the run budget, the
+OWNERS wiring, the gate's identity exclusions, the runner label, _publish.py's permission
+closure and the citation gating. A refusal is not necessarily drift -- the callers quote
+the ❌ line, so say which check refused.
 
 prompts/worker.md and prompts/refuter.md quote SKILL.md verbatim (the Step 8 Output rules and
 the Step 7.7 text). If SKILL.md changes and the copies do not, they drift silently and the
@@ -301,13 +306,21 @@ def check_notified_handoff():
     return 0
 
 
-def check_runner_label_exclusive():
-    """boxBusy() decides 'is the box busy' by looking only at this workflow's runs. That holds
-    only while nothing else targets the same runner label -- otherwise a healthy box doing other
-    work reads as idle, and the watchdog pages the owner about it."""
+def check_runner_label_matches():
+    """watchdog.py's RUNNER_LABEL must be the label the review job actually runs on.
+
+    This replaces a check that required the label to be exclusive to this workflow. That was
+    never a property the review needed -- the runner serialises work by itself, and queueing
+    behind another workflow is fine -- it was propping up a box_busy() that counted only this
+    workflow's runs. The cost of propping it up was the whole product: run_one.sh takes any
+    refusal here as fatal, so one unrelated workflow adopting the label stopped every review
+    in the repo. aiter#8255 lost 2026-11-18 to exactly that, under a message about prompt
+    drift. box_busy() asks about the label now, so the ban is unnecessary; what still has to
+    hold is that the two agree.
+    """
     miss = _missing(WORKFLOW)
     if miss:
-        print(f"\u23ed\ufe0f  check_runner_label_exclusive: skipped \u2014 not yet built: "
+        print(f"\u23ed\ufe0f  check_runner_label_matches: skipped \u2014 not yet built: "
               f"{[p.name for p in miss]}")
         return 0
     wf = WORKFLOW.read_text(encoding="utf-8")
@@ -316,13 +329,16 @@ def check_runner_label_exclusive():
         print("\u274c cannot read the review job's runner label")
         return 1
     label = m.group(1)
-    others = sorted(q.name for q in WORKFLOW.parent.glob("*.y*ml")
-                    if q != WORKFLOW and label in q.read_text(encoding="utf-8"))
-    if others:
-        print(f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
-              "check only sees atom-review-bot runs and would page about a busy, healthy box")
+    wd = (HERE / "watchdog.py").read_text(encoding="utf-8")
+    w = re.search(r'^RUNNER_LABEL = "([^"]+)"', wd, re.M)
+    if not w:
+        print("\u274c watchdog.py has no RUNNER_LABEL to compare")
         return 1
-    print(f"\u2705 runner label '{label}' is exclusive to atom-review-bot.yml")
+    if w.group(1) != label:
+        print(f"\u274c watchdog.py's RUNNER_LABEL {w.group(1)!r} is not the review job's "
+              f"label {label!r}; box_busy would watch the wrong box and page about a healthy one")
+        return 1
+    print(f"\u2705 watchdog.py watches the label the review job runs on: '{label}'")
     return 0
 
 
@@ -499,12 +515,12 @@ def main():
     bad += check_prompt_artifacts()
     bad += check_publish_has_bot_env()
     bad += check_notified_handoff()
-    bad += check_runner_label_exclusive()
+    bad += check_runner_label_matches()
     bad += check_publish_needs_post_flag()
     bad += check_publish_review_is_advisory()
     bad += check_range_anchor_shape()
     bad += check_unanchorable_citations_are_linked()
-    print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
+    print(f"{'OK' if bad == 0 else 'REFUSED'}: {bad} check(s) failed")
     return bad
 
 

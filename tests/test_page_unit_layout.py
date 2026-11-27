@@ -80,9 +80,10 @@ def test_the_pool_names_each_unit_by_its_layer_and_splits_it_by_head():
         "mha.kv.k.layer_0",
         "mha.kv.k.layer_1",
     ]
-    assert units["k", 0].head_major_runs == units["v_scale", 6].head_major_runs
-    assert units["k", 0].head_major_runs == (BLOCK // 16, 4)  # page-16
-    assert units["v", 1].head_major_runs == (1, 4)  # one page-128 run
+    # `(heads, widths)`: a page-16 unit is BLOCK // 16 runs, each 16 tokens a head.
+    assert units["k", 0].head_major_runs == (4, (16 * HEAD_DIM,) * (BLOCK // 16))
+    assert units["v_scale", 6].head_major_runs == (4, (16 * 4,) * (BLOCK // 16))
+    assert units["v", 1].head_major_runs == (4, (BLOCK * HEAD_DIM,))  # one page-128 run
     assert units["index", 6].head_major_runs is None  # the same on every rank
     assert (units["k", 3].unit_spec.dim, units["k_scale", 3].unit_spec.dim) == (128, 1)
     index = units["index", 2].unit_spec
@@ -152,12 +153,47 @@ def test_each_rank_receives_exactly_its_own_heads(runs, heads, tp):
         first, count = kv_heads_of_rank(rank, tp, heads)
         dst = np.full(runs * count * width, 255, np.uint8)
         cuts = consumer_head_slices(
-            src.size, dst.size, (runs, heads), (runs, count), rank, tp, "k"
+            src.size,
+            dst.size,
+            (heads, (width,) * runs),
+            (count, (width,) * runs),
+            rank,
+            tp,
+            "k",
         )
         for s, d, n in cuts:
             dst[d : d + n] = src[s : s + n]
         want = src.reshape(runs, heads, width)[:, first : first + count]
         assert np.array_equal(dst.reshape(runs, count, width), want)
+
+
+@pytest.mark.parametrize("heads, tp", [(4, 4), (4, 2), (2, 4)])
+@pytest.mark.parametrize("widths", [(8, 4, 8, 4), (8, 4, 8, 4, 4)])
+def test_runs_of_named_widths_cut_each_ranks_heads(heads, tp, widths):
+    # NVFP4-like page: K data, K scales, V data, V scales, each one width a head;
+    # and five runs, as many as a layout names.
+    src = (np.arange(heads * sum(widths)) % 251).astype(np.uint8)
+    for rank in range(tp):
+        first, count = kv_heads_of_rank(rank, tp, heads)
+        dst = np.full(count * sum(widths), 255, np.uint8)
+        cuts = consumer_head_slices(
+            src.size, dst.size, (heads, widths), (count, widths), rank, tp, "kv"
+        )
+        assert len(cuts) == len(widths)
+        for s, d, n in cuts:
+            dst[d : d + n] = src[s : s + n]
+        want, at = [], 0
+        for w in widths:
+            want.append(src[at + first * w : at + (first + count) * w])
+            at += heads * w
+        assert np.array_equal(dst, np.concatenate(want))
+
+
+def test_named_widths_must_agree_on_both_ends():
+    with pytest.raises(ValueError, match="kv"):
+        consumer_head_slices(
+            4 * 24, 24, (4, (8, 4, 8, 4)), (1, (4, 8, 4, 8)), 0, 4, "kv"
+        )
 
 
 def test_a_unit_that_is_not_per_head_moves_whole():
@@ -169,12 +205,13 @@ def test_a_unit_that_is_not_per_head_moves_whole():
 @pytest.mark.parametrize(
     "args",
     [
-        (128, 128, None, (1, 1), 0, 4),  # per head on one end only
+        (128, 128, None, (1, (128,)), 0, 4),  # per head on one end only
         (128, 64, None, None, 0, 4),  # not per head, sized differently
-        (128, 32, (8, 8), (1, 2), 0, 4),  # run counts disagree
-        (128, 64, (1, 8), (1, 2), 0, 4),  # a head is wider on one end
-        (128, 32, (1, 8), (1, 2), 4, 4),  # rank outside the consumer's TP
-        (4 * 64, 64, (1, 4), (1, 1), 0, 3),  # neither shards nor replicates
+        (128, 32, (8, (2,) * 8), (2, (16,)), 0, 4),  # run counts disagree
+        (128, 64, (8, (16,)), (2, (32,)), 0, 4),  # a head is wider on one end
+        (128, 32, (8, (16,)), (2, (16,)), 4, 4),  # rank outside the consumer's TP
+        (4 * 64, 64, (4, (64,)), (1, (64,)), 0, 3),  # neither shards nor replicates
+        (120, 30, (4, (16, 16)), (1, (16, 16)), 0, 4),  # runs do not tile the unit
     ],
 )
 def test_geometry_the_two_ends_cannot_share_is_refused_by_name(args):

@@ -438,6 +438,642 @@ t "a card that softens BEYOND ONE PASS is refused" \
   "$(_cov_gate "$_BIG" 'Coverage: 47 files / 16647 added lines')" "SOFTENED-COVERAGE"
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+# The label alone, with nothing after the colon, is not a verdict.
+t "a coverage label with nothing after it is refused" \
+  "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
+# SKILL.md forbids rule codes in output; the gate parsed a leading one as a claim, so
+# the instruction and the gate disagreed and ATOM#3481 shipped a finding opening `A5:`.
+_card_kinds() {  # <card text> [verdicts] [diff] -> the problem kinds the card gate raises
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+_, probs = triage.audit_card(sys.argv[2], sys.argv[3], "", "", sys.argv[4], "")
+print(" ".join(sorted({k for k, _, _ in probs})))' "$S" "$1" "${2:-}" "${3:-}"
+}
+t "a finding opening with a rule code is refused" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "1"
+t "the same finding without the rule code is not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "0"
+# `FP8:`, `TP8:`, `MI300:` and `V4:` share the rule-id shape and are ordinary ways to open
+# a finding here. Refusing those would be a false positive carrying a nonsense message.
+t "a rule code behind emphasis is still a rule code" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ **A5:** planner.rs:108 charges the prompt only when req.stream. **Author must** say so.' | grep -c RULE-CODE-IN-CARD)" "1"
+t "an ordinary FP8: opening is not a rule code" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+
+⚠️ FP8: minimax_m3/config.py:39 still refuses the connector. **Author must** fix the text.' | grep -c RULE-CODE-IN-CARD)" "0"
+# triage's CITATION did not cover .rs/.toml while _publish anchors them, so a Rust finding
+# had no path-based way to claim its FIRE and the rule id was the only one left.
+# The three cases above pass no verdicts, so they never exercised what happens when a
+# FIRE is on the ledger. These do.
+_V_PATH="A5 FIRE -- planner.rs:108 charges only on req.stream"
+_V_NOPATH="A5 FIRE -- the prefill charge is skipped for non-streaming placements"
+_DIFF="diff --git a/atom/mesh/src/routers/planner.rs b/atom/mesh/src/routers/planner.rs"
+_CARD_ID='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges the prompt only when req.stream. **Author must** say so.'
+_CARD_PATH='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ planner.rs:108 charges the prompt only when req.stream. **Author must** say so.'
+t "an A5: card against an A5 FIRE is refused for the id, not for tracing" \
+  "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+t "the same card without the id traces by path" \
+  "$(_card_kinds "$_CARD_PATH" "$_V_PATH" "$_DIFF")" ""
+# Many of the 54 ids also appear under atom/ as ordinary words: B1..B7 are the
+# KV-offload chunk groups, C1..C3 the MTP4 rows and deepseek_v4's capture topology,
+# T1 and D11 label obligations in atom/mesh/tests/*.rs, and there are more. (C4 belongs
+# to that topology too and is not an id at all.) No number here on purpose -- see
+# _diff_vocabulary: four were written during review and all four were wrong. No
+# shape separates `B1` the rule from `B1` the chunk group, so the diff decides. Refusing a
+# lawful finding is fatal -- the way out is an untrue `-- not reported:` -- while
+# shipping an id-led line is cosmetic, so a word the PR uses itself is not read as an id.
+_DIFF_B1='diff --git a/atom/kv_transfer/offload/README.md b/atom/kv_transfer/offload/README.md
+--- a/atom/kv_transfer/offload/README.md
++++ b/atom/kv_transfer/offload/README.md
+@@ -1084,2 +1084,2 @@
+-SAVE chunk staging is tail-to-head. For B1-B8 the order is B7-B8, B5-B6, B3-B4, B1-B2.
++SAVE chunk staging is tail-to-head. For B1-B8 the new order is B7-B8, B5-B6, B1-B2.'
+_CARD_B1='## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ B1-B2 stage before B3-B4, breaking the tail-to-head order. **Author must** fix it.'
+t "a finding using a word the diff uses is not read as a rule id" \
+  "$(_card_kinds "$_CARD_B1" "" "$_DIFF_B1" | grep -c RULE-CODE-IN-CARD)" "0"
+# And the exclusion that keeps this from switching the gate off: rules.md names every
+# id, so a PR touching the skill -- this one does -- would put all 54 in the vocabulary.
+# .claude/ contributes nothing, in exactly the reviews most likely to exercise the gate.
+_DIFF_SKILL='diff --git a/.claude/skills/review-pr/rules.md b/.claude/skills/review-pr/rules.md
+--- a/.claude/skills/review-pr/rules.md
++++ b/.claude/skills/review-pr/rules.md
+@@ -1,1 +1,1 @@
+-| B1 | Silent bypass | x |
++| B1 | Silent bypass, reworded | x |'
+t "but a diff that only touches the skill contributes no vocabulary" \
+  "$(python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(len(triage._diff_vocabulary(sys.argv[2])))' "$S" "$_DIFF_SKILL")" "0"
+t "so a rule-id card is still refused when the skill is what changed" \
+  "$(_card_kinds "$_CARD_ID" "$_V_PATH" "$_DIFF_SKILL" | grep -c RULE-CODE-IN-CARD)" "1"
+# Before any of this, such a FIRE had no legal card at all: name the id and the
+# no-rule-codes gate refuses it, drop the id and UNREPORTED-FIRE fires, and both are
+# fatal -- the only way out was an untrue `-- not reported:`.
+# A path-less FIRE is claimed by a symbol its own reason backticked, and by nothing else.
+# The shape-based version this replaces lost a round of review five times running -- one
+# shared word, lower-casing, GEMM/BF16, then FP32/MI355X/num_tokens -- because no shape
+# separates a name from this codebase's vocabulary.
+t "a path-less FIRE is claimed by a backticked symbol from its reason" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 kv_scale is dropped on reload. **Author must** recompute it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv_scale\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py")" ""
+# ...named on identifier boundaries. As a plain substring a two-character symbol finds
+# itself everywhere: `tp` inside "output", `kv` inside "kv_cache", `ep` inside "step".
+t "a symbol inside a longer word does not claim its FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 output tuned config missing. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 tuned config missing
+B1 FIRE -- \`tp\` is off by one" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+t "nor does one inside a longer identifier" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 guard missing. **Author must** add one.
+📝 kv_cache is resized late. **Author must** fix it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# A symbol end that is punctuation needs no word boundary. Requiring one before `.cuda()`
+# rejects `x.cuda()` because the preceding `x` is a word character.
+t "a punctuation-led symbol can be named as part of an expression" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+📝 x.cuda() runs before set_device. **Author must** move it.' \
+     "B1 FIRE -- \`.cuda()\` runs before set_device" \
+     "diff --git a/foo.py b/foo.py")" ""
+# ...but punctuation ON ITS OWN names nothing, and no boundary can be put around it:
+# a reason backticking `==` was claimed by any finding with `==` anywhere in it, so the
+# UNREPORTED-FIRE that forces that rule onto the card never fired.
+t "a reason backticking only punctuation is not claimed by an unrelated finding" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 the tuned config lookup uses == on floats. **Author must** use isclose.' \
+     "B1 FIRE -- the \`==\` check silently equates None and 0" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# Without backticks the reason offers no handle, whatever its words look like. FP32,
+# MI355X, GSM8K, num_tokens and head_dim all used to pass as names.
+t "a reason that backticks nothing is not claimed by look-alike words" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 FP32 num_tokens tuned config missing. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 tuned config missing
+B1 FIRE -- FP32 output cast drops num_tokens per-token scale" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# And a card that does not name the symbol does not claim it either.
+t "an unrelated finding does not claim a backticked FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv_scale\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# Matched as the reason spelled it: the backticks were the author's choice of spelling.
+t "a symbol is matched as it was written" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ foo.py:3 has no guard on the index. **Author must** add one.
+📝 KV_SCALE is dropped on reload. **Author must** recompute it.' \
+     "A5 FIRE -- foo.py:3 guard missing
+B1 FIRE -- \`kv_scale\` dropped on reload" \
+     "diff --git a/foo.py b/foo.py" | grep -c UNREPORTED-FIRE)" "1"
+# SKILL.md:111-113 notes that ids such as HK3 are not emitted by the current deriver;
+# HK3 is therefore UNREACHABLE_BY_DESIGN rather than ALL_RULES, but must still be refused.
+# `_publish.first_clause` strips the `[verified]` tag before publishing, so anything the
+# tag or the emphasis hides still reaches the reader as an id-led line. ATOM#3481 used
+# bold. Main refused none of these.
+_head_forms() {  # -> how many of the decorated forms are refused
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+forms = ["**[verified] B1:** x", "**[verified]** B1: x", "`[verified]` B1: x",
+         "[verified] [B1] x", "[verified] (B1): x", "A5/B1: x", "D4 - x",
+         "D4 violation in the quant path", "HK3 bug fix without test",
+         "B1 (silent bypass): x", "[B1/B2] x", "B1 The condition is wrong",
+         "B1 `foo.py:3` drops it", "B1.", "B1 = broken", "B1 → broken",
+         "B1+D4:", "B1 FIRE:", "`foo.py:3`: A5: broken",
+         "foo.py:3 A5: broken", "foo.py:3 (A5)", "[verified, A5] broken",
+         "atom/foo.py:563-569 A5: broken", "`atom/foo.py:563`, A5: broken",
+         "foo.py:563 — A5: broken", "foo.py:3. A5: guard missing",
+         "foo.py:3 - A5: broken"]
+print(sum(1 for f in forms if triage._rule_head(f)))' "$S"
+}
+t "a rule id hidden behind decoration or a citation is still refused" "$(_head_forms)" "27"
+_head_passes() {  # -> how many ordinary openings are left alone
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+forms = ["FP8: x", "MI300: x", "[verified] x.py:1 drops it", "The caller must hold it",
+         "[inferred] planner.rs:108 charges only on req.stream",
+         "FP8 scale is wrong", "MI300 support is missing",
+         "foo.py:3 — the E2E path never runs", "foo.py:3-5 TP8 is off by one",
+         # Many ids are words this codebase uses itself, not rule codes: the KV-offload
+         # chunk groups (offload/README.md:1084), the MTP4 rows
+         # (glm52/mono/kernels/op.py:131), the deepseek_v4 capture topology
+         # (mono/session.py), T1 and D11 in mesh/tests/*.rs. No number here on
+         # purpose -- see _diff_vocabulary.
+         # A finding that cites a file and then says "C1/C2 rows
+         # are swapped" is lawful, and refusing it is fatal -- the only way out is an
+         # untrue "-- not reported:". Past the citation only the colon form is read.
+         # That is a trade, not a clean line: first_clause drops the citation either
+         # way, so "planner.rs:108 A5 charges only on req.stream" still publishes as
+         # "A5 charges only ...", and this gate passes it. Refusing the no-colon form
+         # would take the lawful sentences below with it whenever the diff does not
+         # itself use the word. A refusal is fatal and an id-led index line is
+         # cosmetic, so the cosmetic one is the one left open.
+         "kv_transfer/offload/README.md:1084, B1-B2 stage before B3-B4",
+         "glm52/mono/kernels/op.py:131 — C1/C2 rows for MTP4 are swapped",
+         "mono/session.py:1527 C3 buffers are updated under the C4 capture key",
+         # the same two separators, with no colon after them: nothing lawful is lost
+         "README.md:1084. B1-B2 stage before B3-B4",
+         "README.md:1084 - B1-B2 stage before B3-B4"]
+print(sum(1 for f in forms if triage._rule_head(f) is None))' "$S"
+}
+t "and an ordinary opening is left alone" "$(_head_passes)" "14"
+# Four different counts of "how many ids are also ATOM words" were written into these
+# comments during review -- eleven, ten, nineteen, twenty-two -- and every one was
+# wrong, because the answer moves with the tree and with which file extensions the
+# counter happened to grep. Each was fixed in one copy and left standing in another.
+# Prose cannot hold this; a gate can. No comment states such a count.
+t "no comment states a count of the ids that are also ATOM words" \
+  "$(grep -ciE '[0-9]+ of the 54|(ten|eleven|nineteen|twenty[- ]two) of the 54' \
+       "$S/triage.py" "$S/selftest.sh" | awk -F: '{n+=$2} END{print n+0}')" "0"
+# One shared 4-letter word was far too loose. SKILL.md mandates "**Author must**" on
+# every finding, so `must` alone let any finding claim any path-less FIRE whose reason
+# used it -- silencing the UNREPORTED-FIRE that should have fired for the other rule.
+# rules.md taught the shape the gate now withholds: ~50 `→ ⚠️ A1:` templates reach the
+# worker through `expand`, so the model was being shown the opening it would be refused
+# for. Refusing the output while the examples teach it is the same instruction/gate
+# disagreement this PR is about, one level up.
+# The template rewrite stripped the only `HKn` from each Housekeeping row, and
+# `expand_rules` finds those rows by that id -- so any diff deriving an HK rule got
+# MISSING-RULE-TEXT, rc 1, and fetch.sh aborted the whole review. A `.sh` file, a
+# `# TODO`, an `ATOM_` env var or three top-level dirs is enough to trigger it, which
+# includes this PR. The ids live in the Check column now, where expand reads them and no
+# card ever quotes them.
+t "a diff deriving housekeeping rules still expands" \
+  "$(d=$(mktemp -d)
+     printf 'diff --git a/x.sh b/x.sh\n--- a/x.sh\n+++ b/x.sh\n@@ -0,0 +1,2 @@\n+# TODO fix\n+export ATOM_FOO=1\n' > "$d/pr.diff"
+     python3 "$S/triage.py" rules "$d/pr.diff" > "$d/rules.txt" 2>/dev/null
+     grep -qE 'HK[0-9]' "$d/rules.txt" || { echo NO-HK-DERIVED; exit; }
+     python3 "$S/triage.py" expand "$d/rules.txt" "$S/rules.md" >/dev/null 2>&1
+     echo $?)" "0"
+t "no rule template opens with an internal rule id" \
+  "$(python3 -c '
+import re, sys, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+s = pathlib.Path(sys.argv[1], "rules.md").read_text()
+print(len([m for m in re.findall(r"[\u26a0\ufe0f\U0001f4dd\U0001f534/]+\s*([A-Z]+\d+[a-z]?)[-\w\[\]]*\s*:", s)
+           if m in triage.REFUSED_IDS]))' "$S")" "0"
+# A verdict writes the path it found; SKILL.md's own good examples write the basename.
+# Matching the verdict's exact string meant the form the skill teaches could not claim
+# the FIRE it was reporting.
+t "the basename form SKILL.md teaches can claim a path FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/atom/models/x.py b/atom/models/x.py")" ""
+# ...on a segment boundary. A bare endswith would let `scale.py` answer for
+# `atom/models/kv_scale.py`, which is a different file whose name merely ends the same way.
+t "a file whose name merely ends the same way does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ scale.py:1 drops it. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/kv_scale.py:1 drops the scale" \
+     "diff --git a/scale.py b/scale.py" | grep -c UNREPORTED-FIRE)" "1"
+t "a same-named file elsewhere does not" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ other/x.py:1 drops the scale. **Author must** keep it.' \
+     "A5 FIRE -- atom/models/x.py:1 drops the scale" \
+     "diff --git a/other/x.py b/other/x.py" | grep -c UNREPORTED-FIRE)" "1"
+t "an id rules.md names but never derives is refused too" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+📝 HK3: foo.py:3 has no integration test. **Author must** add one.' \
+     "" "diff --git a/foo.py b/foo.py" | grep -c RULE-CODE-IN-CARD)" "1"
+t "and naming its id instead is still refused, not silently accepted" \
+  "$(_card_kinds "$_CARD_ID" "$_V_NOPATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+t "a backticked rule id is a rule id" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ `A5`: planner.rs:108 charges only on req.stream. **Author must** say so.' "$_V_PATH" "$_DIFF")" "RULE-CODE-IN-CARD"
+
+# The in-card scan kept its own extension list; a Rust-only finding read as citing
+# nothing and skipped UNANCHORED and UNBACKED both. Drive it through audit_card, not
+# just the regex.
+# The guard runs before both readers, so a non-rule id cannot claim a FIRE either. A
+# ledger line like `FP8 FIRE` is malformed; letting `FP8:` on the card answer it would
+# hide that instead of reporting it. The reason cites no path and shares no words with
+# the card, so the id is the only claim the guard could let through.
+# RULE-CODE-IN-CARD is about how a finding is written, not whether it traces; the
+# summary counted it under "findings cannot be traced", which misnames it. The sentence
+# only exists on the CLI path, so drive that.
+_card_summary() {  # -> the CARD NOT NAILED DOWN sentence
+  d=$(mktemp -d)
+  printf '%s\n' "$1" > "$d/card.md"
+  printf '%s\n' "$2" > "$d/verdicts.txt"
+  : > "$d/empty.txt"
+  printf 'diff --git a/p/planner.rs b/p/planner.rs\n' > "$d/pr.diff"
+  python3 "$S/triage.py" card "$d/card.md" "$d/verdicts.txt" "$d/empty.txt" \
+          "$d/empty.txt" "$d/pr.diff" "$d/empty.txt" 2>&1 | grep "NAILED DOWN" || true
+}
+t "the summary does not call a rule code an untraceable finding" \
+  "$(_card_summary '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+    'A5 FIRE -- planner.rs:108 charges only on req.stream' | grep -c 'cannot be traced')" "0"
+# ...and says something rather than printing a bare `CARD NOT NAILED DOWN: `. The check
+# above passes on an empty line, and on a crash.
+t "and names the rule code instead of saying nothing" \
+  "$(_card_summary '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ A5: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+    'A5 FIRE -- planner.rs:108 charges only on req.stream' | grep -c 'ship an internal rule id')" "1"
+t "a non-rule id cannot claim a FIRE" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ FP8: planner.rs:108 charges only on req.stream. **Author must** say so.' \
+     "FP8 FIRE -- quantised buffers lose their alignment guarantee" \
+     "diff --git a/atom/mesh/src/routers/planner.rs b/atom/mesh/src/routers/planner.rs" \
+   | grep -c UNREPORTED-FIRE)" "1"
+t "a Rust-only finding is checked against the diff like any other" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ worker.rs:1007 charges before releasing. **Author must** assert instead.' \
+     "A5 FIRE -- worker.rs:1007 charges before releasing" \
+     "diff --git a/atom/mesh/src/core/other.rs b/atom/mesh/src/core/other.rs")" \
+  "UNANCHORED-FINDING"
+t "and passes once the diff touches it" \
+  "$(_card_kinds '## T
+
+**what**
+
+Review: OK
+Validation (deterministic): N/A -- no runtime surface changed
+
+⚠️ worker.rs:1007 charges before releasing. **Author must** assert instead.' \
+     "A5 FIRE -- worker.rs:1007 charges before releasing" \
+     "diff --git a/atom/mesh/src/core/worker.rs b/atom/mesh/src/core/worker.rs")" ""
+t "a Rust citation is a citation" \
+  "$(python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(bool(triage.CITATION.findall("lookup.rs:185")) and bool(triage.CITATION.findall("x.toml:3")))' "$S")" "True"
+
+# Only two of check_prompts.py's checks are drift. run_one reported every
+# refusal as "prompts drifted" and sent the output that named the real one to /dev/null,
+# so the owner was told to regenerate files that were fine. aiter#8255's review aborted
+# that way on 2026-11-19 against prompts that matched SKILL.md verbatim.
+_flow_msg() {  # <python snippet that makes check_prompts fail> -> what run_one would say
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"
+  cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/atom-review-bot.yml" "$r/.github/workflows/" 2>/dev/null
+  python3 -c "$1" "$d"
+  # The block run here is extracted from run_one.sh, not a copy of it: a test that
+  # reimplements the thing it guards passes whatever run_one.sh does.
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>/dev/null
+  rm -rf "$r"
+}
+# These stand-ins model an early crash, before any ❌ was printed. An empty reason is the
+# very thing this block exists to remove, so it falls back to the last output line.
+_flow_raw() {  # <python body for a stand-in check_prompts> -> what run_one would say
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> prompt-gate/,/# <<< prompt-gate/p' "$S/run_one.sh")
+  # run_one.sh is `set -euo pipefail`; a harness without it is a different shell, and the
+  # difference is load-bearing here (a grep that matches nothing aborts the script).
+  # The block's headline behaviour is the dump: it keeps check_prompts' output instead of
+  # discarding it. A harness that sends stderr to /dev/null cannot see that, so deleting
+  # the dump kept the suite green. FLOW_ERR makes it readable without a third harness --
+  # the pin test above counts the harnesses by their `set -euo pipefail` line.
+  SKILL="$d" bash -c "set -euo pipefail
+fail(){ printf '%s\n' \"\$3\"; exit \"\$2\"; }
+$blk" 2>"${FLOW_ERR:-/dev/null}"
+  rm -rf "$d"
+}
+# The two harnesses above hand-copy run_one.sh's shell options. If run_one gains or loses
+# one, they silently go on testing a shell that no longer exists -- which is how the grep
+# abort above survived a green suite. Pin them to the real line.
+t "the harness runs the block under run_one's own shell options" \
+  "$(grep -c '^set -euo pipefail$' "$S/run_one.sh")$(grep -c 'bash -c "set -euo pipefail$' "$S/selftest.sh")" "12"
+
+t "a crash with a message reports the message" \
+  "$(_flow_raw 'import sys
+print("Traceback: boom", file=sys.stderr)
+raise SystemExit(1)' | grep -c 'Traceback: boom')" "1"
+t "and a crash with no output still says something" \
+  "$(_flow_raw 'raise SystemExit(7)' | grep -c 'run it by hand')" "1"
+# The two halves of the headline behaviour: the notice quotes at most the first three ❌,
+# and the whole output -- context lines and the ❌ past the third included -- is kept on
+# stderr instead of going to /dev/null. Neither was covered, so deleting the dump or
+# narrowing `grep -m3` to `-m1` left the suite green.
+_FOUR_BAD='print("check_prompts: 14 checks")
+print("❌ one")
+print("❌ two")
+print("❌ three")
+print("❌ four")
+raise SystemExit(1)'
+_flow_err=$(mktemp)
+t "the notice quotes the first three ❌ lines" \
+  "$(FLOW_ERR="$_flow_err" _flow_raw "$_FOUR_BAD")" \
+  "check_prompts.py refused: ❌ one;❌ two;❌ three"
+t "and the output the notice dropped is kept on stderr" \
+  "$(grep -c -e 'check_prompts: 14 checks' -e '❌ four' "$_flow_err")" "2"
+rm -f "$_flow_err"
+# preflight.sh carries a hand-copy of that fallback, and an owner runs preflight when
+# paged -- the one moment the reason has to be there. It had no coverage at all, so the
+# empty reason this change removes could come back in the copy while run_one's original
+# stayed pinned by the cases above. Same treatment: extracted between its own markers and
+# run, never reimplemented here.
+_pf_gate() {  # <python body for a stand-in check_prompts> -> what preflight would print
+  d=$(mktemp -d); printf '%s\n' "$1" > "$d/check_prompts.py"
+  blk=$(sed -n '/# >>> preflight-prompt-gate/,/# <<< preflight-prompt-gate/p' "$S/preflight.sh")
+  # preflight.sh is `set -uo pipefail` -- NOT -e, unlike run_one. The difference is the
+  # whole point of extracting rather than copying: pipefail is what makes the no-match
+  # grep fail, and the absence of -e is what keeps the script alive to use the fallback.
+  S="$d" ok=0 bad=0 bash -c "set -uo pipefail
+$blk" 2>/dev/null
+  rm -rf "$d"
+}
+t "preflight says something when check_prompts prints nothing" \
+  "$(_pf_gate 'raise SystemExit(7)' | grep -c 'no output; run it by hand')" "1"
+t "and preflight names the check that actually refused" \
+  "$(_pf_gate 'print("\u274c ATOM_RUN_BUDGET=9300s does not fit the review job'"'"'s 9000s cap")
+raise SystemExit(1)' | awk '/ATOM_RUN_BUDGET=9300s/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+# The harness above hand-copies preflight's shell options, as the two run_one harnesses do
+# for run_one's. Pin it to the real line for the same reason.
+t "the preflight harness runs under preflight's own shell options" \
+  "$(grep -c '^set -uo pipefail$' "$S/preflight.sh")$(grep -c 'bash -c "set -uo pipefail$' "$S/selftest.sh")" "11"
+t "a drifted prompt is reported as drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "prompts/worker.md")
+p.write_text(p.read_text().replace("**Output rules (strictly enforced):**", "**Output rules:**", 1))
+' | grep -c DRIFTED)" "1"
+t "and a refusal that is not drift is not called drift" \
+  "$(_flow_msg '
+import pathlib,sys
+p = pathlib.Path(sys.argv[1], "check_prompts.py")
+p.write_text(p.read_text().replace("def check_fail_classes():",
+    "def check_fail_classes():\n    print(\"\\u274c run budget fits the job cap: FORCED\"); return 1\n    # o", 1))
+' | awk '/refused: ❌ run budget fits the job cap: FORCED/{n++} tolower($0)~/drift/{d++} END{print n+0 ":" d+0}')" "1:0"
+
+# `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
+# so the card has to supply one and it has to say BEYOND ONE PASS.
+_cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+if sys.argv[2] != "MISSING":
+    pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+card = "## T\n\nReview: OK\n" + ("" if sys.argv[3] == "-" else sys.argv[3] + "\n")
+p = triage._check_coverage_line(card, d)
+print(p[0][0] if p else "ok")' "$S" "$1" "$2"
+}
+# An unreadable or ruleless rules.txt is NOT this gate's job: the ledger gate (Step 1b,
+# SKILL.md:380) runs first and exits non-zero on both, so the review never reaches the
+# card gate. Asserted here rather than assumed -- deleting a check is only safe while the
+# check that replaces it is the one being measured.
+_ledger_rc() {  # <rules.txt content, or MISSING> -> exit code of the ledger gate
+  d=$(mktemp -d)
+  [ "$1" = MISSING ] || printf '%s\n' "$1" > "$d/rules.txt"
+  : > "$d/verdicts.txt"
+  python3 "$S/triage.py" ledger "$d/rules.txt" "$d/verdicts.txt" >/dev/null 2>&1
+  rc=$?
+  rm -rf "$d"
+  echo $rc
+}
+t "a missing rules.txt is refused by the ledger gate, before this one" \
+  "$(_ledger_rc MISSING)" "1"
+t "a rules.txt that is not Step 1 output is refused by the ledger gate" \
+  "$(_ledger_rc 'some other file entirely')" "1"
+t "and the card gate stays out of it" \
+  "$(_cov_raw MISSING -)" "ok"
+t "a diff GitHub refused to serve still owes the reader a coverage line" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' -)" "MISSING-COVERAGE"
+t "a diff GitHub refused to serve passes once the card says it is partial" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: BEYOND ONE PASS -- GitHub refused the diff')" "ok"
+# ...but only if it says the right thing: a present coverage line is not enough, it has
+# to carry the verdict.
+t "a diff GitHub refused to serve may not be called ordinary" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: 3 files / 20 added lines -- within one review pass')" \
+  "SOFTENED-COVERAGE"
+# And it may not claim a measurement that does not exist: with `[diff-too-large]` the
+# rule is policy, so the message must not open "Step 1 measured this diff".
+_cov_why() {  # <full rules.txt> <card coverage line> -> the problem's reason text
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+p = triage._check_coverage_line("## T\n\nReview: OK\n" + sys.argv[3] + "\n", d)
+print(p[0][2] if p else "ok")' "$S" "$1" "$2"
+}
+t "a refused diff is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Coverage: 3 files -- within one review pass' \
+     | grep -c 'Step 1 measured')" "0"
+t "a measured BEYOND ONE PASS diff still says so" \
+  "$(_cov_why "$_BIG" 'Coverage: 47 files / 16647 added lines' | grep -c 'Step 1 measured')" "1"
+# Same for the MISSING branch, which the SOFTENED fix did not cover: a refused diff has
+# no measurement there either, and nothing was checking its wording.
+t "a refused diff with no coverage line is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Review: OK' | grep -c 'measured')" "0"
+t "MISSING names what it could not find" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' - >/dev/null; \
+     python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text("    [diff-too-large        ] A1 A2\n")
+print(len(triage._check_coverage_line("## T\n\nReview: OK\n", d)[0][1]) > 0)' "$S")" "True"
+# A real measurement outranks the policy: `[diff-too-large]` alongside a coverage line
+# must compare against the line, not fall back to the refusal rule.
+t "a measured line outranks the diff-too-large policy" \
+  "$(_cov_raw '  coverage: 5 files / 49 added lines -- within one review pass
+    [diff-too-large        ] A1 A2' 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+t "an underivable diff has nothing to compare and stays silent" \
+  "$(_cov_raw '    [underivable           ] A1 A2' -)" "ok"
+t "a failed derivation has nothing to compare and stays silent" \
+  "$(_cov_raw '    [derivation-failed     ] A1 A2' -)" "ok"
 
 # The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
 # trips no family and the test passes with the filter removed -- it did, until this was
@@ -492,7 +1128,7 @@ _drift_outside_a_repo() {
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
-t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+t "check_prompts runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
 
 
 # ATOM_AGENT_TIMEOUT and ATOM_RUN_BUDGET are coupled and nothing else enforces it. A review
@@ -504,6 +1140,27 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
   ( ATOM_AGENT_TIMEOUT=$1 ATOM_RUN_BUDGET=$2 \
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
+# The old gate here forbade any other workflow from using the review runner's label, to
+# prop up a box_busy() that counted only its own runs. That ban cost every review in a repo
+# the day one landed (aiter#8255). What has to hold instead is that watchdog watches the
+# label the job actually runs on -- checked on its own, because a watchdog whose behaviour
+# tests also fail would hide whether this gate still bites.
+_label_gate() {  # <RUNNER_LABEL to plant> -> does check_prompts refuse?
+  r=$(mktemp -d); d="$r/.claude/skills/review-pr"
+  mkdir -p "$d" "$r/.github/workflows"; cp -r "$S"/. "$d/" 2>/dev/null
+  cp "$S/../../../.github/workflows/"*.y*ml "$r/.github/workflows/" 2>/dev/null
+  python3 -c '
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1], "watchdog.py")
+p.write_text(re.sub(r"^RUNNER_LABEL = .[^\"]+.$", "RUNNER_LABEL = \"%s\"" % sys.argv[2],
+                    p.read_text(), count=1, flags=re.M))' "$d" "$1"
+  out=$(python3 "$d/check_prompts.py" 2>&1 | grep -c "is not the review job.s label")
+  rm -rf "$r"
+  printf '%s\n' "$out"
+}
+t "a watchdog watching the wrong label is refused" "$(_label_gate wrong-box)" "1"
+t "and the right one is not" "$(_label_gate atom-bot)" "0"
+
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 
 # A cross-family refuter must be reachable by doing what the comment says. The hook has

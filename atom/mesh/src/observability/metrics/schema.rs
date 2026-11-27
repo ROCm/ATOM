@@ -204,6 +204,10 @@ pub mod labels {
     pub const AFFINITY_EXPIRED: &str = "expired";
     pub const WORKER_CHANGE_RANK_MAPPING: &str = "rank_mapping";
     pub const DP_RANK_NONE: &str = "none";
+    pub const CACHE_PROMPT: &str = "prompt";
+    pub const CACHE_CACHED: &str = "cached";
+    pub const CACHE_ESTIMATED: &str = "estimated";
+    pub const CACHE_ACTUAL: &str = "actual";
 
     // Token types
     pub const TOKEN_INPUT: &str = "input";
@@ -252,6 +256,7 @@ pub mod names {
     pub const WORKER_POOL_SIZE: &str = "mesh_worker_pool_size";
     pub const WORKER_CONNECTIONS_ACTIVE: &str = "mesh_worker_connections_active";
     pub const WORKER_REQUESTS_ACTIVE: &str = "mesh_worker_requests_active";
+    pub const WORKER_PREFILL_TOKENS: &str = "mesh_worker_prefill_tokens";
     pub const WORKER_HEALTH: &str = "mesh_worker_health";
     pub const WORKER_HEALTH_CHECKS_TOTAL: &str = "mesh_worker_health_checks_total";
     pub const WORKER_SELECTION_TOTAL: &str = "mesh_worker_selection_total";
@@ -267,6 +272,11 @@ pub mod names {
         "mesh_route_selected_worker_active_requests";
     pub const SESSION_WORKER_CHANGE_TOTAL: &str = "mesh_session_worker_change_total";
     pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
+    pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL: &str = "mesh_route_cache_estimate_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_ERROR_RATIO: &str = "mesh_route_cache_estimate_error_ratio";
+    pub const KV_EVENTS_DROPPED_PREDICTIONS_TOTAL: &str =
+        "mesh_kv_events_dropped_predictions_total";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -420,6 +430,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         status: MetricStatus::Active,
     },
     MetricSpec {
+        name: names::WORKER_PREFILL_TOKENS,
+        kind: MetricKind::Gauge,
+        help: "Prompt tokens charged to a worker (url@rank) whose prefill has not finished; only HTTP P/D prefills and streaming HTTP requests with counted or estimated tokens are charged",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
         name: names::WORKER_HEALTH,
         kind: MetricKind::Gauge,
         help: "Worker health status (1=healthy, 0=unhealthy)",
@@ -495,6 +511,30 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::SELECTED_DP_RANK_TOTAL,
         kind: MetricKind::Counter,
         help: "Dispatched requests after rank mapping by pool, worker (base URL), dp_rank (HTTP routers)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of routed requests whose response reported cached tokens by pool (regular/prefill), kind (prompt/cached) (HTTP routers)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of those requests that also have a router cache estimate by pool, kind (prompt/estimated/actual)",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        kind: MetricKind::Histogram,
+        help: "Per-request (estimated - actual) cached tokens over prompt tokens by pool",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_DROPPED_PREDICTIONS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Routed prompts left out of the KV index's predictions as its writer was behind, by model, pool",
         status: MetricStatus::Active,
     },
     MetricSpec {
@@ -605,6 +645,12 @@ pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         names::ROUTE_SELECTED_WORKER_ACTIVE_REQUESTS,
         &[
             0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+        ],
+    ),
+    (
+        names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        &[
+            -1.0, -0.5, -0.25, -0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
         ],
     ),
 ];

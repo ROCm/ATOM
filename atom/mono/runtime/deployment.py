@@ -80,6 +80,15 @@ def dp_attention_ranks(atom_config) -> int:
     return dp if dpa and dp > 1 else 0
 
 
+def peer_memory_refusals(atom_config) -> list[tuple[bool, str]]:
+    """``(holds, why not)`` of any launch that maps its TP group's peer
+    buffers (HIP IPC): a model's mono kernels and the shared mono LM head
+    alike. HIP IPC cannot reach a GPU on another node."""
+    return [
+        (not atom_config.is_multinode_tp, "TP group spans nodes (HIP IPC peer memory)")
+    ]
+
+
 def common_refusals(
     atom_config,
     dims,
@@ -141,6 +150,7 @@ def common_refusals(
             "decode CP",
         ),
         (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
+        *peer_memory_refusals(atom_config),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
@@ -185,7 +195,9 @@ def _cu_count() -> int | None:
 def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
     and spin on each other (``plan.execution.BLOCKS``). ``connectors``: the KV
-    connectors a model admits, whose copy kernels finish on their own."""
+    connectors a model admits anyway. A copy kernel beside these kernels can
+    still wedge them (``tools/mono_mailbox_copy_repro.md``); the polling backoff
+    only mitigates that, see ROCm/ATOM#3369."""
     from atom.kv_transfer.disaggregation import KVConnectorFactory
 
     cus = _cu_count()

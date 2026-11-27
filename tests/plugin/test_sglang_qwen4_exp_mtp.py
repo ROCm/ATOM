@@ -259,6 +259,27 @@ def test_bind_qsa_caches_uses_explicit_layer_mapping(model_type, pool_layer):
     assert model._atom_qwen4_exp_qsa_bound is True
 
 
+def test_qsa_side_caches_include_kv_padding_page():
+    layer = _QsaLayer(layer_num=48)
+    model = SimpleNamespace(
+        modules=lambda: [layer], parameters=lambda: iter([torch.zeros(1)])
+    )
+    pool = _Pool(layers=1)
+    pool._bufs[0] = (torch.zeros(128, 2, 4), torch.zeros(128, 2, 4))
+    fb = SimpleNamespace(token_to_kv_pool=pool, page_size=64)
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp_mtp", indexer_compress_ratio=4, indexer_head_dim=8
+        )
+    )
+    bind_qsa_caches(model, fb, config)
+    k, v, raw, compressed = layer.bound
+    assert k.shape[0] == v.shape[0] == raw.shape[0] == compressed.shape[0] == 2
+    # The last physical page remains addressable despite pool.size == 64.
+    raw[1].fill_(7)
+    assert raw[1].min() == 7
+
+
 def test_target_qsa_missing_layer_does_not_fall_back_to_zero():
     layer = _QsaLayer(layer_num=48)
     model = SimpleNamespace(
@@ -622,3 +643,52 @@ def test_draft_qsa_covers_the_graph_bucket_without_a_request_limit(monkeypatch):
     bridge._ensure_draft_qsa(torch.device("cpu"), block_size=64, ctx_len=8192)
     assert seen["max_bs"] == 64
     assert seen["max_tokens"] == 64 * 5
+
+
+@pytest.mark.parametrize(
+    "mode, native_qsa, built",
+    [
+        # Target prefill and, on the draft runner, the draft prefill.
+        ("EXTEND", True, []),
+        ("MIXED", True, []),
+        ("TARGET_VERIFY", True, []),
+        ("DRAFT_EXTEND_V2", True, []),
+        ("DECODE", True, ["decode", "fixup"]),
+        ("EXTEND", False, ["extend", "fixup"]),
+    ],
+    ids=["extend", "mixed", "verify", "draft-extend-v2", "decode", "not-qsa"],
+)
+def test_native_qsa_extend_builds_no_flashinfer_tables(
+    monkeypatch, mode, native_qsa, built
+):
+    """QSA reads none of the MHA tables; building them costs a host sync."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
+        ATOMAttnBackendForSgl,
+    )
+
+    calls = []
+    for name, tag in (
+        ("_init_forward_metadata_decode", "decode"),
+        ("_init_forward_metadata_extend", "extend"),
+        ("_fixup_page_table", "fixup"),
+    ):
+        monkeypatch.setattr(
+            ATOMAttnBackendForSgl,
+            name,
+            lambda self, forward_batch, tag=tag: calls.append(tag),
+        )
+    backend = ATOMAttnBackendForSgl.__new__(ATOMAttnBackendForSgl)
+    backend._atom_native_qsa = native_qsa
+    backend.use_mla = False
+    backend.forward_metadata = None
+
+    backend.init_forward_metadata(
+        SimpleNamespace(forward_mode=ForwardMode[mode], batch_size=2, spec_info=None)
+    )
+
+    assert calls == built
+    if not built:
+        assert backend.forward_metadata.kv_indices is None
+        assert backend.forward_metadata.kv_indptr is None

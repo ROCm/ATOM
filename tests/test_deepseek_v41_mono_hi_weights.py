@@ -269,14 +269,26 @@ def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints(tp):
         q_norm=SimpleNamespace(weight=p(w["attn.q_norm.weight"])), kv_norm=SimpleNamespace(weight=p(w["attn.kv_norm.weight"])),
         attn_sink=p(_part(w["attn.attn_sink"], 0, tp)), compressor=None, indexer=None,
     )  # fmt: skip
-    se = "ffn.shared_experts."
+    # the shared expert as the loader holds it: the rank's share padded with zero rows of gate_up and columns of w2
+    # to the group32 FP8 GEMM's K step on gfx950 (``fp8_group32_k_pad_align``: TP8's 288 -> 320), zero scale codes
+    se, share = "ffn.shared_experts.", INTER // tp
+    from atom.model_ops.linear import GROUP32_FP8_K_ALIGN as K_STEP
+
+    pad = -(-share // K_STEP) * K_STEP - share
+    rows = lambda t, n: torch.nn.functional.pad(t.view(torch.uint8), (0, 0, 0, n))
+    cols = lambda t, n: torch.nn.functional.pad(t.view(torch.uint8), (0, n))
     gate_up = torch.cat(
-        [_part(w[se + n + ".weight"].view(torch.uint8), 0, tp) for n in ("w1", "w3")]
+        [rows(_part(w[se + n + ".weight"], 0, tp), pad) for n in ("w1", "w3")]
+    )
+    gate_up_s = torch.cat(
+        [rows(_part(sc(se + n), 0, tp), pad // 32) for n in ("w1", "w3")]
     )
     ffn = SimpleNamespace(
         shared_experts=SimpleNamespace(
-            gate_up_proj=_linear(gate_up.view(torch.float8_e4m3fn), torch.cat([_part(sc(se + n), 0, tp) for n in ("w1", "w3")])),
-            w2=_linear(_part(w[se + "w2.weight"], 1, tp), _part(sc(se + "w2"), 1, tp)),
+            gate_up_proj=_linear(gate_up.view(torch.float8_e4m3fn), gate_up_s, _ckpt_output_sizes=[INTER, INTER],
+                                 tp_size=tp),
+            w2=_linear(cols(_part(w[se + "w2.weight"], 1, tp), pad).view(torch.float8_e4m3fn),
+                       cols(_part(sc(se + "w2"), 1, tp), pad // 32)),
         ),
         gate=SimpleNamespace(weight=p(w["ffn.gate.weight"]), e_score_correction_bias=p(w["ffn.gate.bias"])),
         experts=_experts(w, NE, INTER, H, g, tp),

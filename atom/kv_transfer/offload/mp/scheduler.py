@@ -147,7 +147,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if not self._do_load or not getattr(client, "driving", False):
             return
         for seq in seqs:
-            if self._lookup_len(seq) <= 0:
+            if not self._lookup_wanted(seq):
                 continue
             client.offer(
                 str(seq.id),
@@ -163,6 +163,48 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if getattr(seq, "status", None) != SequenceStatus.WAITING:
             return None
         return self._lookup_token_ids(seq)
+
+    # -- turning lookups off ---------------------------------------------------
+
+    _lookups_enabled = True
+
+    def set_offload_lookups(self, enabled: bool) -> bool:
+        """Start tier lookups for new requests or not; True if applied.
+
+        Off once what a read-only tier holds is back in HBM (a replayed warmup).
+        An answer already held still loads, and a load planned before the
+        switch re-takes its pin with one synchronous lookup when dispatched.
+        A lookup no request has consumed, answered or not, is released, so
+        that request prefills its prompt.
+        Refused while this scheduler saves: without a lookup its saves would
+        store every prompt from token 0 again.
+        """
+        if not enabled and self._do_save:
+            return False
+        self._lookups_enabled = bool(enabled)
+        if enabled:
+            for name in ("_lookup_wanted", "lookup_pending", "lookup_would_defer"):
+                self.__dict__.pop(name, None)
+        else:
+            # On the instance: a scheduler that is never switched off keeps
+            # the class methods and pays nothing for the switch.
+            cls = type(self)
+            self._lookup_wanted = lambda seq: False
+            self.lookup_pending = lambda seq: (
+                not self._lookups_off_for(seq) and cls.lookup_pending(self, seq)
+            )
+            self.lookup_would_defer = lambda seq: (
+                not self._lookups_off_for(seq) and cls.lookup_would_defer(self, seq)
+            )
+        self._lookup_client.set_enabled(enabled)
+        return True
+
+    def _lookups_off_for(self, seq: Any) -> bool:
+        """Lookups are off and `seq` holds no answer from before: it cannot load."""
+        if self._lookups_enabled:
+            return False
+        held = self._lookup_results.get(str(seq.id))
+        return held is None or held[0] is not seq
 
     # -- same-step saves -------------------------------------------------------
 
@@ -206,8 +248,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return reach
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        matched = super().get_num_new_matched_tokens(seq)
         sid = str(seq.id)
+        if not self._lookups_enabled and self._lookups_off_for(seq):
+            # As with loads off (`_do_load`): no lookup, and a plan made from a
+            # remembered hit before the switch must not load after allocation.
+            if sid in self._load_specs:
+                self._clear_pending_load(sid)
+            return 0, False
+        matched = super().get_num_new_matched_tokens(seq)
         num_prompt = int(seq.num_prompt_tokens)
         # The base's remembered hit, not `hit_tokens`: a step answered from the
         # memo runs no lookup, so there is no client-side state to read back.
@@ -218,7 +266,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
             return matched
-        if self.block_size == 1:
+        if self.virtual_block_size == 1:
             # Allocating prompt-1 one-token blocks cannot provide a destination
             # for the complete final LMCache chunk. Recompute instead.
             self._clear_pending_load(sid)
