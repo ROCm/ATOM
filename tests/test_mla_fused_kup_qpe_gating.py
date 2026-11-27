@@ -13,11 +13,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_ops.mla_fused import kup_qpe_fusion_ok, kup_qpe_fusion_reason
+from atom.model_ops.mla_fused import kup_qpe_fusion_reason
 from atom.utils import envs
 
 FP8 = torch.float8_e4m3fn
 H, L, P, R, BS, M = 128, 512, 128, 64, 64, 96
+
+
+def _eligible(**kwargs):
+    return kup_qpe_fusion_reason(**kwargs) is None
 
 
 def test_flag_default_off(monkeypatch):
@@ -54,8 +58,8 @@ def _kup_args(**over):
 
 
 def test_kup_qpe_eligible():
-    assert kup_qpe_fusion_ok(**_kup_args())
-    assert kup_qpe_fusion_ok(**_kup_args(k_scale=None))
+    assert _eligible(**_kup_args())
+    assert _eligible(**_kup_args(k_scale=None))
 
 
 @pytest.mark.parametrize(
@@ -80,7 +84,7 @@ def test_kup_qpe_eligible():
     ],
 )  # fmt: skip
 def test_kup_qpe_falls_back(over):
-    assert not kup_qpe_fusion_ok(**_kup_args(**over))
+    assert not _eligible(**_kup_args(**over))
 
 
 def _cpu_mla_method(name, **globals_):
@@ -164,7 +168,7 @@ def test_inline_q_proj_matches_independent_projection(qrep, group):
 
 @pytest.mark.parametrize("rank", [0, 768, 1280, 1536, 2048])
 def test_non_supported_rank_falls_back(rank):
-    assert not kup_qpe_fusion_ok(
+    assert not _eligible(
         **_kup_args(
             w_k=torch.empty(H, rank, P, dtype=torch.bfloat16),
             q_out=torch.empty(M, H, rank + R, dtype=FP8),
@@ -175,13 +179,13 @@ def test_non_supported_rank_falls_back(rank):
 
 @pytest.mark.parametrize("nope", [0, 16, 96, 160])
 def test_non_supported_nope_falls_back(nope):
-    assert not kup_qpe_fusion_ok(
+    assert not _eligible(
         **_kup_args(w_k=torch.empty(H, L, nope, dtype=torch.bfloat16))
     )
 
 
 def test_lds_over_budget_falls_back():
-    assert not kup_qpe_fusion_ok(
+    assert not _eligible(
         **_kup_args(
             w_k=torch.empty(H, 256, 128, dtype=torch.bfloat16),
             q_out=torch.empty(M, H, 512, dtype=FP8),
@@ -196,7 +200,7 @@ def test_lds_over_budget_falls_back():
     "rank,nope,rope", [(256, 128, 128), (512, 128, 256), (1024, 32, 32)]
 )
 def test_supported_partition_bounds(rank, nope, rope):
-    assert kup_qpe_fusion_ok(
+    assert _eligible(
         **_kup_args(
             w_k=torch.empty(H, rank, nope, dtype=torch.bfloat16),
             q_out=torch.empty(M, H, rank + rope, dtype=FP8),
@@ -217,7 +221,7 @@ def test_supported_partition_bounds(rank, nope, rope):
     ],
 )
 def test_invalid_freq_cache_falls_back(cos):
-    assert not kup_qpe_fusion_ok(**_kup_args(cos_cache=cos))
+    assert not _eligible(**_kup_args(cos_cache=cos))
 
 
 def test_q_out_int32_limit_falls_back():
@@ -229,7 +233,7 @@ def test_q_out_int32_limit_falls_back():
     args["q_out"] = torch.empty_strided(
         (M, H, L + R), (2**31 // M + 1, L + R, 1), dtype=FP8, device="meta"
     )
-    assert not kup_qpe_fusion_ok(**args)
+    assert not _eligible(**args)
 
 
 @pytest.mark.parametrize("m", [64, 65, 128, 512])
@@ -316,8 +320,7 @@ def test_fallback_reasons_distinguish_failures():
     )
 
 
-@pytest.mark.parametrize("cause", ["prefill", "dcp", "kv_heads", "seg", "padding"])
-def test_fusion_guards_after_parent_static_gate(cause):
+def test_fusion_declines_prefill_after_parent_static_gate():
     path = Path(__file__).parents[1] / "atom/model_ops/attention_mla.py"
     branch = next(
         n
@@ -342,28 +345,17 @@ def test_fusion_guards_after_parent_static_gate(cause):
     reasons = []
     fake = SimpleNamespace(
         _kup_qpe_enabled=True,
-        dcp_world_size=2 if cause == "dcp" else 1,
-        num_kv_heads=2 if cause == "kv_heads" else 1,
-        use_seg_mla=cause == "seg",
-        _fused_q_head_pad=cause == "padding",
         _log_kup_qpe=lambda reason, count: reasons.append(reason),
     )
     namespace = {
-        "context": SimpleNamespace(is_prefill=cause == "prefill"),
+        "context": SimpleNamespace(is_prefill=True),
         "q": torch.empty(64, 1),
     }
     exec(  # noqa: S102 - trusted production fusion guards
         compile(module, str(path), "exec"), namespace
     )
     assert namespace["driver"](fake) is None
-    expected = {
-        "prefill": "prefill",
-        "dcp": "DCP must be 1",
-        "kv_heads": "multiple KV heads",
-        "seg": "segmented KV cache",
-        "padding": "head padding",
-    }
-    assert reasons == [expected[cause]]
+    assert reasons == ["prefill"]
 
 
 def test_diagnostics_log_each_reason_once():

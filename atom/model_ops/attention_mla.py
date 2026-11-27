@@ -3816,11 +3816,6 @@ class MLAAttention(nn.Module):
                 and self.dcp_prefill_qrep
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
-            # BF16 absorb + shuffled-KV fused rope: let the K-up GEMM store q_nope
-            # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so
-            # the rope kernel skips the q_nope read/rewrite entirely. Retain the
-            # provisional M>=64 threshold pending an isolated GPU sweep; q_out
-            # can be BF16 or FP8, and the latter rounds through BF16 in Gluon.
             q_out_prestored = None
             absorb_into_q_out = (
                 use_qrep
@@ -3838,6 +3833,10 @@ class MLAAttention(nn.Module):
                 and kv_cache.numel() > 0
                 and attn_metadata.slot_mapping.numel() == q.shape[0]
             ):
+                # BF16 absorb + shuffled-KV fused rope: the K-up GEMM stores q_nope
+                # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so the
+                # rope kernel skips the q_nope read/rewrite. M>=64 is provisional
+                # pending an isolated GPU sweep; an FP8 q_out rounds through BF16.
                 q_out_prestored = torch.empty(
                     (
                         q.shape[0],
@@ -3848,16 +3847,10 @@ class MLAAttention(nn.Module):
                     device=q.device,
                 )
                 if self._kup_qpe_enabled:
+                    # Shuffled KV already rules out DCP>1, the segmented cache
+                    # and head padding (`check_kv_shuffled_supported`).
                     if context.is_prefill:
                         reason = "prefill"
-                    elif self.dcp_world_size != 1:
-                        reason = "DCP must be 1"
-                    elif self.num_kv_heads != 1:
-                        reason = "multiple KV heads"
-                    elif self.use_seg_mla:
-                        reason = "segmented KV cache"
-                    elif self._fused_q_head_pad:
-                        reason = "head padding"
                     else:
                         kv_view = self._shuffled_kv_view(kv_cache)
                         reason = kup_qpe_fusion_reason(
@@ -3883,13 +3876,9 @@ class MLAAttention(nn.Module):
                             attn_metadata.slot_mapping,
                             q_out_prestored,
                         )
-                        # The fusion guards above require pure decode, DCP=1
-                        # and no head padding. This is the normal decode tail.
+                        # Pure decode with DCP=1: the normal decode tail.
                         return self._forward_decode(
-                            q_out_prestored,
-                            kv_cache,
-                            attn_metadata,
-                            q_prepadded=self._fused_q_head_pad,
+                            q_out_prestored, kv_cache, attn_metadata
                         )
                 q_nope, q_rope = self._q_proj_and_k_up_proj(
                     q,

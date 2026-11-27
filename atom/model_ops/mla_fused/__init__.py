@@ -47,8 +47,8 @@ def kup_qpe_fusion_reason(
 ) -> str | None:
     """None means eligible; otherwise return the specific decline reason.
 
-    The caller owns the flag/TDM, prefill/DCP and slot-count checks. Keep
-    use_qrep and the kernel shape/dtype contracts.
+    The caller owns the flag/TDM and prefill checks (shuffled KV rules out
+    DCP>1). Keep use_qrep and the kernel shape/dtype contracts.
     """
     if use_qrep:
         return "query replication"
@@ -122,7 +122,3 @@ def kup_qpe_fusion_reason(
     if isinstance(k_scale, torch.Tensor) and k_scale.device != q_out.device:
         return "k_scale and query device mismatch"
     return None if num_tokens > 0 else "no decode tokens"
-
-
-def kup_qpe_fusion_ok(**kwargs) -> bool:
-    return kup_qpe_fusion_reason(**kwargs) is None
