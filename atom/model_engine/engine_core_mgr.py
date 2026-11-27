@@ -309,6 +309,8 @@ class CoreManager:
     # No prefix router, and so no backlog ledger, unless __init__ builds one.
     _prefix_router = None
     _backlog = None
+    # No session moves unless a pool-sharing connector sets a margin.
+    _session_migrate_margin = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
@@ -438,6 +440,10 @@ class CoreManager:
         # reported prefill backlog, tracked by the ledger). Created only when
         # this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
+        sharing = KVConnectorFactory.pool_sharing(config)
+        self._session_migrate_margin = (
+            sharing.get("session_migrate_margin") if sharing else None
+        )
         # The ledger holds each rank's reported prefill backlog and the charges
         # it does not cover yet (`EngineCoreRequestType.PREFILL_BACKLOG`).
         self._backlog = (
@@ -1077,7 +1083,7 @@ class CoreManager:
                     with self.ctx.socket(zmq.PAIR) as shutdown_sender:
                         shutdown_sender.connect(shutdown_path)
                         shutdown_sender.send(b"")
-                except Exception as e:
+                except (OSError, zmq.ZMQError) as e:
                     logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
 
         for thread in self.output_threads:
@@ -1248,6 +1254,17 @@ class CoreManager:
                 "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
             )
         tier = KVConnectorFactory.offload_tier(config)
+        if not tier.loads:
+            # No offload tier, but a pool the ranks share: a request placed
+            # away from its prefix copies it from another rank's pool instead
+            # of recomputing it.
+            sharing = KVConnectorFactory.pool_sharing(config)
+            if sharing and sharing.get("loads"):
+                from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+                tier = OffloadTierProfile(
+                    loads=True, min_load_tokens=0, load_chunk_tokens=1
+                )
         if strategy == "prefix_spread":
             return PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS, tier, config.max_num_seqs
@@ -1750,6 +1767,10 @@ class CoreManager:
                 )
         elif self._dp_session_affinity_enabled:
             if not isinstance(policy, SessionPolicy):
+                # Moving a session is worth it only where its history moves
+                # along: the ranks share their pools, and a margin was set.
+                margin = self._session_migrate_margin
+                migrate = margin is not None
                 policy = SessionPolicy(
                     self._select_dp_rank_locked,
                     self._select_new_session_rank_locked,
@@ -1757,6 +1778,8 @@ class CoreManager:
                     self._dp_session_prompt_tokens,
                     self._routable_engine_count,
                     self._record_ignored_parent,
+                    rank_reqs=(lambda: self._rank_reqs) if migrate else None,
+                    margin=margin if migrate else 0.1,
                 )
         elif policy is None or type(policy) is not LoadPolicy:
             policy = LoadPolicy(self._select_dp_rank_locked)
@@ -2251,11 +2274,21 @@ class CoreManager:
             if not outer:
                 ctx.sync_id = uuid.uuid4().hex
                 ctx.failure = None
+                ctx.abort_sent = False
             ctx.active = True
             try:
                 yield
             finally:
                 ctx.active = outer
+
+    def claim_weight_sync_abort(self) -> bool:
+        """Return true once for the outer weight-sync session's abort."""
+        with self._weight_sync_lock:
+            ctx = self._weight_sync_context
+            if not getattr(ctx, "active", False) or getattr(ctx, "abort_sent", False):
+                return False
+            ctx.abort_sent = True
+            return True
 
     def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
         """Fence every engine this reaches and drop the failed sync's scratch.
@@ -2854,5 +2887,5 @@ class DisaggCoreManager(CoreManager):
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
-            except Exception:
-                pass
+            except (BufferError, FileNotFoundError, OSError) as error:
+                logger.debug("Could not release CU shared memory: %s", error)

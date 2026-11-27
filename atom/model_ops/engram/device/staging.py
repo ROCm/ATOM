@@ -80,6 +80,8 @@ class EngramStaging:
         self.step = None
         # the step `start` left to the model (`EngramStep.served_by_round`)
         self._served = False
+        # the step `start` looked up on the compute stream (no fork to close)
+        self._inline = False
         widths = {host.prefetcher._tables[layer].head_dim for layer in host.layer_ids}
         if len(widths) != 1:
             raise ValueError(f"Engram layers of different head dims {sorted(widths)}")
@@ -181,12 +183,14 @@ class EngramStaging:
             return {layer: gathered[i] for i, layer in enumerate(self.host.layer_ids)}
         return {layer: buf.gpu[:width] for layer, buf in self.host.buffers.items()}
 
-    def _lookup(self, width):
+    def _lookup(self, width, stream=None):
         """Every layer's rows looked up from their hashed ids (`_snapshot`'s),
-        on the current (side) stream, then reassembled over TP by one
-        all-gather where the private collective serves; each layer's `done`
-        recorded once its rows are complete."""
+        on the current stream, ``stream`` (default: the side stream; the
+        compute stream when `start` does not fork), then reassembled over TP
+        by one all-gather where the private collective serves; each layer's
+        `done` recorded once its rows are complete."""
         host = self.host
+        stream = self.stream if stream is None else stream
         rows = self._rows(width)
         self.gather(
             self.uva.row_ids[:, :width],
@@ -199,13 +203,13 @@ class EngramStaging:
             for i, layer in enumerate(host.layer_ids):
                 if host._tp_group is None:
                     host.buffers[layer].gpu[:width].copy_(rows[i])
-                self.done[layer].record(self.stream)
+                self.done[layer].record(stream)
         if self.collective is not None:
             self.collective.all_gather_reg(
                 rows, out=self._gathered(width), dim=rows.dim() - 1
             )
             for layer in host.layer_ids:
-                self.done[layer].record(self.stream)
+                self.done[layer].record(stream)
 
     def prepare(self, step, width):
         """Name the forward's inputs (`EngramStep`); `start` launches on them."""
@@ -253,15 +257,26 @@ class EngramStaging:
             )
 
     def start(self, width):
+        from atom.utils.forward_context import graph_records_single_stream
+
         # A step whose model looks the rows up itself: only the cursor advance
         # (no snapshot, no side stream), and `join` waits on nothing.
         self._served = self.step.served_by_round
+        self._inline = False
         if self._served:
             self._advance_cursor(width)
             return
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
+        if graph_records_single_stream():
+            # A graph window kept on one stream (ATOM_GRAPH_SIDE_STREAMS): the
+            # lookup runs inline after the cursor advance, which reads the
+            # snapshot too, and `join` has no fork to close.
+            self._inline = True
+            self._advance_cursor(width)
+            self._lookup(width, compute)
+            return
         # Get the parent BEFORE entering the guard: waiting on ourselves
         # would neither order the inputs nor join the graph capture.
         self.stream.wait_stream(compute)
@@ -280,7 +295,7 @@ class EngramStaging:
             host.buffers[layer].gpu[:width].copy_(out)
 
     def join(self):
-        if self._served:
+        if self._served or self._inline:
             return
         # Close the fork even if a partial forward did not consume every layer.
         torch.cuda.current_stream(self.host.device).wait_stream(self.stream)

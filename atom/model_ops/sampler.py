@@ -33,7 +33,10 @@ SAMPLER_EPS = 1e-10
 
 
 def _apply_greedy_tokens(
-    probs: torch.Tensor, temperatures: torch.Tensor, next_tokens: torch.Tensor
+    probs: torch.Tensor,
+    temperatures: torch.Tensor,
+    next_tokens: torch.Tensor,
+    any_greedy: bool = True,
 ) -> torch.Tensor:
     """Keep row selection on the device, with a fixed-size int32 result.
 
@@ -45,7 +48,15 @@ def _apply_greedy_tokens(
     A greedy row is one at or below ``SAMPLER_EPS``: the runner clamps every
     temperature to it before the sampler sees them (``prepare_sample``), so a
     requested 0 never arrives as 0.
+
+    ``any_greedy`` is the caller's host-side answer to "does any row ask for
+    greedy?" (the runner reads it off the scheduled batch's temperatures, which
+    are already on the CPU). When no row does, the argmax over the whole
+    vocabulary and the select are skipped and the sampled tokens are returned
+    as they are; every row would have kept its sampled token anyway.
     """
+    if not any_greedy:
+        return next_tokens.view(-1).to(torch.int)
     greedy_tokens = topk_select(probs, 1, tie="low")[1].view(-1)
     return torch.where(
         temperatures <= SAMPLER_EPS, greedy_tokens, next_tokens.view(-1).to(torch.int)
@@ -106,6 +117,7 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
+        any_greedy: bool = True,
     ) -> torch.Tensor:
         """Sample each draft-conditioned target row with independent noise.
 
@@ -134,6 +146,7 @@ class Sampler(nn.Module):
             expand(top_ps),
             all_greedy=False,
             needs_independent_noise=True,
+            any_greedy=any_greedy,
         )
 
     def forward(
@@ -148,6 +161,7 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        any_greedy: bool = True,  # False if no temperature is 0 (checked on CPU)
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -158,6 +172,9 @@ class Sampler(nn.Module):
             top_ks: Uniform CPU scalar or per-token tensor; -1 means disabled
             top_ps: Uniform CPU scalar or per-token tensor; 1.0 means disabled
             all_greedy: True if all requests use greedy sampling (checked on CPU)
+            any_greedy: False if no request uses greedy sampling (checked on
+                CPU); the greedy-row correction is then skipped. True (the
+                default) always applies it, which is correct for any batch.
             needs_independent_noise: True when the batch contains fan-out
                 siblings (SamplingParams.n>1). ORed here, once, with the
                 sampler policy (``always_independent_noise``), so every
@@ -189,7 +206,7 @@ class Sampler(nn.Module):
             if needs_independent_noise:
                 return self._independent_noise_sample(logits, temperatures)
             sampled = self._temperature_sample(logits, temperatures)
-            return _apply_greedy_tokens(logits, temperatures, sampled)
+            return _apply_greedy_tokens(logits, temperatures, sampled, any_greedy)
 
         # Apply top-k/top-p filtering
         return self._topk_topp_sample(
@@ -198,6 +215,7 @@ class Sampler(nn.Module):
             top_ks,
             top_ps,
             needs_independent_noise=needs_independent_noise,
+            any_greedy=any_greedy,
         )
 
     def _needs_filtering(
@@ -273,6 +291,7 @@ class Sampler(nn.Module):
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
         needs_independent_noise: bool = False,
+        any_greedy: bool = True,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
 
@@ -299,10 +318,10 @@ class Sampler(nn.Module):
 
         if AITER_TOPK_TOPP_AVAILABLE:
             return self._aiter_sample(
-                probs, top_ks, top_ps, has_topk, has_topp, temperatures
+                probs, top_ks, top_ps, has_topk, has_topp, temperatures, any_greedy
             )
         else:
-            return self._native_sample(probs, top_ks, top_ps, temperatures)
+            return self._native_sample(probs, top_ks, top_ps, temperatures, any_greedy)
 
     def _to_tensor_scalar(self, x: float | torch.Tensor | None):
         """Adapt filters to AITER's tensor/scalar arguments.
@@ -340,6 +359,7 @@ class Sampler(nn.Module):
         has_topk: bool,
         has_topp: bool,
         temperatures: torch.Tensor,
+        any_greedy: bool = True,
     ) -> torch.Tensor:
         """Use aiter optimized ops for top-k/top-p sampling."""
         # Convert to tensor/scalar format for aiter
@@ -378,7 +398,7 @@ class Sampler(nn.Module):
             # Neither - just multinomial from probs
             next_tokens = torch.multinomial(probs, num_samples=1)
 
-        return _apply_greedy_tokens(probs, temperatures, next_tokens)
+        return _apply_greedy_tokens(probs, temperatures, next_tokens, any_greedy)
 
     def _native_sample(
         self,
@@ -386,6 +406,7 @@ class Sampler(nn.Module):
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
         temperatures: torch.Tensor,
+        any_greedy: bool = True,
     ) -> torch.Tensor:
         """
         EXPERIMENTAL: Native PyTorch fallback for top-k/top-p sampling.
@@ -446,7 +467,7 @@ class Sampler(nn.Module):
         sampled_idx = torch.multinomial(filtered_probs, num_samples=1).squeeze(-1)
         next_tokens = sorted_indices.gather(1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
-        return _apply_greedy_tokens(probs, temperatures, next_tokens)
+        return _apply_greedy_tokens(probs, temperatures, next_tokens, any_greedy)
 
     # Legacy methods kept for reference
     def greedy_sample(

@@ -140,7 +140,8 @@ def _shared_tokens(a: np.ndarray, b: np.ndarray) -> int:
 
 class TokenPrefixChains:
     """Token-id prompts' chains: each reuses the complete blocks it shares with
-    the stored prompt sharing the most leading tokens, then is stored itself."""
+    the stored prompt sharing the most leading tokens, then is stored itself
+    unless that prompt holds all of its tokens."""
 
     def __init__(self, budget_bytes: int, block_size: int, enabled: bool = True):
         self.block_size = block_size
@@ -186,9 +187,10 @@ class TokenPrefixChains:
             if rehash and full != chain.hashes:
                 self._turn_off()
                 chain = PrefixBlockHashes(bs, -1, len(toks), full)
-            elif rehash and verify and self.enabled:
+            elif rehash and self.enabled:
                 self._verified += 1
-            if enabled and self.enabled and n:
+            # a prefix of `base` would serve no later prompt better than `base`
+            if enabled and self.enabled and n and shared < len(toks):
                 whole = reused and reused == base.hashes.num_blocks
                 self._store(raw, chain, base if whole else None)
             counts = self._counts

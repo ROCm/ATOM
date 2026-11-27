@@ -1,8 +1,15 @@
 # Structured output and deployment discovery
 
 The native Chat and Responses endpoints support JSON output constraints through
-the optional `atom[structured-output]` dependency. This is separate from the
+llguidance and RE2, which the base install includes. This is separate from the
 SGLang plugin's structured-output implementation.
+
+The backend needs exactly the llguidance release ATOM pins (1.9.1), plus
+`google-re2` and `jsonschema`. Without them (ATOM installed with `--no-deps`), or with another
+llguidance release (the vLLM plugin image pins `<1.8`), structured output is
+off: requests that ask for it get a 400 naming what it needs,
+`ATOM_TOOL_CALL_GRAMMAR=1` leaves tool calls unconstrained, and `/v1/models`
+omits `structured_output`.
 
 ## Code organization
 
@@ -80,7 +87,7 @@ preventing an executor task from enqueueing after cancellation cleanup.
 Only local references are allowed, including references reached transitively
 through a local pointer into an otherwise literal `const` or `enum` value.
 Every runtime validator also disables external resource retrieval. Schema regexes
-use the non-backtracking RE2 evaluator from the optional `google-re2` dependency
+use the non-backtracking RE2 evaluator from the `google-re2` dependency
 for candidate filtering and final validation, including property-name matching.
 Each compiled regex has a 2 MiB memory limit; patterns are limited to 262,144
 characters and the cache retains at most 32 compiled expressions. Unsupported
@@ -289,6 +296,9 @@ required/named `tool_choice` still applies.
 - DSpark advertises text input, even if the checkpoint also declares vision.
 - Text output and the configured model's supported effort levels are exposed.
 - Unknown capabilities are omitted rather than inferred from a served alias.
+- `structured_output` is present only when the backend is installed:
+  `{"backend": "llguidance", "formats": ["json_object", "json_schema"]}`. A
+  request can still be refused at admission on a topology that cannot run it.
 
 The V4.1 adapter advertises `low`, `high`, and `max` thinking effort. The output
 cap is also bounded by its 393,216-token API limit. Returning model metadata does
