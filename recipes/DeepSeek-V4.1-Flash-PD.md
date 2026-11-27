@@ -74,12 +74,65 @@ acceptance `--spec-decode-acceptance-length 3.51` on P and D; FP8 KV, FP4
 index, block size 16; P with MegaMoE, `--max-num-batched-tokens 16384`, chunk
 16384, long-prefill threshold 8192, early handoff
 (`ATOM_PD_EARLY_HANDOFF=1`), `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` and
-`ATOM_DP_IDLE_WHEN_BLOCKED=1`; prefill delayer off on P and D; base64 prompt
-token ids (`ATOM_PROMPT_IDS_B64=1` on P and D, ingress with
-`ATOM_FRONT_IDS_B64=1`); D `--max-num-batched-tokens 1024`; P and D each
+`ATOM_DP_IDLE_WHEN_BLOCKED=1` (these three set explicitly because the
+measured tree had them off by default; see
+[PRs used and how to configure them](#prs-used-and-how-to-configure-them));
+prefill delayer off on P and D; base64 prompt token ids
+(`ATOM_PROMPT_IDS_B64=1` on P and D, the default on main since #3854 was
+merged; ingress with `ATOM_FRONT_IDS_B64=1`); D `--max-num-batched-tokens 1024`; P and D each
 with a single API server except the D at c512 and c768. Prefix caching is on
 by default (`enable_prefix_caching: True` in the logged engine arguments; no
 flag was passed).
+
+### PRs used and how to configure them
+
+The ladder was measured on a frozen ATOM tree (see
+[Software stack](#software-stack-identical-on-p-and-d-every-point)); several
+of the PRs it carries have since been merged or revised. The table says, for
+each P/D-relevant PR, what the measured tree had, what to set today, and on
+which side. "Side" is where the setting goes: P (prefill server), D (decode
+server), router (atomesh) or ingress (the encoding ingress in front of the
+router). PR states are as of 2026-11-27.
+
+| PR | What it does | State | Version in the measured tree | Setting (side) | Default | Points that used it | Notes |
+|---|---|---|---|---|---|---|---|
+| [#3772](https://github.com/ROCm/ATOM/pull/3772) | Wait for a Mooncake Store load already in flight before the first forward, instead of recomputing the prefix | open | old fixed-wait version: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS` | measured: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (P). Current PR: `ATOM_OFFLOAD_LOAD_EVENT_WAIT` (P) | measured tree: 0 (off). Current PR: on (`1`); `0` turns it off | all (c1-c768) | The current PR head replaces the fixed wait with an event-driven wait (woken by the load-completion doorbell, bounded by the measured forward time) and removes `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`. Once it is merged the old variable does nothing: drop it and leave `ATOM_OFFLOAD_LOAD_EVENT_WAIT` at its default. Measured gain at 1P1D c256: TTFT mean -20.2%, throughput +0.55%. Inert without a Store tier. |
+| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates and pulls KV while P still computes | open | early version, default off | `ATOM_PD_EARLY_HANDOFF=1` (P) | measured tree: 0. Current PR head: 1 | all (c1-c768) | **Known issue:** after a P step that stalls for more than 60 s, early requests can leak a state slot; once a rank has leaked `--max-num-seqs` slots it admits nothing more, permanently. Set `ATOM_PD_EARLY_HANDOFF=0` at c1024 and above until the fix lands (in progress). Load visibility is correct only with a single P instance: with several P instances behind one router, the router's view of P load is wrong. Because the current PR head turns it on by default, set `0` explicitly where it should be off. |
+| [#3777](https://github.com/ROCm/ATOM/pull/3777) | `ATOM_DP_IDLE_WHEN_BLOCKED`: a DP rank whose only work is blocked (Store lookup/load, KV send) idles instead of forcing dummy forwards | merged 2026-11-27 | pre-merge version, default off | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (P) | main: unset = on for a P/D prefill (`kv_producer`), off elsewhere | all (c1-c768) | On main nothing needs to be set on P. Needs `ATOM_ENABLE_PREFILL_DELAYER=0` (the delayer turns it off). |
+| [#3854](https://github.com/ROCm/ATOM/pull/3854) | Prompt token ids as base64 packed uint32, cutting the decode-side ingest cost | merged 2026-11-26 | pre-merge version, default off (merged by hand, two conflicts) | `ATOM_PROMPT_IDS_B64=1` (P and D); ingress `ATOM_FRONT_IDS_B64=1` and `ATOM_FRONT_SPLICE_BODY=1` | main: on (`1`) for P and D. The ingress variables belong to the external ingress and must be set there | all (c1-c768) | On main P and D read base64 ids by default; the ingress still has to send them. |
+| [#3873](https://github.com/ROCm/ATOM/pull/3873) | D accepts the request first and P's `kv_transfer_params` later, on `/v1/pd/late_kv/chat/completions` | merged 2026-11-26 | not in the tree | `ATOM_PD_LATE_KV=1` (D) | off (`0`): the route answers 404 | none | Pair with #3874. |
+| [#3874](https://github.com/ROCm/ATOM/pull/3874) | atomesh sends the decode leg concurrently with prefill instead of after it | merged 2026-11-26 | not in the router used | `--atom-pd-concurrent` (router, `--backend atom`) | off | none | The frozen router of the ladder relays serially. With the flag the router opens D's late-KV request while P runs; a D without `ATOM_PD_LATE_KV=1` answers 404 and the router falls back to the serial relay (logged once). Measured: D receives the request 4-11 ms earlier; end to end neutral. |
+
+The measured tree also carries these PRs, which need no P/D-specific setting
+beyond the commands in each point's section: MegaMoE route selection
+[#3187](https://github.com/ROCm/ATOM/pull/3187) (T1 version; merged
+2026-11-25, `--moe-backend mega`), #3738 (merged), #3842 (merged; net diff),
+#3838 (open), #3839 (open), #3840 (open), #3647 (open), #3186 (merged; EPLB
+is off in the ladder), #2903 (open), #3437 (merged), #3639 (open), #3748
+(open) and #2877 (merged). Their combination as measured is the reproduction
+branch `lirzhang/agentx-v41-recipe-de7d8ec1c`; individual PRs merged since may
+differ from the versions in that branch.
+
+### High-concurrency notes (c768 and above)
+
+These come from runs at and beyond the top of the ladder. Except where stated,
+they were not part of the measured points.
+
+- **`MC_TRANSFER_TIMEOUT=300` on P and D.** Mooncake's sync-write timeout is
+  30 s when unset; raise it for c768 and above. The ladder points did not
+  set it.
+- **Store placement.** Keep each Store owner at 1024 GiB or less per node,
+  and do not put it on a node that runs P or D. On one NIC, the Store's
+  registration plus the KV registrations of several ranks above about 2 TiB
+  fails with `EINVAL`, which surfaces as empty responses. As measured, the
+  c768 point ran a 1 TiB Store on the P node without a failure; that is the
+  only co-located 1 TiB data point.
+- **Pre-warm every rail before the window.** The first transfer on a new
+  P-rank x D-rank rail takes 35-60 s to set up, while P's lookup times out at
+  60 s (`PREFILL_LOOKUP_TIMEOUT`). Before timing, drive enough traffic that
+  every P rank has transferred to every D rank.
+- **Early handoff.** Set `ATOM_PD_EARLY_HANDOFF=0` at c1024 and above (see
+  #3773 above).
 
 ### Software stack (identical on P and D, every point)
 
@@ -92,7 +145,11 @@ flag was passed).
   #3186, #2903, #3437, #3639, #3748, #2877, #3854 (base64 prompt ids, two
   conflicts resolved by hand), and the P/D endpoint-recovery patch (not
   enabled: `ATOM_PD_ENDPOINT_RECOVERY` unset). #3164 and #3645 were not
-  included.
+  included. **To reproduce**, check out the ROCm/ATOM branch
+  [`lirzhang/agentx-v41-recipe-de7d8ec1c`](https://github.com/ROCm/ATOM/tree/lirzhang/agentx-v41-recipe-de7d8ec1c)
+  (head `de7d8ec1c`), which is exactly this tree, and use it as
+  `$ATOM_TREE`. How each P/D PR is configured, then and on current main, is
+  in [PRs used and how to configure them](#prs-used-and-how-to-configure-them).
 - **aiter**: the image's aiter `7ecd46b07` plus ROCm/aiter #8547, #8636,
   #8171 and #8633, bind-mounted file by file over `/app/aiter-test` (the
   image's prebuilt `.so` modules are kept). The ten files are listed in every
@@ -129,7 +186,7 @@ MODEL_VIEW=<host dir with the checkpoint's config and tokenizer files; its weigh
 MODEL_WEIGHTS=<host dir with the DeepSeek-V4.1-Flash-1017 safetensors>
 TOKENIZER_VIEW=<host dir with the same checkpoint's config and tokenizer files, for router and ingress>
 # Source trees and caches (same paths on both nodes)
-ATOM_TREE=<ATOM checkout at de7d8ec1c, see Software stack>
+ATOM_TREE=<ATOM checkout of branch lirzhang/agentx-v41-recipe-de7d8ec1c (de7d8ec1c), see Software stack>
 AITER_FILES=<aiter checkout at 7ecd46b07 + aiter #8547 #8636 #8171 #8633>
 DIAG_PATCH=<dir with the two diagnostic files, c768 only>
 CACHE=<persistent cache dir: aiter-jit, atom, mori>
@@ -2381,7 +2438,7 @@ recipe; see [4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
 | 6 | D | `--moe-backend mega` (E19 = E14a + items 6 and 7) | ITL fell from 6.37 to 5.88 ms on Host A, and throughput rose to 7,572 tok/s. |
 | 7 | P | `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (needs ATOM #3772) | The first forward waits up to 20 ms for a Store load already in flight, instead of recomputing the prefix. |
 | 8 | P | `ATOM_PD_EARLY_HANDOFF=1` (needs ATOM #3773) | P answers the router as soon as it has dispatched the request, so D allocates and pulls KV while P computes. Time from P finish to first token fell from 0.309 to 0.136 s. **Use only with a single P instance** (see [Caveats](#caveats)). |
-| 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (needs the T1 PR) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
+| 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (ATOM #3777, merged; on by default on a P/D prefill on main) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
 | 10 | D | `--cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]'` | D runs batch 15-20 per rank at C256. The old 16→24 step padded those batches. In a same-host A/B, a step at batch 17 was 2.67 ms faster and at batch 19 2.49 ms faster. Batches 16 and 24 changed by ±0.15 ms. Startup time and cudagraph memory (1.53 GB) were unchanged. |
 
 Several other changes were tried and are **not** part of this recipe. Each
@@ -2432,16 +2489,22 @@ Base image: `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0`.
    The copy keeps the image's prebuilt `.so` modules. Bind-mount `<WORK>/aiter-P`
    at `/app/aiter-test` in the P container. D keeps the image's aiter.
 
-**Best configuration only.** Items 7-9 are opt-in environment variables
-added by open ATOM PRs:
+**Best configuration only.** Items 7-9 are environment variables added by
+these ATOM PRs (they were off by default in the measured trees, so the
+commands set them; see
+[PRs used and how to configure them](#prs-used-and-how-to-configure-them)
+for their current defaults):
 
-3. **ATOM [#3772](https://github.com/ROCm/ATOM/pull/3772)**:
-   `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`.
-4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)**:
+3. **ATOM [#3772](https://github.com/ROCm/ATOM/pull/3772)** (open):
+   `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS` as measured. The current PR head
+   replaces it with `ATOM_OFFLOAD_LOAD_EVENT_WAIT` (on by default).
+4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)** (open):
    `ATOM_PD_EARLY_HANDOFF`. It applies only when P uses single-node DP and
-   the router uses the legacy relay.
-5. **The T1 PR**: `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the
-   `BLOCKED_IDLE_SLEEP_S` GIL yield.
+   the router uses the legacy relay. The current PR head turns it on by
+   default.
+5. **ATOM [#3777](https://github.com/ROCm/ATOM/pull/3777)** (merged):
+   `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the `BLOCKED_IDLE_SLEEP_S`
+   GIL yield. On main it is on by default on a P/D prefill.
 
 With a variable unset, or its PR missing, that item falls back to the E14a
 behaviour. **D with MegaMoE (item 6)** needs the same #3187 tree and aiter as
@@ -2813,10 +2876,12 @@ What the tables show:
 
 ### Caveats
 
-- ATOM #3187 and aiter #7788 are open. Pin the commits listed above;
-  newer heads have not been measured with this recipe. The best
-  configuration also depends on ATOM #3772, #3773 and the T1 PR, which are
-  open too. Each of them is off by default.
+- ATOM #3187 and aiter #7788 were open when this was measured; both have
+  since been merged. The commits listed above are the ones measured; the
+  merged versions have not been measured with this appendix. The best
+  configuration also depends on ATOM #3772 and #3773 (open) and #3777
+  (merged); their defaults have changed since, see
+  [PRs used and how to configure them](#prs-used-and-how-to-configure-them).
 - **P99 TTFT is bound by the arrival burst.** P99 is 12.0-12.4 s with or
   without items 6-9, because the burst about 300 s into the window queues
   every request behind a 4-GPU P. Items 6-10 improve the mean, P50, P90 and
