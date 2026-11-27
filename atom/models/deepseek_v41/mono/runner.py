@@ -1120,7 +1120,8 @@ class V41MonoDecodeRunner:
         # rank joins it: beside a kernel that needs every CU resident it
         # deadlocks, so it ends before the first one
         rows_staged = metadata.engram_embeddings
-        if getattr(rows_staged, "stage", None) is not None:
+        engram_joined = getattr(rows_staged, "stage", None) is not None
+        if engram_joined:
             rows_staged.join()
         write_step_meta(
             step,
@@ -1153,7 +1154,9 @@ class V41MonoDecodeRunner:
             rope = model.global_rope if spec.ratio else model.window_rope
             fuses = self._fuses(rows, spec, key, block)
             if block.engram is not None:
-                state = self._engram(rows, spec, block, state, metadata, sharded)
+                state = self._engram(
+                    rows, spec, block, state, metadata, sharded, engram_joined
+                )
             # this layer leaves its columns only, as every one past it
             sharded = shards
             if fuses and i in paired and self._layer_pair(
@@ -1249,14 +1252,15 @@ class V41MonoDecodeRunner:
         split, _, n = rows
         return self.engram.build(n, split)
 
-    def _engram(self, rows, spec, block, state, metadata, sharded):
+    def _engram(self, rows, spec, block, state, metadata, sharded, joined=False):
         """An Engram layer's gated residual (settled, owing nothing): one launch
         (``engram_launch``) where built, else the original on every column
-        (gathered first where sharded)."""
+        (gathered first where sharded). ``joined``: the step's stream already
+        waited on the Engram staging's (``forward``)."""
         how = None if self.engram is None else self._engram_rows(rows)
         if how is not None and self.engram.launch(
             self.build.engram, spec.layer_id, state, metadata,
-            self.peers.kernel_args(), t0=how[1],
+            self.peers.kernel_args(), t0=how[1], joined=joined,
         ):  # fmt: skip
             return SinglePassHCState(self.engram.gated(rows), state.pre_mix)
         if sharded:

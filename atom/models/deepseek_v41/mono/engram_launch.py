@@ -46,6 +46,25 @@ def _engram_served(block) -> bool:
     )
 
 
+def _staged_rows(rows, layer, joined: bool):
+    """The layer's looked-up rows. Once the caller's stream has waited on the
+    staging's (``joined``) and taking them would only wait on the layer's
+    ``done`` event (no main-stream gather of its own: ``fallback_done``
+    empty), they are read in place: that wait, captured, adds a redundant
+    edge from the side stream's all-gather to this launch, which a graph
+    replay pays as ~4 us of idle before it (G368). Else ``get``."""
+    staging = getattr(rows, "staging", None)
+    if (
+        joined
+        and isinstance(rows, dict)
+        and staging is not None
+        and not staging.fallback_done
+        and not getattr(staging, "_served", False)
+    ):
+        return dict.get(rows, layer)
+    return rows.get(layer)
+
+
 class MonoEngram:
     """The Engram layers the launch serves (layer id -> block), their shared
     buffers (the projection's partials, the gated residual) and an S-row
@@ -80,17 +99,20 @@ class MonoEngram:
         key = eg.EngramBuild(rows=rows, tp=self.tp, eps=self.eps, split=split)
         return eg.build_engram(key)
 
-    def launch(self, launcher, layer_id, state, metadata, peer_args, t0=0) -> bool:
+    def launch(
+        self, launcher, layer_id, state, metadata, peer_args, t0=0, joined=False
+    ) -> bool:
         """``state`` (owing its post) through the layer's gate into ``out``,
         the launch's rows from row ``t0`` (a token-parallel step's own); False
         where the launch does not serve this layer or step (the caller runs
-        the original)."""
+        the original). ``joined``: the caller's stream has already waited on
+        the staging's (``_staged_rows``)."""
         block = self.blocks.get(layer_id)
         if launcher is None or block is None or state.pending is None:
             return False
         if metadata.image_mask is not None:
             return False
-        emb = metadata.engram_embeddings.get(block.engram.layer_id)
+        emb = _staged_rows(metadata.engram_embeddings, block.engram.layer_id, joined)
         rows = state.residual.shape[1]
         if (
             emb is None
