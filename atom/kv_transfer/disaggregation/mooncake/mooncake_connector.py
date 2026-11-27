@@ -103,11 +103,11 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
-from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, mooncake_hca, zmq_socket_ctx
 from atom.utils.network import get_ip
+from atom.utils.pci_topology import gpu_pci_bdf
 
 logger = logging.getLogger("atom")
 
