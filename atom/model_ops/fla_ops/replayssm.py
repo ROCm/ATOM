@@ -1387,7 +1387,9 @@ def _serial_launch_config(
     H: int,
     K: int,
     cache_len: int,
-    input_dtype: torch.dtype,
+    input_dtypes: tuple[
+        torch.dtype, torch.dtype, torch.dtype, torch.dtype, torch.dtype
+    ],
     record_dtypes: tuple[torch.dtype, torch.dtype, torch.dtype],
     state_dtype: torch.dtype,
 ) -> tuple[int, int, int]:
@@ -1416,7 +1418,14 @@ def _serial_launch_config(
     if (
         not is_kda
         and (N, H, HV, K, V, max_query_len, cache_len) == (1, 8, 24, 128, 128, 4, 16)
-        and input_dtype == torch.bfloat16
+        and input_dtypes
+        == (
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            torch.bfloat16,
+        )
         and record_dtypes == (torch.bfloat16, torch.bfloat16, torch.float32)
         and state_dtype == torch.float32
         and get_gfx_runtime() == "gfx942"
@@ -1603,7 +1612,7 @@ def replayssm_gated_delta_rule(
         H=H,
         K=K,
         cache_len=cap,
-        input_dtype=q.dtype,
+        input_dtypes=(q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype),
         record_dtypes=(buf_k.dtype, buf_u.dtype, buf_g.dtype),
         state_dtype=ckpt.dtype,
     )

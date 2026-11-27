@@ -29,7 +29,13 @@ def _bv(
     H=8,
     K=128,
     cache_len=16,
-    input_dtype=torch.bfloat16,
+    input_dtypes=(
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+    ),
     record_dtypes=(torch.bfloat16, torch.bfloat16, torch.float32),
     state_dtype=torch.float32,
 ):
@@ -44,7 +50,7 @@ def _bv(
         H=H,
         K=K,
         cache_len=cache_len,
-        input_dtype=input_dtype,
+        input_dtypes=input_dtypes,
         record_dtypes=record_dtypes,
         state_dtype=state_dtype,
     )[0]
@@ -92,7 +98,6 @@ def test_gfx942_measured_shape_uses_sixteen_wide_tiles(replay, monkeypatch):
         {"T": 2},
         {"is_kda": True},
         {"cache_len": 32},
-        {"input_dtype": torch.float16},
         {"record_dtypes": (torch.float32, torch.bfloat16, torch.float32)},
         {"record_dtypes": (torch.bfloat16, torch.float32, torch.float32)},
         {"record_dtypes": (torch.bfloat16, torch.bfloat16, torch.bfloat16)},
@@ -102,6 +107,16 @@ def test_gfx942_measured_shape_uses_sixteen_wide_tiles(replay, monkeypatch):
 def test_gfx942_unmeasured_shapes_keep_existing_tiles(replay, monkeypatch, delta):
     args = {"N": 1, "HV": 24, **delta}
     assert _bv(replay, monkeypatch, "gfx942", **args) == 64
+
+
+@pytest.mark.parametrize("index", range(5), ids=["q", "k", "v", "g", "beta"])
+def test_gfx942_unmeasured_input_dtypes_keep_existing_tiles(replay, monkeypatch, index):
+    dtypes = [torch.bfloat16] * 5
+    dtypes[3] = torch.float32
+    dtypes[index] = torch.float16
+    assert (
+        _bv(replay, monkeypatch, "gfx942", 1, HV=24, input_dtypes=tuple(dtypes)) == 64
+    )
 
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250", "gfx1200"])
