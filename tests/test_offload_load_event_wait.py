@@ -2,13 +2,17 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
-"""Event-driven load wait (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`).
+"""Offload load wait (`atom/kv_transfer/offload/load_wait.py`).
 
-The early tier load runs ahead of `schedule()`, its loads are shipped at once,
-and the step is held for them only while holding pays. The hold blocks on the
-KV progress doorbell a worker rings when a load job ends, not on a sleep, and
-ends as soon as every started load landed; its bound comes from the measured
-forward time and the requests the hold would delay, not from a constant.
+The early tier load runs ahead of `schedule()` and its loads are shipped at
+once; after a KV progress doorbell (a worker's load job ended) one completion
+answer requested after the ring is fetched before `schedule()`
+(`ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on). With `ATOM_OFFLOAD_LOAD_WAIT_HOLD` (off by
+default) the step is also held for the loads it started while holding pays:
+the hold blocks on the doorbell, not on a sleep, and ends as soon as every
+started load landed; its bound comes from the measured forward time and the
+requests the hold would delay, not from a constant. All of it is an engine
+step hook: the engine and the scheduler carry none of its state.
 """
 
 import pickle
@@ -18,7 +22,8 @@ import sys
 import threading
 import time
 from collections import deque
-from types import MethodType, ModuleType, SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -30,6 +35,7 @@ from test_mooncake_store_offload import (  # noqa: F401 (fixtures)
 from test_scheduler_early_load import _free, _make
 
 from atom.kv_transfer import progress_doorbell
+from atom.kv_transfer.offload import load_wait
 from atom.model_engine.sequence import SequenceStatus
 
 WAITING_LOAD = SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -69,12 +75,13 @@ class _Mgr:
     """Runner-manager double.
 
     A shipped load lands on a timer thread after its delay (None: only with a
-    forward) and rings the doorbell, as `LoadExecutor` does. A completion
-    answer is a snapshot taken when it is requested, as a worker answers the
-    query when it reaches it, and arrives at once (setting the engine's KV
-    progress event); `collect` closes the outstanding one and requests the next
-    (`AsyncIOProcManager.call_func_with_aggregation`'s pipelining). A forward
-    lands whatever is still in flight by its end.
+    forward) and rings the doorbell, as `LoadExecutor` does (the marker's
+    arrival rings the engine's doorbell, which sets its KV progress event). A
+    completion answer is a snapshot taken when it is requested, as a worker
+    answers the query when it reaches it, and arrives at once (setting the
+    engine's KV progress event); `collect` closes the outstanding one and
+    requests the next (`AsyncIOProcManager.call_func_with_aggregation`'s
+    pipelining). A forward lands whatever is still in flight by its end.
     """
 
     def __init__(self, sched, progress_event, delay=0.0, fail=False, forward_s=0.0):
@@ -83,15 +90,10 @@ class _Mgr:
         self.delay = delay  # seconds, None, or {seq id: seconds | None}
         self.fail = fail
         self.forward_s = forward_s
-        self.kv_doorbell_event = threading.Event()
         self.lock = threading.Lock()
         self.shipped, self.inflight, self.landed = set(), set(), set()
         self.pending = None  # (requested at, snapshot)
         self.calls, self.forwards, self.timers = [], [], []
-
-    @property
-    def kv_aggregation_started_at(self):
-        return None if self.pending is None else self.pending[0]
 
     def _delay(self, seq_id):
         return self.delay.get(seq_id) if isinstance(self.delay, dict) else self.delay
@@ -102,7 +104,7 @@ class _Mgr:
                 return
             self.inflight.discard(seq_id)
             self.landed.add(seq_id)
-        self.kv_doorbell_event.set()
+        progress_doorbell.ring()
 
     def call_func(self, name, *args, **kwargs):
         self.calls.append(name)
@@ -161,7 +163,10 @@ class _Mgr:
             timer.cancel()
 
 
-def _engine(module, sched, *, on=True, tick_s=1.0, dp=1, **mgr_kwargs):
+def _engine(module, sched, *, on=True, hold=True, tick_s=1.0, dp=1, **mgr_kwargs):
+    """An engine double running the real step (`_process_engine_step_inner`)
+    with the real hook (`OffloadLoadWait`) as its only step hook; `on=False`:
+    no hook, as with `ATOM_OFFLOAD_LOAD_EVENT_WAIT=0`."""
     event = threading.Event()
     mgr = _Mgr(sched, event, **mgr_kwargs)
     engine = SimpleNamespace(
@@ -179,17 +184,18 @@ def _engine(module, sched, *, on=True, tick_s=1.0, dp=1, **mgr_kwargs):
         _wait_for_kv_progress=lambda: None,
         _advance_idle_kv_transfer=mgr.collect,
         label="test",
-        _load_event_wait=on,
-        _load_wait=module.LoadWaitState(dp),
+        step_hooks=(),
     )
-    engine._load_wait.tick_s = tick_s
-    for name in (
-        "_prestart_tier_loads_and_wait",
-        "_ship_connector_meta",
-        "_wait_for_loads",
-    ):
-        setattr(engine, name, MethodType(getattr(module.EngineCore, name), engine))
+    if on:
+        hook = load_wait.OffloadLoadWait(engine, dp, hold=hold)
+        hook.state.tick_s = tick_s
+        engine.step_hooks = (hook,)
     return engine, mgr
+
+
+def _stats(engine):
+    (hook,) = engine.step_hooks
+    return hook.state
 
 
 def _step(module, engine):
@@ -216,7 +222,7 @@ def test_load_that_already_landed_prefills_in_this_step_without_waiting(
     t0 = time.monotonic()
     assert _steps_until_prefill(engine_core, engine, mgr, seq) == 1
     assert time.monotonic() - t0 < 0.5
-    stats = engine._load_wait
+    stats = _stats(engine)
     assert (stats.steps, stats.loads, stats.waits, stats.landed) == (1, 1, 1, 1)
     assert stats.timed_out == 0 and stats.wakes == 1
     assert sched.kv_connector.allocs == [seq.id]  # one admission only
@@ -240,7 +246,7 @@ def test_hold_ends_on_the_doorbell_not_at_its_bound(
     assert mgr.calls[0] == "process_kvconnector_output"
     held = mgr.calls[: mgr.calls.index("forward")]
     assert held.count("poll") <= 3
-    assert engine._load_wait.wakes == 1
+    assert _stats(engine).wakes == 1
 
 
 def test_late_load_rides_the_forward_after_the_bound(
@@ -255,13 +261,13 @@ def test_late_load_rides_the_forward_after_the_bound(
 
     assert 0.05 <= elapsed < 1.0  # held for the bound, one tick
     assert seq.status == WAITING_LOAD
-    stats = engine._load_wait
+    stats = _stats(engine)
     assert (stats.waits, stats.landed, stats.timed_out, stats.wakes) == (1, 0, 1, 0)
     # It lands later and is admitted when its completion is read, as without
     # the hold; it is not held for again (not a new load).
     mgr.land(seq.id)
     assert _steps_until_prefill(engine_core, engine, mgr, seq) is not None
-    assert engine._load_wait.waits == 1
+    assert _stats(engine).waits == 1
 
 
 def test_failed_load_wakes_the_hold_and_falls_back_to_prefill(
@@ -273,19 +279,139 @@ def test_failed_load_wakes_the_hold_and_falls_back_to_prefill(
     t0 = time.monotonic()
     assert _steps_until_prefill(engine_core, engine, mgr, seq) == 1  # recomputed
     assert time.monotonic() - t0 < 1.0
-    assert engine._load_wait.landed == 1
+    assert _stats(engine).landed == 1
     assert sched._num_parked_remote_kv == 0
     assert seq.id not in sched._early_load.entries
 
 
-def test_without_the_hold_the_same_load_prefills_later(
+def test_without_the_hook_the_same_load_prefills_later(
     engine_core, monkeypatch, seq_factory
 ):
     # Off: the load lands during step 1's forward and is read only after it.
     sched, _, (seq,) = _fire(monkeypatch, seq_factory)
     engine, mgr = _engine(engine_core, sched, on=False, delay=0)
     assert _steps_until_prefill(engine_core, engine, mgr, seq) >= 2
-    assert engine._load_wait.steps == 0
+    assert engine.step_hooks == ()
+
+
+# -- the default: doorbell + a fresh answer before schedule(), no hold -----------
+
+
+def test_default_does_not_hold_for_a_load_in_flight(
+    engine_core, monkeypatch, seq_factory
+):
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, hold=False, tick_s=2.0, delay=0.3)
+    try:
+        t0 = time.monotonic()
+        _step(engine_core, engine)
+        assert time.monotonic() - t0 < 0.2  # no hold for the 300 ms load
+        assert seq.status == WAITING_LOAD
+        stats = _stats(engine)
+        assert (stats.steps, stats.loads, stats.waits, stats.skipped) == (1, 1, 0, 0)
+        assert mgr.calls[0] == "process_kvconnector_output"  # still shipped early
+    finally:
+        mgr.stop()
+
+
+def _steps_to_prefill_with_pauses(module, engine, mgr, seq, pause_s=0.1):
+    """Steps until `seq` prefills, idling `pause_s` between steps (the load
+    lands in a pause, not during a forward)."""
+    for step in range(1, 7):
+        _step(module, engine)
+        if mgr.forwards and seq.id in mgr.forwards[-1]:
+            return step
+        time.sleep(pause_s)
+    return None
+
+
+def test_default_fresh_answer_admits_a_landed_load_before_schedule(
+    engine_core, monkeypatch, seq_factory
+):
+    """The load lands between steps. The doorbell makes the next step fetch an
+    answer requested after the ring before it schedules, so it prefills on
+    that step; without the hook it waits for the pipelined answers."""
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, hold=False, tick_s=2.0, delay=0.03)
+    assert _steps_to_prefill_with_pauses(engine_core, engine, mgr, seq) == 2
+    stats = _stats(engine)
+    assert stats.fresh == 1 and stats.waits == 0
+
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, on=False, delay=0.03)
+    assert _steps_to_prefill_with_pauses(engine_core, engine, mgr, seq) >= 3
+
+
+def test_default_fresh_answer_runs_while_a_decode_is_running(
+    engine_core, monkeypatch, seq_factory
+):
+    # No pre-phase load while a decode runs (page reservation), but a load that
+    # landed is still read before schedule().
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, hold=False, tick_s=2.0, delay=None)
+    _step(engine_core, engine)  # parks and ships the load
+    assert seq.status == WAITING_LOAD
+    allocs = list(sched.kv_connector.allocs)
+    sched.running = deque([_decode()])
+    mgr.land(seq.id)  # rings
+
+    (hook,) = engine.step_hooks
+    hook.before_schedule()
+
+    assert seq.id in sched.finished_recving_kv_req_ids
+    assert hook.state.fresh == 1
+    assert sched.kv_connector.allocs == allocs  # nothing allocated ahead
+
+
+def _bare_hook(tick_s, collect):
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            waiting=[], kv_connector=SimpleNamespace(build_connector_meta=lambda: None)
+        ),
+        runner_mgr=SimpleNamespace(call_func=Mock()),
+        _collect_kv_transfer_progress=collect,
+        _wake_event=threading.Event(),
+        label="test",
+    )
+    hook = load_wait.OffloadLoadWait(engine, 1, hold=False)
+    hook.state.tick_s = tick_s
+    return hook
+
+
+def test_fresh_answer_is_bounded_by_one_tick():
+    # A query that is never answered: the step goes on after one tick.
+    collect = Mock(return_value=None)
+    hook = _bare_hook(0.05, collect)
+    progress_doorbell.ring()
+    t0 = time.monotonic()
+    hook.before_schedule()
+    assert 0.05 <= time.monotonic() - t0 < 0.5
+    assert hook.state.fresh == 1 and collect.called
+
+
+def test_no_fresh_answer_without_a_ring_or_before_the_first_forward():
+    collect = Mock(return_value=None)
+    hook = _bare_hook(0.05, collect)
+    hook.before_schedule()  # nothing rang
+    assert not collect.called
+    cold = _bare_hook(0.0, collect)
+    progress_doorbell.ring()
+    cold.before_schedule()  # no forward yet: left for the next step
+    assert not collect.called and cold.state.fresh == 0
+
+
+def test_load_wait_hook_follows_its_envs(monkeypatch):
+    engine = SimpleNamespace(_wake_event=threading.Event())
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
+    monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
+    monkeypatch.delenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", raising=False)
+    hook = load_wait.load_wait_hook(engine, config)
+    assert hook is not None and hook.hold is False  # default: no hold
+    assert hook.state.dp_size == 4
+    monkeypatch.setenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", "1")
+    assert load_wait.load_wait_hook(engine, config).hold is True
+    monkeypatch.setenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", "0")
+    assert load_wait.load_wait_hook(engine, config) is None
 
 
 def test_cold_engine_never_holds(engine_core, monkeypatch, seq_factory):
@@ -296,7 +422,7 @@ def test_cold_engine_never_holds(engine_core, monkeypatch, seq_factory):
     _step(engine_core, engine)
 
     assert time.monotonic() - t0 < 0.5
-    stats = engine._load_wait
+    stats = _stats(engine)
     assert (stats.steps, stats.skipped, stats.waits) == (1, 1, 0)
     assert mgr.calls[0] == "process_kvconnector_output"  # still shipped early
 
@@ -331,8 +457,8 @@ def test_hold_waits_for_every_started_load(engine_core, monkeypatch, seq_factory
 
     assert mgr.forwards == [[a.id, b.id]]  # both, in arrival order
     assert 0.08 <= elapsed < 1.0
-    assert engine._load_wait.landed == 2
-    assert engine._load_wait.wakes >= 1
+    assert _stats(engine).landed == 2
+    assert _stats(engine).wakes >= 1
 
 
 def test_a_load_that_misses_the_bound_does_not_hold_back_one_that_landed(
@@ -347,7 +473,7 @@ def test_a_load_that_misses_the_bound_does_not_hold_back_one_that_landed(
 
     assert mgr.forwards == [[b.id]]
     assert a.status == WAITING_LOAD
-    stats = engine._load_wait
+    stats = _stats(engine)
     assert (stats.landed, stats.timed_out) == (1, 1)
 
 
@@ -365,14 +491,14 @@ def _decode():
 
 
 def test_budget_formula(engine_core):
-    state = engine_core.LoadWaitState(dp_size=1)
+    state = load_wait.LoadWaitState(dp_size=1)
     assert state.budget_s(1, 0) == 0.0  # no forward measured yet
     state.tick_s = 0.2
     assert state.budget_s(0, 0) == 0.0  # nothing to gain
     assert state.budget_s(1, 0) == pytest.approx(0.2)  # nothing to delay: 1 tick
     assert state.budget_s(3, 1) == pytest.approx(0.2)  # never past one tick
     assert state.budget_s(1, 4) == pytest.approx(0.05)
-    dp = engine_core.LoadWaitState(dp_size=4)
+    dp = load_wait.LoadWaitState(dp_size=4)
     dp.tick_s = 0.2
     assert dp.budget_s(1, 4) == pytest.approx(0.0125)  # peers pay too
     assert dp.budget_s(1, 0) == pytest.approx(0.05)
@@ -381,33 +507,33 @@ def test_budget_formula(engine_core):
 def test_tradeoff_on_a_prefill_only_step(monkeypatch, seq_factory):
     sched, _, (a, b, c) = _fire(monkeypatch, seq_factory, n=3)
     sched.kv_connector.not_ready_ids = {a.id}  # a stays an ordinary waiter
-    started = sched.prestart_tier_loads()
+    started = load_wait.prestart_tier_loads(sched)
     assert started == [b, c]
     # a (16 tokens) ahead of b and c: both still fit the 64-token budget, and
     # the step carries a anyway.
-    assert sched.load_wait_tradeoff(started) == (2, 1)
+    assert load_wait.load_wait_tradeoff(sched, started) == (2, 1)
     sched.running = deque([_partial_prefill()])
     sched._partial_prefill_count = 1
-    assert sched.load_wait_tradeoff(started) == (2, 2)
+    assert load_wait.load_wait_tradeoff(sched, started) == (2, 2)
     # A load that landed or was aborted is not a gain.
     c.status = SequenceStatus.ABORTED
-    assert sched.load_wait_tradeoff(started) == (1, 2)
-    assert sched.load_wait_tradeoff([]) == (0, 1)
+    assert load_wait.load_wait_tradeoff(sched, started) == (1, 2)
+    assert load_wait.load_wait_tradeoff(sched, []) == (0, 1)
 
 
 def test_tradeoff_stops_at_the_token_budget_and_slots(monkeypatch, seq_factory):
     sched, _, seqs = _fire(monkeypatch, seq_factory, n=6)
     *ahead, last = seqs
     sched.kv_connector.not_ready_ids = {s.id for s in ahead}
-    started = sched.prestart_tier_loads()
+    started = load_wait.prestart_tier_loads(sched)
     assert started == [last]
     # 5 x 16 tokens ahead fill the 64-token budget: nothing to gain.
-    assert sched.load_wait_tradeoff(started)[0] == 0
+    assert load_wait.load_wait_tradeoff(sched, started)[0] == 0
     sched2, _, _ = _fire(monkeypatch, seq_factory)
-    started = sched2.prestart_tier_loads()
+    started = load_wait.prestart_tier_loads(sched2)
     sched2.running = deque(_partial_prefill(1) for _ in range(sched2.max_num_seqs))
     sched2._partial_prefill_count = sched2.max_num_seqs
-    assert sched2.load_wait_tradeoff(started)[0] == 0  # no free slot
+    assert load_wait.load_wait_tradeoff(sched2, started)[0] == 0  # no free slot
 
 
 def test_running_decodes_shrink_the_bound_to_almost_nothing(
@@ -416,11 +542,11 @@ def test_running_decodes_shrink_the_bound_to_almost_nothing(
     # The same rule, no special case: every running decode is delayed by a
     # hold, so the bound falls with the decode batch.
     sched, _, _ = _fire(monkeypatch, seq_factory)
-    started = sched.prestart_tier_loads()
+    started = load_wait.prestart_tier_loads(sched)
     sched.running = deque(_decode() for _ in range(6))
-    gain, cost = sched.load_wait_tradeoff(started)
+    gain, cost = load_wait.load_wait_tradeoff(sched, started)
     assert (gain, cost) == (1, 6)
-    state = engine_core.LoadWaitState(dp_size=4)
+    state = load_wait.LoadWaitState(dp_size=4)
     state.tick_s = 0.012  # a decode step
     assert state.budget_s(gain, cost) == pytest.approx(0.0005)
 
@@ -431,38 +557,43 @@ def test_no_pre_phase_load_while_a_decode_is_running(monkeypatch, seq_factory):
     sched, _, (seq,) = _fire(monkeypatch, seq_factory)
     sched.running = deque([_decode()])
     free = _free(sched)
-    assert sched.prestart_tier_loads() == []
+    assert load_wait.prestart_tier_loads(sched) == []
     assert sched.kv_connector.allocs == [] and _free(sched) == free
     assert seq.status == SequenceStatus.WAITING
-    assert not sched._early_load_prestarted  # `_schedule()` runs its own pass
+    assert sched._early_load.take_tick_pass()  # `_schedule()` runs its own pass
     sched.running = deque([_partial_prefill(), _decode()])
     sched._partial_prefill_count = 1
-    assert sched.prestart_tier_loads() == []
+    assert load_wait.prestart_tier_loads(sched) == []
     # Partial prefills only (the P/D prefill case): the pre-phase runs.
     sched.running = deque([_partial_prefill()])
-    assert sched.prestart_tier_loads() == [seq]
+    assert load_wait.prestart_tier_loads(sched) == [seq]
 
 
 def test_no_decode_prefill_only_step_holds(engine_core, monkeypatch, seq_factory):
     sched, _, (seq,) = _fire(monkeypatch, seq_factory)
     engine, mgr = _engine(engine_core, sched, tick_s=2.0, delay=0.03)
-    assert not sched._has_running_decode()
+    assert not load_wait.has_running_decode(sched)
     _step(engine_core, engine)
     assert mgr.forwards == [[seq.id]]
-    assert engine._load_wait.waits == 1
+    assert _stats(engine).waits == 1
 
 
 def test_forward_time_is_the_tick(engine_core, monkeypatch, seq_factory):
     sched, _, _ = _fire(monkeypatch, seq_factory)
     engine, _ = _engine(engine_core, sched, tick_s=2.0, delay=0, forward_s=0.03)
     _step(engine_core, engine)
-    assert 0.03 <= engine._load_wait.tick_s < 0.5
+    assert 0.03 <= _stats(engine).tick_s < 0.5
 
 
 # -- off is main, one early-load pass per step ------------------------------------
 
 
-def test_off_step_is_unchanged(engine_core):
+def test_off_step_is_unchanged(engine_core, monkeypatch):
+    monkeypatch.setattr(
+        load_wait,
+        "prestart_tier_loads",
+        Mock(side_effect=AssertionError("pre-phase ran")),
+    )
     batch = SimpleNamespace(
         req_ids=["r"], connector_meta_output=None, total_seqs_num_prefill=1
     )
@@ -473,7 +604,6 @@ def test_off_step_is_unchanged(engine_core):
         compute_detailed_aggregates=Mock(),
         metrics=SimpleNamespace(record_forward=Mock()),
         prefill_delayer=None,
-        prestart_tier_loads=Mock(side_effect=AssertionError("pre-phase ran")),
     )
     order.attach_mock(scheduler.schedule, "schedule")
     runner = SimpleNamespace(call_func=Mock(return_value="fwd"))
@@ -481,7 +611,7 @@ def test_off_step_is_unchanged(engine_core):
     poll = Mock(return_value=False)
     order.attach_mock(poll, "poll")
     engine = SimpleNamespace(
-        _load_event_wait=False,
+        step_hooks=(),
         scheduler=scheduler,
         kv_transfer_enabled=True,
         runner_mgr=runner,
@@ -611,7 +741,7 @@ def test_load_executor_rings_after_the_job_recorded_its_result():
     assert seen == [["done"]]
 
 
-def test_manager_turns_the_doorbell_into_an_event_not_an_answer():
+def test_manager_rings_the_engine_doorbell_and_keeps_the_marker_out_of_answers():
     import zmq
     from aiter_stub import stubbed_aiter
 
@@ -629,8 +759,11 @@ def test_manager_turns_the_doorbell_into_an_event_not_an_answer():
     mgr.zmq_ctx = zmq.Context()
     mgr.still_running = True
     mgr.kv_outputs_queues = [queue.Queue()]
-    mgr.kv_doorbell_event = threading.Event()
     mgr.kv_progress_event = threading.Event()
+    # The engine's doorbell, as `OffloadLoadWait` installs it.
+    rung = threading.Event()
+    progress_doorbell.install(rung.set, coalesce=False)
+    rings = progress_doorbell.rings()
     thread = threading.Thread(
         target=mgr.process_kv_output_sockets, args=(addr, 0), daemon=True
     )
@@ -639,11 +772,13 @@ def test_manager_turns_the_doorbell_into_an_event_not_an_answer():
     push.connect(addr)
     try:
         push.send(pickle.dumps(KV_PROGRESS_DOORBELL))
-        assert mgr.kv_doorbell_event.wait(5)
-        assert mgr.kv_progress_event.is_set()
+        assert rung.wait(5)
+        assert progress_doorbell.rings() == rings + 1
+        assert mgr.kv_progress_event.wait(5)
         assert mgr.kv_outputs_queues[0].empty()  # never joins an aggregation
         push.send(pickle.dumps(KVConnectorOutput()))
         assert isinstance(mgr.kv_outputs_queues[0].get(timeout=5), KVConnectorOutput)
+        assert progress_doorbell.rings() == rings + 1  # an answer is not a ring
     finally:
         mgr.still_running = False
         push.close(linger=0)
@@ -651,23 +786,40 @@ def test_manager_turns_the_doorbell_into_an_event_not_an_answer():
         mgr.zmq_ctx.term()
 
 
-def test_aggregation_start_time_is_exposed():
-    from aiter_stub import stubbed_aiter
+def test_offload_worker_rearms_the_doorbell_in_get_finished():
+    from atom.kv_transfer.offload._offload_common import OffloadWorkerMixin
 
-    with stubbed_aiter():
-        from atom.model_engine.async_proc import AsyncIOProcManager
+    sent = []
+    progress_doorbell.install(lambda: sent.append(1))
+    worker = OffloadWorkerMixin.__new__(OffloadWorkerMixin)
+    worker._lock = threading.Lock()
+    worker._done_load, worker._failed_load, worker._done_save = {"a"}, set(), set()
+    worker._connector_completions = set()
+    progress_doorbell.ring()
+    progress_doorbell.ring()  # coalesced
+    assert worker.get_finished().finished_loading == {"a"}
+    progress_doorbell.ring()  # rearmed by the answer
+    assert sent == [1, 1]
 
-    mgr = AsyncIOProcManager.__new__(AsyncIOProcManager)
-    mgr.label = "test"
-    mgr.proc_num = 1
-    mgr.rpc_broadcast_mq = Mock()
-    mgr.kv_output_aggregator = None
-    mgr.kv_outputs_queues = [queue.Queue()]
-    mgr._pending_kv_aggregation = None
-    assert mgr.kv_aggregation_started_at is None
-    t0 = time.monotonic()
-    assert mgr.call_func_with_aggregation("async_proc_aggregation", timeout=0) is None
-    assert mgr.kv_aggregation_started_at >= t0
+
+def test_shared_engine_classes_carry_no_load_wait_state():
+    """The load wait lives in its offload module, reached through the
+    engine's generic step hooks: the shared engine classes name none of it."""
+    root = Path(__file__).resolve().parents[1] / "atom" / "model_engine"
+    feature_names = (
+        "load_wait",
+        "LoadWait",
+        "prestart",
+        "_load_event_wait",
+        "kv_doorbell_event",
+        "kv_aggregation_started_at",
+        "ATOM_OFFLOAD_LOAD_EVENT_WAIT",
+        "ATOM_OFFLOAD_LOAD_WAIT_HOLD",
+        "rearm",
+    )
+    for name in ("engine_core.py", "scheduler.py", "async_proc.py", "model_runner.py"):
+        source = (root / name).read_text(encoding="utf-8")
+        assert [n for n in feature_names if n in source] == [], name
 
 
 # -- a load parked on its Store lease renewal -----------------------------------------
@@ -710,14 +862,12 @@ def _hold_for_a_renewal(engine_core, clock, monkeypatch, *, stall):
         _install_future(connector, clock, monkeypatch, future, [])
 
     event = threading.Event()
-    doorbell = threading.Event()
-    progress_doorbell.install(doorbell.set, coalesce=False)
     shipped, worker_landed, reported = [], set(), set()
     pending = []
 
     def land():
         worker_landed.add(seq.id)
-        doorbell.set()
+        progress_doorbell.ring()  # the worker's marker, rung in the engine
 
     def call_func(name, meta):
         assert name == "process_kvconnector_output"
@@ -727,42 +877,35 @@ def _hold_for_a_renewal(engine_core, clock, monkeypatch, *, stall):
     def collect():
         answer = None
         if pending:
-            answer = pending.pop()[1]
+            answer = pending.pop()
             reported.update(answer)
-        pending.append((time.monotonic(), set(worker_landed)))
+        pending.append(set(worker_landed))
         event.set()
         return answer
 
-    class _RunnerMgr(SimpleNamespace):
-        @property
-        def kv_aggregation_started_at(self):
-            return pending[0][0] if pending else None
-
+    monkeypatch.setattr(load_wait, "prestart_tier_loads", lambda sched: [seq])
+    monkeypatch.setattr(load_wait, "load_wait_tradeoff", lambda sched, s: (1, 0))
     scheduler = SimpleNamespace(
         kv_connector=connector,
-        prestart_tier_loads=lambda: [seq],
-        load_wait_tradeoff=lambda started: (1, 0),
         _still_loading=lambda s: s.id not in reported,
     )
     engine = SimpleNamespace(
         scheduler=scheduler,
-        runner_mgr=_RunnerMgr(call_func=call_func, kv_doorbell_event=doorbell),
+        runner_mgr=SimpleNamespace(call_func=call_func),
         _collect_kv_transfer_progress=collect,
         _wake_event=event,
-        _load_wait=engine_core.LoadWaitState(1),
         label="test",
     )
-    engine._load_wait.tick_s = 2.0
-    for name in ("_ship_connector_meta", "_wait_for_loads"):
-        setattr(engine, name, MethodType(getattr(engine_core.EngineCore, name), engine))
+    hook = load_wait.OffloadLoadWait(engine, 1, hold=True)
+    hook.state.tick_s = 2.0
     if not stall:
         threading.Timer(0.03, future.set_result, (5,)).start()  # renewal finishes
     try:
         t0 = time.monotonic()
-        engine_core.EngineCore._prestart_tier_loads_and_wait(engine)
+        hook.before_schedule()
         elapsed = time.monotonic() - t0
         assert not connector._reqs_need_recv
-        return elapsed, shipped, reported, seq, engine._load_wait
+        return elapsed, shipped, reported, seq, hook.state
     finally:
         connector.close()
 

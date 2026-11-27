@@ -13,10 +13,10 @@ import zmq
 
 from atom.config import Config
 from atom.distributed.group_agreement import group_max_each
-from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+from atom.kv_transfer.engine_step_hooks import kv_transfer_step_hooks
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
@@ -111,88 +111,6 @@ def yield_gil() -> None:
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
-class LoadWaitState:
-    """The event-driven load wait's inputs and counters
-    (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`, `EngineCore._prestart_tier_loads_and_wait`).
-
-    `tick_s` is the wall time of the last forward this engine ran: the step
-    cadence the wait is measured against. 0 until a forward ran, so a cold
-    engine never waits.
-    """
-
-    LOG_INTERVAL_S = 60.0
-
-    def __init__(self, dp_size: int) -> None:
-        self.dp_size = max(1, int(dp_size))
-        self.tick_s = 0.0
-        self._last_log = time.monotonic()
-        self._reset()
-
-    def budget_s(self, gain: int, cost: int) -> float:
-        """How long holding this step for `gain` loading requests is worth.
-
-        Each request that lands in time prefills one forward (`tick_s`) earlier;
-        each of the `cost` requests the step carries anyway is delayed by the
-        hold, and under DP so are the peers' (the forward is a collective, and
-        the router keeps the ranks alike, so the group carries about `dp_size`
-        times this rank's count). The hold pays while it stays under
-        `tick_s * gain / (cost * dp_size)`, and it is never longer than one
-        tick: past that the request is no later than without the hold. With a
-        running decode, `cost` is the whole decode batch and the bound is ~0.
-        """
-        if gain <= 0 or self.tick_s <= 0.0:
-            return 0.0
-        return min(self.tick_s, self.tick_s * gain / (max(1, cost) * self.dp_size))
-
-    def _reset(self) -> None:
-        self.steps = 0  # steps that started at least one load ahead of schedule()
-        self.loads = 0  # loads started ahead of schedule()
-        self.skipped = 0  # steps with nothing worth holding for (budget 0)
-        self.waits = 0  # steps that held
-        self.landed = 0  # held-for loads that landed (done or failed) in time
-        self.timed_out = 0  # held-for loads still in flight at the bound
-        self.wakes = 0  # doorbells taken while holding
-        self.wait_s = 0.0
-        self.max_wait_s = 0.0
-        self.budget_total_s = 0.0
-
-    def note_wait(
-        self, landed: int, timed_out: int, waited_s: float, budget_s: float
-    ) -> None:
-        self.waits += 1
-        self.landed += landed
-        self.timed_out += timed_out
-        self.wait_s += waited_s
-        self.max_wait_s = max(self.max_wait_s, waited_s)
-        self.budget_total_s += budget_s
-
-    def maybe_log(self, label: str) -> None:
-        now = time.monotonic()
-        if now - self._last_log < self.LOG_INTERVAL_S:
-            return
-        if self.steps:
-            logger.info(
-                "%s: [LOAD-WAIT] last %.0fs: steps=%d loads=%d skipped=%d "
-                "waits=%d landed=%d timed_out=%d wakes=%d avg_wait=%.1fms "
-                "max_wait=%.1fms avg_bound=%.1fms tick=%.1fms",
-                label,
-                now - self._last_log,
-                self.steps,
-                self.loads,
-                self.skipped,
-                self.waits,
-                self.landed,
-                self.timed_out,
-                self.wakes,
-                1e3 * self.wait_s / self.waits if self.waits else 0.0,
-                1e3 * self.max_wait_s,
-                1e3 * self.budget_total_s / self.waits if self.waits else 0.0,
-                1e3 * self.tick_s,
-            )
-        self._last_log = now
-        self._reset()
-
-
 def flush_dp_reuse(scheduler, output_queue) -> None:
     """Queue the scheduler's `share_cache` reuse reports (`Scheduler.
     dp_reuse_reports`) for the CoreManager. Called before a step's outputs are
@@ -218,6 +136,10 @@ class EngineCore:
     # Whether the engine reports its prefill backlog to the CoreManager
     # (`share_cache` routing); the data-parallel engine turns it on.
     _report_backlog = False
+    # Objects called around every step: `before_schedule()` ahead of
+    # `schedule()`, `on_forward_done(seconds)` after a real forward
+    # (`atom.kv_transfer.engine_step_hooks`). None by default.
+    step_hooks: tuple = ()
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -392,19 +314,8 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
-        # Event-driven load wait (`_prestart_tier_loads_and_wait`).
-        self._load_event_wait = (
-            self.kv_transfer_enabled and envs.ATOM_OFFLOAD_LOAD_EVENT_WAIT
-        )
-        self._load_wait = LoadWaitState(config.parallel_config.data_parallel_size)
-        if self._load_event_wait:
-            # In this process the doorbell is rung by a finished Store lease
-            # renewal (`AsyncStoreLookup.renew_async`); the workers ring theirs
-            # over the KV channel, which sets the same event.
-            progress_doorbell.install(
-                self.runner_mgr.kv_doorbell_event.set, coalesce=False
-            )
         if self.kv_transfer_enabled:
+            self.step_hooks = kv_transfer_step_hooks(self, config)
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
 
@@ -767,8 +678,8 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._wake_event.clear()
-        if self._load_event_wait:
-            self._prestart_tier_loads_and_wait()
+        for hook in self.step_hooks:
+            hook.before_schedule()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -808,8 +719,8 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
-            if self._load_event_wait:
-                self._load_wait.tick_s = time.monotonic() - fwd_start
+            for hook in self.step_hooks:
+                hook.on_forward_done(time.monotonic() - fwd_start)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -833,90 +744,6 @@ class EngineCore:
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         return True
-
-    def _prestart_tier_loads_and_wait(self) -> None:
-        """Event-driven load wait, ahead of `schedule()`
-        (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`).
-
-        Without it a waiting request with a tier hit parks inside `schedule()`,
-        its load leaves with that step's batch and lands within milliseconds,
-        but the engine asks the workers for completions only after the step's
-        forward returns: the request prefills one whole forward later.
-
-        Here the step's early tier load runs first (`Scheduler.
-        prestart_tier_loads`) and its loads are shipped at once. The step is then
-        held for them only while holding pays (`LoadWaitState.budget_s` over
-        `Scheduler.load_wait_tradeoff`: the measured forward time, weighted by
-        the requests that gain against those the hold delays). The hold is not
-        a sleep: the engine blocks on the doorbell a worker rings the moment a
-        load job ends (`progress_doorbell`; a finished Store lease renewal rings
-        it in this process), then fetches a completion answer requested after
-        that ring, and goes on as soon as every started load landed. A load that
-        does not land within the bound rides the forward, as before; a failed
-        one reports through the same answer and falls back to prefill.
-
-        Rank-local: no collective runs here and the step count is unchanged, so
-        DP lockstep holds; peers reach the next forward collective later by at
-        most the bound, which already counts them.
-        """
-        scheduler = self.scheduler
-        state = self._load_wait
-        started = scheduler.prestart_tier_loads()
-        if started:
-            self._ship_connector_meta()
-            state.steps += 1
-            state.loads += len(started)
-            budget = state.budget_s(*scheduler.load_wait_tradeoff(started))
-            if budget > 0.0:
-                t0 = time.monotonic()
-                pending = self._wait_for_loads(started, t0 + budget)
-                state.note_wait(
-                    len(started) - pending, pending, time.monotonic() - t0, budget
-                )
-            else:
-                state.skipped += 1
-        state.maybe_log(self.label)
-
-    def _ship_connector_meta(self) -> None:
-        """Dispatch whatever loads the connector releases now, outside a batch
-        (the loads a pre-phase started; with `ATOM_STORE_ASYNC_RENEW`, a load
-        whose lease renewal just finished). No RPC when there is nothing."""
-        meta = self.scheduler.kv_connector.build_connector_meta()
-        if connector_metadata_has_work(meta):
-            self.runner_mgr.call_func("process_kvconnector_output", meta)
-
-    def _wait_for_loads(self, loading, deadline: float) -> int:
-        """Block until every request of `loading` stopped loading or `deadline`;
-        returns how many still load. Woken by events only: the KV doorbell (a
-        load job ended on a worker, or a lease renewal here finished or reached
-        its timeout unfinished) and the arrival of a completion answer."""
-        scheduler = self.scheduler
-        doorbell = self.runner_mgr.kv_doorbell_event
-        # When the last unread doorbell was taken: an answer requested after it
-        # holds the completion that rang it. None: no unread doorbell.
-        rung_at = None
-        while True:
-            pending = sum(1 for seq in loading if scheduler._still_loading(seq))
-            now = time.monotonic()
-            if not pending or now >= deadline:
-                return pending
-            if rung_at is None:
-                if not doorbell.wait(deadline - now):
-                    continue
-                doorbell.clear()
-                rung_at = time.monotonic()
-                self._load_wait.wakes += 1
-            # Cleared before the poll: an answer arriving after it wakes the wait.
-            self._wake_event.clear()
-            requested_at = self.runner_mgr.kv_aggregation_started_at
-            answered = self._collect_kv_transfer_progress() is not None
-            # A load parked on its lease renewal leaves as soon as it is free.
-            self._ship_connector_meta()
-            if answered and requested_at is not None and requested_at >= rung_at:
-                rung_at = None
-                continue
-            # The outstanding answer (or the one just requested) is still out.
-            self._wake_event.wait(max(0.0, deadline - time.monotonic()))
 
     def _wait_for_kv_progress(self) -> None:
         # Work queued before the event was cleared must also prevent sleeping.

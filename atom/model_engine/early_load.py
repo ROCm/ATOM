@@ -49,6 +49,24 @@ class EarlyLoadState:
         self.wait_n = 0
         self.tick = 0
         self._last_log = time.monotonic()
+        # This tick's pass (lookup prefetch + early tier load) already ran ahead
+        # of `schedule()` (the offload load wait, `load_wait.prestart_tier_loads`).
+        self._tick_pass_ran = False
+
+    # -- once per tick ----------------------------------------------------------
+
+    def mark_tick_pass_ran(self) -> None:
+        """This tick's early-load pass runs ahead of `schedule()`: the
+        `schedule()` that follows skips its own (`take_tick_pass`)."""
+        self._tick_pass_ran = True
+
+    def take_tick_pass(self) -> bool:
+        """Whether `schedule()` still runs this tick's early-load pass: False
+        once after `mark_tick_pass_ran`, True otherwise."""
+        if self._tick_pass_ran:
+            self._tick_pass_ran = False
+            return False
+        return True
 
     # -- counters -------------------------------------------------------------
 
