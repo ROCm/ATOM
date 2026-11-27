@@ -46,6 +46,7 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `GET`  | `/health` | Health check (returns `{"status": "ok"}`) |
 | `POST` | `/start_profile` | Start torch profiler on the engine |
 | `POST` | `/stop_profile` | Stop torch profiler and flush traces |
+| `POST` | `/offload/lookups` | Turn an `lmcache_mp` tier's lookups for new requests on or off (`{"enabled": bool}`) |
 
 ### Request models
 

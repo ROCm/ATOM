@@ -140,8 +140,9 @@ image must provide `protoc` either way, for `smg-grpc-client`.
 ATOM standalone mode starts the ATOM engine in Python, while Rust Mesh serves
 the OpenAI API (template, tokenizer, parsers, SSE) and hands each request's
 token ids to the engine through the token bridge. A model whose chat template
-is Python (DeepSeek-V4's encoder, Kimi-K3's tokenizer) has its prompt rendered
-by ATOM instead. Enable the Atomesh entrypoint through
+is Python (DeepSeek-V3.2's, V4's and V4.1's encoders, Kimi-K3's tokenizer) is
+rendered in Rust too, as ATOM renders it (see below). Enable the Atomesh
+entrypoint through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
@@ -277,7 +278,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
 | `GET` | `/kv_events/sources` | With `--kv-events`: each followed worker rank's KV event stream and what it carried. A worker not followed, as with the engine's KV events off (`ATOM_KV_EVENTS_ENABLE`) or sources that cannot be read, has no row, as if not registered; the log says why |
-| `GET` | `/kv_storage/sources` | With `--kv-events`: each Mooncake Store the workers report offloading to, its readers, and each pool master's answer, asked meanwhile at `--mooncake-admin-port`: tainted or not |
+| `GET` | `/kv_storage/sources` | With `--kv-events`: each Mooncake Store the workers report offloading to, its readers, and each pool master's answer, asked meanwhile at `--mooncake-admin-port`: tainted or not. Also whether the store's lookup breaker is open (`breaker_open`) and how long its last lookup took (`last_lookup_us`): `false` and `null` until a lookup, as at `--kv-storage-weight` 0 |
 
 ## Load balancing
 
@@ -285,7 +286,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, and with `--kv-storage-weight` by what its engine will load from the Mooncake Store it reads, at that weight per token, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
@@ -293,22 +294,24 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. So do chats for a model whose tokenizer
-llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
-chat template, such as DeepSeek V3.2 and V4
-([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
-need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
+`501 token_routing_unsupported`. Use a policy that does not need tokens, such
+as `cache_aware` or `round_robin`, for these APIs.
 
 The router renders a chat it tokenizes with the model's chat template and the
 request's `reasoning_effort` and `chat_template_kwargs`. A checkpoint whose
-`config.json` has `model_type` `deepseek_v41` (DeepSeek-V4.1) renders with
-llm-tokenizer's port of V4.1's encoder instead, and the router gives it the
-effort and mode as ATOM's V4.1 encoder takes them: `minimal` as `low`, `medium`
-and `xhigh` as `high`, `none` as chat mode, and the mode from `thinking_mode`,
-or chat mode where `enable_thinking` is false. Other controls, such as a
-message's list of text blocks, can still render otherwise than on ATOM; ATOM
-renders the chat again, so the difference costs prefix hits, not a different
-prompt.
+`config.json` has `model_type` `deepseek_v32`, `deepseek_v4`, `deepseek_v41`
+(or its `deepseek_v41_text` / `deepseek_v41_dspark`), `kimi_k3` or `kimi_k31`
+renders with llm-tokenizer's port of the model's encoder instead,
+given the chat as ATOM's server gives it (`routers/prepare/chat_render.rs`):
+the body as sent, `thinking` and `reasoning_effort` resolved by ATOM's
+reasoning controls (for V4.1, `minimal` as `low`, `medium` and `xhigh` as
+`high`, `none` as chat mode), and the prompt's text encoded as ATOM encodes
+it, so its tokens are ATOM's (`test_requests_tokenize_as_on_atom`). The
+same render prepares the chats of the gRPC and ATOM standalone routers. A
+tokenizer llm-tokenizer renders with a built-in encoder chosen from
+`config.json`, whose `model_type` is none of these, is refused at registration
+([#3377](https://github.com/ROCm/ATOM/issues/3377)): its chats would render
+otherwise than ATOM renders them.
 
 ## Tokenization
 
