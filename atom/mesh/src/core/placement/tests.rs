@@ -261,7 +261,7 @@ mod b_policy_apply {
     use super::super::types::PlacementError;
     use crate::core::{HashRing, Worker};
     use crate::policies::{
-        CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+        AgenticPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
         PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
     };
 
@@ -270,6 +270,18 @@ mod b_policy_apply {
             make_regular_http("http://w1:8000", "m"),
             make_regular_http("http://w2:8000", "m"),
         ]
+    }
+
+    #[tokio::test]
+    async fn test_policy_reports_its_prefill_estimate() {
+        let candidates = two_workers();
+        let tokens = [1u32, 2, 3];
+        let descriptor = make_descriptor(Some("m"), None, Some(&tokens), None);
+        let (round_robin, agentic) = (RoundRobinPolicy::new(), AgenticPolicy::default());
+        let placed = apply_policy(&candidates, &round_robin, &descriptor, None).await;
+        assert_eq!(placed.unwrap().prefill_tokens, None);
+        let placed = apply_policy(&candidates, &agentic, &descriptor, None).await;
+        assert_eq!(placed.unwrap().prefill_tokens, Some(3));
     }
 
     #[tokio::test]
@@ -282,7 +294,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -295,7 +307,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -308,7 +320,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -366,7 +378,7 @@ mod b_policy_apply {
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].hash_ring.is_none());
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -462,7 +474,7 @@ mod b_policy_apply {
             let chosen = apply_policy(&candidates, &policy, &descriptor, None)
                 .await
                 .unwrap();
-            assert!(candidate_urls.iter().any(|u| u == chosen.url()));
+            assert!(candidate_urls.iter().any(|u| u == chosen.worker.url()));
         }
     }
 }
@@ -2603,16 +2615,26 @@ mod i_route_metrics {
     use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
     use super::super::types::PlacementError;
     use crate::core::Worker;
-    use crate::policies::PolicyFactory;
+    use crate::policies::{LeastLoadPolicy, LoadBalancingPolicy, PolicyFactory};
 
-    const POLICIES: [&str; 6] = [
+    const POLICIES: [&str; 8] = [
         "random",
         "round_robin",
         "dp_sticky",
         "power_of_two",
         "cache_aware",
         "prefix_hash",
+        "agentic",
+        "least_load",
     ];
+
+    /// `least_load` is not available by name: a label policy never reserves decode load.
+    fn policy(name: &str) -> Arc<dyn LoadBalancingPolicy> {
+        match name {
+            "least_load" => Arc::new(LeastLoadPolicy::default()),
+            _ => PolicyFactory::create_by_name(name).unwrap(),
+        }
+    }
 
     fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
         worker.set_healthy(false);
@@ -2643,7 +2665,7 @@ mod i_route_metrics {
         let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
 
         for name in POLICIES {
-            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let policy = policy(name);
             apply_policy(&candidates, policy.as_ref(), &descriptor, None)
                 .await
                 .unwrap();
@@ -2678,7 +2700,7 @@ mod i_route_metrics {
         let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
 
         for name in POLICIES {
-            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let policy = policy(name);
             let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None)
                 .await
                 .unwrap_err();

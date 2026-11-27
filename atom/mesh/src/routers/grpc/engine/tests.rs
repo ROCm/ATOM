@@ -843,6 +843,7 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
             prefill_tokens: 0,
+            decode_load: None,
         };
         match Dispatcher::dispatch(&e, &plan, &mut basic_payload()).await {
             Ok(_) => panic!("expected ConnectionAcquireFailed"),
@@ -881,6 +882,7 @@ mod e_engine_dispatch {
             prefill_policy: "rr",
             decode_policy: "rr",
             prefill_tokens: 0,
+            decode_load: None,
         };
         let _s = mock.dispatch(&plan, &mut basic_payload()).await.unwrap();
         let calls = mock.calls();

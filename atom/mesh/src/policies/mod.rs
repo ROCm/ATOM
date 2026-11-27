@@ -9,9 +9,11 @@ use async_trait::async_trait;
 
 use crate::core::{HashRing, Worker};
 
+mod agentic;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
+mod least_load;
 mod power_of_two;
 mod prefix_hash;
 mod random;
@@ -19,9 +21,11 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+pub use agentic::{AgenticConfig, AgenticCost, AgenticPolicy};
 pub use cache_aware::CacheAwarePolicy;
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
+pub use least_load::LeastLoadPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
@@ -41,8 +45,15 @@ pub struct RouteDecision {
     /// Expected prefix cache hit ratio on the selected worker, reconciled with the
     /// cached tokens its response reports. `cache_aware`'s tree branches set it only
     /// when the selected worker is the best candidate, its KV event branch unless the
-    /// store the worker loads from does not answer; other policies leave it None.
+    /// store the worker loads from does not answer; `agentic` sets it when it knows the
+    /// selected worker's hit; other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
+    /// Prompt tokens the selected worker still has to prefill, for policies that
+    /// estimate its cache reuse. `None` charges the whole prompt.
+    pub prefill_tokens: Option<usize>,
+    /// Id of a load reservation `least_load` already charged. The placement
+    /// layer takes it so a dropped plan releases the charge.
+    pub reservation_id: Option<u64>,
 }
 
 impl RouteDecision {
@@ -51,6 +62,8 @@ impl RouteDecision {
             branch,
             match_ratio: None,
             estimated_hit_ratio: None,
+            prefill_tokens: None,
+            reservation_id: None,
         }
     }
 }
@@ -140,6 +153,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Take a load reservation recorded by [`RouteDecision::reservation_id`].
+    fn take_load_reservation(&self, _id: u64) -> Option<crate::core::LoadReservation> {
+        None
+    }
 }
 
 /// Configuration for cache-aware policy

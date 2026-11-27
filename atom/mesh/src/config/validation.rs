@@ -92,7 +92,30 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::DpSticky => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::DpSticky
+            | PolicyConfig::LeastLoad { .. } => {}
+            PolicyConfig::Agentic {
+                request_token_equivalent: _,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -383,6 +406,32 @@ impl ConfigValidator {
                         });
                     }
                 }
+
+                // Decode has no prefill charge, so agentic would pin long sessions to it.
+                if let PolicyConfig::Agentic { .. } = config.mode.get_decode_policy(&config.policy)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason:
+                            "agentic places prefill only; set --decode-policy to another policy"
+                                .to_string(),
+                    });
+                }
+
+                // least_load's reservation is decode KV. On prefill it would rank
+                // the wrong pool.
+                if let PolicyConfig::LeastLoad { .. } =
+                    config.mode.get_prefill_policy(&config.policy)
+                {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "least_load places PD decode only; set --prefill-policy to another policy"
+                            .to_string(),
+                    });
+                }
+            } else if let PolicyConfig::LeastLoad { .. } = &config.policy {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "least_load places PD decode only; set --pd-disaggregation and --decode-policy least_load"
+                        .to_string(),
+                });
             }
         }
 
@@ -711,6 +760,79 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_agentic_places_prefill_only() {
+        let agentic = PolicyConfig::Agentic {
+            request_token_equivalent: 512,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        };
+        let pd = |main: PolicyConfig, prefill, decode| {
+            let mode = RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: vec!["http://decode1:8000".to_string()],
+                prefill_policy: prefill,
+                decode_policy: decode,
+            };
+            ConfigValidator::validate(&RouterConfig::new(mode, main))
+        };
+
+        assert!(pd(PolicyConfig::Random, Some(agentic.clone()), None).is_ok());
+        let dp_sticky = Some(PolicyConfig::DpSticky);
+        assert!(pd(agentic.clone(), None, dp_sticky).is_ok());
+        let error = pd(agentic.clone(), None, None).unwrap_err().to_string();
+        assert!(error.contains("agentic places prefill only"), "{error}");
+        assert!(pd(PolicyConfig::Random, None, Some(agentic)).is_err());
+    }
+
+    #[test]
+    fn test_validate_least_load_places_pd_decode_only() {
+        let least_load = PolicyConfig::LeastLoad {
+            request_token_equivalent: 512,
+        };
+        let regular = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            least_load.clone(),
+        );
+        let error = ConfigValidator::validate(&regular).unwrap_err().to_string();
+        assert!(
+            error.contains("least_load places PD decode only"),
+            "{error}"
+        );
+
+        let pd = |main: PolicyConfig, prefill, decode| {
+            ConfigValidator::validate(&RouterConfig::new(
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                    decode_urls: vec!["http://decode1:8000".to_string()],
+                    prefill_policy: prefill,
+                    decode_policy: decode,
+                },
+                main,
+            ))
+        };
+        assert!(pd(
+            PolicyConfig::Random,
+            Some(PolicyConfig::DpSticky),
+            Some(least_load.clone())
+        )
+        .is_ok());
+        let prefill_error = pd(PolicyConfig::Random, Some(least_load.clone()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            prefill_error.contains("set --prefill-policy"),
+            "{prefill_error}"
+        );
+        let fallback_error = pd(least_load, None, None).unwrap_err().to_string();
+        assert!(
+            fallback_error.contains("set --prefill-policy"),
+            "{fallback_error}"
+        );
     }
 
     #[test]

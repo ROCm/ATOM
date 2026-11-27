@@ -230,7 +230,7 @@ pub struct CliArgs {
     #[arg(
         long,
         default_value = "cache_aware",
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "Routing Policy"
     )]
     pub policy: String,
@@ -262,6 +262,11 @@ pub struct CliArgs {
     /// Load factor threshold for prefix_hash policy
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     pub prefix_hash_load_factor: f64,
+
+    /// Tokens the agentic and least_load policies charge per in-flight request; keep
+    /// it equal to the engine's ATOM_DP_LB_REQ_EQUIV
+    #[arg(long, default_value_t = 512, help_heading = "Routing Policy")]
+    pub agentic_request_token_equivalent: u64,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -308,7 +313,7 @@ pub struct CliArgs {
     /// Specific policy for prefill nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub prefill_policy: Option<String>,
@@ -316,7 +321,7 @@ pub struct CliArgs {
     /// Specific policy for decode nodes in PD mode
     #[arg(
         long,
-        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash", "agentic", "least_load"],
         help_heading = "PD Disaggregation"
     )]
     pub decode_policy: Option<String>,
@@ -591,6 +596,14 @@ impl CliArgs {
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
+            },
+            "agentic" => PolicyConfig::Agentic {
+                request_token_equivalent: self.agentic_request_token_equivalent,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+            },
+            "least_load" => PolicyConfig::LeastLoad {
+                request_token_equivalent: self.agentic_request_token_equivalent,
             },
             _ => PolicyConfig::RoundRobin,
         }
@@ -1006,6 +1019,21 @@ mod tests {
             PolicyConfig::DpSticky
         ));
     }
+
+    #[test]
+    fn cli_accepts_agentic_with_its_request_weight() {
+        let flags = "atomesh --pd-disaggregation --prefill-policy agentic \
+                     --agentic-request-token-equivalent 256";
+        let cli = Cli::try_parse_from(flags.split_whitespace());
+        let args = cli.expect("agentic is a prefill policy").router_args;
+        let expected = PolicyConfig::Agentic {
+            request_token_equivalent: 256,
+            eviction_interval_secs: 120,
+            max_tree_size: 67108864,
+        };
+        let parsed = args.parse_policy(args.prefill_policy.as_deref().unwrap());
+        assert_eq!(format!("{parsed:?}"), format!("{expected:?}"));
+    }
 }
 
 impl Default for CliArgs {
@@ -1026,6 +1054,7 @@ impl Default for CliArgs {
             max_tree_size: 67_108_864,
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
+            agentic_request_token_equivalent: 512,
             dp_aware: false,
             kv_events: false,
             mooncake_admin_port: 9003,

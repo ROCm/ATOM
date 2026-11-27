@@ -186,6 +186,23 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Release tokens taken by `charge_prefill_tokens`.
     fn release_prefill_tokens(&self, tokens: usize);
 
+    /// KV tokens reserved on this worker for requests whose decode has not finished.
+    fn decode_kv_tokens(&self) -> usize {
+        0
+    }
+
+    /// In-flight requests reserved here without a prompt length.
+    fn decode_untokenized(&self) -> usize {
+        0
+    }
+
+    /// Reserve one request and, when `tokens` is `Some`, that many KV tokens.
+    /// `None` counts the request as untokenized. Pair with [`Self::release_decode_load`].
+    fn charge_decode_load(&self, _tokens: Option<usize>) {}
+
+    /// Release one reservation taken by [`Self::charge_decode_load`].
+    fn release_decode_load(&self, _tokens: Option<usize>) {}
+
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -498,6 +515,8 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub prefill_token_counter: Arc<AtomicUsize>,
+    pub decode_kv_counter: Arc<AtomicUsize>,
+    pub decode_untokenized_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -677,6 +696,68 @@ impl Worker for BasicWorker {
             );
         }
         MeshMetrics::set_worker_prefill_tokens(self.url(), previous.saturating_sub(tokens));
+    }
+
+    fn decode_kv_tokens(&self) -> usize {
+        self.decode_kv_counter.load(Ordering::Relaxed)
+    }
+
+    fn decode_untokenized(&self) -> usize {
+        self.decode_untokenized_counter.load(Ordering::Relaxed)
+    }
+
+    fn charge_decode_load(&self, tokens: Option<usize>) {
+        self.increment_load();
+        match tokens {
+            Some(tokens) => {
+                let previous = self.decode_kv_counter.fetch_add(tokens, Ordering::Relaxed);
+                MeshMetrics::set_worker_decode_kv_tokens(self.url(), previous + tokens);
+            }
+            None => {
+                self.decode_untokenized_counter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn release_decode_load(&self, tokens: Option<usize>) {
+        self.decrement_load();
+        match tokens {
+            Some(tokens) => {
+                let previous = self
+                    .decode_kv_counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(tokens))
+                    })
+                    .unwrap_or_else(|current| current);
+                if previous < tokens {
+                    tracing::warn!(
+                        worker_url = %self.metadata.url,
+                        tokens,
+                        previous,
+                        "Released more decode KV tokens than were charged"
+                    );
+                }
+                MeshMetrics::set_worker_decode_kv_tokens(
+                    self.url(),
+                    previous.saturating_sub(tokens),
+                );
+            }
+            None => {
+                let previous = self
+                    .decode_untokenized_counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_sub(1))
+                    })
+                    .unwrap_or_else(|current| current);
+                if previous == 0 {
+                    tracing::warn!(
+                        worker_url = %self.metadata.url,
+                        "Released an untokenized decode reservation that was not charged"
+                    );
+                }
+            }
+        }
     }
 
     fn reset_load(&self) {
@@ -910,6 +991,22 @@ impl Worker for DPAwareWorker {
         self.base_worker.release_prefill_tokens(tokens);
     }
 
+    fn decode_kv_tokens(&self) -> usize {
+        self.base_worker.decode_kv_tokens()
+    }
+
+    fn decode_untokenized(&self) -> usize {
+        self.base_worker.decode_untokenized()
+    }
+
+    fn charge_decode_load(&self, tokens: Option<usize>) {
+        self.base_worker.charge_decode_load(tokens);
+    }
+
+    fn release_decode_load(&self, tokens: Option<usize>) {
+        self.base_worker.release_decode_load(tokens);
+    }
+
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         self.base_worker.worker_routing_key_load()
     }
@@ -981,6 +1078,57 @@ impl Worker for DPAwareWorker {
     }
 }
 
+/// One in-flight request reserved at selection time.
+///
+/// Drop releases it unless [`Self::defuse`] transferred it to a [`WorkerLoadGuard`].
+pub struct LoadReservation {
+    worker: Arc<dyn Worker>,
+    tokens: Option<usize>,
+    armed: bool,
+}
+
+impl fmt::Debug for LoadReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadReservation")
+            .field("worker", &self.worker.url())
+            .field("tokens", &self.tokens)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl LoadReservation {
+    pub fn charge(worker: Arc<dyn Worker>, tokens: Option<usize>) -> Self {
+        worker.charge_decode_load(tokens);
+        Self {
+            worker,
+            tokens,
+            armed: true,
+        }
+    }
+
+    /// Keep the charge and hand the worker to the caller. Drop becomes a no-op.
+    pub fn defuse(mut self) -> (Arc<dyn Worker>, Option<usize>) {
+        self.armed = false;
+        (self.worker.clone(), self.tokens)
+    }
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.worker.release_decode_load(self.tokens);
+            self.armed = false;
+        }
+    }
+}
+
+enum DecodeCharge {
+    None,
+    Tokens(usize),
+    Untokenized,
+}
+
 /// RAII guard for worker load management
 ///
 /// Automatically decrements worker load when dropped. Can be attached to
@@ -990,6 +1138,8 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     prefill_tokens: usize,
+    decode_charge: DecodeCharge,
+    owns_load: bool,
 }
 
 impl WorkerLoadGuard {
@@ -998,6 +1148,22 @@ impl WorkerLoadGuard {
         Self {
             worker,
             prefill_tokens: 0,
+            decode_charge: DecodeCharge::None,
+            owns_load: true,
+        }
+    }
+
+    /// Take over a reservation made at selection. Does not charge again.
+    pub fn adopt(reservation: LoadReservation) -> Self {
+        let (worker, tokens) = reservation.defuse();
+        Self {
+            worker,
+            prefill_tokens: 0,
+            decode_charge: match tokens {
+                Some(tokens) => DecodeCharge::Tokens(tokens),
+                None => DecodeCharge::Untokenized,
+            },
+            owns_load: false,
         }
     }
 
@@ -1024,7 +1190,16 @@ impl WorkerLoadGuard {
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.release_prefill();
-        self.worker.decrement_load();
+        match self.decode_charge {
+            DecodeCharge::None => {}
+            DecodeCharge::Tokens(tokens) => self.worker.release_decode_load(Some(tokens)),
+            DecodeCharge::Untokenized => self.worker.release_decode_load(None),
+        }
+        self.decode_charge = DecodeCharge::None;
+        if self.owns_load {
+            self.worker.decrement_load();
+            self.owns_load = false;
+        }
     }
 }
 
@@ -1936,5 +2111,25 @@ mod tests {
         }
 
         assert_eq!(worker.load(), 0);
+    }
+
+    fn decode_worker() -> Arc<dyn Worker> {
+        use crate::core::BasicWorkerBuilder;
+        Arc::new(
+            BasicWorkerBuilder::new("http://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        )
+    }
+
+    #[test]
+    fn adopt_keeps_the_selection_charge_and_drop_releases_it() {
+        let worker = decode_worker();
+        let reservation = LoadReservation::charge(worker.clone(), Some(8));
+        assert_eq!((worker.load(), worker.decode_kv_tokens()), (1, 8));
+        let guard = WorkerLoadGuard::adopt(reservation);
+        assert_eq!((worker.load(), worker.decode_kv_tokens()), (1, 8));
+        drop(guard);
+        assert_eq!((worker.load(), worker.decode_kv_tokens()), (0, 0));
     }
 }
