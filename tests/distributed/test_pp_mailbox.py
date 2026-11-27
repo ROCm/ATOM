@@ -49,21 +49,43 @@ def test_closed_bank_blocks_without_attn_res():
 
 
 def test_closed_blocks_match_attn_res():
-    """A stage starting at L reads, before writing them itself, only bank slots
-    below ``closed_bank_blocks(L)``, and writes exactly those up to its end's:
-    checked against AttnRes's own window / maybe_close_block (pure torch; the
-    module's AITER imports are stand-ins on a CPU runner)."""
+    """A stage starting at L hands on, and reads before writing, only the bank
+    slots below ``closed_bank_blocks(L)``: checked against AttnRes's own
+    maybe_close_block (pure torch; the module's AITER imports are stand-ins on a
+    CPU runner), for a fixed bank read through ``window`` and for one that grows
+    by a slot per closed block."""
     with atom_without_aiter() as load:
-        _check_bank_rule(load("atom.model_ops.attention_residual").AttnRes)
+        AttnRes = load("atom.model_ops.attention_residual").AttnRes
+        if hasattr(AttnRes, "window"):
+            _check_bank_rule(AttnRes)
+        else:
+            _check_growing_bank_rule(AttnRes)
+
+
+def _site(AttnRes, layer_idx):
+    stub = torch.nn.Identity()
+    return AttnRes(stub, stub, enabled=True, block_size=K3_BLOCK, layer_idx=layer_idx)
+
+
+def _check_growing_bank_rule(AttnRes):
+    """A bank that grows by one slot per closed block: a stage starting at L
+    receives exactly ``closed_bank_blocks(L)`` slots, all of them read, and
+    hands on exactly its end's."""
+    for first in range(1, K3_LAYERS):
+        bank = torch.zeros(1, 0, 1)
+        for layer in range(first):  # the stages before this one
+            bank, _ = _site(AttnRes, layer).maybe_close_block(torch.ones(1, 1), bank)
+        assert bank.shape[1] == closed_bank_blocks(first, K3_BLOCK, K3_BLOCKS)
+        for end in range(first + 1, K3_LAYERS + 1):
+            out = bank
+            for layer in range(first, end):
+                out, _ = _site(AttnRes, layer).maybe_close_block(torch.ones(1, 1), out)
+            assert out.shape[1] == closed_bank_blocks(end, K3_BLOCK, K3_BLOCKS)
 
 
 def _check_bank_rule(AttnRes):
-    stub = torch.nn.Identity()
-
     def site(layer_idx):
-        return AttnRes(
-            stub, stub, enabled=True, block_size=K3_BLOCK, layer_idx=layer_idx
-        )
+        return _site(AttnRes, layer_idx)
 
     for first in range(K3_LAYERS):
         for end in range(first + 1, K3_LAYERS + 1):
@@ -122,11 +144,12 @@ def test_equal_mla_split_payload_per_hop():
     assert sum(mailbox) / sum(nccl) < 0.75
 
 
-def _trimmer(out_closed, in_closed):
+def _trimmer(out_closed, in_closed, full_bank=True):
     """A PPMailbox carrying only what trim / expand read (no HIP, no group)."""
     box = object.__new__(PPMailbox)
     box.trim_nccl_bank = True
     box.total_blocks = K3_BLOCKS
+    box.full_bank = full_bank
     box.out_layout = None if out_closed is None else _layout(out_closed, 0)
     box.in_layout = None if in_closed is None else _layout(in_closed, 0)
     return box
@@ -144,6 +167,21 @@ def test_nccl_hop_trims_and_restores_the_bank():
     _trimmer(out_closed=None, in_closed=3).expand_from_nccl(received)
     assert received["block_residual"].shape == (rows, K3_BLOCKS, hidden)
     assert torch.equal(received["block_residual"][:, :3], bank[:, :3])
+
+
+def test_nccl_hop_leaves_a_growing_bank_as_sent():
+    """A bank that grows by a slot per closed block already holds only closed
+    blocks: nothing to trim, nothing to rebuild."""
+    rows, hidden = 5, 16
+    bank = torch.randn(rows, 3, hidden)
+    sent = {"block_residual": bank}
+    assert (
+        _trimmer(out_closed=3, in_closed=None, full_bank=False).trim_for_nccl(sent)
+        == ()
+    )
+    assert sent["block_residual"] is bank
+    _trimmer(out_closed=None, in_closed=3, full_bank=False).expand_from_nccl(sent)
+    assert sent["block_residual"] is bank
 
 
 def test_nccl_hop_keeps_a_bank_it_cannot_trim():

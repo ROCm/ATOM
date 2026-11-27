@@ -127,9 +127,10 @@ def _non_negative_or_none(value: int | None) -> int | None:
     return None if value is None else max(0, value)
 
 
-def _int_env(name: str, default: int) -> int:
-    """Unset or empty reads as ``default``; anything else must be an integer."""
-    value = _optional_int_env(name)
+def _int_env(name: str, default: int, *, min_value: int | None = None) -> int:
+    """Unset or empty reads as ``default``; anything else must be an integer
+    (of at least ``min_value``)."""
+    value = _optional_int_env(name, min_value=min_value)
     return default if value is None else value
 
 

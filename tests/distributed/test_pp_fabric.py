@@ -232,7 +232,7 @@ def no_gpu(monkeypatch):
     return calls
 
 
-def _box(role, mode, closed=5, aux_taps=3, slots=2, rows_max=64):
+def _box(role, mode, closed=5, aux_taps=3, slots=2, rows_max=64, full_bank=True):
     lay = HopLayout(rows_max, H, 8, closed, aux_taps * H, 2, slots)
     box = object.__new__(PPMailbox)
     box.device, box.dtype, box.hidden, box.total_blocks = (
@@ -241,6 +241,7 @@ def _box(role, mode, closed=5, aux_taps=3, slots=2, rows_max=64):
         H,
         8,
     )
+    box.full_bank = full_bank
     box.check = False
     box.fabric = pf.FabricOptions(mode=mode)
     box.send_seq = box.recv_seq = 0
@@ -309,16 +310,19 @@ def test_fabric_pull_send(no_gpu):
     ]
 
 
+@pytest.mark.parametrize("full_bank", [True, False])
 @pytest.mark.parametrize("mode", ["push", "pull"])
-def test_fabric_recv(no_gpu, monkeypatch, mode):
-    box, hop, lay = _box("recv", mode)
+def test_fabric_recv(no_gpu, monkeypatch, mode, full_bank):
+    """The received bank: the model's full bank (closed blocks filled), or for a
+    bank that grows per closed block exactly the closed blocks."""
+    box, hop, lay = _box("recv", mode, full_bank=full_bank)
     reads = []
     monkeypatch.setattr(
         mb, "copy_in", lambda src, dst, rows, cols, ss, ds: reads.append(src)
     )
     out = box.recv(12)
     assert set(out) == {"hidden_states", "block_residual", "pp_aux"}
-    assert out["block_residual"].shape == (12, 8, H)
+    assert out["block_residual"].shape == (12, 8 if full_bank else lay.closed_blocks, H)
     assert hop.waits == [(hop.local + 8 * pf.FLAG_WORD, 1)]
     base = (hop.local if mode == "push" else hop.peer) + pf.RING_OFFSET
     assert reads == [base + off for off in lay.offsets().values()]

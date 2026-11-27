@@ -298,12 +298,18 @@ class PPMailbox:
         fabric=None,
         trim_nccl_bank: bool = False,
         check: bool = False,
+        full_bank: bool = False,
     ):
         if slots < 1:
             raise ValueError(f"PP mailbox needs at least one slot, got {slots}")
         self.device, self.dtype = device, dtype
         self.hidden, self.total_blocks = hidden, total_blocks
         self.trim_nccl_bank, self.check = trim_nccl_bank, check
+        # The AttnRes bank a stage hands on: full_bank, a fixed [T, total_blocks, H]
+        # bank each stage fills in place (a model with ``block_bank``); else the
+        # bank grows by one slot per closed block (``AttnRes.maybe_close_block``
+        # concatenates), so a hop's bank is exactly its closed blocks.
+        self.full_bank = full_bank
         elem = torch.empty((), dtype=dtype).element_size()
         if (hidden * elem) % 8:
             raise ValueError(
@@ -488,9 +494,10 @@ class PPMailbox:
             (
                 m
                 for m in model.modules()
-                if hasattr(m, "block_bank")
-                and hasattr(m, "start_layer")
+                if hasattr(m, "start_layer")
                 and hasattr(m, "end_layer")
+                and getattr(getattr(m, "config", None), "attn_res_block_size", None)
+                is not None
             ),
             None,
         )
@@ -529,6 +536,7 @@ class PPMailbox:
             fabric=fabric_options_from_env(),
             trim_nccl_bank=envs.ATOM_PP_TRIM_BANK,
             check=envs.ATOM_PP_MAILBOX_CHECK,
+            full_bank=hasattr(inner, "block_bank"),
         )
 
     # -- mailbox hops -------------------------------------------------------------------------------------------------
@@ -691,10 +699,9 @@ class PPMailbox:
         hop = self._fabric_in if self.recv_kind == "fabric" else None
         with torch.cuda.stream(r):
             hidden = torch.empty(rows, h, dtype=self.dtype, device=self.device)
+            slots = self.total_blocks if self.full_bank else lay.closed_blocks
             bank = (
-                torch.empty(
-                    rows, self.total_blocks, h, dtype=self.dtype, device=self.device
-                )
+                torch.empty(rows, slots, h, dtype=self.dtype, device=self.device)
                 if self.total_blocks
                 else None
             )
@@ -751,9 +758,7 @@ class PPMailbox:
         if lay.closed_blocks:
             cols = lay.closed_blocks * h // w
             dst = bank.view(rows, -1).view(torch.int64)
-            copy_in(
-                base + off["bank"], dst, rows, cols, cols, self.total_blocks * h // w
-            )
+            copy_in(base + off["bank"], dst, rows, cols, cols, bank.shape[1] * h // w)
         if lay.aux_cols:
             cols = lay.aux_cols // w
             copy_in(base + off["aux"], aux.view(torch.int64), rows, cols, cols, cols)
@@ -786,8 +791,8 @@ class PPMailbox:
 
     def expand_from_nccl(self, tensors: dict[str, torch.Tensor]) -> None:
         """An NCCL hop under ``ATOM_PP_TRIM_BANK``: rebuild the full bank from the
-        closed blocks the previous stage sent."""
-        if not self.trim_nccl_bank or self.in_layout is None:
+        closed blocks the previous stage sent (a growing bank is already whole)."""
+        if not self.trim_nccl_bank or self.in_layout is None or not self.full_bank:
             return
         bank = tensors.get("block_residual")
         if bank is None or bank.shape[1] == self.total_blocks:
