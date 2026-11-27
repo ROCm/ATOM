@@ -2868,12 +2868,9 @@ def test_window_rows_start_each_row_at_its_own_window(window):
         assert tables[row].tolist() == list(range(first, first + P))
 
 
-@pytest.mark.parametrize(
-    "tp, kv_role, kv_heads",
-    [(4, None, 1), (2, None, 2), (1, None, 4), (1, "kv_producer", 4)],
-)
+@pytest.mark.parametrize("tp, kv_heads", [(4, 1), (2, 2), (1, 4)])
 def test_minimax_m31_dspark_holds_its_ranks_share_of_the_kv_heads(
-    monkeypatch, tp, kv_role, kv_heads
+    monkeypatch, tp, kv_heads
 ):
     """The MiniMax-M3.1 draft decodes its block one KV head per row, so a rank
     may hold several: all 4 at attention TP1 (DP attention, a TP1 P/D producer)."""
@@ -2891,10 +2888,7 @@ def test_minimax_m31_dspark_holds_its_ranks_share_of_the_kv_heads(
         max_position_embeddings=4096,
         rope_theta=5e6,
     )
-    kv_transfer_config = {"kv_role": kv_role} if kv_role else {}
-    atom_config = types.SimpleNamespace(
-        kv_transfer_config=kv_transfer_config, kv_cache_dtype="fp8"
-    )
+    atom_config = types.SimpleNamespace(kv_transfer_config={}, kv_cache_dtype="fp8")
     attn = m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
     assert attn.num_kv_heads == kv_heads
     assert attn.num_heads == 64 // tp

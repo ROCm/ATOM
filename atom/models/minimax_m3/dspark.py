@@ -120,12 +120,13 @@ def _window_rows(
     bt16_flat: torch.Tensor,  # [(rb + 1) * P] request tables, then P of slack
     ctx_eff: torch.Tensor,  # [rb] keys each request can read
     positions: torch.Tensor,  # [rb * T] each row's own position
-    row_req: torch.Tensor,  # [rb * T] the request each row belongs to
+    row_req: torch.Tensor,  # [rb * T * H] the request each (row, KV head) belongs to
     window: int,  # 0: attend the whole context
     real_rows: int,  # rows past this are padding
-    start16: torch.Tensor,  # [rb * T] int64 scratch
-    out_tables: torch.Tensor,  # [rb * T, P]
-    out_lens: torch.Tensor,  # [rb * T]
+    start16: torch.Tensor,  # [rb * T * H] int64 scratch
+    out_tables: torch.Tensor,  # [rb * T * H, P]
+    out_lens: torch.Tensor,  # [rb * T * H]
+    kv_heads: torch.Tensor | None = None,  # [H] = arange(H), when H > 1
 ) -> None:
     """Each block row's page-16 table and length under the sliding window.
 
@@ -136,19 +137,31 @@ def _window_rows(
     the P-wide window of its request's table from that page on, taken from
     the flat buffer; its length ends it within its own request's columns,
     so what that window runs into past them is never read.
+
+    With H > 1 KV heads a rank, every row is written once per KV head, its
+    pages KV-head encoded (page p of head h is ``p * H + h``), straight into
+    the ``[rows * H, P]`` tables ``sparse_pa_per_row`` reads.
     """
     P = out_tables.shape[1]
+    rows = positions.numel()
+    H = out_tables.shape[0] // rows
     if window:
-        torch.sub(positions, window - 1, out=start16)
+        torch.sub(
+            positions.view(rows, 1).expand(rows, H),
+            window - 1,
+            out=start16.view(rows, H),
+        )
         start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
         # Pad rows read one page.
-        start16[real_rows:].zero_()
+        start16[real_rows * H :].zero_()
     else:
         start16.zero_()
     torch.index_select(ctx_eff, 0, row_req, out=out_lens)
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+    if H > 1:
+        out_tables.view(rows, H, P).mul_(H).add_(kv_heads.view(1, H, 1))
 
 
 class M3DSparkAttention(nn.Module):
@@ -459,25 +472,20 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             (max_bs + 1) * P, dtype=torch.int32, device=device
         )
         self._bt16 = self._bt16_flat[: max_bs * P].view(max_bs, P)
-        self._bt16_rows = torch.zeros(max_bs * T, P, dtype=torch.int32, device=device)
-        self._ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
+        # One row per (block row, KV head), as `sparse_pa_per_row` reads them.
+        H = self.kv_heads_per_rank
+        rows = max_bs * T * H
+        self._bt16_rows = torch.zeros(rows, P, dtype=torch.int32, device=device)
+        self._ctx_rows = torch.zeros(rows, dtype=torch.int32, device=device)
         self._row_req = torch.arange(
             max_bs, dtype=torch.int64, device=device
-        ).repeat_interleave(T)
+        ).repeat_interleave(T * H)
         self._sub_pages = torch.arange(
             PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=device
         )
-        self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
+        self._start16 = torch.zeros(rows, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        H = self.kv_heads_per_rank
-        if H > 1:
-            # One row per (block row, KV head), as `sparse_pa_per_row` reads them.
-            rows_kv = max_bs * T * H
-            self._bt16_rows_kv = torch.zeros(
-                rows_kv, P, dtype=torch.int32, device=device
-            )
-            self._ctx_rows_kv = torch.zeros(rows_kv, dtype=torch.int32, device=device)
-            self._kv_heads = torch.arange(H, dtype=torch.int32, device=device)
+        self._kv_heads = torch.arange(H, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
@@ -524,7 +532,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             # A pad row reads one page: page 0.
             bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._sub_pages)
 
-        rows = running_bs * T
+        rows = running_bs * T * self.kv_heads_per_rank
         _window_rows(
             self._bt16_flat,
             ctx_eff,
@@ -535,19 +543,10 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._start16[:rows],
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
+            self._kv_heads,
         )
-        tables, lens = self._bt16_rows[:rows], self._ctx_rows[:rows]
-        H = self.kv_heads_per_rank
-        if H > 1:
-            # Page p of KV head h is p * H + h in the KV-head-collapsed cache view.
-            kv_tables = self._bt16_rows_kv[: rows * H].view(rows, H, P)
-            kv_tables.copy_(tables.unsqueeze(1).expand(rows, H, P))
-            kv_tables.mul_(H).add_(self._kv_heads.view(1, H, 1))
-            kv_lens = self._ctx_rows_kv[: rows * H].view(rows, H)
-            kv_lens.copy_(lens.unsqueeze(1).expand(rows, H))
-            tables, lens = kv_tables.view(rows * H, P), kv_lens.view(rows * H)
-        attn_metadata.dspark_bt16_rows = tables
-        attn_metadata.dspark_ctx_rows = lens
+        attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
+        attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
