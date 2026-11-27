@@ -207,6 +207,12 @@ impl CacheAwarePolicy {
         let _ = self.kv_events.set(provider);
     }
 
+    /// What the KV tiers below a worker's device cache count for in this policy's config.
+    #[cfg(test)]
+    pub(crate) fn tier_weights(&self) -> super::TierWeights {
+        self.config.tier_weights
+    }
+
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
@@ -724,6 +730,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            ..Default::default()
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -761,6 +768,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0,
             max_tree_size: 10000,
+            ..Default::default()
         });
         let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
             .into_iter()

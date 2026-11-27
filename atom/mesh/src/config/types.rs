@@ -3,7 +3,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{ConfigError, ConfigResult};
-use crate::core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode};
+use crate::{
+    core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode},
+    kv_tiers::TierWeights,
+};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -650,6 +653,15 @@ impl RouterConfig {
     /// concurrently with prefill: `--atom-pd-concurrent` on the ATOM backend.
     pub fn atom_pd_concurrent_dispatch(&self) -> bool {
         matches!(self.backend, BackendType::Atom) && self.atom_pd_concurrent
+    }
+
+    /// What `kv_share_weight` and `kv_storage_weight` count the tiers below a worker's
+    /// device cache for, as each cache-aware policy takes them in its config.
+    pub fn kv_tier_weights(&self) -> TierWeights {
+        TierWeights {
+            shared: self.kv_share_weight,
+            stored: self.kv_storage_weight,
+        }
     }
 
     /// Create a new configuration with mode and policy

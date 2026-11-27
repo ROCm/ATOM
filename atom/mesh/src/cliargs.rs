@@ -882,6 +882,62 @@ mod tests {
         assert_eq!(context.kv_event_monitor.unwrap().share_weight(), 0.5);
     }
 
+    /// The two weights on the command line are the `TierWeights` in the config of each
+    /// cache-aware policy of the `AppContext` built from it: the default policy, one a
+    /// worker's `policy` label asks for by name, and one the PD routers create. Leaving
+    /// either out of the `RouterConfig`, or of what the registry creates policies with,
+    /// fails it at the defaults.
+    #[tokio::test]
+    async fn cli_kv_weights_fill_the_tier_weights_of_every_cache_aware_policy() {
+        use crate::{
+            app_context::AppContext,
+            core::prepare_pool::PreparePoolRuntime,
+            policies::{CacheAwarePolicy, LoadBalancingPolicy, TierWeights},
+        };
+
+        let flags = "atomesh --kv-events --kv-share-weight 0.5 --kv-storage-weight 0.25";
+        let args = CliArgs::try_parse_from(flags.split_whitespace()).unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+        let context = AppContext::from_config(config.clone(), 5, runtime.handle())
+            .await
+            .unwrap();
+        let registry = &context.policy_registry;
+        let policies: [std::sync::Arc<dyn LoadBalancingPolicy>; 3] = [
+            registry.get_default_policy(),
+            registry.on_worker_added("m", Some("cache_aware")),
+            registry.create_policy(&config.policy),
+        ];
+        for policy in policies {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let want = TierWeights {
+                shared: 0.5,
+                stored: 0.25,
+            };
+            assert_eq!(cache_aware.tier_weights(), want);
+        }
+    }
+
+    /// The weights no flag sets are `TierWeights::default()`, however the config is made.
+    #[test]
+    fn kv_tier_weights_default_alike_on_the_command_line_and_in_the_config() {
+        use crate::policies::TierWeights;
+
+        let parsed = CliArgs::try_parse_from(["atomesh"]).unwrap();
+        let mut saved = serde_json::to_value(RouterConfig::default()).unwrap();
+        for weight in ["kv_share_weight", "kv_storage_weight"] {
+            assert!(saved.as_object_mut().unwrap().remove(weight).is_some());
+        }
+        for config in [
+            parsed.to_router_config(Vec::new()).unwrap(),
+            CliArgs::default().to_router_config(Vec::new()).unwrap(),
+            RouterConfig::default(),
+            serde_json::from_value(saved).unwrap(),
+        ] {
+            assert_eq!(config.kv_tier_weights(), TierWeights::default());
+        }
+    }
+
     #[test]
     fn cli_kv_storage_options_map_to_router_config() {
         let args = CliArgs::try_parse_from([

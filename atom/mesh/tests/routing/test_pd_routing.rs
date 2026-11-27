@@ -186,7 +186,7 @@ mod pd_routing_unit_tests {
 
                 // Initialize registries
                 let worker_registry = Arc::new(WorkerRegistry::new());
-                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+                let policy_registry = Arc::new(PolicyRegistry::for_router(&config));
 
                 // Initialize storage backends
                 let response_storage = Arc::new(MemoryResponseStorage::new());

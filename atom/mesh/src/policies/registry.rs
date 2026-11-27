@@ -9,8 +9,12 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker, kv_index::PrefixMatchProvider};
+use super::{CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory, TierWeights};
+use crate::{
+    config::types::{PolicyConfig, RouterConfig},
+    core::Worker,
+    kv_index::PrefixMatchProvider,
+};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -32,12 +36,30 @@ pub struct PolicyRegistry {
 
     /// The KV event index, for cache-aware policies (set once at startup)
     kv_events: Arc<OnceLock<Arc<dyn PrefixMatchProvider>>>,
+
+    /// What the KV tiers below a worker's device cache count for in the config of every
+    /// cache-aware policy the registry creates
+    tier_weights: TierWeights,
 }
 
 impl PolicyRegistry {
-    /// Create a new PolicyRegistry with a default policy
+    /// Create a new PolicyRegistry with a default policy, its cache-aware policies with
+    /// the default tier weights
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
+        Self::with_tier_weights(default_policy_config, TierWeights::default())
+    }
+
+    /// The registry of a router: its default policy, and the tier weights of its
+    /// `kv_share_weight` and `kv_storage_weight` for every cache-aware policy it creates
+    pub fn for_router(config: &RouterConfig) -> Self {
+        Self::with_tier_weights(config.policy.clone(), config.kv_tier_weights())
+    }
+
+    fn with_tier_weights(default_policy_config: PolicyConfig, tier_weights: TierWeights) -> Self {
+        let default_policy = PolicyFactory::create_from_config_with_tier_weights(
+            &default_policy_config,
+            tier_weights,
+        );
 
         Self {
             model_policies: Arc::new(DashMap::new()),
@@ -46,7 +68,15 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             kv_events: Arc::new(OnceLock::new()),
+            tier_weights,
         }
+    }
+
+    /// Create a policy from its config as the registry creates its own: a cache-aware one
+    /// with the registry's tier weights. The PD routers create their prefill and decode
+    /// policies here.
+    pub fn create_policy(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        PolicyFactory::create_from_config_with_tier_weights(config, self.tier_weights)
     }
 
     /// Lets every cache-aware policy, the ones created later included, place requests by
@@ -185,15 +215,11 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
-            warn!("Unknown policy type '{}', using default", policy_type);
-            Arc::clone(&self.default_policy)
-        })
-    }
-
-    /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
+        PolicyFactory::create_by_name_with_tier_weights(policy_type, self.tier_weights)
+            .unwrap_or_else(|| {
+                warn!("Unknown policy type '{}', using default", policy_type);
+                Arc::clone(&self.default_policy)
+            })
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
@@ -642,5 +668,45 @@ mod tests {
         assert!(!registry
             .on_worker_added("n", Some("round_robin"))
             .wants_tokens());
+    }
+
+    /// A router's tier weights are in the config of every cache-aware policy its registry
+    /// creates: its default policy, one a worker's `policy` label asks for by name, and
+    /// the ones the PD routers have it create.
+    #[tokio::test]
+    async fn a_routers_tier_weights_are_in_every_cache_aware_policy_its_registry_creates() {
+        let cache_aware = PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 100,
+        };
+        let config = RouterConfig {
+            policy: cache_aware.clone(),
+            kv_share_weight: 0.5,
+            kv_storage_weight: 0.25,
+            ..Default::default()
+        };
+        let weights = |policy: Arc<dyn LoadBalancingPolicy>| {
+            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>();
+            cache_aware.unwrap().tier_weights()
+        };
+        let registry = PolicyRegistry::for_router(&config);
+        let want = TierWeights {
+            shared: 0.5,
+            stored: 0.25,
+        };
+        for policy in [
+            registry.get_default_policy(),
+            registry.on_worker_added("m", Some("cache_aware")),
+            registry.create_policy(&cache_aware),
+        ] {
+            assert_eq!(weights(policy), want);
+        }
+        // Without a router's config, the defaults of its flags.
+        let registry = PolicyRegistry::new(cache_aware);
+        let default = registry.get_default_policy();
+        assert_eq!(weights(default), TierWeights::default());
     }
 }

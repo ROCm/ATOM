@@ -76,7 +76,7 @@ async fn create_mocker_context_inner(
     };
 
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::for_router(&config));
     let response_storage = Arc::new(MemoryResponseStorage::new());
     let conversation_storage = Arc::new(MemoryConversationStorage::new());
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());

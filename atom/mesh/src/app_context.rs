@@ -439,7 +439,7 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        self.policy_registry = Some(Arc::new(PolicyRegistry::for_router(config)));
         self
     }
 
