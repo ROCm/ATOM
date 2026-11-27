@@ -1105,8 +1105,9 @@ class ParallelConfig:
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
     pp_kv_status_addr: str = ""
-    """ZMQ endpoint where the head receives KV offload status from downstream
-    PP stages. All downstream stages PUSH; the head PULLs."""
+    """ZMQ endpoint where the head receives KV offload status: downstream stages'
+    polls and, where stages push, every stage's load terminals. Senders PUSH;
+    the head PULLs."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 

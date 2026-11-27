@@ -513,6 +513,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     proc = PPEngineCoreProc.__new__(PPEngineCoreProc)
     proc.pp_size = 1
     proc.pp_max_inflight = 1
+    proc._stages_push_load_terminals = False
     proc.kv_transfer_enabled = False
     proc._in_flight = deque()
     proc.scheduler = SimpleNamespace(
