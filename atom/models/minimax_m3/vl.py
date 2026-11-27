@@ -315,6 +315,13 @@ class MiniMaxM3SparseForConditionalGenerationVL(
         MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes
     )
 
+    @classmethod
+    def encoder_only_modules(cls, atom_config: Config) -> dict[str, nn.Module]:
+        """The vision modules alone, by attribute name, for ``--encoder-only``
+        (``atom.model_engine.encoder_only``)."""
+        names = ("vision_tower", "multi_modal_projector", "patch_merge_mlp")
+        return dict(zip(names, build_vision_modules(atom_config.hf_config)))
+
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         super().__init__(atom_config, prefix=prefix)
         hf_config = atom_config.hf_config

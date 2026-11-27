@@ -31,9 +31,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import zmq
 from conftest import MockConfig, with_min_load
 
 from atom.config import KVCacheTensor
+from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -988,6 +990,28 @@ def test_key_spellings():
     assert probe == "ns/probe/w2/abc" and not probe.startswith("ns/w")
 
 
+def test_keys_are_the_ones_atomesh_looks_up():
+    # atom/mesh/src/kv_storage/keys.rs asserts the same digests and keys.
+    for chunk_tokens, want in [
+        (16, "b4f719a070effaaae20d233b3341c77d"),
+        (64, "a1aef9c4be290e35c90734297b3e6c8a"),
+        (256, "368bbb8bdb74a66c980c2a9762fef7fa"),
+    ]:
+        assert keys.chunk_hash_chain(range(chunk_tokens), chunk_tokens).hex() == want
+    namespace = "atomkv1-0123456789abcdef01234567"
+    hashes = keys.chunk_hash_chain([(i * 7919) % 150000 for i in range(53)], 16)
+    digests = (
+        "48a73da894d8d0ef643123150b31991e",
+        "a53c74ba1da5cce48218d8a3729dc7a1",
+        "bdff5c9bb8a712526c9ad1e28caa2a8e",
+    )
+    for rank in (0, 1):
+        assert keys.chunk_keys(namespace, rank, 8, hashes, 0, 3) == [
+            f"{namespace}/w{rank}of8/{digest}" for digest in digests
+        ]
+    assert len(hashes) == 3 * keys.DIGEST_BYTES
+
+
 # --- client ------------------------------------------------------------------
 
 
@@ -1385,7 +1409,6 @@ def test_rail_rdma_device_refuses_two_equally_close_nics(tmp_path):
 def node(tmp_path, monkeypatch):
     pci, ib = _make_node(tmp_path)
     monkeypatch.setattr(nic, "_IB_SYSFS_ROOT", ib)
-    monkeypatch.setattr(nic, "_PCI_SYSFS_ROOT", pci)
     monkeypatch.setattr(nic, "gpu_pci_bdf", lambda index: f"0000:{GPU_BDF[index]}:00.0")
     real = nic.rail_rdma_device
     # Keyword defaults were bound at import; rebind to the fake tree.
@@ -3606,6 +3629,156 @@ def test_load_of_another_layout_fails(cluster, make_worker):
     assert worker.get_finished().failed_loading == {request.load_operation}
 
 
+class _Pusher:
+    """Stands in for `PPKVStatusPusher`: what a load thread sent the PP head."""
+
+    def __init__(self, takes=True):
+        self.takes = takes  # False: the head's pipe is full
+        self.sent = []
+
+    def try_send(self, output):
+        if self.takes:
+            self.sent.append(output)
+        return self.takes
+
+    def close(self):
+        pass
+
+
+def test_a_pushed_load_terminal_is_not_reported_again(cluster, make_worker):
+    """A pushed terminal reached the head: the stage's poll must not report it again."""
+    worker, gpu = make_worker(load_slots=8)
+    worker._do_save_req(_save_req(36, 40))
+    worker.get_finished()
+    worker._load_terminal_pusher = pusher = _Pusher()
+    request = _load_req(36, hbm=0, lmc=40, block_ids=list(range(100, 110)))
+    worker._do_load_req(request)
+    assert [gpu.kv[block] for block in range(100, 110)] == [
+        gpu.pattern(block) for block in range(10)
+    ]
+    assert [o.finished_loading for o in pusher.sent] == [{request.load_operation}]
+    assert [o.failed_loading for o in pusher.sent] == [set()]
+    output = worker.get_finished()
+    assert output.finished_loading == set() and output.failed_loading == set()
+
+
+@pytest.mark.parametrize("refused", [True, False])
+def test_a_pushed_load_failure_keeps_its_error_blocks(cluster, make_worker, refused):
+    worker, _ = make_worker(load_slots=8)
+    worker._load_terminal_pusher = pusher = _Pusher()
+    if refused:  # HBM prefix not on a chunk: refused before any get
+        request = _load_req(37, hbm=4, lmc=24, block_ids=list(range(8)))
+        unfilled = set(range(1, 6))
+    else:  # a miss: the load fails whole
+        worker._do_save_req(_save_req(37, 40))
+        request = _load_req(37, hbm=8, lmc=40, block_ids=list(range(100, 110)))
+        del cluster.objects[MASTER][_key(request.chunk_hashes, 3)]
+        unfilled = set(range(102, 110))
+    worker._do_load_req(request)
+    assert [o.failed_loading for o in pusher.sent] == [{request.load_operation}]
+    assert [o.finished_loading for o in pusher.sent] == [set()]
+    assert worker.get_finished().failed_loading == set()
+    assert worker.take_load_error_blocks() == unfilled
+
+
+def test_a_load_with_nothing_to_load_is_pushed_too(cluster, make_worker):
+    worker, _ = make_worker()
+    worker._load_terminal_pusher = pusher = _Pusher()
+    request = _load_req(38, hbm=16, lmc=16, block_ids=[0, 1, 2, 3])
+    worker._do_load_req(request)
+    assert [o.finished_loading for o in pusher.sent] == [{request.load_operation}]
+    assert worker.get_finished().finished_loading == set()
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_a_terminal_the_head_pipe_refuses_goes_to_the_poll(cluster, make_worker, ok):
+    worker, _ = make_worker()
+    worker._load_terminal_pusher = pusher = _Pusher(takes=False)
+    # Nothing to load, or an HBM prefix not on a chunk: refused before any get.
+    request = _load_req(39, hbm=16 if ok else 4, lmc=16 if ok else 24, block_ids=[0])
+    worker._do_load_req(request)
+    assert pusher.sent == []
+    output = worker.get_finished()
+    assert output.finished_loading == ({request.load_operation} if ok else set())
+    assert output.failed_loading == (set() if ok else {request.load_operation})
+
+
+def test_registration_opens_the_pusher_and_close_closes_it(cluster, one_rank, tmp_path):
+    addr = f"ipc://{tmp_path}/kv"
+    ctx = zmq.Context()
+    head = PPStageTransport(
+        0,
+        2,
+        [f"ipc://{tmp_path}/meta{i}" for i in range(2)],
+        f"ipc://{tmp_path}/tok",
+        kv_status_addr=addr,
+        ctx=ctx,
+    )
+    worker = MooncakeStoreOffloadConnector(
+        _config(
+            pp=2,
+            extra=_extra(save_pool_mib=1, load_pool_mib=1),
+            parallel_config=SimpleNamespace(
+                pp_kv_status_addr=addr, pipeline_parallel_rank=1
+            ),
+        )
+    )
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        pusher = worker._load_terminal_pusher
+        request = _load_req(40, hbm=16, lmc=16, block_ids=[0, 1, 2, 3])
+        worker._do_load_req(request)
+        got = []
+        for _ in range(50):
+            got += head.recv_kv_status(timeout_ms=100)
+            if got:
+                break
+        assert [(r, o.finished_loading) for r, o in got] == [
+            (1, {request.load_operation})
+        ]
+    finally:
+        worker.close()
+        head.close()
+        ctx.term()
+    assert worker._load_terminal_pusher is None and pusher._sock.closed
+
+
+@pytest.mark.parametrize(
+    ("pp", "tp", "pcp", "opens"),
+    [
+        (2, 1, 1, True),
+        (1, 1, 1, False),  # no PP: there is no head
+        (2, 2, 1, False),  # one rank cannot stand for its stage's other ranks
+        (2, 1, 2, False),
+    ],
+)
+def test_the_load_terminal_pusher_opens_only_for_one_rank_a_stage(
+    monkeypatch, pp, tp, pcp, opens
+):
+    opened = []
+    monkeypatch.setattr(
+        store_worker_mod,
+        "PPKVStatusPusher",
+        lambda rank, address: opened.append((rank, address)) or _Pusher(),
+    )
+    worker = worker_mod.MooncakeStoreOffloadConnector(
+        _config(
+            pp=pp,
+            tp=tp,
+            prefill_context_parallel_size=pcp,
+            parallel_config=SimpleNamespace(
+                pp_kv_status_addr="ipc:///dev/null/kv", pipeline_parallel_rank=1
+            ),
+        )
+    )
+    try:
+        pusher = worker._open_load_terminal_pusher()
+        assert (pusher is not None) is opens
+        assert opened == ([(1, "ipc:///dev/null/kv")] if opens else [])
+    finally:
+        worker.close()
+
+
 def test_load_transfer_failure_before_the_batch_wait_frees_its_slots(
     cluster, make_worker
 ):
@@ -3772,6 +3945,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
     head = SimpleNamespace(
         pp_size=4,
         pp_max_inflight=4,
+        _stages_push_load_terminals=False,
         scheduler=engine,
         kv_transfer_enabled=True,
         _in_flight=deque(),

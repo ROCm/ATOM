@@ -2,8 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The loaded layer tensors the mono kernels read in place.
 
-Nothing is copied or re-laid-out: a kernel reads a parameter where the original
-model keeps it, so a layout the kernels were not written for must be refused here
+Nothing is copied or re-laid-out: a kernel reads a tensor where the original
+model keeps it (a parameter, or the routed experts' copies a MoE method keeps
+instead, ``routed_expert_copies``), so a layout the kernels were not written for
+must be refused here
 rather than read wrong. Every tensor is checked against the shape and dtype the
 kernels assume for the rank's shard.
 """
@@ -122,6 +124,9 @@ def bind_layer(block, config, dims: Dims, moe_tp: int = 1) -> LayerWeights:
             "rows, MXFP8 activations)"
         )
     params = dict(block.named_parameters())
+    # the routed experts where the MoE keeps them (MegaMoE: its own copies)
+    for name, tensor in method.routed_expert_copies(block.ffn.experts).items():
+        params[f"ffn.experts.{name}"] = tensor
     for name, (shape, dtype) in expected(config, spec.mode, dims, moe_tp).items():
         tensor = params.get(name)
         if tensor is None:

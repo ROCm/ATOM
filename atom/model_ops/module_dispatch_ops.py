@@ -30,7 +30,11 @@ import torch
 from atom.config import get_current_atom_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import get_forward_context, plugin_graph_is_piecewise
+from atom.utils.forward_context import (
+    get_forward_context,
+    graph_records_single_stream,
+    plugin_graph_is_piecewise,
+)
 
 # ---------------------------------------------------------------------------
 # Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
@@ -68,12 +72,15 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
     from atom.utils.tbo.ubatching import tbo_active
 
     # Eager, FULL capture and a token-graph segment all hold the fork/join; a
-    # plugin frontend's own PIECEWISE graphs are left single-stream.
+    # plugin frontend's own PIECEWISE graphs are left single-stream, and so is
+    # a graph window ATOM_GRAPH_SIDE_STREAMS keeps on one stream, its warmup
+    # forward included (`graph_records_single_stream`).
     return (
         self._use_dual_stream
         and 0 < num_tokens <= _dual_stream_row_bound(self)
         and not tbo_active()
         and not plugin_graph_is_piecewise()
+        and not graph_records_single_stream()
     )
 
 

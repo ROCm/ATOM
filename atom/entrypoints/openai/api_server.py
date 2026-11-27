@@ -108,6 +108,7 @@ from .protocol import (
     BetaChatCompletionRequest,
     BetaCompletionRequest,
     ChatCompletionRequest,
+    ChatCompletionResponse,
     CompletionRequest,
     ModelCard,
     ModelList,
@@ -217,6 +218,13 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
+# `EncoderOnly` under --encoder-only, which builds no engine.
+encoder = None
+# --accept-ec-transfer-params: a chat request's `ec_transfer_params` names
+# where this prefill server reads its image embeddings. Off, they are dropped:
+# only a router that runs the encoder (ATOMesh) may set them.
+accept_ec_transfer_params = False
+_warned_ec_transfer_params = False
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -709,6 +717,8 @@ def _validate_context_length(
 
 
 def _get_engine_config():
+    if encoder is not None:
+        return encoder.config
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
@@ -1909,6 +1919,8 @@ async def lifespan(app: FastAPI):
         try:
             if engine is not None:
                 engine.close()
+            if encoder is not None:
+                encoder.close()
         finally:
             try:
                 # After the engine: its output threads flush into the hub.
@@ -1945,6 +1957,35 @@ def _engine_route(path: str, **kwargs):
 async def _publish_frontend_stats_once() -> None:
     board, index = _frontend_stats
     board.publish(index, oldest_waiting_since())
+
+
+# What an encoder-only server answers; every other route needs the engine.
+_ENCODER_ONLY_ROUTES = frozenset(
+    (
+        "/v1/chat/completions",
+        "/beta/chat/completions",
+        "/v1/models",
+        "/health",
+        "/metrics",
+    )
+)
+
+
+@app.middleware("http")
+async def _refuse_engine_routes_without_engine(request: Request, call_next):
+    """Under --encoder-only, refuse the routes the absent engine would serve."""
+    if encoder is None or request.url.path in _ENCODER_ONLY_ROUTES:
+        return await call_next(request)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": f"an encoder-only server does not serve {request.url.path}",
+                "type": "invalid_request_error",
+                "code": 400,
+            }
+        },
+    )
 
 
 @app.middleware("http")
@@ -2393,6 +2434,8 @@ async def _chat_completions(
         is_multimodal = has_media and not (
             pretokenized is not None and leaves_media_on_prefill(kv_transfer_params)
         )
+        if encoder is not None and not is_multimodal:
+            raise ValueError("an encoder-only server takes image requests only")
         # ATOM_PROMPT_IDS_B64 on a P/D prefill leg: the caller sent these ids
         # itself, and the PD router forwards that same field to decode.
         # Echoing them as a JSON list would have the router carry a second
@@ -2425,6 +2468,17 @@ async def _chat_completions(
                 merged_kwargs,
                 request.tools,
             )
+            if encoder is not None:
+                return await _encoder_only_response(
+                    request_id, len(prompt_or_tokens), multimodal_data
+                )
+            if request.ec_transfer_params is not None:
+                if accept_ec_transfer_params:
+                    # The prefill encode reads these rows instead of running
+                    # the tower.
+                    multimodal_data["ec_transfer_params"] = request.ec_transfer_params
+                else:
+                    _warn_ec_transfer_params_dropped()
         elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
@@ -2678,6 +2732,53 @@ async def _chat_completions(
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _warn_ec_transfer_params_dropped() -> None:
+    global _warned_ec_transfer_params
+    if not _warned_ec_transfer_params:
+        _warned_ec_transfer_params = True
+        logger.warning(
+            "Dropping ec_transfer_params: start the server with "
+            "--accept-ec-transfer-params to read image embeddings from an "
+            "encoder server"
+        )
+
+
+async def _encoder_only_response(
+    request_id: str, num_prompt_tokens: int, multimodal_data: dict[str, Any]
+) -> JSONResponse:
+    """No choices: where the prefill server reads the image embeddings."""
+    from atom.ec_transfer import EcStoreFull
+
+    try:
+        params = await encoder.encode(multimodal_data)
+    except EcStoreFull as e:
+        # The router sends the request on without these, and prefill encodes.
+        logger.warning("Embedding pool full for %s: %s", request_id, e)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "internal_server_error",
+                    "code": 503,
+                }
+            },
+        )
+    resp = ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model_name,
+        choices=[],
+        usage={
+            "prompt_tokens": num_prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": num_prompt_tokens,
+        },
+        ec_transfer_params=params,
+    )
+    return JSONResponse(content=resp.model_dump(mode="json", exclude_none=True))
 
 
 @app.post("/v1/completions")
@@ -3747,6 +3848,8 @@ async def list_models():
 @_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
+    if encoder is not None:
+        return {"status": "ok"}
     if engine is None or not engine.core_mgr.is_healthy():
         raise HTTPException(status_code=503, detail="Engine workers unavailable")
     dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
@@ -3963,7 +4066,7 @@ async def set_offload_lookups(raw_request: Request):
 
 def main():
     """Main entry point for the server."""
-    global engine
+    global engine, encoder
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -4036,6 +4139,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--accept-ec-transfer-params",
+        action="store_true",
+        help=(
+            "Read a chat request's image embeddings from the encoder server its "
+            "ec_transfer_params name (E/P/D prefill). Set it only where clients "
+            "cannot reach this server except through a router that runs the "
+            "encoder and replaces any client-sent ec_transfer_params (ATOMesh); "
+            "without it they are dropped and this server encodes images itself."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
@@ -4057,8 +4171,16 @@ def main():
 
     _setup_frontend(args)
 
-    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.encoder_only:
+        if args.api_server_count > 1:
+            parser.error("--encoder-only serves from one process")
+        logger.info(f"Initializing the vision encoder of {args.model}...")
+        _setup_reasoning_and_tools(args)
+        encoder = engine_args.create_encoder()
+        _serve(args)
+        return
+    logger.info(f"Initializing engine with model {args.model}...")
     # Remote DP nodes block inside engine startup and never run the API loop.
     # Expose their local mmap metrics on the same configured HTTP port.
     dp_rank = (
@@ -4097,7 +4219,8 @@ def _setup_frontend(args) -> None:
     """Request log, tokenizer, chat template and model name: everything a
     front end needs before the engine exists (shared with front-end workers)."""
     global tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder, fim_format
+    global custom_message_encoder, fim_format, accept_ec_transfer_params
+    accept_ec_transfer_params = getattr(args, "accept_ec_transfer_params", False)
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -4230,6 +4353,66 @@ def _setup_stream_dispatch(args) -> None:
     )
 
 
+def _find_jemalloc() -> str | None:
+    """jemalloc's soname if the dynamic linker can find it, else None.
+
+    LD_PRELOAD takes a soname and resolves it like any other library, so no
+    distro-specific paths are needed.
+    """
+    import ctypes.util
+
+    return ctypes.util.find_library("jemalloc")
+
+
+def _loaded_allocator(maps_path="/proc/self/maps") -> str:
+    """The malloc this process actually runs on: ld.so only warns when an
+    LD_PRELOAD entry fails to load and goes on with glibc malloc."""
+    try:
+        with open(maps_path) as maps:
+            for line in maps:
+                if "jemalloc" in line:
+                    return line.split()[-1]
+    except OSError:
+        pass
+    return "glibc malloc"
+
+
+@contextlib.contextmanager
+def _frontend_allocator_env():
+    """Run the front-end workers on jemalloc.
+
+    Each front-end worker tokenizes and renders very long prompts on many
+    threads (default executor + the tokenizers' rayon pool). With glibc malloc
+    every thread gets its own arena and the freed memory stays there, so a
+    worker's RSS keeps growing for hours. jemalloc returns freed pages to the
+    OS and keeps the thread count (and so the tokenizer parallelism) unchanged.
+
+    LD_PRELOAD is only set while the workers are spawned; this process and the
+    engine processes (started before) keep their allocator. Without jemalloc on
+    the host the workers fall back to glibc malloc with one warning.
+    """
+    old = os.environ.get("LD_PRELOAD")
+    if old is not None and "jemalloc" in old:
+        yield old
+        return
+    lib = _find_jemalloc()
+    if lib is None:
+        logger.warning(
+            "libjemalloc.so.2 not found; front-end workers use glibc malloc "
+            "(their memory grows on long runs; install libjemalloc2 to avoid it)"
+        )
+        yield None
+        return
+    os.environ["LD_PRELOAD"] = f"{lib}:{old}" if old else lib
+    try:
+        yield lib
+    finally:
+        if old is None:
+            os.environ.pop("LD_PRELOAD", None)
+        else:
+            os.environ["LD_PRELOAD"] = old
+
+
 def _start_frontend_workers(args) -> None:
     """--api-server-count > 1: start the hub and spawn the front-end workers,
     which take over the public port. This process then serves management
@@ -4252,15 +4435,21 @@ def _start_frontend_workers(args) -> None:
     )
     ctx = multiprocessing.get_context("spawn")
     processes = []
-    for index in range(args.api_server_count):
-        proc = ctx.Process(
-            target=_frontend_worker_main,
-            args=(args, engine.config, hub.connection_info(index), os.getpid()),
-            name=f"ATOM-APIServer-{index}",
-            daemon=True,
-        )
-        proc.start()
-        processes.append(proc)
+    with _frontend_allocator_env() as allocator:
+        for index in range(args.api_server_count):
+            proc = ctx.Process(
+                target=_frontend_worker_main,
+                args=(args, engine.config, hub.connection_info(index), os.getpid()),
+                name=f"ATOM-APIServer-{index}",
+                daemon=True,
+            )
+            proc.start()
+            processes.append(proc)
+    logger.info(
+        "Front-end workers %s spawned with LD_PRELOAD allocator %s",
+        [proc.pid for proc in processes],
+        allocator or "none",
+    )
     try:
         hub.wait_for_workers(processes)
     except RuntimeError:
@@ -4318,10 +4507,11 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
         timeout_keep_alive=args.timeout_keep_alive,
     )
     logger.info(
-        "Front-end worker %d serving %s:%s",
+        "Front-end worker %d serving %s:%s on %s",
         info["index"],
         args.host,
         args.server_port,
+        _loaded_allocator(),
     )
     uvicorn.Server(uv_config).run(sockets=[listener])
 
@@ -4347,7 +4537,7 @@ def _serve(args) -> None:
 
     def _sigint_handler(signum, frame):
         logger.info("Received SIGINT, shutting down engine...")
-        engine.close()
+        (encoder or engine).close()
         import psutil
 
         try:
