@@ -467,16 +467,19 @@ class PageUnitCheckpointStore:
         predecessor, record.predecessor = record.predecessor, -1
         return predecessor
 
-    def demote(self, prefix_hash: int) -> None:
-        """Make `prefix_hash`'s READY image the first to evict.
+    def demote(self, prefix_hash: int) -> bool:
+        """Make `prefix_hash`'s READY image the first to evict; False if it is
+        no longer held.
 
         Not released: a request that shares the prefix may still restore it,
         and `begin_restore` then moves it back to the warm end.
         """
         checkpoint_id = self.lookup(prefix_hash)
-        if checkpoint_id >= 0:
-            self._lru.move_to_end(checkpoint_id, last=False)
-            self._lru[checkpoint_id] = float("-inf")
+        if checkpoint_id < 0:
+            return False
+        self._lru.move_to_end(checkpoint_id, last=False)
+        self._lru[checkpoint_id] = float("-inf")
+        return True
 
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
@@ -1330,8 +1333,7 @@ class PagedStateCheckpointCoordinator:
         if seq is not None:
             self._resumed_from[id(seq)] = h
         predecessor = self.store.take_predecessor(h)
-        if predecessor != -1 and predecessor != h:
-            self.store.demote(predecessor)
+        if predecessor not in (-1, h) and self.store.demote(predecessor):
             self.checkpoints_demoted += 1
         return True
 
