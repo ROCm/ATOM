@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Qwen3.8-Flash-Next sequence-parallel HC streams, on CPU with simulated TP ranks."""
 
 import itertools
@@ -10,10 +11,26 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("triton")
-pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+qwen4_exp = qwen4_exp_mtp = None
 
-from atom.models import qwen4_exp, qwen4_exp_mtp
+
+@pytest.fixture(scope="module", autouse=True)
+def imported_models():
+    global qwen4_exp, qwen4_exp_mtp
+    if torch.cuda.is_available():
+        from atom.models import qwen4_exp as target
+        from atom.models import qwen4_exp_mtp as draft
+
+        qwen4_exp, qwen4_exp_mtp = target, draft
+        yield
+    else:
+        from aiter_stub import atom_without_aiter
+
+        with atom_without_aiter() as load:
+            qwen4_exp = load("atom.models.qwen4_exp")
+            qwen4_exp_mtp = load("atom.models.qwen4_exp_mtp")
+            yield
+    qwen4_exp = qwen4_exp_mtp = None
 
 
 class _Collectives:
@@ -116,15 +133,15 @@ def test_scatter_sums_partials_into_local_rows(ranks, world, tokens, trailing):
         torch.testing.assert_close(gathered, total)
 
 
-class _FakePendingReduceScatter(qwen4_exp.PendingReduceScatter):
-    """A reduce-scatter handed out chunk by chunk, as it lands over SDMA."""
+def _pending_reduce_scatter(summed, bounds):
+    """The pending type is available after the module fixture loads Qwen."""
 
-    def __init__(self, summed, bounds):
-        self.bounds, self._summed = bounds, summed
+    class Pending(qwen4_exp.PendingReduceScatter):
+        def chunks(self):
+            for r0, r1 in itertools.pairwise(self.bounds):
+                yield r0, r1, summed[r0:r1]
 
-    def chunks(self):
-        for r0, r1 in itertools.pairwise(self.bounds):
-            yield r0, r1, self._summed[r0:r1]
+    return Pending(None, None, bounds, None)
 
 
 class _FakeAllGatherWriter:
@@ -161,7 +178,7 @@ class _FakeSdma:
         padded = qwen4_exp._pad_rows(x, self.world * local_rows - x.shape[0])
         summed = qwen4_exp.get_tp_group().reduce_scatter_tensor(padded)
         bounds = [local_rows * j // chunks for j in range(chunks + 1)]
-        return _FakePendingReduceScatter(summed, bounds)
+        return _pending_reduce_scatter(summed, bounds)
 
     def all_gather(self, local_rows, num_tokens, pushes):
         return _FakeAllGatherWriter(local_rows, num_tokens, pushes, self.hidden)

@@ -18,8 +18,10 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
+from atom.plugin import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.region_graph import TokenGraphQueryLayout
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -718,6 +720,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
+            impl = getattr(module, "impl", None)
+            if isinstance(impl, MLAAttention):
+                layout = getattr(impl, "prefill_query_layout", None)
+                target = getattr(runner, "model", None)
+                valid = (
+                    isinstance(layout, TokenGraphQueryLayout)
+                    and impl.is_sparse_mla
+                    and layout.dtype == torch.bfloat16
+                    and layout.layer_num == impl.layer_num == module.layer_num
+                    and 0 <= module.layer_num < runner.hf_text_config.num_hidden_layers
+                    and not is_plugin_mode()
+                    and runner.config.parallel_config.data_parallel_size == 1
+                    and runner.config.prefill_context_parallel_size == 1
+                    and isinstance(target, torch.nn.Module)
+                    and any(candidate is module for candidate in target.modules())
+                )
+                impl.token_graph_query_layout = layout if valid else None
             # This module's MLA row. K3's linear-attention layers are bound
             # above and take none, and a shared draft's layers simply continue
             # the numbering, which is what the pool was sized for.
@@ -800,31 +819,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
     @property
     def supports_token_graph(self) -> bool:
-        """Every launch outside the model's eager regions -- the KDA recurrence
-        and the MLA prefill core -- is sized by the token count alone, so a
-        prefill may pad to a recorded token-graph bucket. The regions
-        (`_kda_recurrence`, `attention_mla._mla_prefill_core`) run the whole
-        bucket too. A pad row belongs to no request: its batch id and KV slot
-        are -1, it lies past every request's `cu_seqlens` (a padding request
-        there is zero long), and the KDA metadata names the requests' rows and
-        state slots alone. Their kernels skip it.
+        """Record native Kimi's target layers when every MLA path is supported.
 
-        Not under DP: a decoding or idle rank would replay the prefill
-        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
-        prefill alone. Only while the model opted every MLA layer of its own
-        into the prefill split (`MLAAttention.split_prefill_recording`, which
-        Kimi-K3 sets) and each can take it
-        (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
-        ``ATOM_USE_TRITON_GEMM``). Any other layer would run as one region,
-        which cannot serve a padded bucket: `forward_impl` takes no live row
-        count, so its FP8 prefill attention would quantize the bucket's pad
-        rows with the step's. A sparse layer's DSA indexer is besides no
-        eager region and returns on the recording's dummy step, so a replay
-        would attend with a stale top-k. So no model on this builder with a
-        sparse MLA layer records: Kimi-K3.1, whose layers opt in but all carry
-        a DSA indexer, and GLM-5.3-Flash, whose layers are all sparse and opt
-        nothing in. A drafter's layers, numbered past the target's
-        (`layer_offset`), do not count: the recording runs the target alone."""
+        Dense MLA and KDA keep their whole-bucket split regions, whose
+        metadata bounds the kernel reads. Sparse MLA instead runs its bound
+        unscaled query's live rows, as its scheduled-row index metadata
+        requires; the indexer is also a live region. Unknown or quantized
+        sparse queries have no bound layout and keep eager execution.
+
+        DP cannot replay this prefill recording on decoding or idle ranks.
+        Draft layers are outside the target's layer range; plugin layers do
+        not opt in. Dense layers retain their existing split capability gate.
+        """
         config = self.model_runner.config
         if config.parallel_config.data_parallel_size != 1:
             return False
@@ -837,7 +843,19 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             and impl.layer_num < target_layers
         ]
         return bool(target_mla) and all(
-            impl.split_prefill_recording and impl.prefill_split_supported()
+            impl.split_prefill_recording
+            and (
+                impl.prefill_split_supported()
+                or (
+                    impl.is_sparse_mla
+                    and isinstance(
+                        layout := getattr(impl, "token_graph_query_layout", None),
+                        TokenGraphQueryLayout,
+                    )
+                    and layout.layer_num == impl.layer_num
+                    and layout.dtype == torch.bfloat16
+                )
+            )
             for impl in target_mla
         )
 

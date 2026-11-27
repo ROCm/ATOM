@@ -34,10 +34,211 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
+
+
+def _column_tail_op(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize the latent, then project and add one rank's BF16 columns."""
+    from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_mul_add import (
+        fused_gemm_a16w16_mul_add,
+    )
+
+    from atom.model_ops.layernorm import rmsnorm2d_fwd_
+
+    if latent.ndim != 2 or up_proj_rows.ndim != 2:
+        raise ValueError("column tail expects two-dimensional latent and weights")
+    tokens, width = latent.shape
+    columns, weight_width = up_proj_rows.shape
+    if not 1 <= tokens <= 64 or width != 3584 or columns != 896:
+        raise ValueError("column tail supports 1..64 rows and the TP8 Kimi geometry")
+    if weight_width != width or shared.shape != (tokens, columns):
+        raise ValueError("column tail weight and shared shapes must match the latent")
+    if norm_weight.shape != (width,):
+        raise ValueError("column tail norm weight must match the latent width")
+    for tensor in (latent, norm_weight, up_proj_rows, shared):
+        if tensor.dtype != torch.bfloat16 or tensor.device != latent.device:
+            raise ValueError("column tail operands must be BF16 on one device")
+        if tensor.stride(-1) != 1:
+            raise ValueError("column tail operands require a contiguous feature axis")
+    normalized = rmsnorm2d_fwd_(latent, norm_weight, eps, width)
+    return fused_gemm_a16w16_mul_add(
+        normalized, up_proj_rows, a=1.0, b=shared, dtype=torch.bfloat16
+    )
+
+
+def _column_tail_fake(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    return latent.new_empty((latent.shape[0], up_proj_rows.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_column_tail",
+    op_func=_column_tail_op,
+    mutates_args=[],
+    fake_impl=_column_tail_fake,
+)
+
+
+@mark_trace
+def column_tail(
+    latent: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    up_proj_rows: torch.Tensor,
+    shared: torch.Tensor,
+) -> torch.Tensor:
+    """Return the rank's [T, 896] columns, rounding projection plus add once.
+
+    The BF16 latent is [T, 3584], with 1..64 rows. Weight and shared views
+    can have padded row strides. Normalization keeps the model-sensitive
+    RMSNorm setting; the existing AITER GEMM/add owns the FP32 epilogue.
+    """
+    return torch.ops.aiter.kimi_k3_column_tail(
+        latent, norm_weight, eps, up_proj_rows, shared
+    )
+
+
+def _column_moe_op(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    from atom.config import get_current_atom_config
+
+    module = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return module._column_moe_forward(hidden_states)
+
+
+def _column_moe_fake(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return hidden_states.new_empty((hidden_states.shape[0], 896))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_moe_columns",
+    op_func=_column_moe_op,
+    mutates_args=[],
+    fake_impl=_column_moe_fake,
+)
+
+
+@dataclass(frozen=True)
+class ColumnTail:
+    """A rank's real columns; ordinary readers must gather them explicitly."""
+
+    columns: torch.Tensor
+    gather_name: str
+    world: int
+
+
+def _gather_columns_op(columns: torch.Tensor, world: int) -> torch.Tensor:
+    from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+    output = tensor_model_parallel_all_gather(columns, use_custom=True, dim=-1)
+    if output.shape != (columns.shape[0], columns.shape[1] * world):
+        raise RuntimeError("column gather returned the wrong TP geometry")
+    return output
+
+
+def _gather_columns_fake(columns: torch.Tensor, world: int) -> torch.Tensor:
+    return columns.new_empty((columns.shape[0], columns.shape[1] * world))
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_gather_columns",
+    op_func=_gather_columns_op,
+    mutates_args=[],
+    fake_impl=_gather_columns_fake,
+)
+
+
+def materialize_column_output(value):
+    """Return a complete tensor for an ordinary reader of a pending addend."""
+    if isinstance(value, ColumnTail):
+        return torch.ops.aiter.kimi_k3_gather_columns(value.columns, value.world)
+    return value
+
+
+class PeerColumnGather:
+    """One model's two-parity exchange, consumed by its next residual mix.
+
+    Each int64 word carries two BF16 columns and their row's epoch. A rank
+    cannot reuse a parity until its peers have read the preceding parity.
+    Every rank calls this exchange in the same order on its compute stream.
+    """
+
+    def __init__(self, hidden: int, rows: int, rank: int, world: int, group):
+        from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
+
+        if not self.fits(hidden, world) or not 0 < rows <= 64:
+            raise ValueError("column gather requires paired columns and 1..64 rows")
+        self.rank, self.world, self.rows = rank, world, rows
+        self.cols = hidden // world
+        words = 2 * world * rows * (self.cols // 2)
+        self.buffer = SymmetricPeerBuffer(8 * words, rank, world, group)
+        self.scratch = self.buffer.storage.view(torch.int64)
+        self.epochs = torch.zeros(rows, dtype=torch.int32, device=self.scratch.device)
+        self.scratch.zero_()
+        torch.cuda.synchronize(self.scratch.device)
+        if world > 1:
+            torch.distributed.barrier(group=group)
+        self.closed = False
+
+    @staticmethod
+    def fits(hidden: int, world: int) -> bool:
+        return (
+            hidden > 0
+            and world > 1
+            and world & (world - 1) == 0
+            and hidden % (2 * world) == 0
+        )
+
+    def close(self):
+        """Close mappings after every rank's work has finished, collectively."""
+        if not self.closed:
+            self.buffer.close()
+            self.closed = True
+
+    def kernel_args(self, share: torch.Tensor) -> dict:
+        if self.closed:
+            raise RuntimeError("column gather is closed")
+        if (
+            share.ndim != 2
+            or not 0 < share.shape[0] <= self.rows
+            or share.shape[1] != self.cols
+            or share.dtype != torch.bfloat16
+            or share.device != self.scratch.device
+            or share.stride(1) != 1
+            or share.stride(0) % 2
+        ):
+            raise ValueError("column share does not match its exchange")
+        return {
+            "share_ptr": share,
+            "scratch_ptr": self.scratch,
+            "peers_ptr": self.buffer.addresses,
+            "epochs_ptr": self.epochs,
+            "rank": self.rank,
+            "stride_share_t": share.stride(0),
+            "PEERS": self.world,
+            "COLS": self.cols,
+            "ROWS": self.rows,
+            "BW": triton.next_power_of_2(self.cols // 2),
+            "GATHER": True,
+        }
+
 
 try:
     import triton
@@ -49,6 +250,95 @@ except ImportError:  # pragma: no cover
 
 
 if _HAS_TRITON:
+
+    @triton.jit
+    def _mix_tile(
+        br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
+    ):
+        # One tile of the online softmax over a row's candidates; candidate B is ps.
+        o_l = (i_l * BL + tl.arange(0, BL)).to(tl.int64)
+        m_d = o_d < H
+        v = tl.load(
+            br_row + o_l[:, None] * stride_br_b + o_d[None, :],
+            mask=(o_l < B)[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.where((o_l == B)[:, None], ps[None, :], v)
+
+        # score_weight = norm_weight * proj_weight, precomputed at load time
+        rstd = tl.rsqrt(tl.sum(v * v, axis=1) / H + eps)
+        s = tl.where(o_l <= B, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf"))
+
+        b_m, b_mp = tl.maximum(b_m, tl.max(s, axis=0)), b_m
+        r = tl.exp(b_mp - b_m)  # rescale for the new max
+        p = tl.exp(s - b_m)
+        b_acc = b_acc * r + tl.sum(p, axis=0)
+        b_o = b_o * r + tl.sum(p[:, None] * v, axis=0)
+        return b_m, b_acc, b_o
+
+    @triton.jit
+    def _finish_prefix(
+        ps,
+        t,
+        o_d,
+        m_d,
+        flag,
+        rank,
+        scratch_ptr,
+        share_ptr,
+        epochs_ptr,
+        hs2_ptr,
+        pref_ptr,
+        stride_share_t,
+        stride_hs2_t,
+        stride_pref_t,
+        PEERS: tl.constexpr,
+        COLS: tl.constexpr,
+        ROWS: tl.constexpr,
+        GATHER: tl.constexpr,
+        DO_ADD2: tl.constexpr,
+        WRITE_PREF: tl.constexpr,
+    ):
+        # The prefix's last adds and its store: the gathered columns, the
+        # second addend, then the summed prefix back to pref_ptr.
+        W: tl.constexpr = COLS // 2
+        if GATHER:
+            # This rank's columns from its share, the others' from the scratch
+            # once their words carry the epoch. .cv reads past the caches,
+            # where a stale line would hide the peer's store.
+            src = o_d // COLS
+            col = o_d % COLS
+            words = scratch_ptr + (((flag & 1) * PEERS + src) * ROWS + t) * W + col // 2
+            remote = m_d & (src != rank)
+            ready = flag.to(tl.int64) << 32
+            w = tl.load(
+                words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+            )
+            while tl.min(((w >> 32).to(tl.int32) == flag).to(tl.int32), axis=0) == 0:
+                w = tl.load(
+                    words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+                )
+            bits = ((w >> ((col % 2) * 16).to(tl.int64)) & 0xFFFF).to(tl.int32)
+            mine = tl.load(
+                share_ptr + t * stride_share_t + o_d - rank * COLS,
+                mask=m_d & (src == rank),
+                other=0.0,
+            ).to(tl.float32)
+            ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
+            # Every warp loaded the epoch before the poll's cross-warp min, so
+            # no warp reads this store back as its own.
+            tl.store(epochs_ptr + t, flag)
+        if DO_ADD2:
+            ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
+        if WRITE_PREF:
+            tl.store(
+                pref_ptr + t * stride_pref_t + o_d,
+                ps.to(pref_ptr.dtype.element_ty),
+                mask=m_d,
+            )
+        return ps
 
     @triton.jit
     def _attn_res_fused_kernel(
@@ -84,6 +374,17 @@ if _HAS_TRITON:
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
         QUANT: tl.constexpr,  # fold the consumer's per-token quant into the store
+        share_ptr=None,
+        scratch_ptr=None,
+        peers_ptr=None,
+        epochs_ptr=None,
+        rank=0,
+        stride_share_t=0,
+        PEERS: tl.constexpr = 1,
+        COLS: tl.constexpr = 2,
+        ROWS: tl.constexpr = 1,
+        BW: tl.constexpr = 1,
+        GATHER: tl.constexpr = False,
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -121,9 +422,31 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
-        t = tl.program_id(0)
+        # Fixed-capacity bank strides can put live rows past 2**31 elements.
+        t = tl.program_id(0).to(tl.int64)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
+        flag = 0
+        if GATHER:
+            W: tl.constexpr = COLS // 2
+            flag = tl.load(epochs_ptr + t) + 1
+            o_w = tl.arange(0, BW)
+            o_p = tl.arange(0, PEERS)
+            data = tl.load(
+                share_ptr.to(tl.pointer_type(tl.int32))
+                + t * (stride_share_t // 2)
+                + o_w,
+                mask=o_w < W,
+                other=0,
+            )
+            word = (flag.to(tl.int64) << 32) | (data.to(tl.int64) & 0xFFFFFFFF)
+            slot = (((flag & 1) * PEERS + rank) * ROWS + t) * W + o_w
+            peers = tl.load(peers_ptr + o_p).to(tl.pointer_type(tl.int64))
+            tl.store(
+                peers[:, None] + slot[None, :],
+                word[None, :],
+                mask=(o_p < PEERS)[:, None] & (o_w < W)[None, :],
+            )
         sw = tl.load(sw_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
 
         # prefix (the last candidate) is loaded once and reused across tiles;
@@ -133,41 +456,69 @@ if _HAS_TRITON:
             ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
             )
-        if DO_ADD2:
-            ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
-                tl.float32
-            )
-        if WRITE_PREF:
-            tl.store(
-                pref_ptr + t * stride_pref_t + o_d,
-                ps.to(pref_ptr.dtype.element_ty),
-                mask=m_d,
-            )
-
         b_m = tl.full([], float("-inf"), dtype=tl.float32)  # running max
         b_acc = tl.zeros([], dtype=tl.float32)  # running softmax denominator
         b_o = tl.zeros([BD], dtype=tl.float32)  # running weighted sum
 
-        for i_l in range(tl.cdiv(Bp, BL)):
-            o_l = i_l * BL + tl.arange(0, BL)
-            m_l = o_l < Bp
-            is_last = o_l == B
-            v = tl.load(
-                br_ptr + t * stride_br_t + o_l[:, None] * stride_br_b + o_d[None, :],
-                mask=(o_l < B)[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            v = tl.where(is_last[:, None], ps[None, :], v)
-
-            # score_weight = norm_weight * proj_weight, precomputed at load time
-            rstd = tl.rsqrt(tl.sum(v * v, axis=1) / H + eps)
-            s = tl.where(m_l, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf"))
-
-            b_m, b_mp = tl.maximum(b_m, tl.max(s, axis=0)), b_m
-            r = tl.exp(b_mp - b_m)  # rescale for the new max
-            p = tl.exp(s - b_m)
-            b_acc = b_acc * r + tl.sum(p, axis=0)
-            b_o = b_o * r + tl.sum(p[:, None] * v, axis=0)
+        # Keep matching loop structures for gathered and full inputs. A lone
+        # bank-only tile stays with the prefix tile to preserve contraction.
+        BANK_TILES: tl.constexpr = B // BL if B >= 2 * BL else 0
+        FINISH_AFTER: tl.constexpr = 0 if GATHER and B // BL == 1 else -1
+        br_row = br_ptr + t * stride_br_t
+        for i_l in range(BANK_TILES):
+            b_m, b_acc, b_o = _mix_tile(
+                br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
+            )
+        if FINISH_AFTER < 0:
+            ps = _finish_prefix(
+                ps,
+                t,
+                o_d,
+                m_d,
+                flag,
+                rank,
+                scratch_ptr,
+                share_ptr,
+                epochs_ptr,
+                hs2_ptr,
+                pref_ptr,
+                stride_share_t,
+                stride_hs2_t,
+                stride_pref_t,
+                PEERS,
+                COLS,
+                ROWS,
+                GATHER,
+                DO_ADD2,
+                WRITE_PREF,
+            )
+        for i_l in range(BANK_TILES, tl.cdiv(Bp, BL)):
+            b_m, b_acc, b_o = _mix_tile(
+                br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
+            )
+            if i_l == FINISH_AFTER:
+                ps = _finish_prefix(
+                    ps,
+                    t,
+                    o_d,
+                    m_d,
+                    flag,
+                    rank,
+                    scratch_ptr,
+                    share_ptr,
+                    epochs_ptr,
+                    hs2_ptr,
+                    pref_ptr,
+                    stride_share_t,
+                    stride_hs2_t,
+                    stride_pref_t,
+                    PEERS,
+                    COLS,
+                    ROWS,
+                    GATHER,
+                    DO_ADD2,
+                    WRITE_PREF,
+                )
 
         b_o = b_o / b_acc
         if OUT_NORM:
@@ -227,14 +578,16 @@ def _apply_attn_res_impl(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
     quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
+    column_gather: str = "",
+    num_blocks: int | None = None,
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
 
-    Candidates are the B rows of ``block_residual`` plus ``prefix_sum``, so
-    ``score_weight`` must already fold the rmsnorm gain into the scoring
+    Candidates are its first ``num_blocks`` rows (all rows when omitted) plus
+    ``prefix_sum``. ``score_weight`` must fold the rmsnorm gain into the scoring
     projection (see ``_attn_res_score_weight`` on the model side).
 
     Returns ``(mixed_output, prefix_out)``. When ``add_hidden`` (and optionally
@@ -254,9 +607,25 @@ def _apply_attn_res_impl(
     mix would hand the consumer an activation on the wrong scale entirely.
     """
     T, B, H = block_residual.shape
+    if num_blocks is not None:
+        if not 0 <= num_blocks <= B:
+            raise ValueError("num_blocks must fit the supplied block bank")
+        B = num_blocks
     Bp = B + 1
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
+    gather = None
+    if column_gather:
+        from atom.config import get_current_atom_config
+
+        gather = get_current_atom_config().compilation_config.static_forward_context[
+            column_gather
+        ]
+        if not isinstance(gather, PeerColumnGather) or H != gather.world * gather.cols:
+            raise ValueError("residual mix does not match its column exchange")
+        if not do_add:
+            raise ValueError("column exchange requires a local column input")
+    load_add = do_add and gather is None
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
@@ -264,12 +633,12 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # the kernel reads T and B by stride (i32 offsets) and H unit-stride, so a
-    # slice of a wider block bank needs no copy
+    # The active prefix is read by stride (i64 offsets); a wider bank needs no
+    # slice or copy when H is unit-stride.
     br = (
         block_residual
         if block_residual.stride(-1) == 1
-        else block_residual.contiguous()
+        else block_residual[:, :B].contiguous()
     )
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
@@ -287,7 +656,7 @@ def _apply_attn_res_impl(
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
     # WRITE_PREF are False).
-    hs = add_hidden.contiguous() if do_add else ps
+    hs = add_hidden.contiguous() if load_add else ps
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
 
@@ -324,11 +693,12 @@ def _apply_attn_res_impl(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        DO_ADD=do_add,
+        DO_ADD=load_add,
         DO_ADD2=do_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
         QUANT=quant,
+        **(gather.kernel_args(add_hidden) if gather is not None else {}),
     )
     prefix_out = pref if do_add else prefix_sum
     if quant:
@@ -343,6 +713,7 @@ def _apply_attn_res_op(
     eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
+    num_blocks: int | None = None,
 ) -> torch.Tensor:
     mixed_output, _ = _apply_attn_res_impl(
         prefix_sum,
@@ -351,6 +722,7 @@ def _apply_attn_res_op(
         eps,
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
+        num_blocks=num_blocks,
     )
     return mixed_output
 
@@ -362,6 +734,7 @@ def _apply_attn_res_op_fake(
     eps: float,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
+    num_blocks: int | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(prefix_sum)
 
@@ -383,6 +756,8 @@ def _apply_attn_res_add_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -393,6 +768,8 @@ def _apply_attn_res_add_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         add_hidden2=add_hidden2,
+        column_gather=column_gather,
+        num_blocks=num_blocks,
     )
 
 
@@ -405,6 +782,8 @@ def _apply_attn_res_add_op_fake(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
 
@@ -430,6 +809,7 @@ def _apply_attn_res_quant_op(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     y, y_scale, _ = _apply_attn_res_impl(
         prefix_sum,
@@ -439,6 +819,7 @@ def _apply_attn_res_quant_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         quant_dtype=quant_dtype,
+        num_blocks=num_blocks,
     )
     return y, y_scale
 
@@ -451,6 +832,7 @@ def _apply_attn_res_quant_op_fake(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -478,6 +860,8 @@ def _apply_attn_res_add_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -489,6 +873,8 @@ def _apply_attn_res_add_quant_op(
         out_eps=out_eps,
         add_hidden2=add_hidden2,
         quant_dtype=quant_dtype,
+        column_gather=column_gather,
+        num_blocks=num_blocks,
     )
 
 
@@ -502,6 +888,8 @@ def _apply_attn_res_add_quant_op_fake(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    column_gather: str = "",
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -526,22 +914,29 @@ def apply_attn_res(
     block_residual: torch.Tensor,
     score_weight: torch.Tensor,
     eps: float,
-    add_hidden: torch.Tensor | None = None,
+    add_hidden: torch.Tensor | ColumnTail | None = None,
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     quant_dtype: torch.dtype | None = None,
+    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
     ``add_hidden2`` folds a second addend into the prefix (see the impl).
+    ``num_blocks`` bounds the active bank prefix without constructing a view.
 
     ``quant_dtype`` additionally folds the consuming GEMM's per-token quant in,
     making the first element of the returned pair a ``(quantized, scale)`` tuple
     rather than a tensor -- the same shape the fused-quant RMSNorm hands its
     consumers, so the call sites that already unpack one need no new branch."""
+    column_gather = ""
+    if isinstance(add_hidden, ColumnTail):
+        column_gather, add_hidden = add_hidden.gather_name, add_hidden.columns
+    if isinstance(add_hidden2, ColumnTail):
+        raise TypeError("the column tail must be the first pending addend")
     if quant_dtype is not None:
         if add_hidden is None:
             if add_hidden2 is not None:
@@ -554,6 +949,7 @@ def apply_attn_res(
                 out_norm_weight,
                 out_eps,
                 quant_dtype,
+                num_blocks,
             )
             return (y, y_scale), prefix_sum
         y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_apply_attn_res_add_quant(
@@ -566,6 +962,8 @@ def apply_attn_res(
             out_eps,
             quant_dtype,
             add_hidden2,
+            column_gather,
+            num_blocks,
         )
         return (y, y_scale), prefix_out
     if add_hidden is None:
@@ -573,7 +971,13 @@ def apply_attn_res(
             raise ValueError("add_hidden2 requires add_hidden")
         return (
             torch.ops.aiter.kimi_k3_apply_attn_res(
-                prefix_sum, block_residual, score_weight, eps, out_norm_weight, out_eps
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                out_norm_weight,
+                out_eps,
+                num_blocks,
             ),
             prefix_sum,
         )
@@ -586,4 +990,6 @@ def apply_attn_res(
         out_norm_weight,
         out_eps,
         add_hidden2,
+        column_gather,
+        num_blocks,
     )

@@ -37,7 +37,7 @@ import threading
 import warnings
 import weakref
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import torch
 
@@ -48,6 +48,7 @@ from atom.utils.graph_holders import register_graph_holder
 __all__ = [
     "ReqGraph",
     "TokenGraph",
+    "TokenGraphQueryLayout",
     "eager_region",
     "forks",
     "graph_pool",
@@ -57,6 +58,13 @@ __all__ = [
 ]
 
 _local = threading.local()
+
+
+class TokenGraphQueryLayout(NamedTuple):
+    """An unscaled, row-sliceable query declared by its native model layer."""
+
+    layer_num: int
+    dtype: torch.dtype
 
 
 def _recorder() -> "_Recorder | None":

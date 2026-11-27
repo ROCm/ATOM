@@ -197,6 +197,19 @@ def test_the_attention_op_takes_the_split_its_impl_asks_for(
     )
     monkeypatch.setattr(base, "_attention_region", lambda *args: ("region", args))
     monkeypatch.setattr(base, "_attention", lambda *args: ("call", args))
+    layers["layer"].impl.forward = lambda **kw: (
+        "call",
+        (
+            kw["query"],
+            kw["q_scale"],
+            kw["k_nope"],
+            kw["k_rope"],
+            kw["positions"],
+            "layer",
+            use_mla,
+            None,
+        ),
+    )
     q, k, v, positions = (torch.zeros(4, 2) for _ in range(4))
     q_scale = torch.ones(4, 1)  # q_b_proj's ptpc FP8 output scale
     kind, args = base.unified_attention_with_output_base(
@@ -725,6 +738,7 @@ def _kda_layer(model, calls, fused=False):
         num_local_heads=KDA_HEADS,
         local_proj_size=width,
         fuse_f_a_quant=fused,
+        _split_in_proj=False,
         conv_weight=None,
         in_proj=_scaled(w_in),
         f_b_proj=_scaled(w_f),

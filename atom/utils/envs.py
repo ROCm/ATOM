@@ -1211,7 +1211,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
     # --- MoE (DeepSeek-style shared experts) ---
-    # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # Dual-stream MoE only when num_tokens <= threshold; 0 disables the fork.
+    # Eligible Kimi latent TP blocks keep their dispatch op: outside capture/TBO
+    # the row tail also requires the model's fixed minimum row count.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),

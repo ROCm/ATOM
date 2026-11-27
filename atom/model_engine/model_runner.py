@@ -1266,6 +1266,12 @@ class ModelRunner:
         # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
         # both. A close error propagates once the rest of the teardown has run.
         try:
+            model = getattr(self, "model", None)
+            if model is not None:
+                for module in model.modules():
+                    close_resources = getattr(module, "close_inference_resources", None)
+                    if close_resources is not None:
+                        close_resources()
             sp_mega_moe = getattr(self, "sp_mega_moe", None)
             if sp_mega_moe is not None:
                 sp_mega_moe.close()

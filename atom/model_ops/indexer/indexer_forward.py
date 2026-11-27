@@ -31,6 +31,7 @@ from atom.model_ops.dcp_ops import (
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region
 from atom.utils.tbo.ubatching import tbo_active
 
 from .layout import MFMA, PRESHUFFLE, fp4_scale_byte
@@ -103,6 +104,7 @@ def _dcp_stage_indexer_fp4_prefill(
     return staged, staged_scale
 
 
+@eager_region()
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -131,6 +133,28 @@ def sparse_attn_indexer(
     stable_topk: bool,
     kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
+    # Cache writes and selection follow the live requests, outside the graph.
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    context = forward_context.context
+    if context.is_dummy_run:
+        return
+    slot_mapping = attn_metadata.slot_mapping
+    mode = getattr(context, "forward_mode", None)
+    if (
+        context.is_prefill
+        and mode is not None
+        and mode.prefill_token_graph
+        and 0 < context.scheduled_tokens < hidden_states.shape[0]
+    ):
+        rows = context.scheduled_tokens
+        hidden_states, q_input, k, weights = (
+            t[:rows] for t in (hidden_states, q_input, k, weights)
+        )
+        if positions is not None:
+            positions = positions[:rows]
+        # Keep the bucket-sized metadata for the drafter and ordinary readers.
+        slot_mapping = slot_mapping[:rows]
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
     # than there are prefill rows; giving the allocation that slack is what
@@ -145,15 +169,6 @@ def sparse_attn_indexer(
         dtype=torch.int32,
         device=hidden_states.device,
     )
-    # careful! this will be None in dummy run
-    forward_context = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    context = forward_context.context
-    slot_mapping = attn_metadata.slot_mapping
-    # Skip for dummy runs to avoid corrupting KV cache
-    if forward_context.context.is_dummy_run:
-        # dummy runner
-        return
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
     # Which width this indexer's cache is in -- the one thing the arguments

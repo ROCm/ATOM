@@ -433,8 +433,10 @@ def test_the_forward_writes_heads_ends_and_conv_windows(cpu_checkpoint_writer):
 
 
 @pytest.mark.parametrize("kind", ["none", "end", "mixed"])
+@pytest.mark.parametrize("route", ["eager", "split"])
+@pytest.mark.parametrize("bucket", [9, 16])
 def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
-    kind, monkeypatch, k3_modules, cpu_checkpoint_writer
+    kind, route, bucket, monkeypatch, k3_modules, cpu_checkpoint_writer
 ):
     model = k3_modules.model
     layer = object.__new__(model.KimiKDAAttention)
@@ -442,8 +444,14 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
     layer.layer_name, layer.layer_num = "layer_0", 0
     layer.local_proj_size, layer.num_local_heads, layer.head_dim = 2, 1, 2
     layer.fuse_f_a_quant, layer.activation, layer.conv_weight = False, "silu", None
-    fused = torch.arange(9 * 13, dtype=torch.float32).reshape(9, 13).bfloat16()[:, :11]
-    layer.in_proj = lambda x, **kw: fused
+    layer._split_in_proj = False
+    fused = (
+        torch.arange(bucket * 13, dtype=torch.float32)
+        .reshape(bucket, 13)
+        .bfloat16()[:, :11]
+    )
+    fused[9:] = float("nan")
+    layer.in_proj = lambda x, **kw: fused[: len(x)]
     layer.f_b_proj = lambda x: x.new_zeros((len(x), 2))
     layer.o_norm = lambda x, gate, **kw: x
     layer.o_proj = lambda x: x
@@ -490,12 +498,14 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         ssm_conv_state_len=3,
     )
     context = SimpleNamespace(
-        tr_graph=None,
+        tr_graph="record" if route == "split" else None,
         in_hipgraph=False,
+        context=SimpleNamespace(is_prefill=True, is_dummy_run=False),
         attn_metadata=SimpleNamespace(kda_metadata=metadata),
         kv_cache_data={"layer_0": SimpleNamespace(k_cache=conv_storage, v_cache=pool)},
     )
     monkeypatch.setattr(model, "get_forward_context", lambda: context)
+    monkeypatch.setattr(model, "prefill_token_graph_capture", lambda: route == "split")
     monkeypatch.setattr(
         model,
         "get_current_atom_config",
@@ -523,7 +533,7 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         calls.append((q.clone(), initial.clone(), offsets.clone()))
         assert final
         assert len(initial) + 1 == offsets.numel()
-        assert q.shape[1] == int(offsets[-1])
+        assert q.shape[1] >= int(offsets[-1])
         states = initial + torch.arange(len(initial)).reshape(-1, 1, 1, 1) + 100
         return q.contiguous(), states
 
@@ -532,16 +542,17 @@ def test_public_forward_reaches_the_prefill_and_checkpoint_writer(
         monkeypatch.setattr(
             layer, "_prefill_kda", lambda *a: pytest.fail("unneeded prefill wrapper")
         )
-    output = layer.forward(torch.zeros(11, 2, dtype=torch.bfloat16))
+    output = layer.forward(torch.zeros(bucket, 2, dtype=torch.bfloat16))
     assert len(calls) == 1
     q, initial, offsets = calls[0]
     selected = [*range(9), 4, 5, 6] if kind == "mixed" else list(range(9))
-    assert torch.equal(q.reshape(-1, 2), fused[selected, :2])
+    assert torch.equal(q.reshape(-1, 2)[: len(selected)], fused[selected, :2])
     assert initial[:, 0, 0, 0].tolist() == (
         [20, 30, 30] if kind == "mixed" else [20, 30]
     )
     assert offsets.tolist() == ([0, 4, 9, 12] if kind == "mixed" else [0, 4, 9])
-    torch.testing.assert_close(output, fused[:, :2], rtol=0, atol=0)
+    assert output.shape[0] == (bucket if route == "split" else 9)
+    torch.testing.assert_close(output[:9], fused[:9, :2], rtol=0, atol=0)
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
     torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
 

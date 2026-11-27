@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """apply_attn_res must read a strided slice of a block bank exactly as its copy."""
 
@@ -37,7 +38,7 @@ def _inputs(tokens, seed):
     }
 
 
-def _call(x, block_residual, adds, out_norm, quant):
+def _call(x, block_residual, adds, out_norm, quant, num_blocks=None):
     return _apply_attn_res_impl(
         x["prefix"],
         block_residual,
@@ -47,6 +48,7 @@ def _call(x, block_residual, adds, out_norm, quant):
         out_norm_weight=x["out_norm"] if out_norm else None,
         add_hidden2=x["adds"][1] if adds == 2 else None,
         quant_dtype=dtypes.fp8 if quant else None,
+        num_blocks=num_blocks,
     )
 
 
@@ -78,6 +80,7 @@ def test_bank_slice_matches_its_copy(tokens, adds, out_norm, quant):
         assert view.is_contiguous() == (blocks == BANK or tokens == 1)
         want = _call(x, view.contiguous(), adds, out_norm, quant)
         _assert_bitwise(_call(x, view, adds, out_norm, quant), want, f"{blocks} blocks")
+        _assert_bitwise(_call(x, x["bank"], adds, out_norm, quant, blocks), want)
 
 
 @pytest.mark.parametrize("tokens", [1, 16])
@@ -122,3 +125,26 @@ def test_strided_hidden_dim_is_still_copied():
     _assert_bitwise(
         _call(x, bank, 2, True, False), _call(x, bank.contiguous(), 2, True, False)
     )
+
+
+@pytest.mark.parametrize(
+    "capacity,blocks,block_major",
+    [(7, 7, False), (8, 1, False), (8, 8, True)],
+    ids=["contiguous-seven", "capacity-eight-live-one", "block-major-eight"],
+)
+@torch.inference_mode()
+def test_wide_bank_offsets(capacity, blocks, block_major):
+    tokens = 49152
+    shape = (capacity, tokens, HIDDEN) if block_major else (tokens, capacity, HIDDEN)
+    bank = torch.full(shape, blocks + 1, dtype=torch.bfloat16, device="cuda")
+    if block_major:
+        bank = bank.transpose(0, 1)
+    assert bank.stride(-1) == 1
+    assert max((tokens - 1) * bank.stride(0), (blocks - 1) * bank.stride(1)) > 2**31
+    prefix = torch.zeros((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    score = torch.zeros(HIDDEN, dtype=torch.float32, device="cuda")
+
+    got, prefix_out = _apply_attn_res_impl(prefix, bank, score, 1e-6, num_blocks=blocks)
+    # Zero scores average the live constant blocks with the zero prefix.
+    torch.testing.assert_close(got, torch.full_like(got, blocks), rtol=0, atol=0)
+    assert prefix_out is prefix
