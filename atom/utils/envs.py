@@ -1164,13 +1164,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SYNC_INTERVAL": _dp_sync_interval_env,
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
-    # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
-    # replicated path via `_can_use_dp_sharded_head`):
+    # case — TP>1, DP off, prefill, ragged/draft rows — falls back to the
+    # replicated path via `_can_use_dp_sharded_head`, except that "argmax" fails
+    # at startup without pure DP):
     #   "all2all"   -> shard vocab across the DP group + gather hidden, then a
     #                  single all-to-all delivers each rank its own rows x full
     #                  vocab (config ③, minimal comm). DEFAULT.
     #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
     #                  (config ②); kept for A/B and as a fallback.
+    #   "argmax"    -> same shard/gather, but exchange each shard's (max, id) and
+    #                  return greedy ids; the sampler is skipped. For all-greedy
+    #                  workloads only: startup fails without a single DP-sharded
+    #                  ParallelLMHead, with the model's own head output
+    #                  (verify_head) or with speculative decoding, and requests
+    #                  with temperature != 0, logprobs, structured output or a
+    #                  required channel are rejected.
     #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
     #                  explicit opt-out.
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
