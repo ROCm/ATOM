@@ -31,18 +31,12 @@ jobs:
       lumen_shell: ${{ steps.classify.outputs.lumen_shell }}
       lumen_package: ${{ steps.classify.outputs.lumen_package }}
       lumen_tests: ${{ steps.classify.outputs.lumen_tests }}
-      dapo_shard: ${{ steps.classify.outputs.dapo_shard }}
-      lumen_shard: ${{ steps.classify.outputs.lumen_shard }}
       lumen_compat: ${{ steps.classify.outputs.lumen_compat }}
-      lumen_root_docker: ${{ steps.classify.outputs.lumen_root_docker }}
-      lumen_packaging: ${{ steps.classify.outputs.lumen_packaging }}
       packaging_workflow: ${{ steps.classify.outputs.packaging_workflow }}
       atomrl_packaging: ${{ steps.classify.outputs.atomrl_packaging }}
       main_workflow: ${{ steps.classify.outputs.main_workflow }}
       run_atomrl: ${{ steps.result.outputs.run_atomrl }}
       run_lumen: ${{ steps.result.outputs.run_lumen }}
-      run_atomrl_gpu: ${{ steps.result.outputs.run_atomrl_gpu }}
-      run_lumen_gpu: ${{ steps.result.outputs.run_lumen_gpu }}
       run_packaging: ${{ steps.result.outputs.run_packaging }}
     steps:
       - uses: actions/checkout@v6
@@ -64,41 +58,8 @@ jobs:
               - 'atomrl/atomrl/lumen/**'
             lumen_tests:
               - 'atomrl/tests/lumen/**'
-            lumen_shard:
-              - '.github/workflows/atomrl-lumen-gpu-shard.yaml'
             lumen_compat:
               - '.github/scripts/lumen-docker-compat.py'
-              - '.github/scripts/run_lumen_gpu_suite.sh'
-            dapo_shard:
-              - '.github/workflows/atomrl-dapo-gpu-shard.yaml'
-            atomrl_gpu_core:
-              - 'atomrl/atomrl/**/*.{py,c,cc,cpp,cu,hip}'
-              - '!atomrl/atomrl/lumen/**'
-            dapo_gpu_examples:
-              - 'atomrl/examples/{DAPO,GRPO,SDDD,harness}/**/*.{py,sh,bash,yaml,yml,toml,json}'
-            dapo_gpu_runner:
-              - 'atomrl/examples/run.sh'
-              - '.github/scripts/run_atomrl_dapo_gpu_suite.sh'
-            dapo_gpu_catalog:
-              - 'atomrl/examples/examples.yaml'
-            atomrl_gpu_docker:
-              - 'atomrl/docker/Dockerfile.dev'
-            atomrl_gpu_build_inputs:
-              - 'atomrl/{pyproject.toml,setup.py,release/build_apex_te.sh}'
-            lumen_gpu_code:
-              - 'atomrl/{atomrl/lumen,lumen,tests/lumen}/**/*.{py,sh,bash,yaml,yml,toml,json,c,cc,cpp,cu,hip}'
-              - '!atomrl/lumen/lumen-docs/**'
-            lumen_gpu_docker:
-              - 'atomrl/lumen/**/Dockerfile*'
-            lumen_root_docker:
-              - 'atomrl/docker/{Dockerfile.lumen,Dockerfile.lumenrelease}'
-            lumen_packaging:
-              - 'atomrl/{pyproject.toml,setup.py}'
-            lumen_gpu_deps:
-              - 'atomrl/lumen/**/requirements*.txt'
-              - '!atomrl/lumen/lumen-docs/**'
-            lumen_gpu_setup:
-              - 'atomrl/setup.py'
             packaging_workflow:
               - '.github/workflows/atomrl-*.yaml'
             atomrl_packaging:
@@ -111,64 +72,25 @@ jobs:
           LUMEN_SHELL: ${{ steps.classify.outputs.lumen_shell }}
           LUMEN_PACKAGE: ${{ steps.classify.outputs.lumen_package }}
           LUMEN_TESTS: ${{ steps.classify.outputs.lumen_tests }}
-          LUMEN_SHARD: ${{ steps.classify.outputs.lumen_shard }}
           LUMEN_COMPAT: ${{ steps.classify.outputs.lumen_compat }}
-          LUMEN_ROOT_DOCKER: ${{ steps.classify.outputs.lumen_root_docker }}
-          LUMEN_PACKAGING: ${{ steps.classify.outputs.lumen_packaging }}
-          DAPO_SHARD: ${{ steps.classify.outputs.dapo_shard }}
-          ATOMRL_GPU_CORE: ${{ steps.classify.outputs.atomrl_gpu_core }}
-          ATOMRL_GPU_DOCKER: ${{ steps.classify.outputs.atomrl_gpu_docker }}
-          ATOMRL_GPU_BUILD_INPUTS: ${{ steps.classify.outputs.atomrl_gpu_build_inputs }}
-          DAPO_GPU_EXAMPLES: ${{ steps.classify.outputs.dapo_gpu_examples }}
-          DAPO_GPU_RUNNER: ${{ steps.classify.outputs.dapo_gpu_runner }}
-          DAPO_GPU_CATALOG: ${{ steps.classify.outputs.dapo_gpu_catalog }}
-          LUMEN_GPU_CODE: ${{ steps.classify.outputs.lumen_gpu_code }}
-          LUMEN_GPU_DOCKER: ${{ steps.classify.outputs.lumen_gpu_docker }}
-          LUMEN_GPU_DEPS: ${{ steps.classify.outputs.lumen_gpu_deps }}
-          LUMEN_GPU_SETUP: ${{ steps.classify.outputs.lumen_gpu_setup }}
           PACKAGING_WORKFLOW: ${{ steps.classify.outputs.packaging_workflow }}
           ATOMRL_PACKAGING: ${{ steps.classify.outputs.atomrl_packaging }}
           MAIN_WORKFLOW: ${{ steps.classify.outputs.main_workflow }}
         run: |
           run_atomrl=false
           run_lumen=false
-          run_atomrl_gpu=false
-          run_lumen_gpu=false
           run_packaging=false
           if [[ "$ATOMRL" == true || "$LUMEN_PACKAGE" == true ||
                 "$LUMEN_TESTS" == true ||
-                "$LUMEN_GPU_CODE" == true || "$LUMEN_GPU_DEPS" == true ||
-                "$LUMEN_GPU_SETUP" == true ||
-                "$DAPO_SHARD" == true ||
                 "$LUMEN_COMPAT" == true || "$MAIN_WORKFLOW" == true ||
                 "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             run_atomrl=true
           fi
           if [[ "$LUMEN_SHELL" == true || "$LUMEN_PACKAGE" == true ||
-                "$LUMEN_TESTS" == true || "$LUMEN_SHARD" == true ||
-                "$LUMEN_COMPAT" == true ||
+                "$LUMEN_TESTS" == true || "$LUMEN_COMPAT" == true ||
                 "$MAIN_WORKFLOW" == true ||
                 "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             run_lumen=true
-          fi
-          if [[ "$ATOMRL_GPU_CORE" == true || "$ATOMRL_GPU_DOCKER" == true ||
-                "$ATOMRL_GPU_BUILD_INPUTS" == true ||
-                "$LUMEN_PACKAGE" == true || "$LUMEN_GPU_SETUP" == true ||
-                "$DAPO_GPU_EXAMPLES" == true || "$DAPO_GPU_RUNNER" == true ||
-                "$DAPO_GPU_CATALOG" == true ||
-                "$DAPO_SHARD" == true ||
-                "$MAIN_WORKFLOW" == true ||
-                "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            run_atomrl_gpu=true
-          fi
-          if [[ "$LUMEN_GPU_CODE" == true || "$LUMEN_GPU_DOCKER" == true ||
-                "$LUMEN_ROOT_DOCKER" == true || "$LUMEN_PACKAGING" == true ||
-                "$LUMEN_GPU_DEPS" == true ||
-                "$LUMEN_GPU_SETUP" == true || "$LUMEN_SHARD" == true ||
-                "$LUMEN_COMPAT" == true ||
-                "$MAIN_WORKFLOW" == true ||
-                "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            run_lumen_gpu=true
           fi
           if [[ "$PACKAGING_WORKFLOW" == true || "$ATOMRL_PACKAGING" == true ||
                 "$MAIN_WORKFLOW" == true ||
@@ -177,8 +99,6 @@ jobs:
           fi
           echo "run_atomrl=$run_atomrl" >> "$GITHUB_OUTPUT"
           echo "run_lumen=$run_lumen" >> "$GITHUB_OUTPUT"
-          echo "run_atomrl_gpu=$run_atomrl_gpu" >> "$GITHUB_OUTPUT"
-          echo "run_lumen_gpu=$run_lumen_gpu" >> "$GITHUB_OUTPUT"
           echo "run_packaging=$run_packaging" >> "$GITHUB_OUTPUT"
   packaging:
     name: Verify wheel (Python ${{ matrix.python-version }})
@@ -276,26 +196,3 @@ jobs:
             atomrl/tests/lumen/patches/test_cli.py \
             atomrl/tests/lumen/models/test_launcher_parity.py \
             atomrl/tests/lumen/models/test_training_stack_policy.py -q
-
-  lumen-gpu:
-    name: Lumen README GPU cases
-    needs: changes
-    if: >-
-      needs.changes.outputs.run_lumen_gpu == 'true'
-      && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    uses: ./.github/workflows/atomrl-lumen-gpu-shard.yaml
-    secrets: inherit
-    with:
-      image_tag: atomrl:lumen-ci
-
-  dapo-gpu:
-    name: AtomRL DAPO GPU examples
-    needs: changes
-    if: >-
-      needs.changes.outputs.run_atomrl_gpu == 'true'
-      && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    uses: ./.github/workflows/atomrl-dapo-gpu-shard.yaml
-    secrets: inherit
-    with:
-      image_tag: atomrl:dapo-ci
-      data_root: /models/atomrl

@@ -41,12 +41,6 @@ python3 -c "import apex; print('apex ok')"
 git clone https://github.com/ROCm/TransformerEngine.git "$SRC/te"
 git -C "$SRC/te" checkout "$TE_SHA"
 git -C "$SRC/te" submodule update --init --recursive --jobs 16
-# ROCm LLVM 24 rejects quoted wildcard exports when no matching typeinfo
-# symbols are emitted. Removing these two no-op patterns leaves all concrete
-# QoLA exports unchanged.
-sed -i \
-    '/"typeinfo for qola::\*";/d; /"typeinfo name for qola::\*";/d' \
-    "$SRC/te/3rdparty/QoLA/qola/cpp_itfs/qola_exports.lds"
 cd "$SRC/te"
 export NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1
 export NVTE_ROCM_ARCH="$ARCH" PYTORCH_ROCM_ARCH="$ARCH"

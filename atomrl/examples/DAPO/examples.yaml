@@ -116,8 +116,7 @@ examples:
       steps: 3
       checks:
         metrics:
-          # Pinned runs now span down to 0.001958 under dynamic sampling.
-          - {name: rollout_corr/k3_kl, ref: 0.00399, rtol: 0.60}
+          - {name: rollout_corr/k3_kl, ref: 0.00399, rtol: 0.50}
           - {name: entropy, ref: 0.599, rtol: 0.50}
           - {name: rollout_corr/kl, ref: 0.00374, band: 10}
           - {name: rollout_corr/ppl_ratio, info: true}
@@ -165,8 +164,7 @@ examples:
       checks:
         metrics:
           - {name: rollout_corr/k3_kl, ref: 0.00144, rtol: 0.50}
-          # Pinned runs now span through 1.023 at step 1 under dynamic sampling.
-          - {name: entropy, ref: 0.620, rtol: 0.70}
+          - {name: entropy, ref: 0.620, rtol: 0.60}
           - {name: rollout_corr/kl, ref: 0.00140, band: 10}
           - {name: rollout_corr/ppl_ratio, info: true}
     full: {config: configs/dapo_qwen3moe_a3b_ray_vllm_verlref_longrun.yaml}
@@ -190,8 +188,8 @@ examples:
       checks:
         metrics:
           - {name: rollout_corr/k3_kl, ref: 0.00161, rtol: 0.50}
-          # Pinned-model runs measured 0.602, 0.686, 0.986 and 1.243 at step 1.
-          - {name: entropy, ref: 0.986, rtol: 0.60}
+          # Pinned-model runs measured 0.686, 0.986 and 1.243 at step 1.
+          - {name: entropy, ref: 0.986, rtol: 0.32}
           - {name: rollout_corr/kl, ref: 0.00161, band: 10}
           - {name: rollout_corr/ppl_ratio, info: true}
     full: {config: configs/dapo_qwen3moe_a3b_ray_megatron_verlref_4k_longrun.yaml}
