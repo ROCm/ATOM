@@ -30,6 +30,7 @@ from atom.model_engine.engine_utility import (
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
+from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY, RequestOutput
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -84,6 +85,35 @@ def dp_idle_when_blocked(config: Config) -> bool:
     if enabled is None:
         enabled = disaggregated_kv_role(config) == "kv_producer"
     return enabled
+
+
+def send_early_handoff_answers(core) -> None:
+    """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: tell each early request's front end
+    that the step just scheduled scheduled it (or sent it to wait for D), so
+    it answers the router now. Queued ahead of the step's forward."""
+    take = getattr(
+        getattr(core.scheduler, "kv_connector", None), "take_early_answers", None
+    )
+    answers = take() if callable(take) else None
+    if not isinstance(answers, list) or not answers:
+        return
+    core.output_queue.put_nowait(
+        (
+            "STREAM",
+            [
+                (
+                    req_id,
+                    RequestOutput(
+                        request_id=req_id,
+                        output_tokens=[],
+                        finished=False,
+                        kv_transfer_params_output={PD_EARLY_SCHEDULED_KEY: True},
+                    ),
+                )
+                for req_id in answers
+            ],
+        )
+    )
 
 
 def yield_gil() -> None:
@@ -668,6 +698,7 @@ class EngineCore:
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
         result = self.scheduler.schedule()
+        send_early_handoff_answers(self)
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.

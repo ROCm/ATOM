@@ -734,6 +734,308 @@ def test_late_write_request_before_p_allocation_is_not_expired(monkeypatch):
     pw._notify_transfer_result.assert_not_called()
 
 
+# ------------------------------- a retired transfer releases its early source
+
+
+def test_worker_reports_a_retired_transfers_source_safe():
+    """A save for a transfer the worker already retired creates no source
+    (no reader can acquire it), so the worker reports the send claim safe;
+    `continue`-ing silently left the finished request's blocks and state slot
+    deferred forever (c2048 hang)."""
+    from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+    pw, _, _, _ = idle_producer()
+    with pw._completed_prefills_lock:
+        pw._retire_chunked_transfer(TRANSFER)
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_save(
+        7,
+        [0, 1, 2],
+        {"transfer_id": TRANSFER, "chunked_transfer": True, "num_prompt_tokens": 10},
+    )
+    pw.start_load_kv(meta)
+    assert TRANSFER not in pw._chunked_prefills
+    out = pw.get_finished()
+    assert mc.ConnectorCompletion("pd_source_safe", 7, True) in (
+        out.connector_completions
+    )
+
+
+def test_failed_report_for_an_allocated_early_source_aborts_it(
+    monkeypatch, seq_factory
+):
+    """`pd_admission_ready(False)` for a source allocated before D (not in
+    `_chunked_waiting` any more) used to be ignored, so P prefilled for
+    nobody. Now the scheduler is asked to abort it."""
+    p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=6)
+    a = seq_factory(_prompt(3), kv_transfer_params=p_params("early-a"))
+    b = seq_factory(_prompt(1, 100), kv_transfer_params=p_params("early-b"))
+    for s in (a, b):
+        assert p.admission_ready(s)
+        _allocate(p, s, [0, 1, 2] if s is a else [3])
+    assert set(p._early_sources) == {str(a.id), str(b.id)}
+    _ack(p, a, succeeded=False)
+    _ack(p, b)  # D reached B: not aborted, no longer tracked
+    assert p.take_sources_to_abort() == [a.id]
+    assert p.take_sources_to_abort() == []
+    assert not p._early_sources and not p._spec_pins
+
+
+def _p_scheduler_with_state_slots(monkeypatch, num_blocks, state_slots):
+    from conftest import MockConfig
+
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+    from atom.model_engine.scheduler import Scheduler
+
+    p = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=num_blocks,
+            max_num_batched_tokens=4,
+            pool_entries={STATE_SLOT_CLASS: state_slots},
+        )
+    )
+    p.kv_connector = make_scheduler_connector(
+        monkeypatch, True, early=True, num_kvcache_blocks=num_blocks
+    )
+    return p
+
+
+@pytest.mark.parametrize("per_req_state", [False, True])
+def test_p_stall_past_the_lookup_timeout_releases_the_early_source(
+    monkeypatch, seq_factory, per_req_state
+):
+    """The c2048 P0 wedge, end to end. P allocates an early source before D
+    (idle pool), then that step stalls past PREFILL_LOOKUP_TIMEOUT before its
+    metadata (the registration and the save) reaches the worker. D's write
+    request queues meanwhile; out of the stall, `get_finished` runs before
+    the metadata and retires it as an orphan, telling D it failed. The
+    registration and the save then arrive for a retired transfer.
+
+    P must stop the prefill, and the source -- its blocks and its state slot
+    -- must come back (before the fix: `released 0 of N`, `state: 128/128`
+    and Running 0 for good). D must abort the receive and free its pages."""
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+    from atom.model_engine.sequence import SequenceStatus
+    from atom.sampling_params import SamplingParams
+
+    monkeypatch.setattr(mc, "PREFILL_LOOKUP_TIMEOUT", 0.05)
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
+    p = _p_scheduler_with_state_slots(monkeypatch, 6, 1 if per_req_state else 0)
+    d = _d_scheduler(monkeypatch)
+    ps = seq_factory(
+        _prompt(3),
+        sampling_params=SamplingParams(max_tokens=1),
+        kv_transfer_params=p_params(TRANSFER),
+        has_per_req_cache=per_req_state,
+    )
+    _, ds = _pair(seq_factory, TRANSFER, _prompt(3))
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    results = []
+    _wire(pw, dw, results)
+    p_free, d_free = p.block_manager.kv.num_free, d.block_manager.kv.num_free
+
+    p.extend([ps])
+    batch, seqs = p.schedule()
+    assert list(seqs) == [ps.id] and str(ps.id) in p.kv_connector._spec_pins
+    if per_req_state:
+        assert ps.state_slot >= 0 and not p.block_manager.state.has_free(1)
+    stalled_meta = batch.connector_meta_output  # this step stalls
+    # D got P's early answer and reaches P's listener during the stall.
+    d.extend([ds])
+    d_batch, _ = d.schedule()
+    dw.start_load_kv(d_batch.connector_meta_output)
+    post_write_requests(dw, monkeypatch)
+    assert pw._pending_chunked_requests
+    time.sleep(0.1)  # the stall outlasts the (shortened) lookup timeout
+    # Out of the stall: get_finished runs before the step's metadata.
+    p._update_from_kv_xfer_finished(pw.get_finished())
+    assert results == [(TRANSFER, False)]  # retired as an orphan, D told
+    pw.start_load_kv(stalled_meta)  # registration + save of a retired transfer
+    p._update_from_kv_xfer_finished(pw.get_finished())
+    assert ps.status == SequenceStatus.ABORTED, "P must not prefill for nobody"
+    # The stalled forward returns; the aborted request leaves.
+    p.postprocess(
+        [ps], ScheduledBatchOutput([ps.id], [(42,)], None, None, None), batch=batch
+    )
+    pw.start_load_kv(p.kv_connector.build_connector_meta())
+    p._update_from_kv_xfer_finished(pw.get_finished())
+    assert ps.status == SequenceStatus.FINISHED and ps.leave_reason == "aborted"
+    assert not p.deferred_free_blocks and not ps.block_table
+    assert p.block_manager.kv.num_free == p_free
+    if per_req_state:
+        assert p.block_manager.state.has_free(1)
+    conn = p.kv_connector
+    assert not conn._spec_pins and not conn._early_sources
+    assert not conn._awaiting_send and not conn._chunked_waiting
+    assert not pw._chunked_prefills and not pw._chunked_local_ids
+    # D gives up on the receive and frees its reservation.
+    d._update_from_kv_xfer_finished(dw.get_finished())
+    assert ds.leave_reason == "aborted"
+    assert d.block_manager.kv.num_free == d_free
+
+    # The rank is not wedged: the next early request allocates (its state
+    # slot included) and completes with D.
+    ps2, ds2 = _pair(seq_factory, "early-next", _prompt(3, 100))
+    ps2.has_per_req_cache = per_req_state
+    p.extend([ps2])
+    d.extend([ds2])
+    finished, _ = _drive(p, d, pw, dw, monkeypatch, lambda f: ds2 in f)
+    assert ds2 in finished and ("early-next", True) in results
+    assert not p.deferred_free_blocks and p.block_manager.kv.num_free == p_free
+
+
+# ----------------------------------- answering when P schedules the request
+
+
+@pytest.mark.parametrize("at_schedule", [False, True])
+def test_answer_waits_for_allocation_or_the_gate(monkeypatch, seq_factory, at_schedule):
+    """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: an early request is answered when
+    its source is allocated, or at once when the rule sends it to wait for D
+    (D must learn of it, or it would wait on itself). Queuing on P's own
+    capacity answers nothing. Each request is answered once."""
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1" if at_schedule else "0")
+    p = make_scheduler_connector(monkeypatch, True, early=True, num_kvcache_blocks=7)
+    a = seq_factory(_prompt(3), kv_transfer_params=p_params("early-a"))
+    b = seq_factory(_prompt(4, 100), kv_transfer_params=p_params("early-b"))
+    c = seq_factory(_prompt(1, 200), kv_transfer_params=p_params("early-c"))
+    for s in (a, b):
+        assert p.admission_ready(s)  # registered by `add`; 3 + 4 <= 7
+    assert p.take_early_answers() == []
+    _allocate(p, a, [0, 1, 2])
+    assert p.admission_ready(a)  # re-asked: no second answer
+    assert p.take_early_answers() == ([a.id] if at_schedule else [])
+    assert not p.admission_ready(c)  # 3 pinned + 1 + room for B (4) > 7: gate
+    assert not p.admission_ready(c)
+    assert p.take_early_answers() == ([c.id] if at_schedule else [])
+    _ack(p, c)
+    assert p.admission_ready(c)
+    _allocate(p, c, [3])  # D reached it first; it was answered already
+    assert p.take_early_answers() == []
+    c.leave_reason = "aborted"
+    p.request_finished(c)
+    assert c.id not in p._answered
+
+
+def test_router_chunked_leg_is_never_answered_by_the_scheduler(
+    monkeypatch, seq_factory
+):
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    p = make_scheduler_connector(monkeypatch, True, early=True)
+    seq = seq_factory(list(range(10)), kv_transfer_params=p_params(early=False))
+    assert not p.admission_ready(seq)
+    _ack(p, seq)
+    _allocate(p, seq, [0, 1, 2])
+    assert p.take_early_answers() == []
+
+
+def test_engine_sends_each_answer_as_a_tokenless_stream_output(monkeypatch):
+    import queue
+
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import send_early_handoff_answers
+    from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY
+
+    answers = [[3, 5], []]
+    core = SimpleNamespace()
+    core.scheduler = SimpleNamespace(
+        kv_connector=SimpleNamespace(take_early_answers=lambda: answers.pop(0))
+    )
+    core.output_queue = queue.Queue()
+    send_early_handoff_answers(core)
+    send_early_handoff_answers(core)  # nothing due: nothing sent
+    kind, outputs = core.output_queue.get_nowait()
+    assert core.output_queue.empty() and kind == "STREAM"
+    assert [rid for rid, _ in outputs] == [3, 5]
+    for rid, out in outputs:
+        assert out.request_id == rid and out.output_tokens == []
+        assert not out.finished
+        assert out.kv_transfer_params_output == {PD_EARLY_SCHEDULED_KEY: True}
+    core.scheduler = SimpleNamespace(kv_connector=None)
+    send_early_handoff_answers(core)  # no connector: no-op
+    assert core.output_queue.empty()
+
+
+def test_multi_connector_forwards_answers_and_aborts():
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [
+        SimpleNamespace(
+            take_early_answers=lambda: [1, 2], take_sources_to_abort=lambda: [9]
+        ),
+        SimpleNamespace(),  # an offload tier keeps neither
+    ]
+    assert multi.take_early_answers() == [1, 2]
+    assert multi.take_sources_to_abort() == [9]
+
+
+def test_at_schedule_answers_progress_with_real_schedulers(monkeypatch, seq_factory):
+    """D only learns of a request from P's answer, which now leaves when P
+    schedules it. P has room for both prompts but one prefill chunk a step,
+    so B is answered only once P gets to it; both complete, and P's pool and
+    D's pool end whole."""
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    p = _p_scheduler(monkeypatch, num_blocks=6)
+    d = _d_scheduler(monkeypatch, num_blocks=6)
+    pa, da = _pair(seq_factory, "early-a", _prompt(3))
+    pb, db = _pair(seq_factory, "early-b", _prompt(3, 100))
+    d_of = {pa.id: da, pb.id: db}
+    p.extend([pa, pb])
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    _wire(pw, dw)
+    answered = []
+
+    def relay_answers():
+        for rid in p.kv_connector.take_early_answers():
+            answered.append((rid, len(pb.block_table)))
+            d.extend([d_of[rid]])
+
+    finished, started = _drive(
+        p, d, pw, dw, monkeypatch, lambda f: len(f) == 2, watch=relay_answers
+    )
+    assert [rid for rid, _ in answered] == [pa.id, pb.id]
+    assert answered[0][1] == 0, "B must not be answered before P schedules it"
+    assert started == [pa.id, pb.id]
+    assert {s.id for s in finished} == {da.id, db.id}
+    assert p.block_manager.kv.num_free == 6 and d.block_manager.kv.num_free == 6
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
+
+
+@pytest.mark.parametrize("pool", [3, 6])
+def test_at_schedule_gate_answers_without_deadlock(monkeypatch, seq_factory, pool):
+    """Copilot's opposite-order case under answer-at-schedule: with room for
+    one prompt the rule gates both requests, and a gated request is answered
+    at once, so D can reserve it and P follows D's order. With room for both,
+    answers follow P's order. Both complete either way."""
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    p = _p_scheduler(monkeypatch, num_blocks=pool)
+    d = _d_scheduler(monkeypatch, num_blocks=3)
+    pa, da = _pair(seq_factory, "early-a", list(range(10)))
+    pb, db = _pair(seq_factory, "early-b", list(range(10)))
+    d_of = {pa.id: da, pb.id: db}
+    p.extend([pa, pb])
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+    _wire(pw, dw)
+
+    def relay_answers():
+        # D admits in reverse answer order when both arrive together.
+        d.extend([d_of[rid] for rid in reversed(p.kv_connector.take_early_answers())])
+
+    finished, _ = _drive(
+        p, d, pw, dw, monkeypatch, lambda f: len(f) == 2, watch=relay_answers
+    )
+    assert {s.id for s in finished} == {da.id, db.id}
+    assert p.block_manager.kv.num_free == pool and d.block_manager.kv.num_free == 3
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
+
+
 # ----------------------------------------------------- negotiation (P and D API)
 
 
@@ -1044,6 +1346,92 @@ def test_router_hanging_up_aborts_the_prefill(monkeypatch, api):
 
     asyncio.run(go())
     assert calls.aborted == [11]
+
+
+def _scheduled(calls):
+    from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY
+
+    calls.callback(
+        SimpleNamespace(
+            output_tokens=[],
+            logprobs=None,
+            finished=False,
+            finish_reason=None,
+            num_cached_tokens=0,
+            kv_transfer_params_output={PD_EARLY_SCHEDULED_KEY: True},
+        )
+    )
+
+
+def test_at_schedule_the_answer_waits_for_the_scheduler(monkeypatch, api):
+    """Line 1 leaves only once P's scheduler reports the request scheduled;
+    line 2 still waits for the end of the prefill."""
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    _, calls = _engine(api, monkeypatch)
+
+    async def go():
+        gen = _generate(api, dict(ROUTER_ASKS))
+        first = asyncio.ensure_future(gen.__anext__())
+        await asyncio.sleep(0.05)
+        assert not first.done(), "no answer before P schedules the request"
+        _scheduled(calls)
+        out = await first
+        assert out["kv_transfer_output_meta_info"]["dp_rank"] == 2
+        response = api._nonstream_response({"x": 1}, out)
+        it = response.body_iterator
+        await it.__anext__()
+        line2 = asyncio.ensure_future(it.__anext__())
+        await asyncio.sleep(0.02)
+        assert not line2.done()
+        _finished(calls)
+        assert json.loads(await line2)[api.EARLY_HANDOFF_DONE_KEY]["ok"] is True
+
+    asyncio.run(go())
+    assert calls.aborted == []
+
+
+def test_at_schedule_a_request_ending_unscheduled_fails(monkeypatch, api):
+    """Ended before it was scheduled (aborted, e.g. its transfer was retired
+    or it timed out at the gate): the router gets an error, not line 1."""
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    _, calls = _engine(api, monkeypatch)
+
+    async def go():
+        gen = _generate(api, dict(ROUTER_ASKS))
+        first = asyncio.ensure_future(gen.__anext__())
+        await asyncio.sleep(0)
+        _finished(calls, reason="aborted")
+        with pytest.raises(RuntimeError, match="before it was scheduled"):
+            await first
+
+    asyncio.run(go())
+    assert calls.aborted == []  # it already ended
+    assert 11 not in api.engine.io_processor.requests
+
+
+def test_at_schedule_router_leaving_before_the_answer_aborts(monkeypatch, api):
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "1")
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "1")
+    seq, calls = _engine(api, monkeypatch)
+
+    async def go():
+        gen = _generate(api, dict(ROUTER_ASKS))
+        first = asyncio.ensure_future(gen.__anext__())
+        for _ in range(500):  # until it was submitted and waits for the answer
+            await asyncio.sleep(0.01)
+            if seq.pd_routed_dp_rank is not None:
+                break
+        await asyncio.sleep(0.01)
+        assert not first.done()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+    asyncio.run(go())
+    assert calls.aborted == [11]
+    assert 11 not in api.engine.io_processor.requests
 
 
 def test_legacy_answer_is_plain_json(monkeypatch, api):

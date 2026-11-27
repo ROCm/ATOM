@@ -231,6 +231,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_EARLY_HANDOFF_SPECULATIVE": lambda: _flag_env(
         "ATOM_PD_EARLY_HANDOFF_SPECULATIVE", "1"
     ),
+    # With early handoff: answer the router (NDJSON line 1) when P's scheduler
+    # first schedules the request -- allocates its source, or sends it to wait
+    # for D -- instead of at DP dispatch. D then binds the request to a DP rank
+    # about one P queue wait later, close to when its KV starts to land, which
+    # balances D's ranks better; TTFT keeps the prefill/transfer overlap.
+    # 0 = answer at DP dispatch.
+    "ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE": lambda: _flag_env(
+        "ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE", "0"
+    ),
     # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
     # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
