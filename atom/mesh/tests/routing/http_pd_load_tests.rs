@@ -1353,3 +1353,62 @@ async fn atom_legacy_prefill_answer_without_early_header_keeps_relay() {
     assert_eq!(result(task).await.status(), StatusCode::OK);
     assert_eq!((p.worker.load(), d.worker.load()), (0, 0));
 }
+
+/// Two P instances behind one router. A request whose P answered early (line
+/// 1) and whose D already answered is still prefilling on that P, so P keeps
+/// its load until line 2 and the prefill policy (`cache_aware`, with the
+/// recipe's balance thresholds) sends the next request to the other, idle P,
+/// even though the busy P holds its prefix. Line 2 then releases the load.
+/// (Before this design P's guard went at line 1, so a still-prefilling P
+/// looked idle and drew the next requests.)
+#[tokio::test]
+async fn atom_early_handoff_multi_prefill_routes_by_in_flight_prefill_load() {
+    use crate::policies::{CacheAwareConfig, CacheAwarePolicy};
+
+    let (mut p1, mut d) = servers().await;
+    let p2 = GatedServer::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let prefills: Vec<Arc<dyn Worker>> = vec![p1.worker.clone(), p2.worker.clone()];
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        cache_threshold: 1.0,
+        balance_abs_threshold: 0,
+        balance_rel_threshold: 1.0,
+        eviction_interval_secs: 0,
+        max_tree_size: 1000,
+    });
+    policy.init_workers(&prefills);
+    let info = SelectWorkerInfo {
+        request_text: Some("the shared system prompt"),
+        ..Default::default()
+    };
+    // The first request's prefix goes to P1.
+    assert_eq!(policy.select_worker(&prefills[..1], &info).await, Some(0));
+
+    let task = dispatch(DispatchKind::Atom, &p1, &d, false);
+    p1.wait_entered().await;
+    let (response, p_tx) = early_prefill_response();
+    p1.respond(response);
+    send_early_handoff_line(&p_tx);
+    d.wait_entered().await;
+    d.respond(axum::Json(json!({"choices": ["decoded"]})).into_response());
+    // D answered (its headers and body are out) while P1 still prefills.
+    assert_eq!(result(task).await.status(), StatusCode::OK);
+    assert_eq!(p1.worker.load(), 1, "P1 stays charged until line 2");
+    assert_eq!(p1.worker.prefill_tokens(), 7);
+    assert_eq!(p2.worker.load(), 0);
+
+    // The next request with the same prefix goes to the idle P2.
+    assert_eq!(policy.select_worker(&prefills, &info).await, Some(1));
+
+    // Line 2 ends P1's prefill and its charge.
+    p_tx.send(Ok(prefill_done_line(true))).unwrap();
+    drop(p_tx);
+    wait_load(&p1.worker, 0).await;
+    assert_eq!(p1.worker.prefill_tokens(), 0);
+    assert_eq!(
+        (p1.worker.load(), p2.worker.load(), d.worker.load()),
+        (0, 0, 0)
+    );
+}
