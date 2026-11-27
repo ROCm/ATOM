@@ -93,10 +93,23 @@ Each check runs only after the previous one passed.
 
 | # | Where | What | Pass |
 |---|---|---|---|
-| V1 | P tray alone, aggregated PP4 (no DSpark on a single-node PP4) + `umbp_store`, DRAM only | gate, GSM8K, needle read-back: push long prompts out of HBM, resend them; they must load from UMBP and answer correctly | GATE PASS, GSM8K ≥ 0.945, read-back 10/10 |
+| V1 | P tray alone, aggregated PP4 (no DSpark on a single-node PP4) + `umbp_store`, DRAM only (`kit/v1_up.sh`) | gate, then the read-back (`kit/needle.py`): 10 prompts of 32K tokens with a code near their head; a flood twice HBM's KV pushes them out to UMBP; asked again, they must load from UMBP and still name the code | GATE PASS, READBACK PASS |
 | V2 | 1P1D | VERIFY C16 (`ATOM_MORIIO_VERIFY=1`, incl. prefixes restored from UMBP), then GSM8K through the router | moriio-verify `bad=0`, GSM8K ≥ 0.945 |
 | A1 | 1P1D | AgentX C192 900 s: the LMCache arm vs the UMBP arm, same DRAM budget | report as below |
 | A2 | 1P1D | the better arm at C256 and C300; C300 for 1 h (30-minute decay) | hit ≥ 94% at C300 |
+
+V1 on one tray (11-27 on e15-05: GATE PASS; READBACK PASS, 10 loads of 328,704 tokens from UMBP, 10/10 right):
+
+```bash
+# in the P tray's kit; GPU_MEM=0.25 leaves HBM about 570K tokens of KV, LRU makes the flood evict every needle prompt
+GPU_MEM=0.25 UMBP_GB=256 V1_ENV=ATOM_PREFIX_CACHE_POLICY=lru ./v1_up.sh v1
+docker exec "$PD_CONTAINER" python3 /kit/gate.py http://127.0.0.1:8010 /models/MiniMax-M3.1-Flash-Quark-MXFP4
+docker exec "$PD_CONTAINER" python3 /kit/needle.py http://127.0.0.1:8010 /models/MiniMax-M3.1-Flash-Quark-MXFP4 \
+  --flood-concurrency 2 --max-tokens 1024
+CONTAINER="$PD_CONTAINER" ./down.sh
+```
+
+GSM8K runs in V2 instead: an aggregated PP4 decodes eagerly, a request at about 10 tokens/s.
 
 What to read:
 - **P log:**
@@ -105,8 +118,10 @@ What to read:
   - `[OFFLOAD-LOOKUP-STATS]`: lookups, uneven ones (a stage missing a chunk), stranded objects;
   - `[Cache Tiers]`: HBM- and tier-served shares of all reuse;
   - `UMBP lazy:` warnings: unsaved blocks HBM evicted, failed demotions.
-- **ATOM Prometheus `atom:`:** the connector's `offload` statistics: loads, saves, `lazy_evicted_unsaved`,
-  `lazy_held_blocks`, and `umbp_*` / `miss_*` counters.
+- **ATOM Prometheus (`/metrics` on the API port):** the offload counters, named `atom:lmcache_*` whatever the tier:
+  `load_requests`, `loaded_tokens`, `load_failures`, `save_requests`, `saved_tokens`, `lazy_evicted_unsaved_blocks`,
+  `lazy_demotions_failed`, `lazy_held_blocks`. The miss split is in the log only (`[OFFLOAD-MISS-ACCOUNT]`), and the
+  `umbp_*` lookup counters are not exported.
 - **UMBP server `:9092/metrics`:**
   - `mori_umbp_client_capacity_{total,used,available}_bytes`;
   - `mori_umbp_client_local_evict_total`;

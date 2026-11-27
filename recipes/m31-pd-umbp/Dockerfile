@@ -37,3 +37,5 @@ RUN cd /app/ATOM && git fetch -q ${ATOM_REPO} ${ATOM_REF} && git -c advice.detac
 # The kit's PD_UMBP_GB mode (also adds umbp_server.sh).
 COPY kit.patch /app/m31_pd_recipe/kit.umbp.patch
 RUN cd /app/m31_pd_recipe/kit && patch -p1 < ../kit.umbp.patch && chmod +x umbp_server.sh
+# Check V1 (README section 5): P's configuration served aggregated on one tray, and the read-back from UMBP.
+COPY v1_up.sh needle.py /app/m31_pd_recipe/kit/
