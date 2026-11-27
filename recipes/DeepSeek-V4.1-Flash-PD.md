@@ -1,11 +1,18 @@
 # DeepSeek V4.1-Flash P/D disaggregation on MI355X
 
+**Naming.** `xPyD` counts instances, not GPUs: x prefill (P) instances and y
+decode (D) instances. Each instance's shape and GPU count are written next to
+it, for example "1P1D: P DEP4 (4 GPUs) + D DEP8 (8 GPUs), 12 GPUs" or
+"2P2D: 2x P DEP4 + 2x D DEP8". Run labels inside the commands (such as
+`4p8d_dep8`) and the chart's file name keep their original GPU-count names;
+they are only labels.
+
 This recipe covers two P/D deployments of DeepSeek-V4.1-Flash on MI355X:
 
-- **4P8D on two nodes, 12 GPUs: the AgentX ladder c1-c768** (P DEP4 + D TP8 Mono at c1-c32, P DEP4 + D DEP8 at c256-c768). This is the main part below: the chart, the results, and for every point on the chart a complete, copyable launch configuration ([c1](#c1), [c2](#c2), [c4](#c4), [c8](#c8), [c16](#c16), [c32](#c32), [c256](#c256), [c512](#c512), [c768](#c768)).
-- **4P4D on one 8-GPU node** (P DEP4 + D DEP4, TTFT-optimized for AgentX C256), in the appendix [Single-node 4P4D](#appendix-single-node-4p4d-ttft-optimized-agentx-c256).
+- **1P1D on two nodes, 12 GPUs: the AgentX ladder c1-c768.** P DEP4 (4 GPUs) + D TP8 Mono (8 GPUs) at c1-c32, P DEP4 (4 GPUs) + D DEP8 (8 GPUs) at c256-c768. This is the main part below: the chart, the results, and for every point on the chart a complete, copyable launch configuration ([c1](#c1), [c2](#c2), [c4](#c4), [c8](#c8), [c16](#c16), [c32](#c32), [c256](#c256), [c512](#c512), [c768](#c768)).
+- **1P1D on one node, 8 GPUs** (P DEP4 (4 GPUs) + D DEP4 (4 GPUs), TTFT-optimized for AgentX C256), in the appendix [Single-node 1P1D](#appendix-single-node-1p1d-ttft-optimized-agentx-c256).
 
-## 4P8D AgentX ladder (c1-c768, 3600 s)
+## 1P1D AgentX ladder (c1-c768, 3600 s)
 
 ![DeepSeek-V4.1-Flash P/D on MI355X: token throughput per GPU vs P90 interactivity (AgentX, 3600 s)](DeepSeek-V4.1-Flash-PD-4P8D-AgentX-curve.png)
 
@@ -74,12 +81,81 @@ acceptance `--spec-decode-acceptance-length 3.51` on P and D; FP8 KV, FP4
 index, block size 16; P with MegaMoE, `--max-num-batched-tokens 16384`, chunk
 16384, long-prefill threshold 8192, early handoff
 (`ATOM_PD_EARLY_HANDOFF=1`), `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` and
-`ATOM_DP_IDLE_WHEN_BLOCKED=1`; prefill delayer off on P and D; base64 prompt
-token ids (`ATOM_PROMPT_IDS_B64=1` on P and D, ingress with
-`ATOM_FRONT_IDS_B64=1`); D `--max-num-batched-tokens 1024`; P and D each
+`ATOM_DP_IDLE_WHEN_BLOCKED=1` (these three set explicitly because the
+measured tree had them off by default; see
+[PRs used and how to configure them](#prs-used-and-how-to-configure-them));
+prefill delayer off on P and D; base64 prompt token ids
+(`ATOM_PROMPT_IDS_B64=1` on P and D, the default on main since #3854 was
+merged; ingress with `ATOM_FRONT_IDS_B64=1`); D `--max-num-batched-tokens 1024`; P and D each
 with a single API server except the D at c512 and c768. Prefix caching is on
 by default (`enable_prefix_caching: True` in the logged engine arguments; no
 flag was passed).
+
+### PRs used and how to configure them
+
+The ladder was measured on a frozen ATOM tree, `de7d8ec1c` (see
+[Software stack](#software-stack-identical-on-p-and-d-every-point)). Several
+of the PRs in it have been merged or revised since. For each P/D PR the
+table gives two settings: the one used when the ladder was measured, and the
+one to use on main today. "Side" says where the setting goes: P (the prefill
+server), D (the decode server), router (atomesh) or ingress (the encoding
+ingress in front of the router). PR states are as of 2026-11-27.
+
+| PR | What it does | State | Side | As measured (tree `de7d8ec1c`) | How to configure now | Points that used it | Notes |
+|---|---|---|---|---|---|---|---|
+| [#3772](https://github.com/ROCm/ATOM/pull/3772) | Store load wait: the first forward waits for a Mooncake Store load that is already in flight, instead of recomputing the prefix | open | P | Old fixed-wait version: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20`. Its default was 0 (off), so the variable was set explicitly. | Not on main yet. On the current PR head: `ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on by default (`0` turns it off), so set nothing. The PR head removes `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`, so drop that variable. | all (c1-c768) | The wait is now event-driven: the load-completion doorbell wakes it, and the measured forward time bounds it. There is no fixed timeout. It does nothing without a Store tier. Measured at 1P1D c256: TTFT mean -20.2%, throughput +0.55%. |
+| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates pages and pulls KV while P is still computing | open | P | `ATOM_PD_EARLY_HANDOFF=1`. Its default was 0, so the variable was set explicitly. | Not on main yet. On the current PR head it is on by default (`1`). Set `ATOM_PD_EARLY_HANDOFF=0` explicitly wherever it should be off. | all (c1-c768) | **Known issue:** if a P step stalls for more than 60 s, early requests can leak a state slot. Once a rank has leaked `--max-num-seqs` slots, it admits no more requests, permanently. Use `0` at c1024 and above until the fix lands; the fix is in progress. Load visibility is correct only with one P instance. With several P instances behind one router, the router's view of P load is wrong. |
+| [#3777](https://github.com/ROCm/ATOM/pull/3777) | Idle when blocked: a DP rank whose only work is blocked (Store lookup or load, KV send) idles instead of forcing dummy forwards | merged 2026-11-27 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1`. The pre-merge default was 0, so the variable was set explicitly. | Set nothing. On main, leaving it unset turns it on for a P/D prefill (`kv_producer`) and off elsewhere. An explicit `0` or `1` applies to any role. | all (c1-c768) | Needs `ATOM_ENABLE_PREFILL_DELAYER=0`, because the prefill delayer turns this setting off. |
+| [#3854](https://github.com/ROCm/ATOM/pull/3854) | Base64 prompt ids: the prompt token ids are sent as base64-packed uint32, which cuts D's ingest cost | merged 2026-11-26 | P, D, ingress | `ATOM_PROMPT_IDS_B64=1` on P and D (pre-merge default 0; merged into the tree by hand with two conflicts). Ingress: `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | P and D: set nothing, since `ATOM_PROMPT_IDS_B64` is on (`1`) by default on main. Ingress: keep `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | all (c1-c768) | The two `ATOM_FRONT_*` variables belong to the external ingress, not to ATOM. Without them the ingress sends JSON ids, which still work. |
+| [#3873](https://github.com/ROCm/ATOM/pull/3873) | Late KV params on D: D accepts the chat request first and P's `kv_transfer_params` afterwards, on `/v1/pd/late_kv/chat/completions` | merged 2026-11-26 | D | Not in the tree and not used. | `ATOM_PD_LATE_KV=1` on D. The default is `0`, under which the route answers 404. | none | Use together with #3874. |
+| [#3874](https://github.com/ROCm/ATOM/pull/3874) | Concurrent dispatch: atomesh sends the decode leg while prefill runs, instead of after it | merged 2026-11-26 | router | Not used: the ladder's frozen router relays serially. | `--atom-pd-concurrent` on the atomesh router, with `--backend atom`. Off by default. | none | Needs D with `ATOM_PD_LATE_KV=1`. A D that answers 404 gets the serial relay's request instead, and the router logs this once. Measured: D receives the request 4-11 ms earlier, with no end-to-end change. |
+
+Our other PRs that the ladder configures were merged before the measurement
+and are part of the tree's base:
+
+| PR | What it does | Side | As measured | How to configure now |
+|---|---|---|---|---|
+| [#3097](https://github.com/ROCm/ATOM/pull/3097) (merged) | Shared Mooncake Store: `share_cache` DP routing and early tier load | P | `--dp-load-balance share_cache`, Store as `ATOM_KV_OFFLOAD=mooncake_store` | Unchanged. The default DP routing is `least_requests`, so pass `share_cache` explicitly. |
+| [#3350](https://github.com/ROCm/ATOM/pull/3350) (merged) | Mono mailbox polling backoff | D (Mono, c1-c32) | `ATOM_MONO_POLL_SLEEP_UNITS=4` at c1, `16` at c2-c32 | Unchanged. When unset, the value is 4, or 16 next to a KV transfer or offload connector. c1 sets 4 explicitly. |
+
+Also in the tree, with nothing to configure: P/D support for V4.1 (#2666),
+prefix-spread routing (#2755), delayed P/D completion reporting (#3105), and
+the Store restore fixes (#3217, #3323, #3324), all merged. The Store opt-ins
+#3475 (`ATOM_STORE_SAVE_BATCH_CHUNKS`) and #3533 (`ATOM_STORE_ASYNC_RENEW`) are
+merged but were not set. The tree's top commit is a P/D endpoint-recovery
+patch that was not enabled (`ATOM_PD_ENDPOINT_RECOVERY` unset); it has no PR.
+#3781 (open) is not in the tree.
+
+Other authors' PRs in the measured tree need no P/D-specific setting beyond
+the commands in each point's section:
+- MegaMoE route selection [#3187](https://github.com/ROCm/ATOM/pull/3187): T1 version, merged 2026-11-25, enabled with `--moe-backend mega`.
+- Merged: #3738, #3842 (net diff), #3186 (EPLB is off in the ladder), #3437 and #2877.
+- Open: #3838, #3839, #3840, #3647, #2903, #3639 and #3748.
+
+The combination that was measured is the reproduction branch
+`lirzhang/agentx-v41-recipe-de7d8ec1c`. PRs merged since then may differ
+from their versions in that branch.
+
+### High-concurrency notes (c768 and above)
+
+These come from runs at and beyond the top of the ladder. Except where stated,
+they were not part of the measured points.
+
+- **`MC_TRANSFER_TIMEOUT=300` on P and D.** Mooncake's sync-write timeout is
+  30 s when unset; raise it for c768 and above. The ladder points did not
+  set it.
+- **Store placement.** Keep each Store owner at 1024 GiB or less per node,
+  and do not put it on a node that runs P or D. On one NIC, the Store's
+  registration plus the KV registrations of several ranks above about 2 TiB
+  fails with `EINVAL`, which surfaces as empty responses. As measured, the
+  c768 point ran a 1 TiB Store on the P node without a failure; that is the
+  only co-located 1 TiB data point.
+- **Pre-warm every rail before the window.** The first transfer on a new
+  P-rank x D-rank rail takes 35-60 s to set up, while P's lookup times out at
+  60 s (`PREFILL_LOOKUP_TIMEOUT`). Before timing, drive enough traffic that
+  every P rank has transferred to every D rank.
+- **Early handoff.** Set `ATOM_PD_EARLY_HANDOFF=0` at c1024 and above (see
+  #3773 above).
 
 ### Software stack (identical on P and D, every point)
 
@@ -92,7 +168,11 @@ flag was passed).
   #3186, #2903, #3437, #3639, #3748, #2877, #3854 (base64 prompt ids, two
   conflicts resolved by hand), and the P/D endpoint-recovery patch (not
   enabled: `ATOM_PD_ENDPOINT_RECOVERY` unset). #3164 and #3645 were not
-  included.
+  included. **To reproduce**, check out the ROCm/ATOM branch
+  [`lirzhang/agentx-v41-recipe-de7d8ec1c`](https://github.com/ROCm/ATOM/tree/lirzhang/agentx-v41-recipe-de7d8ec1c)
+  (head `de7d8ec1c`), which is exactly this tree, and use it as
+  `$ATOM_TREE`. How each P/D PR is configured, then and on current main, is
+  in [PRs used and how to configure them](#prs-used-and-how-to-configure-them).
 - **aiter**: the image's aiter `7ecd46b07` plus ROCm/aiter #8547, #8636,
   #8171 and #8633, bind-mounted file by file over `/app/aiter-test` (the
   image's prebuilt `.so` modules are kept). The ten files are listed in every
@@ -129,7 +209,7 @@ MODEL_VIEW=<host dir with the checkpoint's config and tokenizer files; its weigh
 MODEL_WEIGHTS=<host dir with the DeepSeek-V4.1-Flash-1017 safetensors>
 TOKENIZER_VIEW=<host dir with the same checkpoint's config and tokenizer files, for router and ingress>
 # Source trees and caches (same paths on both nodes)
-ATOM_TREE=<ATOM checkout at de7d8ec1c, see Software stack>
+ATOM_TREE=<ATOM checkout of branch lirzhang/agentx-v41-recipe-de7d8ec1c (de7d8ec1c), see Software stack>
 AITER_FILES=<aiter checkout at 7ecd46b07 + aiter #8547 #8636 #8171 #8633>
 DIAG_PATCH=<dir with the two diagnostic files, c768 only>
 CACHE=<persistent cache dir: aiter-jit, atom, mori>
@@ -2330,7 +2410,7 @@ aiperf profile --scenario inferencex-agentx-mvp --url http://$P_HOST:$INGRESS_PO
 - The c768 P used UUID-based GPU selection with a local diagnostic patch
   (see [c768](#c768)); the other points used `HIP_VISIBLE_DEVICES=0,1,2,3`.
 
-## Appendix: Single-node 4P4D (TTFT-optimized, AgentX C256)
+## Appendix: Single-node 1P1D (TTFT-optimized, AgentX C256)
 
 This appendix describes a single-node prefill/decode (P/D) split for
 DeepSeek-V4.1-Flash-1017 on 8x MI355X running the AgentX C256 workload. The
@@ -2339,7 +2419,7 @@ Both run TP4 with DP attention and EP4 (DEP4). The workload uses FP8 KV, an
 FP4 index plane, DSpark with five speculative tokens, prefix caching, and a
 Mooncake Store as the P-side KV offload tier.
 
-Compared with the earlier 4P4D configuration, the base of this recipe (E14a)
+Compared with the earlier single-node 1P1D configuration, the base of this recipe (E14a)
 cuts mean TTFT from 3.74 s to 1.07-1.24 s (-67 to -71%). ITL improves from
 6.91 to 6.37 ms, and output throughput rises from 6,644 to about 7,390 tok/s
 (+11%).
@@ -2366,10 +2446,11 @@ and runs on the same host. Against it, this P/D config is better on TTFT mean,
 P50 and P90. The single instance is still slightly better on P99 TTFT, ITL and
 output throughput per GPU. See [Results](#results).
 
-The two-node 4P8D AgentX ladder (c1-c768, 12 GPUs) is the main part of this
-recipe; see [4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
+The two-node 1P1D AgentX ladder (c1-c768, P DEP4 + D TP8 Mono or D DEP8,
+12 GPUs) is the main part of this recipe; see
+[1P1D AgentX ladder](#1p1d-agentx-ladder-c1-c768-3600-s).
 
-### What changed relative to the earlier 4P4D config
+### What changed relative to the earlier 1P1D config
 
 | # | Role | Change | Effect measured on AgentX C256 |
 |---|---|---|---|
@@ -2381,7 +2462,7 @@ recipe; see [4P8D AgentX ladder](#4p8d-agentx-ladder-c1-c768-3600-s).
 | 6 | D | `--moe-backend mega` (E19 = E14a + items 6 and 7) | ITL fell from 6.37 to 5.88 ms on Host A, and throughput rose to 7,572 tok/s. |
 | 7 | P | `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (needs ATOM #3772) | The first forward waits up to 20 ms for a Store load already in flight, instead of recomputing the prefix. |
 | 8 | P | `ATOM_PD_EARLY_HANDOFF=1` (needs ATOM #3773) | P answers the router as soon as it has dispatched the request, so D allocates and pulls KV while P computes. Time from P finish to first token fell from 0.309 to 0.136 s. **Use only with a single P instance** (see [Caveats](#caveats)). |
-| 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (needs the T1 PR) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
+| 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (ATOM #3777, merged; on by default on a P/D prefill on main) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
 | 10 | D | `--cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]'` | D runs batch 15-20 per rank at C256. The old 16→24 step padded those batches. In a same-host A/B, a step at batch 17 was 2.67 ms faster and at batch 19 2.49 ms faster. Batches 16 and 24 changed by ±0.15 ms. Startup time and cudagraph memory (1.53 GB) were unchanged. |
 
 Several other changes were tried and are **not** part of this recipe. Each
@@ -2392,7 +2473,7 @@ gave no gain or traded one metric for another:
 - a short-request bypass in the scheduler
 - asynchronous Store unpack
 - early-load tuning
-- a 6:2 P:D split, which MoRI's power-of-two rule blocks inside one node
+- a 6:2 P:D GPU split, which MoRI's power-of-two rule blocks inside one node
 
 ### Dependencies
 
@@ -2432,16 +2513,22 @@ Base image: `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0`.
    The copy keeps the image's prebuilt `.so` modules. Bind-mount `<WORK>/aiter-P`
    at `/app/aiter-test` in the P container. D keeps the image's aiter.
 
-**Best configuration only.** Items 7-9 are opt-in environment variables
-added by open ATOM PRs:
+**Best configuration only.** Items 7-9 are environment variables added by
+these ATOM PRs (they were off by default in the measured trees, so the
+commands set them; see
+[PRs used and how to configure them](#prs-used-and-how-to-configure-them)
+for their current defaults):
 
-3. **ATOM [#3772](https://github.com/ROCm/ATOM/pull/3772)**:
-   `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`.
-4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)**:
+3. **ATOM [#3772](https://github.com/ROCm/ATOM/pull/3772)** (open):
+   `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS` as measured. The current PR head
+   replaces it with `ATOM_OFFLOAD_LOAD_EVENT_WAIT` (on by default).
+4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)** (open):
    `ATOM_PD_EARLY_HANDOFF`. It applies only when P uses single-node DP and
-   the router uses the legacy relay.
-5. **The T1 PR**: `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the
-   `BLOCKED_IDLE_SLEEP_S` GIL yield.
+   the router uses the legacy relay. The current PR head turns it on by
+   default.
+5. **ATOM [#3777](https://github.com/ROCm/ATOM/pull/3777)** (merged):
+   `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the `BLOCKED_IDLE_SLEEP_S`
+   GIL yield. On main it is on by default on a P/D prefill.
 
 With a variable unset, or its PR missing, that item falls back to the E14a
 behaviour. **D with MegaMoE (item 6)** needs the same #3187 tree and aiter as
@@ -2671,7 +2758,7 @@ atomesh launch --host $HOST_IP --port 31530 --prometheus-port 31531 \
   --prefill http://$HOST_IP:31500 --decode http://$HOST_IP:31600
 ```
 
-As in the [8P16D shared-Store recipe](DeepSeek-V4.1-6P16D-C1228-Share-Cache.md#router-and-encoding-ingress),
+As in the [4P4D shared-Store recipe (4x P EP2 + 4x D TP4, 24 GPUs)](DeepSeek-V4.1-6P16D-C1228-Share-Cache.md#router-and-encoding-ingress),
 the measured AgentX runs sent chat requests through an encoding ingress in
 front of atomesh. The ingress applies the exact V4.1 tokenizer and chat
 encoding, preserves streaming, tool payloads, request IDs and cancellation,
@@ -2744,7 +2831,7 @@ is in seconds and ITL is the mean in ms. Throughput is aiperf output tok/s.
 
 | Config | GPUs | TTFT mean | P50 | P90 | P99 | ITL | tok/s | tok/s/GPU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Earlier 4P4D (standard MoE, chunk 32K, delayer on) | 8 | 3.742 | 2.941 | 6.151 | 18.80 | 6.91 | 6,644 | 830 |
+| Earlier 1P1D, P DEP4 + D DEP4 (standard MoE, chunk 32K, delayer on) | 8 | 3.742 | 2.941 | 6.151 | 18.80 | 6.91 | 6,644 | 830 |
 | Single DEP8, standard MoE | 8 | 1.875 | 1.347 | 3.021 | 10.68 | 7.81 | 7,067 | 883 |
 | Single DEP8, mega, chunk 16K | 8 | 1.268 | 0.927 | 1.963 | **8.03** | **5.97** | **7,618** | **952** |
 | **E14a (items 1-5), run 1** | 8 | 1.072 | 0.818 | 1.476 | **7.44** | 6.37 | 7,393 | 924 |
@@ -2813,10 +2900,12 @@ What the tables show:
 
 ### Caveats
 
-- ATOM #3187 and aiter #7788 are open. Pin the commits listed above;
-  newer heads have not been measured with this recipe. The best
-  configuration also depends on ATOM #3772, #3773 and the T1 PR, which are
-  open too. Each of them is off by default.
+- ATOM #3187 and aiter #7788 were open when this was measured; both have
+  since been merged. The commits listed above are the ones measured; the
+  merged versions have not been measured with this appendix. The best
+  configuration also depends on ATOM #3772 and #3773 (open) and #3777
+  (merged); their defaults have changed since, see
+  [PRs used and how to configure them](#prs-used-and-how-to-configure-them).
 - **P99 TTFT is bound by the arrival burst.** P99 is 12.0-12.4 s with or
   without items 6-9, because the burst about 300 s into the window queues
   every request behind a 4-GPU P. Items 6-10 improve the mean, P50, P90 and
@@ -2840,7 +2929,7 @@ What the tables show:
   not needed and are not part of this recipe.
 - Hosts differ. The same configuration ran about 12% slower on Host B than
   on Host A, so compare only runs from the same host.
-- P:D ratios other than 4:4 inside one node are limited. MoRI's EP needs a
+- P:D GPU splits other than 4:4 inside one node are limited. MoRI's EP needs a
   power-of-two GPU count per instance, and atomesh has neither weighted
-  routing nor P-instance affinity. A 6:2-style split (P DEP4 + DEP2, D DEP2)
-  was measured and lost: ITL rose to 12 ms and TTFT to 2.9 s.
+  routing nor P-instance affinity. A 6:2 GPU split, 2P1D (P DEP4 + P DEP2 +
+  D DEP2, 8 GPUs), was measured and lost: ITL rose to 12 ms and TTFT to 2.9 s.
