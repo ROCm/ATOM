@@ -144,7 +144,7 @@ sequenceDiagram
     E-->>M: no choices, ec_transfer_params
     M->>P: body plus ec_transfer_params and kv_transfer_params
     P->>P: fetch and preprocess, same cache_seed
-    P->>E: Mooncake read of the embeddings, then the generation word
+    P->>E: Mooncake read of the embeddings, then their slot
     P->>P: prefill on the read embeddings
     P-->>M: kv_transfer_params
     M->>D: body plus kv_transfer_params, without ec_transfer_params
@@ -163,7 +163,7 @@ Any of the following ends with P encoding locally, as in PD:
 - an E error or timeout, including a full pool (E answers 503),
 - an E answer without an `ec_transfer_params` object,
 - on a P rank: a reader that cannot start (unknown transport, Mooncake
-  missing), a failed read, a changed generation word, a `cache_seed` or
+  missing), a failed read, a given-up or reused slot, a `cache_seed` or
   dtype mismatch, a malformed handle, or embeddings larger than its read
   buffer.
 
@@ -513,30 +513,43 @@ longer sit in the forward step, and Mooncake would be an optimization
 rather than a requirement. The interface above allows that backend without
 changing the handle.
 
-**D12. E keeps an entry for a lease, guarded by a generation word.**
-*#3411 (pool and reader), #3412 (fallback).*
+**D12. E keeps an entry for a lease, guarded by a slot table.**
+*#3411 (pool, slots and reader), #3412 (fallback).*
 
-E's pool (`MooncakeEcWriter`):
-- An entry is `[generation word | rows]`. E places new rows after the last
-  entry, wrapping to the start, and evicts entries oldest-first, but only
-  once an entry is older than `ATOM_EC_LEASE_S` (default 60 s, in
+E's region (`MooncakeEcWriter`) is one registration: a slot table, then the
+pool of rows.
+- An entry's rows sit in the pool; its slot holds `(generation, address,
+  length, ack)`. Rows never overlap a slot, so a later entry's rows cannot
+  forge an earlier entry's generation.
+- E places new rows after the last entry, wrapping to the start, and takes
+  a free slot. It evicts entries oldest-first when space or slots run out,
+  but only once an entry is older than `ATOM_EC_LEASE_S` (default 60 s, in
   `atom/utils/envs.py` and `docs/environment_variables.md`).
-- When an entry the new rows would overwrite is still inside its lease,
-  the pool is full: `EcStoreFull`, which the encoder-only chat handler
-  answers with 503. ATOMesh then falls back to PD for that request (D16).
-- Before writing over evicted entries, E sets their words to 0, a value no
-  generation takes. It then writes the rows, and the new entry's
-  generation word last. Generations start at a random value, so a stale
-  word inside another entry's rows does not match.
+- When an entry in the way is still inside its lease, E is full:
+  `EcStoreFull`, which the encoder-only chat handler answers with 503.
+  ATOMesh then falls back to PD for that request (D16).
+- E zeroes an evicted entry's slot before writing over its rows, and writes
+  a new entry's slot after its rows. Generations only grow from a random
+  start, so a slot never matches a handle given out for another entry.
 
 P's read (`MooncakeEcReader.get`): P checks `cache_seed` against its own,
-reads the rows, then rereads the word. A `cache_seed` mismatch, a dtype
-other than the one E stored (the handle carries it), a malformed handle or
-a generation of 0 (the word of a given-up or never-written entry), a
-failed read, a changed word or rows larger than its buffer make it return
-`None`. A reader that cannot start (`create_reader` raises: unknown
-transport, Mooncake missing, no memory or HCA) is recorded as unavailable
-for that transport, and the rank's verdict is `None` as for a failed read.
+synchronizes its buffer's stream so that no queued fill or copy lands after
+the NIC's write, reads the rows, then reads the slot. It takes the rows
+only if the slot's generation, address and length are the handle's. A
+`cache_seed` mismatch, a dtype other than the one E stored (the handle
+carries it), a malformed handle or a generation of 0, a failed read, a
+given-up or reused slot, or rows larger than its buffer make it return
+`None`. Each such read is logged with its reason and the running counts per
+reason (`MooncakeEcReader.fallbacks`). A reader that cannot start
+(`create_reader` raises: unknown transport, Mooncake missing, no memory or
+HCA) is recorded as unavailable for that transport, and the rank's verdict
+is `None` as for a failed read.
+
+Follow-up: reclaim an entry as soon as P has read it. After the ranks
+agree, P's rank 0 would write the generation into the slot's `ack` field,
+and E would reuse acked entries at once, keeping the lease as a backstop.
+Today reuse waits for the lease, so a P queue longer than the lease wastes
+E's encode and runs the tower.
 
 P's ranks agree before any of them uses the rows
 (`ModelRunner.read_image_embeddings`). Each rank passes its verdict to
@@ -554,9 +567,11 @@ tower wherever image input is accepted, so the fallback is the existing
 encode path. This is the simplest option.
 
 Rejected:
-- P's ranks release each entry after reading. That gives an exact
-  lifetime, but needs a channel from the `ModelRunner` subprocesses to E,
-  and E has to know P's TP size.
+- P's ranks release each entry after reading over a channel of their own.
+  That gives an exact lifetime, but needs a channel from the `ModelRunner`
+  subprocesses to E, and E has to know P's TP size. The `ack` follow-up
+  above needs neither: rank 0 writes once, after the ranks agree, over the
+  RDMA path P already reads on.
 - Rank 0 reads and broadcasts to the other ranks. That is consistent by
   construction, but adds a device broadcast of up to 22 MB to every image
   request's forward step, where a one-integer CPU all-reduce suffices.
@@ -565,8 +580,8 @@ Rejected:
 `kv_transfer_params`.** *#3412; ATOMesh's side in #3409.*
 - E returns a chat completion with no choices and an `ec_transfer_params`
   object, the handle of D11: `transport`, `key` (`cache_seed`), `rows`,
-  `dtype`, and under `mooncake` the session, address, length and
-  generation (`MooncakeEcWriter.put`, `api_server.py:
+  `dtype`, and under `mooncake` the session, address, length,
+  generation and slot (`MooncakeEcWriter.put`, `api_server.py:
   _encoder_only_response`).
 - ATOMesh copies it into P's body. P's chat path puts it into the
   request's `multimodal_data`, which the scheduler already carries to the
@@ -700,7 +715,7 @@ checks (see Acceptance).
 
 The simplest E/P/D: E returns the embeddings base64-encoded in its
 response, ATOMesh copies them into P's body, and P decodes them in its API
-server. There is no Mooncake pool, lease or generation word, and the
+server. There is no Mooncake pool, lease or slot table, and the
 transport is about 100 lines against about 300.
 
 It puts A5 at risk:
