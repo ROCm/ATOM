@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+# The eight cases of NeMo-RL v0.8's performance table on MI355X (README.md).
+# B1, B2, F1, F2 run on two nodes: a site file with two hosts and an rdma section.
+# B3, B4, F3, F4 run on the first host. `run.sh prepare <id>` fetches the models and
+# builds the data. The checks hold perf/throughput (NeMo-RL's Tokens/s/GPU) at step 8
+# to the measured mean of steps 3-8 (README.md); metrics.py applies NeMo-RL's gate.
+
+defaults:
+  image: release
+  command: bash {examples}/GRPO/run_grpo.sh
+  nodes: 2
+  tier: long
+  status: unvalidated
+  needs: [rdma, atom_rdma]
+  prepare: >-
+    python3 {examples}/DAPO/tools/prepare_data.py --data-root {data_root}
+    --models Qwen3-8B Qwen3-30B-A3B &&
+    python3 {examples}/GRPOPerf/prepare_data.py --out {data_root}/data/omi2_train_1M
+    --tokenizer {data_root}/models/Qwen3-8B
+  requires:
+    - models/Qwen3-30B-A3B
+    - data/omi2_train_1M/train.parquet
+    - data/omi2_train_1M/val.parquet
+  env:
+    MODE: longrun
+    BACKEND: atom
+    CONFIG_OVERRIDE: "{config}"
+    MODEL_PATH: "{data_root}/models/Qwen3-30B-A3B"
+    TRAIN_FILE: "{data_root}/data/omi2_train_1M/train.parquet"
+    VAL_FILE: "{data_root}/data/omi2_train_1M/val.parquet"
+    CKPT_DIR: "{data_root}/ckpts/{id}"
+    RESUME_OVERRIDE: "false"
+    WEIGHT_SYNC_BACKEND: rdma
+    WANDB_MODE: disabled
+    NCCL_DEBUG: WARN
+    ATOM_FORCE_ATTN_TRITON: "1"
+  smoke:
+    steps: 10
+    timeout_min: 150
+    stall_min: 40
+  full:
+    steps: 10
+    timeout_min: 150
+    stall_min: 40
+
+examples:
+  # ---- Qwen3-30B-A3B, two nodes ----
+  - id: grpoperf-qwen3moe-onpolicy-2node
+    aliases: ["B1"]
+    title: "B1: Qwen3-30B-A3B on-policy, 16 GPUs, Megatron native EP8 x DP2 + colocated ATOM TP1 x 16"
+    needs: [rdma]
+    compile_cache_key: grpoperf Qwen3-30B-A3B bf16
+    env:
+      # Colocated: weights go over CUDA IPC, not the RDMA path run_grpo.sh selects.
+      WEIGHT_SYNC_BACKEND: auto
+      # The actor group spans both nodes; Gloo otherwise advertises 127.0.0.1.
+      GLOO_SOCKET_IFNAME: "{rdma.interface}"
+      # On the 261125 image's torch, expandable_segments takes effect and a sleeping
+      # colocated ATOM no longer returns its memory to the device; training then
+      # runs out of memory. Turn it off for the colocated cases.
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_onpolicy_2node.yaml
+      overrides: &colocated
+        - cluster.num_nodes=2
+        - cluster.ray_address=auto
+        - controller.ray.actor.num_workers=16
+        - controller.ray.actor.process_on_nodes=[8,8]
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 2543, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_onpolicy_2node.yaml
+      overrides: *colocated
+
+  - id: grpoperf-qwen3moe-1stepoff-2node
+    aliases: ["B2"]
+    title: "B2: Qwen3-30B-A3B 1-step off, Megatron native EP8 on one node, ATOM TP1 x 8 on the other"
+    compile_cache_key: grpoperf Qwen3-30B-A3B bf16
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_2node.yaml
+      overrides: &split
+        - cluster.num_nodes=2
+        - cluster.ray_address=auto
+        - controller.ray.actor.process_on_nodes=[8]
+        - controller.ray.rollout.process_on_nodes=[8]
+        - controller.ray.actor.topology_tags.node_ip={hosts[0].ip}
+        - controller.ray.rollout.topology_tags.node_ip={hosts[1].ip}
+        - weight_sync.backend=rdma
+        - weight_sync.rdma.require_rdma=true
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, info: true}  # not yet measured on the NeMo-RL GRPO code
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_2node.yaml
+      overrides: *split
+
+  - id: grpoperf-qwen3moe-onpolicy-fp8gen-2node
+    aliases: ["F1"]
+    title: "F1: B1 with FP8 generation (ATOM online ptpc_fp8)"
+    needs: [rdma]
+    compile_cache_key: grpoperf Qwen3-30B-A3B fp8
+    env:
+      WEIGHT_SYNC_BACKEND: auto
+      GLOO_SOCKET_IFNAME: "{rdma.interface}"
+      # On the 261125 image's torch, expandable_segments takes effect and a sleeping
+      # colocated ATOM no longer returns its memory to the device; training then
+      # runs out of memory. Turn it off for the colocated cases.
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_onpolicy_fp8gen_2node.yaml
+      overrides: *colocated
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 2335, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_onpolicy_fp8gen_2node.yaml
+      overrides: *colocated
+
+  - id: grpoperf-qwen3moe-1stepoff-fp8gen-2node
+    aliases: ["F2"]
+    title: "F2: B2 with FP8 generation (ATOM online ptpc_fp8)"
+    compile_cache_key: grpoperf Qwen3-30B-A3B fp8
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_fp8gen_2node.yaml
+      overrides: *split
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, info: true}  # not yet measured on the NeMo-RL GRPO code
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_fp8gen_2node.yaml
+      overrides: *split
+
+  # ---- Qwen3-30B-A3B in other layouts (README.md: Results) ----
+  - id: grpoperf-qwen3moe-1stepoff-12p4-2node
+    aliases: ["B2-12P4"]
+    title: "B2 with 12 trainers (8 + 4, Megatron native EP4 x DP3) and ATOM TP1 x 4 on the second node's other GPUs"
+    compile_cache_key: grpoperf Qwen3-30B-A3B bf16
+    env:
+      GLOO_SOCKET_IFNAME: "{rdma.interface}"
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_2node.yaml
+      overrides: &split_12p4
+        - cluster.num_nodes=2
+        - cluster.ray_address=auto
+        - controller.ray.actor.num_workers=12
+        - controller.ray.actor.process_on_nodes=[8,4]
+        - controller.ray.actor.topology_tags.node_ips={hosts[0].ip},{hosts[1].ip}
+        - controller.ray.rollout.num_workers=4
+        - controller.ray.rollout.process_on_nodes=[4]
+        - controller.ray.rollout.topology_tags.node_ip={hosts[1].ip}
+        - policy.training.megatron_cfg.expert_model_parallel_size=4
+        - policy.generation.vllm_cfg.max_num_seqs=512
+        - weight_sync.backend=rdma
+        - weight_sync.rdma.require_rdma=true
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 2800, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_2node.yaml
+      overrides: *split_12p4
+
+  - id: grpoperf-qwen3moe-1stepoff-fp8gen-12p4-2node
+    aliases: ["F2-12P4"]
+    title: "F2 with B2-12P4's layout: 12 trainers (EP4 x DP3) and ATOM ptpc_fp8 TP1 x 4"
+    compile_cache_key: grpoperf Qwen3-30B-A3B fp8
+    env:
+      GLOO_SOCKET_IFNAME: "{rdma.interface}"
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_fp8gen_2node.yaml
+      overrides: *split_12p4
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 2296, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_30b_a3b_1stepoff_fp8gen_2node.yaml
+      overrides: *split_12p4
+
+  - id: grpoperf-qwen3moe-onpolicy-1node
+    aliases: ["B1-1N"]
+    title: "B1's colocated layout on one node: Megatron native EP8 + ATOM TP1 x 8, for training-side experiments"
+    nodes: 1
+    needs: []
+    compile_cache_key: grpoperf Qwen3-30B-A3B bf16
+    env:
+      WEIGHT_SYNC_BACKEND: auto
+      NCCL_SOCKET_IFNAME: "{rdma.interface}"
+      GLOO_SOCKET_IFNAME: "{rdma.interface}"
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke:
+      config: configs/grpo_qwen3_30b_a3b_onpolicy_2node.yaml
+      overrides:
+        - cluster.num_nodes=1
+        - cluster.ray_address=null
+        - controller.ray.actor.num_workers=8
+        - controller.ray.actor.process_on_nodes=[8]
+        - policy.generation.atom_cfg.gpu_memory_utilization=0.65
+        - val_steps=0
+        - checkpointing.save_steps=100000
+        - logger.wandb_enabled=false
+      checks:
+        step: 4
+        metrics:
+          - {name: perf/throughput, info: true}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+
+  # ---- Qwen3-8B, one node, through the DAPO launcher's ATOM environment ----
+  - id: grpoperf-qwen3-8b-1stepoff
+    aliases: ["B3"]
+    title: "B3: Qwen3-8B 1-step off, Megatron native TP1 x DP4 + ATOM TP1 x 4 on one node"
+    nodes: 1
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B bf16
+    requires: &qwen3_8b
+      - models/Qwen3-8B
+      - data/omi2_train_1M/train.parquet
+      - data/omi2_train_1M/val.parquet
+    env: &atom8b
+      MODE: atombf16
+      MODEL_PATH: "{data_root}/models/Qwen3-8B"
+    smoke:
+      config: configs/grpo_qwen3_8b_1stepoff_1node.yaml
+      overrides: &split1
+        # run_dapo.sh puts colocated ATOM to sleep; these rollout GPUs are its own.
+        - policy.generation.vllm_cfg.enable_sleep_mode=false
+        - policy.generation.vllm_cfg.sleep_level=0
+        - weight_sync.rdma.interface={rdma.interface}
+        - weight_sync.rdma.hca={rdma.hca}
+        - weight_sync.rdma.gid_index={rdma.gid_index}
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 6189, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_8b_1stepoff_1node.yaml
+      overrides: *split1
+
+  - id: grpoperf-qwen3-8b-onpolicy
+    aliases: ["B4"]
+    title: "B4: Qwen3-8B on-policy, 8 GPUs, Megatron native TP1 x DP8 + colocated ATOM TP1 x 8"
+    nodes: 1
+    needs: []
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B bf16
+    requires: *qwen3_8b
+    env:
+      MODE: atombf16
+      MODEL_PATH: "{data_root}/models/Qwen3-8B"
+      # On the 261125 image's torch, expandable_segments takes effect and a sleeping
+      # colocated ATOM no longer returns its memory to the device; training then
+      # runs out of memory. Turn it off for the colocated cases.
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke:
+      config: configs/grpo_qwen3_8b_onpolicy_1node.yaml
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 5412, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_8b_onpolicy_1node.yaml
+
+  - id: grpoperf-qwen3-8b-1stepoff-fp8gen
+    aliases: ["F3"]
+    title: "F3: B3 with FP8 generation (ATOM online per_block_fp8)"
+    nodes: 1
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B fp8
+    requires: *qwen3_8b
+    env: *atom8b
+    smoke:
+      config: configs/grpo_qwen3_8b_1stepoff_fp8gen_1node.yaml
+      overrides: *split1
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 6155, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_8b_1stepoff_fp8gen_1node.yaml
+      overrides: *split1
+
+  - id: grpoperf-qwen3-8b-onpolicy-fp8gen
+    aliases: ["F4"]
+    title: "F4: B4 with FP8 generation (ATOM online per_block_fp8)"
+    nodes: 1
+    needs: []
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B fp8
+    requires: *qwen3_8b
+    env:
+      MODE: atombf16
+      MODEL_PATH: "{data_root}/models/Qwen3-8B"
+      # On the 261125 image's torch, expandable_segments takes effect and a sleeping
+      # colocated ATOM no longer returns its memory to the device; training then
+      # runs out of memory. Turn it off for the colocated cases.
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke:
+      config: configs/grpo_qwen3_8b_onpolicy_fp8gen_1node.yaml
+      checks:
+        step: 8
+        metrics:
+          - {name: perf/throughput, ref: 5452, rtol: 0.10}
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full:
+      config: configs/grpo_qwen3_8b_onpolicy_fp8gen_1node.yaml
+
+  # ---- 200-step runs of B4 and B3 (README "Long runs") ----
+  - id: grpoperf-qwen3-8b-onpolicy-200steps
+    aliases: ["B4-200"]
+    title: "B4 for 200 steps"
+    nodes: 1
+    needs: []
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B bf16
+    requires: *qwen3_8b
+    env:
+      MODE: atombf16
+      MODEL_PATH: "{data_root}/models/Qwen3-8B"
+      PYTORCH_ALLOC_CONF: ""
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    smoke: &b4_200
+      config: configs/grpo_qwen3_8b_onpolicy_1node.yaml
+      steps: 200
+      timeout_min: 720
+      checks:
+        step: 200
+        metrics:
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full: *b4_200
+
+  - id: grpoperf-qwen3-8b-1stepoff-200steps
+    aliases: ["B3-200"]
+    title: "B3 for 200 steps"
+    nodes: 1
+    command: bash {examples}/DAPO/run_dapo.sh
+    compile_cache_key: grpoperf Qwen3-8B bf16
+    requires: *qwen3_8b
+    env: *atom8b
+    smoke: &b3_200
+      config: configs/grpo_qwen3_8b_1stepoff_1node.yaml
+      overrides: *split1
+      steps: 200
+      timeout_min: 720
+      checks:
+        step: 200
+        metrics:
+          - {name: rollout_corr/token_mult_prob_error, info: true}
+    full: *b3_200

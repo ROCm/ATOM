@@ -140,6 +140,63 @@ pass yet.
       <td></td>
     </tr>
     <tr>
+      <td rowspan="8"><a href="GRPOPerf/README.md">GRPOPerf</a></td>
+      <td>B1: Qwen3-30B-A3B on-policy, Megatron EP8 + colocated ATOM</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-2node</code> (B1)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>55 min</td>
+    </tr>
+    <tr>
+      <td>B2: Qwen3-30B-A3B 1-step off, trainer and ATOM on separate nodes</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-2node</code> (B2)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>B3: Qwen3-8B 1-step off, 4 + 4 GPUs</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff</code> (B3)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>32 min</td>
+    </tr>
+    <tr>
+      <td>B4: Qwen3-8B on-policy, colocated</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy</code> (B4)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>34 min</td>
+    </tr>
+    <tr>
+      <td>F1: B1 with FP8 generation</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-fp8gen-2node</code> (F1)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>41 min</td>
+    </tr>
+    <tr>
+      <td>F2: B2 with FP8 generation</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-fp8gen-2node</code> (F2)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>F3: B3 with FP8 generation</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff-fp8gen</code> (F3)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>31 min</td>
+    </tr>
+    <tr>
+      <td>F4: B4 with FP8 generation</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy-fp8gen</code> (F4)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>34 min</td>
+    </tr>
+    <tr>
       <td rowspan="2"><a href="FlowGRPO/README.md">FlowGRPO</a></td>
       <td>Qwen-Image FlowGRPO on verl-omni</td>
       <td><code>flowgrpo-qwen-image-baseline</code></td>
@@ -215,6 +272,7 @@ Reference metrics, spreads and per-run results: [release/VALIDATION.md](../relea
 bash examples/run.sh suite                       # t0 + t1, plus t2 when two hosts are configured
 bash examples/run.sh suite --tier t1 --only 1,4,9
 bash examples/run.sh suite --tier long --only flowgrpo-qwen-image-lumen
+bash examples/run.sh suite --tier long --only B1,B2,B3,B4,F1,F2,F3,F4   # GRPOPerf, two hosts
 bash examples/run.sh compare <results-A> <results-B>
 ```
 

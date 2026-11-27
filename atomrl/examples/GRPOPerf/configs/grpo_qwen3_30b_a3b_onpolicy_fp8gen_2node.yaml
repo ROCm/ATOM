@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# NeMo-RL's GRPO loss and data: KL 0.01 (k3) to the initial model, whose
+# log-probs the actors compute with its weights swapped in; leave-one-out
+# advantages; Math-Verify reward; prompts up to 4096 tokens; warmup from 3e-8;
+# old log-probs from their own forward (NeMo-RL's MXFP8 recipes do not set
+# force_on_policy_ratio).
+# The router stays frozen, in fp64, without load balancing, and the MoE permutes
+# are fused (NeMo-RL's defaults).
+
+# F1: B1 with FP8 generation (ATOM online quantization; attention, router and
+# lm_head stay BF16 as in NeMo-RL's MXFP8 recipes; training BF16; token-level IS
+# correction without truncation). ptpc_fp8 measured fastest; per_block_fp8 also
+# works (mxfp8 experts cannot be resynced). Needs ATOM's FP8 expert
+# requantization. Change the format with
+#   policy.generation.atom_cfg.online_quant_config.global_quant_config=<format>
+#
+# B1: GRPO Qwen3-30B-A3B, on-policy, 16 GPUs on two nodes, colocated training + ATOM.
+#
+# Starts from DAPO example 7 (dapo_qwen3moe_a3b_ray_megatron_verlref_4k_smoke.yaml:
+# megatron_native EP=8 with colocated rollout on one node) and spans it over two
+# nodes with the ATOM rollout, following NeMo-RL v0.8's grpo-qwen3-30ba3b-4n4g
+# recipe (the GB200 row with 16 GPUs):
+#   64 prompts x 32 generations = 2048 samples, one optimizer step per step,
+#   prompt + response <= 4096, T=1.0, top_p=1.0, Adam lr 3e-7 (50 warmup steps),
+#   wd 0.01, betas (0.9, 0.999), clip 1.0, symmetric PPO clip 0.2, no rollout IS
+#   correction, rollout and training share every GPU.
+# Training: megatron_native TP=1, EP=8 inside each node, DP=2 across the nodes.
+# NeMo-RL's own layout is EP=16 ([1,1,16,1]); run it with
+# policy.training.megatron_cfg.expert_model_parallel_size=16.
+# Rollout: ATOM BF16, TP=1 x 16 replicas, asleep while training.
+# Deviations from NeMo-RL: README.md.
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 8
+  ray_address: "auto"
+
+weight_sync:
+  backend: auto
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    ref_in_actor: true
+    actor:
+      num_workers: 16
+      dispatch_mode: dp_compute_proto
+      process_on_nodes: [8, 8]
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-30B-A3B"
+  training_backend: megatron_native
+  generation_backend: atom
+  max_total_sequence_length: 4096
+  max_response_length: 4096
+  max_prompt_length: 4096
+  train_global_batch_size: 2048
+  gen_batch_size: 0
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384
+  balance_batch: true
+  learning_rate: 3.0e-7
+  lr_warmup_steps: 50
+  lr_warmup_init: 3.0e-8
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  training:
+    optimizer_dtype: bf16
+    megatron_cfg:
+      use_distributed_optimizer: true
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: false
+      moe_grouped_gemm: true
+      moe_permute_fusion: true
+      moe_token_dispatcher_type: alltoall
+      moe_flex_dispatcher_backend: mori
+      moe_mori_max_tokens_per_rank: null
+      moe_mori_kernel_type: null
+      moe_aux_loss_coeff: 0.0
+      moe_router_load_balancing_type: none
+      moe_router_dtype: fp64
+      freeze_moe_router: true
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 16384
+      optimizer_cpu_offload: false
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 1
+      expert_parallel_size: 1
+      kv_cache_dtype: bf16
+      gpu_memory_utilization: 0.60
+      enable_prefix_caching: false
+      online_quant_config:
+        global_quant_config: ptpc_fp8
+        exclude_layer: ["model.layers.*.self_attn.*", "model.layers.*.mlp.gate", "lm_head"]
+      engine_kwargs:
+        enforce_eager: false
+        compilation_config:
+          level: 3
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.60
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: false
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: true
+      sleep_level: 2
+      update_weights_bucket_megabytes: 2048
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo_leave_one_out
+  use_kl_in_reward: false
+  kl_penalty: k3
+  loss_agg_mode: token-mean
+  clip_ratio: 0.2
+  clip_ratio_high: 0.2
+  grpo:
+    num_generations: 32
+    kl_coeff: 0.01
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 1
+
+quantization:
+  rollout:
+    precision: bf16
+  training:
+    fp8: null
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: "1e9"
+    rollout_is_batch_normalize: false
+    rollout_rs: ""
+
+moe:
+  r3:
+    enabled: false
+    record_router_logits: false
+    replay_mode: hard_assignment
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  scorer: hf_math_verify
+  num_workers: 8
+  dataset: "${oc.env:DATA_ROOT}/data/omi2_train_1M/train.parquet"
+  shuffle: true
+  shuffle_seed: 42
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 100000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 10
+seed: 42

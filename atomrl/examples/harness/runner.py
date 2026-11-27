@@ -277,15 +277,17 @@ class Runner:
             raise Skip(
                 f"image {image.ref} is not on {host.name}: `docker pull {image.ref}`{hint}"
             )
+        # Only a running container can hold GPU memory; a stopped one, such as
+        # another site's container that its last run stopped, is left alone.
         r = self.docker(
             host,
-            ["ps", "-a", "--filter", f"ancestor={image.ref}", "--format", "{{.Names}}"],
+            ["ps", "--filter", f"ancestor={image.ref}", "--format", "{{.Names}}"],
         )
         others = [n for n in r.out.split() if n != name]
         if others:
             if not self.opts.force:
                 raise RunError(
-                    f"{host.name}: other containers on {image.ref} may hold GPU memory: "
+                    f"{host.name}: other containers running on {image.ref} may hold GPU memory: "
                     f"{' '.join(others)} (remove them, or pass --force to remove them)"
                 )
             self.docker(host, ["rm", "-f", *others])

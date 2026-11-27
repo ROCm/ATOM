@@ -137,6 +137,63 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
       <td></td>
     </tr>
     <tr>
+      <td rowspan="8"><a href="GRPOPerf/README_cn.md">GRPOPerf</a></td>
+      <td>B1：Qwen3-30B-A3B on-policy，Megatron EP8 + 共置 ATOM</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-2node</code> (B1)</td>
+      <td>2×8 MI355X</td>
+      <td>长跑</td>
+      <td>55 min</td>
+    </tr>
+    <tr>
+      <td>B2：Qwen3-30B-A3B 1-step off，训练和 ATOM 分在两台</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-2node</code> (B2)</td>
+      <td>2×8 MI355X</td>
+      <td>长跑</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>B3：Qwen3-8B 1-step off，4 + 4 卡</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff</code> (B3)</td>
+      <td>1×8 MI355X</td>
+      <td>长跑</td>
+      <td>32 min</td>
+    </tr>
+    <tr>
+      <td>B4：Qwen3-8B on-policy，共置</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy</code> (B4)</td>
+      <td>1×8 MI355X</td>
+      <td>长跑</td>
+      <td>34 min</td>
+    </tr>
+    <tr>
+      <td>F1：B1 改 FP8 生成</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-fp8gen-2node</code> (F1)</td>
+      <td>2×8 MI355X</td>
+      <td>长跑</td>
+      <td>41 min</td>
+    </tr>
+    <tr>
+      <td>F2：B2 改 FP8 生成</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-fp8gen-2node</code> (F2)</td>
+      <td>2×8 MI355X</td>
+      <td>长跑</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>F3：B3 改 FP8 生成</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff-fp8gen</code> (F3)</td>
+      <td>1×8 MI355X</td>
+      <td>长跑</td>
+      <td>31 min</td>
+    </tr>
+    <tr>
+      <td>F4：B4 改 FP8 生成</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy-fp8gen</code> (F4)</td>
+      <td>1×8 MI355X</td>
+      <td>长跑</td>
+      <td>34 min</td>
+    </tr>
+    <tr>
       <td rowspan="2"><a href="FlowGRPO/README_cn.md">FlowGRPO</a></td>
       <td>verl-omni 上的 Qwen-Image FlowGRPO</td>
       <td><code>flowgrpo-qwen-image-baseline</code></td>
@@ -210,6 +267,7 @@ release 镜像固定了 ROCm、PyTorch、AITER、ATOM、Megatron 和 vLLM 的版
 bash examples/run.sh suite                       # t0 + t1；配置了两台机器时再加 t2
 bash examples/run.sh suite --tier t1 --only 1,4,9
 bash examples/run.sh suite --tier long --only flowgrpo-qwen-image-lumen
+bash examples/run.sh suite --tier long --only B1,B2,B3,B4,F1,F2,F3,F4   # GRPOPerf，需要两台主机
 bash examples/run.sh compare <结果 A> <结果 B>
 ```
 
