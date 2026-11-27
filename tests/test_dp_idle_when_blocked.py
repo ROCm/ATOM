@@ -643,12 +643,13 @@ def test_a_held_rank_sends_no_lookup_and_starts_no_window(make, monkeypatch):
 
 
 def test_sync_reduces_hidden_work_with_the_vote(monkeypatch):
-    # Every rank sends the same four flags, set or not, so the all_reduce
+    # Every rank sends the same five flags, set or not, so the all_reduce
     # matches across ranks whatever each one's setting.
     p = DPEngineCoreProc.__new__(DPEngineCoreProc)
     p.label = "dp0"
     p._shutting_down = False
     p.dp_group = object()  # a real group: the flags go through all_reduce
+    p.scheduler = SimpleNamespace(has_running_decode=lambda: False)
     sent = []
 
     def all_reduce(tensor, op=None, group=None):
@@ -657,14 +658,14 @@ def test_sync_reduces_hidden_work_with_the_vote(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     assert p._sync_dp_state(False, True, False) == (False, True, False)
-    assert sent == [[0, 1, 0, 0]]
+    assert sent == [[0, 1, 0, 0, 0]]
     assert p._dp_group_hidden_work is True
     assert p._sync_dp_state(True, False, False, local_hidden=True) == (
         True,
         False,
         False,
     )
-    assert sent[-1] == [1, 0, 0, 1]
+    assert sent[-1] == [1, 0, 0, 1, 0]
 
 
 # ------------------------------- switch ------------------------------------ #

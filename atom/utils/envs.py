@@ -1549,16 +1549,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # single-engine and DP loops runs the early tier load ahead of schedule()
     # and ships its loads, workers ring a doorbell when a load job ends, and
     # after a ring the engine fetches one completion answer before schedule()
-    # so a landed load is admitted one forward earlier. Inert without an
-    # offload tier that loads early (Mooncake Store).
+    # so a landed load is admitted one forward earlier. Installed only when
+    # the KV connector's offload tier loads early (`supports_early_load`:
+    # Mooncake Store); any other connector (dense or DSV4 offload, P/D only)
+    # gets no hook, so the flag changes nothing there.
     "ATOM_OFFLOAD_LOAD_EVENT_WAIT": lambda: _flag_env(
         "ATOM_OFFLOAD_LOAD_EVENT_WAIT", "1"
     ),
     # Default on (0 turns it off). With ATOM_OFFLOAD_LOAD_EVENT_WAIT, also
     # hold the step for the loads it started while the trade pays
     # (`LoadWaitState.budget_s`: tick * gain / (cost * dp_size), at most one
-    # forward, ~0 while decodes run). The DP peers the hold delays are charged
-    # through cost * dp_size.
+    # forward, 0 while any rank of the DP group has a running decode). The DP
+    # peers the hold delays are charged through cost * dp_size, and their
+    # decodes through the group flag carried on the per-step DP state sync.
     "ATOM_OFFLOAD_LOAD_WAIT_HOLD": lambda: _flag_env(
         "ATOM_OFFLOAD_LOAD_WAIT_HOLD", "1"
     ),

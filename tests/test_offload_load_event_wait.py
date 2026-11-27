@@ -401,7 +401,12 @@ def test_no_fresh_answer_without_a_ring_or_before_the_first_forward():
 
 
 def test_load_wait_hook_follows_its_envs(monkeypatch):
-    engine = SimpleNamespace(_kv_progress_event=threading.Event())
+    engine = SimpleNamespace(
+        _kv_progress_event=threading.Event(),
+        scheduler=SimpleNamespace(
+            kv_connector=SimpleNamespace(supports_early_load=True)
+        ),
+    )
     config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
     monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
     monkeypatch.delenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", raising=False)
@@ -413,6 +418,46 @@ def test_load_wait_hook_follows_its_envs(monkeypatch):
     assert hook is not None and hook.hold is False  # off: doorbell only
     monkeypatch.setenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", "0")
     assert load_wait.load_wait_hook(engine, config) is None
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        SimpleNamespace(supports_early_load=False),  # dense / DSV4 offload, P/D only
+        None,  # no connector (or a disaggregated decode engine before its scheduler)
+    ],
+    ids=["dense", "none"],
+)
+def test_no_hook_without_an_offload_tier_that_loads_early(monkeypatch, connector):
+    # `LoadExecutor` rings the doorbell on every offload tier: without the gate
+    # a dense tier's ring would make each step wait for a fresh answer.
+    from atom.kv_transfer.engine_step_hooks import kv_transfer_step_hooks
+
+    monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
+    monkeypatch.delenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", raising=False)
+    engine = SimpleNamespace(
+        _kv_progress_event=threading.Event(),
+        scheduler=SimpleNamespace(kv_connector=connector),
+    )
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))
+    assert load_wait.load_wait_hook(engine, config) is None
+    assert kv_transfer_step_hooks(engine, config) == ()
+    # The doorbell stays uninstalled: a ring sets no engine event.
+    progress_doorbell.ring()
+    assert not engine._kv_progress_event.is_set()
+
+
+def test_dense_offload_connector_gets_no_hook(monkeypatch, seq_factory):
+    # A real scheduler whose connector cannot load early: the factory leaves
+    # the engine without a step hook, so its steps are main's.
+    sched, _, _ = _make(monkeypatch, seq_factory)
+    sched.kv_connector.supports_early_load = False
+    monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
+    engine = SimpleNamespace(_kv_progress_event=threading.Event(), scheduler=sched)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
+    assert load_wait.load_wait_hook(engine, config) is None
+    sched.kv_connector.supports_early_load = True
+    assert load_wait.load_wait_hook(engine, config) is not None
 
 
 def test_cold_engine_never_holds(engine_core, monkeypatch, seq_factory):
@@ -573,7 +618,7 @@ def test_no_pre_phase_load_while_a_decode_is_running(monkeypatch, seq_factory):
 def test_no_decode_prefill_only_step_holds(engine_core, monkeypatch, seq_factory):
     sched, _, (seq,) = _fire(monkeypatch, seq_factory)
     engine, mgr = _engine(engine_core, sched, tick_s=2.0, delay=0.03)
-    assert not load_wait.has_running_decode(sched)
+    assert not sched.has_running_decode()
     _step(engine_core, engine)
     assert mgr.forwards == [[seq.id]]
     assert _stats(engine).waits == 1
@@ -584,6 +629,105 @@ def test_forward_time_is_the_tick(engine_core, monkeypatch, seq_factory):
     engine, _ = _engine(engine_core, sched, tick_s=2.0, delay=0, forward_s=0.03)
     _step(engine_core, engine)
     assert 0.03 <= _stats(engine).tick_s < 0.5
+
+
+def test_dp_dummy_forward_updates_the_tick(engine_core, monkeypatch, seq_factory):
+    # An idle DP rank runs dummy forwards paired with its peers' real ones:
+    # their wall time is the group's step, so the tick follows it instead of
+    # keeping this rank's last real (long prefill) forward.
+    sched, _, _ = _fire(monkeypatch, seq_factory)
+    engine, _ = _engine(engine_core, sched, tick_s=0.5, dp=8)  # a 500 ms prefill
+
+    def dummy_execution(name, wait_out=False):
+        assert name == "dummy_execution" and wait_out
+        time.sleep(0.03)
+        return "fwd"
+
+    engine.runner_mgr = SimpleNamespace(call_func=dummy_execution)
+    engine.scheduler = SimpleNamespace(running=())
+    engine_core.DPEngineCoreProc._execute_dummy_batch(engine)
+    state = _stats(engine)
+    assert 0.03 <= state.tick_s < 0.3
+    assert state.budget_s(1, 0) == pytest.approx(state.tick_s / 8)
+
+
+def test_a_peer_decode_makes_the_hold_budget_zero(engine_core):
+    state = load_wait.LoadWaitState(dp_size=8)
+    state.tick_s = 0.03
+    # No decode on this rank (cost 0) and a fresh Store hit: tick / dp_size ...
+    assert state.budget_s(1, 0) == pytest.approx(0.03 / 8)
+    # ... unless a peer decodes: the hold would add to its ITL.
+    assert state.budget_s(1, 0, group_decoding=True) == 0.0
+    assert state.budget_s(3, 1, group_decoding=True) == 0.0
+
+
+def test_a_peer_decode_keeps_the_step_from_holding(
+    engine_core, monkeypatch, seq_factory
+):
+    # This rank has no decode, so its pre-phase still starts and ships the
+    # load, but a peer's running decode (reduced on `_sync_dp_state`) leaves
+    # nothing to hold for: the step goes on and the load rides the forward.
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, tick_s=2.0, dp=4, delay=None)
+    engine.dp_group_decoding = True
+
+    t0 = time.monotonic()
+    _step(engine_core, engine)
+
+    assert time.monotonic() - t0 < 0.5
+    stats = _stats(engine)
+    assert (stats.steps, stats.loads, stats.skipped, stats.waits) == (1, 1, 1, 0)
+    assert mgr.calls[0] == "process_kvconnector_output"  # still shipped early
+    assert seq.status == WAITING_LOAD
+
+
+def test_prefill_only_group_keeps_the_hold_and_its_bound(
+    engine_core, monkeypatch, seq_factory
+):
+    # The measured case (a P/D prefill instance: no decode on any rank): the
+    # group flag is clear, the bound is the same formula as before, and the
+    # step holds for the load and prefills it in this step.
+    sched, _, (seq,) = _fire(monkeypatch, seq_factory)
+    engine, mgr = _engine(engine_core, sched, tick_s=2.0, dp=4, delay=0.03)
+    engine.dp_group_decoding = False
+
+    _step(engine_core, engine)
+
+    state = _stats(engine)
+    assert mgr.forwards == [[seq.id]]
+    assert (state.waits, state.landed, state.timed_out) == (1, 1, 0)
+    # tick * gain / (max(1, cost) * dp_size) = 2.0 * 1 / (1 * 4): unchanged.
+    assert state.budget_total_s == pytest.approx(2.0 / 4)
+
+
+def test_sync_dp_state_carries_any_rank_decoding(engine_core, monkeypatch):
+    # One more flag on the same all_reduce (no new collective): a peer's
+    # running decode reaches every rank as `dp_group_decoding`.
+    import torch
+
+    p = engine_core.DPEngineCoreProc.__new__(engine_core.DPEngineCoreProc)
+    p.label = "dp0"
+    p._shutting_down = False
+    p.dp_group = object()
+    p.scheduler = SimpleNamespace(has_running_decode=lambda: False)
+    calls = []
+    peer = {"decoding": 1}
+
+    def all_reduce(tensor, op=None, group=None):
+        calls.append(tensor.tolist())
+        tensor[4] = max(int(tensor[4]), peer["decoding"])
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    assert p._sync_dp_state(True, False, False) == (True, False, False)
+    assert p.dp_group_decoding is True
+    peer["decoding"] = 0
+    p._sync_dp_state(True, False, False)
+    assert p.dp_group_decoding is False
+    p.scheduler = SimpleNamespace(has_running_decode=lambda: True)
+    p._sync_dp_state(True, False, False)
+    assert calls[-1] == [1, 0, 0, 0, 1]  # this rank's own decode is sent
+    assert p.dp_group_decoding is True
+    assert len(calls) == 3  # one collective per sync
 
 
 # -- off is main, one early-load pass per step ------------------------------------
