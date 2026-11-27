@@ -332,10 +332,12 @@ def _tap(j, r_a, aux, HIDDEN: tl.constexpr, BLOCK: tl.constexpr, NHC: tl.constex
 
 
 @triton.jit
-def _draft_begin_kernel(anchor, noise, h_in, anchor_positions, pos, step, hidden, max_pos, NHC: tl.constexpr,
-                        BLOCK: tl.constexpr, BUMP: tl.constexpr = 1):  # fmt: skip
+def _draft_begin_kernel(anchor, noise_shards, noise_shard, noise_at, h_in, anchor_positions, pos, step, hidden,
+                        max_pos, NHC: tl.constexpr, BLOCK: tl.constexpr, BUMP: tl.constexpr = 1):  # fmt: skip
     """The hi block draft's inputs (one request): row r of the block's streams =
-    the anchor's embedding (r = 0: ``anchor``, ATOM's embedding row) or the noise token's, in each of the ``NHC``
+    the anchor's embedding (r = 0: ``anchor``, ATOM's embedding row) or the noise token's (bf16 elements from
+    ``noise_at`` of the shard at ``noise_shards[noise_shard]``: its owner rank's vocab shard of the embedding, read in
+    place), in each of the ``NHC``
     streams (``build_block_state``'s); program (0, 0) also writes the block's first position (anchor + 1, int32),
     clamped to [0, max_pos] as the target's first position is (``_request``: a capture's dummy or a stale anchor reads
     in-range RoPE rows; every real position is below it, so the same bits), and (``BUMP``) bumps the draft's
@@ -345,6 +347,9 @@ def _draft_begin_kernel(anchor, noise, h_in, anchor_positions, pos, step, hidden
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < hidden
     a = tl.load(anchor + offs, mask=m, other=0.0)
+    noise = (
+        tl.load(noise_shards + noise_shard).to(tl.pointer_type(tl.bfloat16)) + noise_at
+    )
     v = tl.where(r == 0, a, tl.load(noise + offs, mask=m, other=0.0))
     for j in tl.static_range(NHC):
         tl.store(h_in + (r * NHC + j) * hidden + offs, v, mask=m)

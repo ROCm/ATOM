@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import triton
@@ -18,6 +19,7 @@ from atom.models.deepseek_v41.mono import hi_bridge as ml
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_compose import _DraftLaunch
 from atom.models.deepseek_v41.mono.hi_gate import log_once
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -26,6 +28,14 @@ CTX_LAUNCH = 42  # the DSpark context write's launch id (40: the head, 41: the E
 
 
 # ---- shared with the runner (``hi_runner``)
+
+
+def block_sources(block) -> tuple:
+    """The parameters a block's packing reads (a target layer's or a draft stage's): every one but the routed
+    experts' (read in place, never packed)."""
+    return tuple(
+        p for n, p in block.named_parameters() if not n.startswith("ffn.experts.")
+    )
 
 
 class _Arena:
@@ -106,19 +116,69 @@ class HiDraft:
         pb = max(k.program.peer_bytes for k in self.ctx_programs.values())
         self.cx_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         self.cx_bufs = _buffers(self.ctx_programs, self.arena, dev, self.step)
-        self.cx_w = D.pack(
-            hw.ctx_tensors(draft, D.STAGES), self.tp, self.rank, "shard", device=dev
-        )
+        self.cx_w = self._pack_ctx(draft)
         self._packed.append(self.cx_w)
         self.cx_geo = torch.zeros(D.STAGES, D.GEO, dtype=torch.int32, device=dev)
         self.cx_geo_key, self.cx_captured = None, False
         return sum(t.numel() * t.element_size() for t in self.cx_w.values())
 
+    def _pack_ctx(self, draft) -> dict:
+        """``CTX``'s weights (the hi runtime's ``draft.pack`` of the draft's tensors), as packed at install and
+        again by its rebuild."""
+        D = self.D
+        return D.pack(
+            hw.ctx_tensors(draft, D.STAGES),
+            self.tp,
+            self.rank,
+            "shard",
+            device=self.dev,
+        )
+
     def bind_draft(self, drafter) -> None:
         """The DSpark proposer (``install_mono_decode``): the draft's context layers (their window rings; their count
-        and the norms' eps checked at install, ``hi_runner.check``)."""
+        and the norms' eps checked at install, ``hi_runner.check``) and where the block draft reads the noise token's
+        embedding row: in place, from its owner rank's vocab shard (``PeerEmbedding``, the mapping DSpark's own draft
+        reads; collective: every rank binds it here), so an in-place weight update of the embedding reaches it. Where
+        the shards are not mapped, the draft's cached ``_noise_row`` (bound on the first draft step), a copy an update
+        does not reach (``dr_noise_cached``: the weight-update audit's refusal)."""
+        from atom.model_ops.embed_head import VocabParallelEmbedding
+        from atom.model_ops.peer_embedding import shared_peer_embedding
+
         self.cx_drafter = drafter
         self.cx_layers = [int(a.spec.layer_id) for a in drafter.model.context_layers]
+        draft = drafter.model
+        embed, token = draft.embed, int(draft.config.dspark_noise_token_id)
+        self.dr_noise, self.dr_noise_cached = None, True
+        if (
+            isinstance(embed, VocabParallelEmbedding)
+            and embed.tp_size > 1
+            and embed.weight.dtype == torch.bfloat16
+        ):
+            from aiter.dist.parallel_state import get_tp_group
+
+            try:
+                peer = shared_peer_embedding(embed, get_tp_group().cpu_group)
+            except MonoUnsupported as why:
+                logger.warning(
+                    "V4.1 mono hi draft: noise row from the draft's cache: %s", why
+                )
+            else:
+                owner = token // peer.rows_per_rank
+                if 0 <= owner < peer.ranks:
+                    local = token - owner * peer.rows_per_rank
+                    self.dr_noise = (peer.view.addresses, owner, local * peer.dim)
+                    self.dr_noise_cached = False
+
+    def _noise_source(self) -> tuple:
+        """(the int64 addresses of the shards the noise row lies in, its shard, its element offset) for
+        ``_draft_begin_kernel``: its owner's vocab shard (``bind_draft``), else the draft's cached row (bound here, on
+        the first draft step: eager, a graph's warmup)."""
+        if self.dr_noise is None:
+            row = self.cx_drafter.model._noise_embedding()
+            self._dr_noise_row = row  # (kept alive with its address)
+            addr = torch.tensor([row.data_ptr()], dtype=torch.int64, device=row.device)
+            self.dr_noise = (addr, 0, 0)
+        return self.dr_noise
 
     def _ctx_taps(self) -> list | None:
         """ATOM's aux buffers of the tapped layers (the draft's ``dspark_target_layer_ids`` order; bound from the
@@ -254,7 +314,7 @@ class HiDraft:
         from .hi.runtime.peer import PeerGroup
         from .hi.v41 import head as H
 
-        D, W = self.D, self.dr_width
+        W = self.dr_width
         self.dr_peers = PeerGroup(
             max(k.program.peer_bytes for k in self.dr_kerns.values()), self._cpu_group
         )
@@ -290,22 +350,24 @@ class HiDraft:
             {n: p.describe() for n, p in self.dr_plans.items()},
         )
         self.dr_w, nbytes, plain = [], 0, 0
-        inter = model.config.moe_intermediate_size
+        self._dr_inter = model.config.moe_intermediate_size
         for s in range(3):
             block = draft.mtp[s]
-            w, raw = hw.block_tensors(block, f"mtp.{s}.")
-            moe = hw.expert_packs(block.ffn.experts, inter, self.tp)
-            packed = D.pack_stage(
-                s, w, raw, self.tp, self.rank, device=dev, local=True, moe=moe
-            )
-            del w, raw, moe
+            packed = self._pack_stage(draft, s)
             plain += hw.alias_plain(block, packed)
+            self._register_packed(
+                f"hi draft stage {s}",
+                packed,
+                block_sources(block),
+                partial(self._pack_stage, draft, s),
+            )
             self.dr_w.append(packed)
             nbytes += sum(
                 t.numel() * t.element_size()
                 for t in packed.values()
                 if not getattr(t, "_atom_alias", False)
             )
+        nbytes -= self._ctx_reads_stage_wkv(draft)
         log_once(
             logging.INFO,
             "V4.1 mono hi: the draft stages' weights packed from ATOM's draft tensors; their routed experts' "
@@ -323,9 +385,54 @@ class HiDraft:
             "norm.g": norm.bfloat16().contiguous().to(dev),
             "mk.w": head_w,
         }
+        # (the verify head's packed head.w where it is one: registered with it, ``hi_runner._head_tables``)
+        self._register_packed(
+            "hi draft head", self.dr_head_w, (model.norm.weight, model.head.weight, draft.mtp[2].norm.weight),
+            lambda: {"norm.g": draft.mtp[2].norm.weight.detach().bfloat16().contiguous().to(dev),
+                     "mk.w": H.pack(model.norm.weight.detach(), model.head.weight.detach(), device=dev)["head.w"]},
+        )  # fmt: skip
         self.dr_tables = {}
         self._packed.extend(self.dr_w)
         return nbytes
+
+    def _pack_stage(self, draft, s: int) -> dict:
+        """Draft stage s's weight args (``draft.pack_stage`` of ATOM's draft tensors, ``hi_weights``), as packed at
+        install and again by its rebuild."""
+        block = draft.mtp[s]
+        w, raw = hw.block_tensors(block, f"mtp.{s}.")
+        moe = hw.expert_packs(block.ffn.experts, self._dr_inter, self.tp)
+        return self.D.pack_stage(
+            s, w, raw, self.tp, self.rank, device=self.dev, local=True, moe=moe
+        )
+
+    def _ctx_reads_stage_wkv(self, draft) -> int:
+        """``CTX``'s stage ``wkv`` args pointed at the stages' own packs (the same packing of the same rows: the same
+        bytes, checked), the duplicates dropped; then what is left of ``CTX``'s pack registered (``main_proj``: a
+        derived weight of the draft's ``main_proj``). -> the bytes no longer held."""
+        freed = 0
+        for s in range(self.D.STAGES):
+            for suffix in ("w", "ws"):
+                key, own = f"cx_wkv{s}.{suffix}", self.dr_w[s][f"wkv.{suffix}"]
+                ctx = self.cx_w.get(key)
+                if (
+                    ctx is not None
+                    and ctx.shape == own.shape
+                    and ctx.dtype == own.dtype
+                    and torch.equal(ctx, own)
+                ):
+                    self.cx_w[key] = own
+                    freed += ctx.numel() * ctx.element_size()
+        # (its sources: every tensor ``ctx_tensors`` reads, the stages' wqkv_a for a wkv pack not shared above)
+        sources = [
+            *draft.mtp[0].main_proj.parameters(),
+            *draft.mtp[0].main_norm.parameters(),
+        ]
+        for a in draft.context_layers:
+            sources += [*a.wqkv_a.parameters(), *a.kv_norm.parameters()]
+        self._register_packed(
+            "hi draft ctx", self.cx_w, sources, partial(self._pack_ctx, draft)
+        )
+        return freed
 
     def _draft_tables(self, cache, anchor_ids, slots, mk_ids, plan=None):
         """The four launches' pointer tables for this pool, these staged buffers and this request's ids row (built
@@ -402,14 +509,15 @@ class HiDraft:
         return 1 <= requests <= self.dr_bmax and width == self.dr_width
 
     def draft_run(
-        self, cache, anchor_ids, anchor_rows, anchor_positions, slots, noise_row
+        self, cache, anchor_ids, anchor_rows, anchor_positions, slots
     ) -> None:
         """The block draft on the hi path (inside the draft graph's capture) by the plan of its request count
         (``_draft_plan``): each request's block streams and first position (``_draft_begin_kernel``, its anchor's
         embedding row, with the launch-tag bump), then stages 0-2 and the head(s); request b's ids land in
         ``mk_ids[b]``. ``anchor_ids`` / ``anchor_positions`` / ``slots``: a row a request; ``anchor_rows``: their
-        embedding rows (ATOM's lookup).
+        embedding rows (ATOM's lookup); the noise token's row from its owner's shard (``bind_draft``).
         """
+        shards, owner, offset = self._noise_source()
         requests = int(anchor_ids.numel())
         self.dr_requests = requests
         self.cx_captured |= torch.cuda.is_current_stream_capturing()
@@ -434,8 +542,8 @@ class HiDraft:
                     cache, ids[b : b + 1], sl[b : b + 1], self.mk_ids[b]
                 )
                 ml._draft_begin_kernel[(W, triton.cdiv(Hd, 1024))](
-                    anchor_rows[b], noise_row, self.dr_h_in, apos[b : b + 1], self.dr_pos, self.dr_step, Hd,
-                    self.draft_max_pos, NHC=HC, BLOCK=1024,
+                    anchor_rows[b], shards, owner, offset, self.dr_h_in, apos[b : b + 1], self.dr_pos, self.dr_step,
+                    Hd, self.draft_max_pos, NHC=HC, BLOCK=1024,
                 )  # fmt: skip
                 launches(plan.launches, tables)
             return
@@ -443,7 +551,7 @@ class HiDraft:
         # request b's streams (rows b W ..) and first position; one tag bump a draft
         for b in range(requests):
             ml._draft_begin_kernel[(W, triton.cdiv(Hd, 1024))](
-                anchor_rows[b], noise_row, self.dr_h_in[b * W :], apos[b : b + 1], self.dr_pos[b:], self.dr_step, Hd,
-                self.draft_max_pos, NHC=HC, BLOCK=1024, BUMP=int(b == 0),
+                anchor_rows[b], shards, owner, offset, self.dr_h_in[b * W :], apos[b : b + 1], self.dr_pos[b:],
+                self.dr_step, Hd, self.draft_max_pos, NHC=HC, BLOCK=1024, BUMP=int(b == 0),
             )  # fmt: skip
         launches(plan.launches, tables)

@@ -25,9 +25,9 @@ class CompressWeights:
     ratio: int
     wkv: torch.Tensor  # [kv | score rows, hidden] bf16
     ape: torch.Tensor  # [ratio, head_dim] f32
-    norm_w: torch.Tensor  # f32
+    norm_w: torch.Tensor  # [head_dim] bf16, the model's own (read in place)
     wk: torch.Tensor  # [index dim, head_dim] bf16
-    k_norm_w: torch.Tensor  # f32
+    k_norm_w: torch.Tensor  # [index dim] bf16, the model's own (read in place)
     eps: float
     k_eps: float
 
@@ -50,6 +50,12 @@ def compress_weights(attn) -> CompressWeights | None:
         and tuple(comp.ape.shape) == (comp.ratio, HEAD_DIM)
         and wkv.is_contiguous()
         and wk.is_contiguous()
+        and comp.norm.weight.dtype == torch.bfloat16
+        and tuple(comp.norm.weight.shape) == (HEAD_DIM,)
+        and comp.norm.weight.is_contiguous()
+        and indexer.k_norm.weight.dtype == torch.bfloat16
+        and tuple(indexer.k_norm.weight.shape) == (ip.DIM,)
+        and indexer.k_norm.weight.is_contiguous()
     )
     if not shapes_ok:
         return None
@@ -57,9 +63,9 @@ def compress_weights(attn) -> CompressWeights | None:
         ratio=comp.ratio,
         wkv=wkv,
         ape=comp.ape.float().contiguous(),
-        norm_w=comp.norm.weight.float().contiguous(),
+        norm_w=comp.norm.weight,
         wk=wk,
-        k_norm_w=indexer.k_norm.weight.float().contiguous(),
+        k_norm_w=indexer.k_norm.weight,
         eps=float(comp.norm.eps),
         k_eps=float(indexer.k_norm.eps),
     )
@@ -99,6 +105,15 @@ class MonoCompressor:
         self.latent = torch.zeros(max_rows, HEAD_DIM, dtype=torch.bfloat16, device=dev)
         self.keys = torch.zeros(max_rows, ip.DIM, dtype=torch.bfloat16, device=dev)
         self.tl = torch.zeros(1, dtype=torch.int64, device=dev)
+
+    def weight_pointers(self) -> dict[str, torch.Tensor]:
+        """The weights the launches read, every one the model's in place
+        (``ape`` is a constant buffer, not a weight)."""
+        return {
+            f"compress {layer} {name}": getattr(w, name)
+            for layer, w in self.layers.items()
+            for name in ("wkv", "norm_w", "wk", "k_norm_w")
+        }
 
     def builds(self, rows: int) -> dict:
         """An S-row step's build a ratio its layers compress at."""

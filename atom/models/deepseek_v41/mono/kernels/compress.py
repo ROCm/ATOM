@@ -55,6 +55,8 @@ from atom.mono.device.ops import (
     CM_NT,
     bf16_pair,
     bf16_round,
+    bf_hi,
+    bf_lo,
     butterfly,
     exp_f32,
     fp8_pack4,
@@ -237,6 +239,14 @@ def _f32x2(ptr, i):
     return [v[0], v[1]]
 
 
+def _bf16x2(ptr, i):
+    """bf16 elements i, i + 1 (i even) of the buffer at ``ptr`` as f32, one
+    word (bf16 -> f32 is exact): the model's own norm weights, read in place
+    like K1's ``qn_w`` / ``kvn_w``, so a weight reload reaches the kernel."""
+    w = fx.Int32(bo.buffer_load(rsrc(ptr), i // 2, vec_width=1, dtype=T.i32))
+    return [bf_lo(w), bf_hi(w)]
+
+
 def _rope_at(a, comp, rp):
     """cos, sin (bf16 tables, as f32) of RoPE pair ``rp`` at position ``comp``."""
     at = comp * (ROPE // 2) + rp
@@ -385,7 +395,7 @@ def pool(c, i, h):
         ci = pos // p.ratio
         comp = ci * p.ratio
         block = _word(a["tables"], bid * a["table_stride"] + ci // a["per_page"])
-        nw = _f32x2(a["norm_w"], 2 * tt)
+        nw = _bf16x2(a["norm_w"], 2 * tt)
         cs, sn = _rope_at(a, comp, fx.max(tt - NOPE_PAIRS, fx.Int32(0)))
         rings = []
         for k in range_constexpr(p.ratio):
@@ -604,7 +614,7 @@ def _key_out(c, i, comp, flat):
         rsrc(a["keys"]),
         i * (ip.DIM // 2) + lane,
     )
-    w = _f32x2(a["k_norm_w"], 2 * lane)
+    w = _bf16x2(a["k_norm_w"], 2 * lane)
     ss = butterfly(k[0] * k[0] + k[1] * k[1], (1, 2, 4, 8, 16, 32))
     rstd = hw_rsq(ss * fx.Float32(1.0 / ip.DIM) + fx.Float32(p.k_eps))
     kn = [bf16_round((k[j] * rstd) * w[j]) for j in range(2)]

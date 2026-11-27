@@ -255,9 +255,15 @@ class V41MonoDecodeRunner:
     index_fp4 = False
     index_layout = "fp8"
 
+    # the deployment's derived weights and audits (``weight_refresh``); None:
+    # no weight-update audit
+    derived = None
+    # this runner's name in the audit
+    audit_path = "V4.1 mono layer kernel"
+
     def __init__(
         self, model, drafter, max_model_len: int, index_fp4: bool, outputs,
-        sampling, draft_context: bool = True,
+        sampling, draft_context: bool = True, derived=None,
     ) -> None:  # fmt: skip
         # the forward's output buffer; the step's staged (temperatures, top-p)
         # the mono LM head draws by, None where the owner verifies otherwise
@@ -265,6 +271,9 @@ class V41MonoDecodeRunner:
         # here (``write_context``; else no launch bound for it)
         self.outputs, self.sampling = outputs, sampling
         self.draft_context = draft_context
+        self.derived = derived
+        # the models whose parameters this runner reads (the audit's)
+        self._read_models = (model, _draft_of(drafter))
         # the indexer's widest bound: a ratio-1 layer sees every position. No
         # token's bound may exceed it (positions stay below max_model_len): its
         # selection would never reach a final level nor publish IRDY
@@ -312,6 +321,48 @@ class V41MonoDecodeRunner:
             self._rows_build, self._row_kernels, group, "V4.1 mono",
             lean=self._lean_rows,
         )  # fmt: skip
+        self._audit_agreed(group)
+
+    def _audit_agreed(self, group) -> None:
+        """The weight-update audit of what this runner bound (``derived``:
+        every weight pointer a launch is handed, ``weight_pointers``, in a
+        parameter's storage or a registered derived buffer), agreed over the
+        group: under a runner that takes weight updates a pointer that is
+        neither refuses the runner on every rank."""
+        if self.derived is None:
+            return
+        refused = None
+        try:
+            self._audit()
+        except MonoUnsupported as why:
+            refused = why
+        if not group_agree(refused is None, group):
+            raise refused or MonoUnsupported(
+                "another TP rank's weight-update audit refused mono"
+            )
+
+    def _audit(self) -> None:
+        params = [p for m in self._read_models if m is not None for p in m.parameters()]
+        self.derived.audit(self.audit_path, self.weight_pointers(), params)
+
+    def weight_pointers(self) -> dict[str, torch.Tensor]:
+        """Every weight a launch of this runner is handed, by name (the
+        weight-update audit's): the layers' parameters, and the bound
+        launches' weights beside them. Every other pointer a launch takes is
+        scratch, an activation, a mailbox, the KV cache or a RoPE table."""
+        out = {}
+        for lw in self.layers:
+            out.update({f"layer {lw.layer_id} {n}": t for n, t in lw.tensors.items()})
+        if self.compressor is not None:
+            out.update(self.compressor.weight_pointers())
+        if self.lm_head is not None:
+            out["lm head weight"] = self.lm_head.weight
+            out["lm head norm"] = self.lm_head.norm[0]
+        if self.engram is not None:
+            out.update(self.engram.weight_pointers())
+        if self.draft_ctx is not None:
+            out.update(self.draft_ctx.weight_pointers())
+        return out
 
     def _place_index_outputs(self, plain: dict) -> None:
         """Each selecting layer's pool rows (the attention's keys), the

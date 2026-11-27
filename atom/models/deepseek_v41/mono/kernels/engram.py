@@ -22,6 +22,10 @@ the rows given, the sums local. "Own columns" below: the rank's, or all.
    output), the three sums ``engram_post_wkv`` reduces (r^2, k^2, (r w) k)
    over the own columns pushed to every rank (ENG), every rank's added in
    rank order, the gate, and r + gate v (bf16) into ``out``'s own columns.
+   The gate weight w is ``q_weight * k_weight`` (bf16 each, read in place),
+   multiplied in f32 here: the product of two bf16 values is exact in f32, the
+   same bits as ATOM's ``EngramOp.gate_weight``, a derived copy an in-place
+   weight update of q / k does not reach.
 
 The sums run in another order than the original kernels'; every rounding
 point is the original's. The other columns of ``out`` are not written (the
@@ -77,8 +81,8 @@ PREFETCH = 3  # row groups' weights in flight a CTA past the one it multiplies
 
 ABI = KernelAbi(
     (
-        "res", "sub", "post", "comb", "emb", "w", "ws", "gate_w", "out", "parts",
-        "sym", "peers", "rank", "layer",
+        "res", "sub", "post", "comb", "emb", "w", "ws", "gate_q", "gate_k", "out",
+        "parts", "sym", "peers", "rank", "layer",
     )
 )  # fmt: skip
 
@@ -328,7 +332,9 @@ def gate(c, i):
         for h in range_constexpr(1, HC):
             v = fx.Float32(fmath.fma(rr[h], comb_b[h], v))
         rs.append(bf16_round(v))
-        ws.append(_ld_f32(a["gate_w"], b * HIDDEN + col))
+        # the gate weight q k: exact in f32 (two bf16 significands)
+        gw = b * HIDDEN + col
+        ws.append(_ld_bf(a["gate_q"], gw) * _ld_bf(a["gate_k"], gw))
     await_project(c)
     ks, vs = [], []
     zero = fx.Float32(0.0)
@@ -422,8 +428,8 @@ def build_engram(key: EngramBuild):
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def engram(
         res: Int64, sub: Int64, post: Int64, comb: Int64, emb: Int64, w: Int64,
-        ws: Int64, gate_w: Int64, out: Int64, parts: Int64, sym: Int64,
-        peers: Int64, rank: Int32, layer: Int32,
+        ws: Int64, gate_q: Int64, gate_k: Int64, out: Int64, parts: Int64,
+        sym: Int64, peers: Int64, rank: Int32, layer: Int32,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek().words.ptr
@@ -434,7 +440,8 @@ def build_engram(key: EngramBuild):
             "lds": lds, "ldsf": fx.recast_iter(fx.Float32, lds),
             "args": {
                 "res": res, "sub": sub, "post": post, "comb": comb, "emb": emb,
-                "w": w, "ws": ws, "gate_w": gate_w, "out": out, "parts": parts,
+                "w": w, "ws": ws, "gate_q": gate_q, "gate_k": gate_k, "out": out,
+                "parts": parts,
             },
             "mb": Mailbox(layer),
             "epf": preg(sym, peer["epf"], "epf"),
@@ -448,14 +455,14 @@ def build_engram(key: EngramBuild):
     @launcher(name)
     def launch(
         res: Int64, sub: Int64, post: Int64, comb: Int64, emb: Int64, w: Int64,
-        ws: Int64, gate_w: Int64, out: Int64, parts: Int64, sym: Int64,
-        peers: Int64, rank: Int32, layer: Int32,
+        ws: Int64, gate_q: Int64, gate_k: Int64, out: Int64, parts: Int64,
+        sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         engram(
-            res, sub, post, comb, emb, w, ws, gate_w, out, parts, sym, peers, rank,
-            layer,
+            res, sub, post, comb, emb, w, ws, gate_q, gate_k, out, parts, sym,
+            peers, rank, layer,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(engram, launch)

@@ -268,8 +268,11 @@ def expert_packs(
     return out
 
 
-# packed key -> (the ATOM block's parameter or buffer, its rows): the plain bf16 / f32 tensors the hi runtime packs
-# as ATOM keeps them (``layer_impl.pack``: the checkpoint's tensors, converted to the dtype ATOM holds them in)
+# packed key -> (the ATOM block's parameter, its rows): the plain bf16 / f32 tensors the hi runtime packs as ATOM
+# keeps them (``layer_impl.pack``: the checkpoint's tensors, converted to the dtype ATOM holds them in). Parameters
+# only: a buffer ATOM derives at load (``EngramOp.gate_weight``, the Engram gate's ``q_weight * k_weight``) is a copy
+# an in-place weight update does not reach, so ``eng.gw`` keeps the hi runtime's own product (``layer_impl.pack``:
+# the same bits; a derived buffer the install registers and rebuilds, ``hi_runner``)
 PLAIN = {
     "router.w": ("ffn.gate.weight", None),
     "router.bias": ("ffn.gate.e_score_correction_bias", None),
@@ -284,11 +287,13 @@ PLAIN = {
     "q_norm.g": ("attn.q_norm.weight", None),
     "kv_norm.g": ("attn.kv_norm.weight", None),
     "attn.sink": ("attn.attn_sink", None),
-    "eng.gw": ("engram.gate_weight", None),
     "idx.wproj": ("attn.indexer.weights_proj.weight", None),
     # the compressor's wkv and (ratio 2) wgate: ATOM's fused wkv_gate, wkv rows first
     "comp.wkv": ("attn.compressor.wkv_gate.weight", (0, 512)),
     "comp.wgate": ("attn.compressor.wkv_gate.weight", (512, 1024)),
+    # the compressor's norm and the indexer's k_norm (``Compressor.pack``)
+    "comp.norm": ("attn.compressor.norm.weight", None),
+    "comp.knorm": ("attn.indexer.k_norm.weight", None),
 }
 
 
@@ -296,7 +301,7 @@ def alias_plain(block, packed: dict) -> int:
     """``packed``'s plain tensors (``PLAIN``) replaced by ``block``'s (a target layer or a draft stage of ATOM's model)
     where those hold the same bytes (contiguous, the same dtype and size); the others keep their packs. -> the number
     aliased."""
-    tensors = {**dict(block.named_parameters()), **dict(block.named_buffers())}
+    tensors = dict(block.named_parameters())
     n = 0
     for key, (name, rows) in PLAIN.items():
         ours, theirs = packed.get(key), tensors.get(name)

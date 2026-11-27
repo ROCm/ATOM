@@ -95,13 +95,17 @@ def _unwrap_once(module) -> torch.nn.Module | None:
     or None when *module* is not one. See `_sync_target_model`.
 
     `_orig_mod` is `torch.compile`'s own name for what it wrapped, private
-    enough that a model is not going to have one of its own. The import is
-    deferred to keep this module importable without the TBO package, as the
-    tests that drive the updater on a stand-in rely on.
+    enough that a model is not going to have one of its own. A routing wrapper
+    a model installs after load (a mono decode's) names the model it routes
+    around by its class (`weight_sync_target`). The import is deferred to keep
+    this module importable without the TBO package, as the tests that drive
+    the updater on a stand-in rely on.
     """
     compiled_inner = getattr(module, "_orig_mod", None)
     if isinstance(compiled_inner, torch.nn.Module):
         return compiled_inner
+    if getattr(type(module), "weight_sync_target", None) is not None:
+        return module.weight_sync_target
     from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
     if isinstance(module, UBatchWrapper):
@@ -1035,6 +1039,8 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         """
         if self._sync is None:
             refusal = self._reload_refusal()
+            for hook in self._model_hooks("weight_update_refusal"):
+                refusal = refusal or hook()
             if refusal is not None:
                 raise WeightReloadRefused(
                     f"{self.label}: weights cannot be reloaded: {refusal}"
@@ -1220,6 +1226,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         """
         sync = self._sync
         self._relayout_rewritten_experts()
+        self._after_weight_update(sync)
         if clear_kv_cache:
             self.clear_kv_cache()
         unwritten = sorted(self._packed_weight_accum)
@@ -1240,6 +1247,43 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                     f"parameter(s) as they were ({missing[:20]}); only a sync "
                     f"that rewrites every parameter makes them whole again"
                 )
+
+    def _model_hooks(self, name: str) -> list:
+        """The bound ``name`` method of every module of the model whose class
+        defines one: a module that reads weights beside its parameters (a
+        model's mono decode, its re-laid-out copies) answers for them,
+        ``weight_update_refusal()`` before a sync writes and
+        ``after_weight_update(changed)`` once it has."""
+        model = getattr(self, "model", None)
+        if not isinstance(model, torch.nn.Module):
+            return []
+        return [
+            getattr(m, name)
+            for m in model.modules()
+            if callable(getattr(type(m), name, None))
+        ]
+
+    def _after_weight_update(self, sync: WeightSyncRecord) -> None:
+        """Hand the parameters this sync wrote to the model's
+        ``after_weight_update`` hooks, which re-derive in place what they read
+        beside them: after the relayout -- a copy derived from an expert must
+        see its final layout -- and behind the wait for the readers every write
+        in a sync takes (``_await_readers_of``): a replay still in flight would
+        read a half-rebuilt buffer."""
+        hooks = self._model_hooks("after_weight_update")
+        if not hooks or sync is None:
+            return
+        touched = sync.touched()
+        changed = [
+            param
+            for _, _, param in self._get_param_to_module_mapping().values()
+            if id(param) in touched
+        ]
+        if not changed:
+            return
+        _synchronize(self.device)
+        for hook in hooks:
+            hook(changed)
 
     def _params_a_full_sync_rewrites(self) -> dict[str, torch.nn.Parameter]:
         """The parameters the checkpoint wrote at load, the ones a trainer's

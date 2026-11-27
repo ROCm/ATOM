@@ -49,8 +49,11 @@ class DraftMonoRunner(V41MonoDecodeRunner):
     # the draft head (``_bind_head``), agreed on as the target's launches
     optional_launches = V41MonoDecodeRunner.optional_launches + ("heads",)
     heads = None
+    audit_path = "V4.1 mono draft"
 
-    def __init__(self, draft) -> None:
+    def __init__(self, draft, derived=None) -> None:
+        self.derived = derived
+        self._read_models = (draft,)
         config = draft.config
         self.width = draft.block_size
         self.max_rows = self.width * MAX_REQUESTS
@@ -142,6 +145,11 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         self.head_conf = (
             torch.empty(rows, dtype=torch.float32, device=dev) if confidence else None
         )
+        self.head_weights = {
+            "draft head weight": w, "draft head markov w1": w1,
+            "draft head markov w2": w2, "draft head norm": norm.weight,
+            **({"draft head confidence": cw} if confidence else {}),
+        }  # fmt: skip
         self.head_ids = torch.empty(rows, dtype=torch.int32, device=dev)
         self.head_embeds = torch.empty(
             rows, w1.shape[1], dtype=torch.bfloat16, device=dev
@@ -163,6 +171,26 @@ class DraftMonoRunner(V41MonoDecodeRunner):
             "conf": p(self.head_conf) if confidence else 0,
             "first": head.vocab_start_idx, "tl": 0,
         }  # fmt: skip
+
+    def weight_pointers(self) -> dict[str, torch.Tensor]:
+        out = super().weight_pointers()
+        if self.heads is not None:
+            # the draft head's weights by name (``_bind_head``)
+            out.update(self.head_weights)
+        return out
+
+    def _audit(self) -> None:
+        if self.embed_peer is None:
+            # the block's noise rows: ``build_block_state`` of the draft's
+            # ``_noise_embedding()``, a row it caches once, not the embedding
+            self.derived.refuse(
+                self.audit_path,
+                "the block's noise rows come from the draft's cached "
+                "_noise_row (no peer embedding), which an in-place weight "
+                "update of the embedding does not reach",
+            )
+            return
+        super()._audit()
 
     def head(self, anchor_ids):
         """After ``backbone``: the block's ids [B, width], each position's

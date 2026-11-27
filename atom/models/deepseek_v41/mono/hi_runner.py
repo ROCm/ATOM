@@ -92,6 +92,8 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
+from functools import partial
 
 import numpy as np
 import torch
@@ -121,12 +123,17 @@ from atom.models.deepseek_v41.mono.hi_draft import (
     _buffers,
     _end_step,
     _Streams,
+    block_sources,
 )
 from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
     BLOCK_SIZE,
     MAX_CTX,
     REQ_ROWS,
     log_once,
+)
+from atom.models.deepseek_v41.mono.weight_refresh import (
+    DerivedWeights,
+    ParameterStorage,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -143,12 +150,33 @@ IMPORT_RING = 16  # the incremental ring import's programs a layer
 HEAD_SEED = 0  # the sampling head's Philox seed
 
 
+@contextmanager
+def _pack_defaults():
+    """The torch defaults the hi runtime's packing and tables assume (float32, CPU): the install's, and a derived
+    weight's rebuild after a weight update (``HiLayers._register_packed``)."""
+    dtype, device = torch.get_default_dtype(), torch.get_default_device()
+    torch.set_default_dtype(torch.float32)
+    torch.set_default_device("cpu")
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(dtype)
+        torch.set_default_device(device)
+
+
 class HiLayers(HiDraft, HiPrograms):
     """the hi runtime's layer programs for one TP rank (``install``) and the per-step
     hand-off (module docstring)."""
 
     def __init__(
-        self, model, atom_config, widths: list[int], max_ctx: int, engram_mapping, draft
+        self,
+        model,
+        atom_config,
+        widths: list[int],
+        max_ctx: int,
+        engram_mapping,
+        draft,
+        derived: DerivedWeights | None = None,
     ):
         from aiter.dist.parallel_state import (
             get_tensor_model_parallel_rank,
@@ -288,18 +316,24 @@ class HiLayers(HiDraft, HiPrograms):
         self.head_bufs = _buffers(self.head_programs, self.arena, dev, self.step)
         # ---- weights (the hi runtime's own packing, from ATOM's loaded tensors: ``hi_weights``) and the pointer tables
         self.tables, self._packed = {}, []
+        # every weight pointer the programs are handed, by set (``audit_weights``); what is packed, not read in place,
+        # registered as derived weights rebuilt in place after a weight update (``_register_packed``)
+        self.derived = DerivedWeights() if derived is None else derived
+        self._in_params = ParameterStorage(model, draft)
+        self._weight_sets: list[tuple[str, dict]] = []
         nbytes = 0
         # the routed experts' weights, the plain bf16 / f32 tensors (``hi_weights.alias_plain``) read in place from ATOM's
         self.plain_aliased = 0
-        inter = cfg.moe_intermediate_size
         for i in self.mf:
             block = model.layers[i]
-            w, raw = hw.block_tensors(block, f"layers.{i}.")
-            moe = hw.expert_packs(block.ffn.experts, inter, self.tp)
-            packed = L.pack(i, w, raw, device=dev, tp=self.tp, rank=self.rank, local=True, moe=moe,
-                            source=self.sources.get(i), engram=self.plan[i].engram)  # fmt: skip
-            del w, raw, moe
+            packed = self._pack_layer(model, i)
             self.plain_aliased += hw.alias_plain(block, packed)
+            self._register_packed(
+                f"hi layer {i}",
+                packed,
+                block_sources(block),
+                partial(self._pack_layer, model, i),
+            )
             nbytes += sum(
                 t.numel() * t.element_size()
                 for t in packed.values()
@@ -351,6 +385,70 @@ class HiLayers(HiDraft, HiPrograms):
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------ build
+
+    def _pack_layer(self, model, i: int) -> dict:
+        """Target layer i's weight args (``layer_impl.pack`` of ATOM's tensors, ``hi_weights``), as packed at install
+        and again by its rebuild after a weight update."""
+        from .hi.v41 import layer as L
+
+        block = model.layers[i]
+        w, raw = hw.block_tensors(block, f"layers.{i}.")
+        moe = hw.expert_packs(
+            block.ffn.experts, model.config.moe_intermediate_size, self.tp
+        )
+        return L.pack(i, w, raw, device=self.dev, tp=self.tp, rank=self.rank, local=True, moe=moe,
+                      source=self.sources.get(i), engram=self.plan[i].engram)  # fmt: skip
+
+    def _register_packed(self, name: str, packed: dict, sources, repack) -> None:
+        """``packed``'s weights (``name``'s set in the audit, ``audit_weights``); its derived ones -- every tensor in
+        no parameter's storage (the aliases, and the plain tensors packed as ATOM keeps them, are) nor already
+        registered -- as derived weight ``name`` of ``sources``, rebuilt in place by ``repack()``: the install's
+        packing again (under its torch defaults), copied into the bound tensors (the tables' addresses).
+        """
+        self._weight_sets.append((name, packed))
+        dests = {
+            k: t
+            for k, t in packed.items()
+            if t not in self._in_params and not self.derived.registered(t)
+        }
+        if not dests:
+            return
+
+        def rebuild():
+            with _pack_defaults():
+                fresh = repack()
+                for key, dest in dests.items():
+                    new = fresh[key]
+                    if new.shape != dest.shape or new.dtype != dest.dtype:
+                        raise RuntimeError(f"V4.1 mono hi: {name}'s {key} repacked {new.dtype} {tuple(new.shape)}, "
+                                           f"bound {dest.dtype} {tuple(dest.shape)}")  # fmt: skip
+                    dest.copy_(new)
+
+        self.derived.register(name, sources, dests, rebuild)
+
+    def audit_weights(self, model, draft) -> None:
+        """The weight-update audit (``derived.DerivedWeights.audit``) of every weight pointer the programs are handed
+        (the packed and aliased sets, the Markov tables), against the target's and the draft's parameters, and of the
+        block draft's noise row (``bind_draft``); raises ``MonoUnsupported`` where it fails under a runner that takes
+        weight updates (``derived.strict``)."""
+        path = "V4.1 mono hi"
+        if self.dr_noise_cached:
+            self.derived.refuse(
+                path,
+                "the block draft's noise row is the draft's cached _noise_row (no peer "
+                "embedding), which an in-place weight update of the embedding does not reach",
+            )
+            return
+        weights = {
+            f"{name} {key}": t
+            for name, ws in self._weight_sets
+            for key, t in ws.items()
+        }
+        markov = draft.mtp[-1].markov_head
+        weights["draft markov w1"] = markov.markov_w1.weight
+        weights["draft markov w2"] = markov.markov_w2.weight
+        params = [p for m in (model, draft) for p in m.parameters()]
+        self.derived.audit(path, weights, params)
 
     def _io(self, i: int) -> dict:
         """Layer i's non-weight pointers (module docstring)."""
@@ -416,28 +514,25 @@ class HiLayers(HiDraft, HiPrograms):
         ``engram.wkv``) and hash words, its table shard ATOM's page-locked host one (``use_host_tables``) + the step
         inputs. -> bytes held.
         """
-        from .hi.v41 import engram_io
-
-        consts = self._engram_consts()
+        consts = self._eng_consts = self._engram_consts()
         args = {"ids": self.ids, "pos": self.pos, "hist": self.hist}
         args["tmap"] = consts["token_map"].to(torch.int32).to(dev)
         for n, i in self.eng.items():
-            kv = engram_io.pack_kv(
-                n,
-                i,
-                hw.engram_tensors(model.layers[i].engram),
-                consts,
-                self.tp,
-                self.rank,
-                dev,
-            )
+            repack = partial(self._pack_engram, model, n, i)
+            kv = repack()
             args.update(kv)
+            self._register_packed(
+                f"hi engram {i}",
+                kv,
+                tuple(model.layers[i].engram.wkv.parameters()),
+                repack,
+            )
             # ATOM's host shards, set by ``use_host_tables`` before any launch
             args[f"{n}.tq"] = torch.zeros(1, 256, dtype=torch.uint8, device=dev)
             args[f"{n}.ts"] = torch.zeros(1, 8, dtype=torch.uint8, device=dev)
             args[f"{n}.kv"] = self.eng_kv[i]
         self._packed.append(args)
-        self._eng_args, self._eng_consts = args, consts
+        self._eng_args = args
         from .hi.runtime.peer import PeerGroup
 
         # a peer group of its own: its regions never overlap the chain's pinned moe.part (module docstring)
@@ -456,6 +551,14 @@ class HiLayers(HiDraft, HiPrograms):
             for k, t in args.items()
             if k not in ("ids", "pos", "hist")
         )
+
+    def _pack_engram(self, model, n: str, i: int) -> dict:
+        """Engram layer i's (block ``n``) wkv column share and hash words (``engram_io.pack_kv`` of ATOM's
+        ``engram.wkv``), as packed at install and again by its rebuild."""
+        from .hi.v41 import engram_io
+
+        return engram_io.pack_kv(n, i, hw.engram_tensors(model.layers[i].engram), self._eng_consts, self.tp,
+                                 self.rank, self.dev)  # fmt: skip
 
     def use_host_tables(self, host, staging) -> None:
         """The Engram kv launch reads each layer's table shard from ATOM's page-locked host shard (``host``: its
@@ -497,13 +600,16 @@ class HiLayers(HiDraft, HiPrograms):
         """The verify head's pointer tables (one a width): ``norm.g`` / ``head.w`` packed from ATOM's own final
         norm and this rank's head rows, the last layer's streams (its R_F and gate; its plain output unless
         chained), the persistent outputs. -> bytes held."""
-        norm_w, head_w = model.norm.weight.detach(), model.head.weight.detach()
         R, H = self.h_in0.shape[0], self.h_in0.shape[-1]
         self.head_ids = torch.zeros(R, dtype=torch.int32, device=dev)
         self.head_vals = torch.zeros(R, dtype=torch.float32, device=dev)
         # the fold's R: ATOM collapses it
         self.r_h = torch.zeros(R, HC, H, dtype=torch.bfloat16, device=dev)
-        packed = self.H.pack(norm_w, head_w, device=dev)
+        repack = partial(self._pack_head, model)
+        packed = repack()
+        self._register_packed(
+            "hi head", packed, (model.norm.weight, model.head.weight), repack
+        )
         # the block draft's MarkovHead reads the same tensor
         self.head_w_packed = packed["head.w"]
         last = self.sets[self.mf[-1] % 2]
@@ -570,6 +676,13 @@ class HiLayers(HiDraft, HiPrograms):
             )
         self._packed.append(packed)
         return sum(t.numel() * t.element_size() for t in packed.values())
+
+    def _pack_head(self, model) -> dict:
+        """The verify head's ``norm.g`` / ``head.w`` (``head.pack`` of ATOM's final norm and this rank's head rows),
+        as packed at install and again by its rebuild."""
+        return self.H.pack(
+            model.norm.weight.detach(), model.head.weight.detach(), device=self.dev
+        )
 
     def set_head_sampling(self, temps=None, top_ps=None, rows=None) -> bool:
         """This step's rows' (temperature, top_p) for the sampling head, with the step's metadata (the builder's
@@ -1044,11 +1157,12 @@ def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     return tq, ts, (lo, hi), shard_device_address(tq), shard_device_address(ts)
 
 
-def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
+def install(model, atom_config, engram_mapping, draft, derived=None) -> HiLayers | None:
     """The hook for this rank (the deployment is one the hi path serves: ``hi_gate.decide``). ``engram_mapping``:
     ATOM's Engram hash mapping (its runtime's), the source of the table lookup's hash constants (``engram_consts``);
-    ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors). Collective (the
-    peer groups): every rank calls it at the same point."""
+    ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors); ``derived``: the
+    deployment's derived weights, the hook's packed ones registered into it. Collective (the peer groups): every rank
+    calls it at the same point."""
     widths = list(ROWS)
     max_ctx = MAX_CTX
     for p in hi_plan.plan_layers(
@@ -1067,17 +1181,12 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     # (bf16) and device set: the hi runtime's packing and tables assume torch's defaults
     from .hi.emit.compile import serving
 
-    dtype, device = torch.get_default_dtype(), torch.get_default_device()
-    torch.set_default_dtype(torch.float32)
-    torch.set_default_device("cpu")
-    try:
-        # the builds from FlyDSL's disk cache where it holds them (a restart traces them but compiles none), their
-        # trace checks left to the CPU checks of the served programs (``hi.emit.compile.serving``)
-        with serving():
-            hook = HiLayers(model, atom_config, widths, max_ctx, engram_mapping, draft)
-    finally:
-        torch.set_default_dtype(dtype)
-        torch.set_default_device(device)
+    # the builds from FlyDSL's disk cache where it holds them (a restart traces them but compiles none), their
+    # trace checks left to the CPU checks of the served programs (``hi.emit.compile.serving``)
+    with _pack_defaults(), serving():
+        hook = HiLayers(
+            model, atom_config, widths, max_ctx, engram_mapping, draft, derived
+        )
     from atom.models.deepseek_v41.mono.round import post_verify
 
     # the verdict and the Engram cursor commit inside the target graph (``post_verify``): the forward's head output
