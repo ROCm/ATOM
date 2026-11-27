@@ -2945,3 +2945,32 @@ models:
               UMBP_POOL_DECODE: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"umbp_pool","kv_connector_extra_config":{"address":"unix:///tmp/umbp-l1/server.sock","namespace":"d${HANDSHAKE_PORT}","fetch":false}}]}
+
+      # umbp_2p1d_kv_events_dshare with four front-end processes on every
+      # engine (--api-server-count). One process reads, parses, templates,
+      # tokenizes and streams all of an engine's requests on one event loop:
+      # with this trace's bodies (400 KB, 110k tokens) a request spends 0.1 s
+      # outside the engines' own queues at 32 sessions a GPU, 0.9 s at 64 and
+      # 4 s at 96, where the decode engine's /health misses the router's 5 s
+      # three times running and the router fails every request after. The
+      # router waits 30 s for /health here: with one decode worker an
+      # unhealthy mark leaves no worker at all.
+      umbp_2p1d_kv_events_fe:
+        - <<: *dsv41_2p1d_umbp_kvev
+          name: ds-v41-flash-2p1d-p2ep2-d4noep-dspark5-agentic-umbp-kvev-fe-c64
+          display_topology: 2P1D-P2EP2-D4NOEP-DSPARK5-UMBP-KVEV-FE
+          router:
+            <<: *dsv41_umbp_kvev_router
+            extra_args: "--request-timeout-secs 1800 --prepare-timeout-ms 15000 --health-check-timeout-secs 30"
+          prefill:
+            <<: *dsv41_p2ep2_prefill_hbm95
+            workers: 2
+            extra_args: "--enable-dp-attention --enable-expert-parallel --dp-load-balance share_cache --attn-prefill-chunk-size 65536 --gpu-memory-utilization 0.95 --api-server-count 4"
+          decode:
+            <<: *dsv41_d4noep_decode
+            workers: 1
+            extra_args: "--enable-dp-attention --dp-load-balance least_requests --attn-prefill-chunk-size 16384 --gpu-memory-utilization 0.75 --api-server-count 4"
+          env:
+            common: *dsv41_one_node_env_common
+            prefill: *dsv41_umbp_wait_env_prefill
+            decode: *dsv41_umbp_env_decode_pool
