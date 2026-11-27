@@ -2741,9 +2741,14 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     mori_experts = None
 
     @staticmethod
-    def mega_quant() -> str:
-        """Activation x weight format of the MegaMoEV2 instances."""
-        return "a4w4" if envs.ATOM_MEGA_A4W4 else "a8w4"
+    def mega_quant(moe: FusedMoEConfig) -> str:
+        """Activation x weight format of the MegaMoEV2 instances: MXFP4 where the
+        checkpoint declares MXFP4 expert activations, else a8w4 (FP8/MXFP8, or
+        none declared)."""
+        act_quant = MoEActivationQuant.from_model_config(
+            getattr(moe, "a_quant_dtype", None)
+        )
+        return "a4w4" if act_quant is MoEActivationQuant.FP4 else "a8w4"
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(quant_config, moe)
@@ -2784,7 +2789,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             inter_dim=inter_dim,
             experts=moe.num_experts,
             topk=moe.experts_per_token,
-            quant=cls.mega_quant(),
+            quant=cls.mega_quant(moe),
             swiglu_limit=mega_swiglu_limit(layer),
         )
 
@@ -2831,7 +2836,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             model_dim=self.hidden_size,
             inter_dim=self.intermediate_size,
             mtpr=self.moe.max_num_tokens,
-            quant=self.mega_quant(),
+            quant=self.mega_quant(self.moe),
         )
         # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
         self.routed_rows_wire = None

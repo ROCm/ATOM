@@ -476,9 +476,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fp8/fp4 MEGA_DISPATCH_WIRE; otherwise it is ignored and dispatch runs on
     # mori.
     "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
-    # MegaMoEV2 (moe_backend=mega) quantizes activations to MXFP4 (a4w4) rather
-    # than MXFP8 (a8w4).
-    "ATOM_MEGA_A4W4": lambda: os.getenv("ATOM_MEGA_A4W4", "0") == "1",
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.

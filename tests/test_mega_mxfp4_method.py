@@ -351,7 +351,7 @@ def _mega_layer(**attrs):
     )
 
 
-def _mega_method(monkeypatch, layer):
+def _mega_method(monkeypatch, layer, a_quant_dtype=None):
     """A MegaMxfp4MoEMethod after the real init_prepare_finalize on `layer`,
     over a pass-through MoRI transport, recording the inherited apply (Mega's
     step), fused_moe (the fallback's) and aiter's resolver."""
@@ -402,7 +402,7 @@ def _mega_method(monkeypatch, layer):
     monkeypatch.setattr(moe_mod.Mxfp4MoEMethod, "apply", inherited_apply)
 
     method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
-    method.moe = SimpleNamespace(max_num_tokens=512)
+    method.moe = SimpleNamespace(max_num_tokens=512, a_quant_dtype=a_quant_dtype)
     method.fused_experts = None
     method.topk_indices_dtype = None
     method.quant_type = moe_mod.QuantType.per_1x32
@@ -435,7 +435,8 @@ def m31_method(monkeypatch):
         mega_combine_wire=experts.mega_combine_wire,
         mega_quantized_steps_only=experts.mega_quantized_steps_only,
     )
-    return _mega_method(monkeypatch, layer)
+    # The Quark checkpoint declares MXFP4 inputs for the routed experts.
+    return _mega_method(monkeypatch, layer, a_quant_dtype="fp4")
 
 
 def _apply(state, rows):
@@ -481,6 +482,7 @@ def test_m31_mega_combines_over_a_bf16_wire_with_swiglu_oai(monkeypatch):
 
 def test_m31_mega_builds_the_mori_kernel_next_to_its_own(m31_method):
     method = m31_method.method
+    assert method.fused_experts._quant == "a4w4"
     assert isinstance(method.fused_experts, m31_method.mega_module.MegaFusedExperts)
     assert isinstance(
         method.mori_experts, m31_method.modular_kernel.FusedMoEModularKernel
@@ -550,23 +552,32 @@ def test_without_the_switch_mega_takes_every_step_as_before(monkeypatch):
     assert state.contexts == 0 and not state.resolved and not state.fused_moe
 
 
-def _mega_layer_without_switch(monkeypatch):
+def _mega_layer_without_switch(monkeypatch, a_quant_dtype=None):
     return _mega_method(
-        monkeypatch, _mega_layer(activation=moe_mod.ActivationType.Silu)
+        monkeypatch,
+        _mega_layer(activation=moe_mod.ActivationType.Silu),
+        a_quant_dtype=a_quant_dtype,
     )
 
 
 @pytest.mark.parametrize(
-    ("env", "quant"), [(None, "a8w4"), ("0", "a8w4"), ("1", "a4w4")]
+    ("a_quant_dtype", "quant"),
+    # None / "": no declared activation quantization keeps a8w4 (DeepSeek-V4).
+    [
+        ("fp4", "a4w4"),
+        ("uint8", "a4w4"),
+        ("fp8_e4m3", "a8w4"),
+        (None, "a8w4"),
+        ("", "a8w4"),
+    ],
 )
-def test_mega_quant_follows_the_a4w4_env(monkeypatch, env, quant):
-    if env is None:
-        monkeypatch.delenv("ATOM_MEGA_A4W4", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_MEGA_A4W4", env)
-    state = _mega_layer_without_switch(monkeypatch)
+def test_mega_quant_follows_the_declared_activation_quant(
+    monkeypatch, a_quant_dtype, quant
+):
+    state = _mega_layer_without_switch(monkeypatch, a_quant_dtype)
 
     assert state.method.fused_experts._quant == quant
+    assert moe_mod.MegaMxfp4MoEMethod.mega_quant(state.method.moe) == quant
 
 
 def test_the_fallback_runs_bf16_at_every_row_count_it_serves(monkeypatch):
