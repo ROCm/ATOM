@@ -28,6 +28,7 @@ from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
+    replayssm_flush_wait,
     replayssm_materialize,
 )
 from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
@@ -97,8 +98,9 @@ def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
     """The `(layer, slot, ...)` caches that together hold one slot's state.
 
     `relocate_state_slots` moves exactly these, and `state_slot_regions`
-    describes exactly these; anything added to the pool belongs here so that
-    neither can be extended without the other.
+    describes exactly these. Persistent slot state added to the pool belongs
+    here so neither can be extended without the other. Per-launch scratch that
+    is zero between launches is excluded.
 
     Takes the runner rather than the builder so that both callers reach it the
     same way whether or not they are bound: the state tests drive those two
@@ -220,6 +222,7 @@ def fork_read_table(write: torch.Tensor, read: torch.Tensor) -> torch.Tensor:
 class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
+        self.replayssm_flush_wait = None
         self._init_gdn_state(model_runner)
 
     def _init_gdn_state(
@@ -632,6 +635,7 @@ class GDNStateMixin(PoolRowsMixin):
             math.prod(sk) * rec_dtype.itemsize
             + math.prod(su) * rec_dtype.itemsize
             + math.prod(sg) * 4  # g stays fp32: it is exponentiated on rebuild
+            + sk[0] * 4  # one int32 flush arrival counter per value head
         )
         return self.num_state_layers() * per_layer
 
@@ -817,6 +821,10 @@ class GDNStateMixin(PoolRowsMixin):
         shapes = self._replayssm_buffer_shapes()
         if shapes is not None:
             sk, su, sg = shapes
+            self.replayssm_flush_wait = replayssm_flush_wait()
+            tensors["replayssm_flush_arrivals"] = torch.zeros(
+                (n, num_slots, sk[0]), dtype=torch.int32, device="cuda"
+            )
             rec_dtype = self.model_runner.config.torch_dtype
             tensors["replayssm_buf_k"] = torch.zeros(
                 (n, num_slots) + sk, dtype=rec_dtype, device="cuda"
@@ -2206,6 +2214,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 ),
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
+                ),
+                replay_flush_arrivals=(
+                    runner.replayssm_flush_arrivals[gdn_idx] if self.replayssm else None
+                ),
+                replay_flush_wait=(
+                    self.replayssm_flush_wait if self.replayssm else None
                 ),
                 # Slot-addressed recurrent state, not paged KV. It has to be
                 # registered (the linear-attention forward reads its state out

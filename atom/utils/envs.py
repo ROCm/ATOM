@@ -1147,6 +1147,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
         "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
+    # Qwen3.8-Flash-Next under the SGLang plugin: run the sequence-parallel
+    # reduce-scatters / all-gathers on the copy engines (mori CCO SDMA),
+    # overlapped with the hyper-connections. gfx942 only; needs mori with CCO
+    # SDMA, FlyDSL and aiter's SdmaComm (fallback: docs/environment_variables.md).
+    "ATOM_QWEN4_EXP_SP_SDMA": lambda: _flag_env("ATOM_QWEN4_EXP_SP_SDMA", "0"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"

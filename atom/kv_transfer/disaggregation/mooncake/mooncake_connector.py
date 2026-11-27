@@ -103,6 +103,7 @@ from atom.kv_transfer.disaggregation.types import (
     pair_units,
     produced_no_handoff,
 )
+from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, mooncake_hca, zmq_socket_ctx
@@ -1059,10 +1060,8 @@ class MooncakeConnector(KVConnectorBase):
         # Determine which RDMA device this TP rank should use. TCP is
         # intentionally initialized with an empty device filter so Mooncake
         # cannot activate an available HCA as an alternate path.
-        # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
-        # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Alternate-HCA mode
-        # registers a single engine on multiple NICs. On rail-isolated fabrics,
+        # By default, register only with the GPU's PCIe-local NIC. Alternate-HCA
+        # mode registers a single engine on multiple NICs. On rail-isolated fabrics,
         # matched-rail mode instead selects a single-HCA engine per request.
         mooncake_hca.configure_transport(self.protocol)
         configured_ib_device = (
@@ -1072,26 +1071,14 @@ class MooncakeConnector(KVConnectorBase):
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
-        phys_idx: int | None = None
+        gpu_bdf: str | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
-            visible_idx = torch.cuda.current_device()
-            # ROCR first, for the reason in numa_utils._physical_index: it
-            # filters before HIP, so a ROCR-only mask must not fall through to
-            # the identity mapping.
-            visible_env = (
-                os.environ.get("ROCR_VISIBLE_DEVICES")
-                or os.environ.get("HIP_VISIBLE_DEVICES")
-                or os.environ.get("CUDA_VISIBLE_DEVICES")
-            )
-            if visible_env:
-                visible_list = [d for d in visible_env.split(",") if d != ""]
-                phys_idx = int(visible_list[visible_idx])
-            else:
-                phys_idx = visible_idx
+            # The GPU this rank drives, whatever *_VISIBLE_DEVICES masks it.
+            gpu_bdf = gpu_pci_bdf(torch.cuda.current_device())
         ib_devices = mooncake_hca.select_ib_devices(
             self.protocol,
             configured_ib_device,
-            phys_idx,
+            gpu_bdf,
             enable_alternate_hca=enable_alternate_hca,
             hca_count=hca_count,
         )
@@ -1108,11 +1095,9 @@ class MooncakeConnector(KVConnectorBase):
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
         elif not configured_ib_device:
             logger.info(
-                "Auto-selecting RDMA devices %s for physical GPU %d "
-                "(visible_idx=%d, tp_rank=%d)",
+                "Auto-selecting RDMA devices %s for GPU %s (tp_rank=%d)",
                 ib_device,
-                phys_idx,
-                visible_idx,
+                gpu_bdf,
                 self.tp_rank,
             )
 

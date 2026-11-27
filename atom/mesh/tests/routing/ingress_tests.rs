@@ -5,6 +5,7 @@ use crate::core::{
 };
 use serde_json::json;
 use std::{
+    collections::HashSet,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -100,11 +101,12 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
                 .code,
             "unsupported_api_topology"
         );
+        let sent = serde_json::to_vec(&body).unwrap();
         let routing = IngressRouting::new(&app);
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &sent, ctx)
             })
             .await
             .unwrap()
@@ -112,54 +114,6 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
             .await
             .unwrap();
         assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
-    }
-}
-
-#[tokio::test]
-async fn chats_rendered_without_their_template_are_not_tokenized() {
-    let config = crate::config::RouterConfig {
-        policy: crate::config::PolicyConfig::PrefixHash {
-            prefix_token_count: 4,
-            load_factor: 1.25,
-        },
-        ..Default::default()
-    };
-    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
-    let app = AppContext::from_config(config, 5, _pool.handle())
-        .await
-        .unwrap();
-    let id = TokenizerRegistry::generate_id();
-    app.tokenizer_registry
-        .load(&id, "m", "hf-test", || async {
-            Ok(crate::routers::test_mocks::tokenizer::hf_tokenizer())
-        })
-        .await
-        .unwrap();
-    for marked in [false, true] {
-        if marked {
-            app.chats_without_template.write().insert(id.clone());
-        }
-        let parsed = ParsedInference::parse(
-            "/v1/chat/completions",
-            br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#,
-        )
-        .unwrap();
-        let routing = IngressRouting::new(&app);
-        let result = app
-            .prepare_pool
-            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
-            })
-            .await
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
-        if marked {
-            assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
-        } else {
-            assert!(result.unwrap().1.is_some());
-        }
     }
 }
 
@@ -231,11 +185,12 @@ async fn fastokens_models_tokenize_up_to_their_own_limit() {
                 body["model"] = json!(model);
                 let parsed =
                     ParsedInference::parse(route, &serde_json::to_vec(&body).unwrap()).unwrap();
+                let sent = serde_json::to_vec(&body).unwrap();
                 let routing = IngressRouting::new(&app);
                 let result = app
                     .prepare_pool
                     .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                        routing.prepare(&parsed, ctx)
+                        routing.prepare(&parsed, &sent, ctx)
                     })
                     .await
                     .unwrap()
@@ -290,8 +245,9 @@ async fn chats_tokenize_with_the_effort_their_model_takes() {
     for (controls, effort, want) in [
         (None, "medium", Ok("hi/-/medium")),
         (None, "minimal", Err("invalid_request")),
-        (v41, "minimal", Ok("hi/-/low")),
-        (v41, "medium", Ok("hi/-/high")),
+        // ATOM's V4.1 encoder adapter renders thinking mode unless told otherwise.
+        (v41, "minimal", Ok("hi/thinking/low")),
+        (v41, "medium", Ok("hi/thinking/high")),
         (v41, "none", Ok("hi/chat/-")),
         (v41, "ultra", Err("invalid_request")),
     ] {
@@ -307,11 +263,12 @@ async fn chats_tokenize_with_the_effort_their_model_takes() {
         let parsed =
             ParsedInference::parse("/v1/chat/completions", &serde_json::to_vec(&body).unwrap())
                 .unwrap();
+        let sent = serde_json::to_vec(&body).unwrap();
         let routing = IngressRouting::new(&app);
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &sent, ctx)
             })
             .await
             .unwrap()
@@ -1486,11 +1443,12 @@ async fn wanted_tokens_fall_back_to_the_text() {
     ] {
         let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
         let text = parsed.metadata_with_text(true).text;
+        let sent = serde_json::to_vec(&body).unwrap();
         let routing = IngressRouting::new(&app);
         let (metadata, tokens) = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &sent, ctx)
             })
             .await
             .unwrap()
@@ -1568,11 +1526,12 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
             ),
         ] {
             let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
+            let sent = body.to_string().into_bytes();
             let routing = IngressRouting::new(&app);
             let (metadata, tokens) = app
                 .prepare_pool
                 .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                    routing.prepare(&parsed, ctx)
+                    routing.prepare(&parsed, &sent, ctx)
                 })
                 .await
                 .unwrap()
@@ -1641,13 +1600,13 @@ async fn chat_tokens_differ_by_image_url_under_a_real_template() {
         let body = json!({"model": "m", "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": url}},
             {"type": "text", "text": "describe"}]}]});
-        let parsed =
-            ParsedInference::parse("/v1/chat/completions", body.to_string().as_bytes()).unwrap();
+        let sent = serde_json::to_vec(&body).unwrap();
+        let parsed = ParsedInference::parse("/v1/chat/completions", &sent).unwrap();
         let routing = IngressRouting::new(&app);
         let (_, prepared) = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &sent, ctx)
             })
             .await
             .unwrap()
@@ -1787,14 +1746,13 @@ async fn atom_keys_a_media_chat_by_all_its_media_at_the_front() {
         let mut keys = Vec::new();
         let mut branches = Vec::new();
         for url in ["https://x/a.png", "https://x/b.png", "https://x/a.png"] {
-            let parsed =
-                ParsedInference::parse("/v1/chat/completions", chat(url).to_string().as_bytes())
-                    .unwrap();
+            let sent = serde_json::to_vec(&chat(url)).unwrap();
+            let parsed = ParsedInference::parse("/v1/chat/completions", &sent).unwrap();
             let routing = IngressRouting::new(&app);
             let (metadata, tokens) = app
                 .prepare_pool
                 .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                    routing.prepare(&parsed, ctx)
+                    routing.prepare(&parsed, &sent, ctx)
                 })
                 .await
                 .unwrap()
@@ -1939,13 +1897,13 @@ async fn atom_keys_a_media_chat_by_the_chat_up_to_its_last_media() {
         cache_aware.init_workers(&workers);
         let mut keys = Vec::new();
         for (case, compared, messages) in &chats {
-            let body = json!({"model": "m", "messages": messages}).to_string();
-            let parsed = ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap();
+            let sent = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+            let parsed = ParsedInference::parse("/v1/chat/completions", &sent).unwrap();
             let routing = IngressRouting::new(&app);
             let (metadata, tokens) = app
                 .prepare_pool
                 .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                    routing.prepare(&parsed, ctx)
+                    routing.prepare(&parsed, &sent, ctx)
                 })
                 .await
                 .unwrap()

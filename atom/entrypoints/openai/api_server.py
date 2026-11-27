@@ -4024,6 +4024,41 @@ async def stop_profile():
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 
+_offload_lookups_lock = asyncio.Lock()
+
+
+@_engine_route("/offload/lookups", methods=["POST"])
+async def set_offload_lookups(raw_request: Request):
+    """Turn the offload tier's lookups for new requests on or off: {"enabled": bool}."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        body = await raw_request.json()
+    except ValueError:
+        body = None
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400, detail='body must be {"enabled": true|false}'
+        )
+    try:
+        # One call at a time: overlapping broadcasts could reach the ranks in
+        # different orders. Off the event loop: each answers between its steps.
+        async with _offload_lookups_lock:
+            ranks = await asyncio.to_thread(engine.set_offload_lookups, enabled)
+    except Exception as e:
+        logger.exception("Failed to set offload lookups")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to set offload lookups: {e!s}"
+        )
+    if not all(r.get("applied") and r.get("enabled") is enabled for r in ranks):
+        # No offload tier that takes it, or one that saves (see the scheduler).
+        raise HTTPException(
+            status_code=409, detail={"enabled": enabled, "ranks": ranks}
+        )
+    return {"status": "success", "enabled": enabled, "ranks": ranks}
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================

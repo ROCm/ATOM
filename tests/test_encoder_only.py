@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """The encoder-only server: the chat app answering with ec_transfer_params from
 a stub tower and the real embedding pool over a fake Mooncake engine."""
@@ -15,6 +16,7 @@ from typing import ClassVar
 import httpx
 import pytest
 import torch
+from conftest import gpu_stack_import
 from PIL import Image
 from safetensors.torch import save_file
 from torch import nn
@@ -358,3 +360,54 @@ def test_weights_load_without_minimax_language_model(tmp_path, monkeypatch):
     encoder_only.load_vision_weights(encoder, config)
 
     assert yielded == ["vision_tower.weight"]
+
+
+@pytest.mark.parametrize(
+    "arch", ["ModelWithoutEncoderOnlyModules", "NoSuchForCausalLM"]
+)
+def test_an_architecture_without_encoder_only_modules_is_refused(arch, monkeypatch):
+    monkeypatch.setitem(
+        encoder_only.support_model_arch_dict,
+        "ModelWithoutEncoderOnlyModules",
+        "torch.nn.Linear",
+    )
+    config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch]))
+    with pytest.raises(ValueError, match=f"does not serve {arch}"):
+        encoder_only.create_encoder_only(config)
+
+
+def test_minimax_m3_names_its_vision_modules_as_the_model_does(monkeypatch):
+    vl = gpu_stack_import("atom.models.minimax_m3.vl")
+    built = (nn.Linear(1, 1), nn.Linear(1, 1), nn.Linear(1, 1))
+    monkeypatch.setattr(vl, "build_vision_modules", lambda hf_config: built)
+    modules = vl.MiniMaxM3SparseForConditionalGenerationVL.encoder_only_modules(
+        SimpleNamespace(hf_config=None)
+    )
+    assert list(modules) == ["vision_tower", "multi_modal_projector", "patch_merge_mlp"]
+    assert tuple(modules.values()) == built
+
+
+def test_kimi_k3_names_its_vision_modules_as_the_model_does(monkeypatch):
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    kimi_vl = gpu_stack_import("atom.models.kimi_k3_vl")
+    built = (nn.Linear(1, 1), nn.Linear(1, 1))
+    vision_config = object()
+    monkeypatch.setattr(
+        kimi_vl,
+        "build_vision_modules",
+        lambda config: built if config is vision_config else None,
+    )
+    config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(vision_config=vision_config)
+    )
+    modules = model.KimiK3ForConditionalGeneration.encoder_only_modules(config)
+    assert list(modules) == ["vision_tower", "mm_projector"]
+    assert tuple(modules.values()) == built
+
+
+def test_kimi_k3_without_a_vision_config_is_refused():
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    with pytest.raises(ValueError, match="vision_config"):
+        model.KimiK3ForConditionalGeneration.encoder_only_modules(
+            SimpleNamespace(multimodal_config=None)
+        )
