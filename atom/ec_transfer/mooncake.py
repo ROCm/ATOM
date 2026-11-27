@@ -35,9 +35,9 @@ from typing import Any
 import torch
 
 from atom.ec_transfer.base import EcStoreFull, dtype_name, handle_mismatch
+from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf
 from atom.utils import envs, mooncake_hca
 from atom.utils.network import get_ip
-from atom.utils.numa_utils import _physical_index
 
 logger = logging.getLogger("atom")
 
@@ -66,7 +66,7 @@ def _open_engine(
 ) -> tuple[Any, str]:
     """A TransferEngine on the HCAs ``mooncake_hca`` picks, and its session.
     ``ib_device`` names them; else ``ATOM_MOONCAKE_IB_DEVICE``; else the
-    GPU's local HCA."""
+    HCA on the GPU's PCIe switch."""
     if not MOONCAKE_AVAILABLE:
         raise RuntimeError(
             "Mooncake is not installed; image embedding transport needs it"
@@ -78,13 +78,14 @@ def _open_engine(
             "may fail and P encodes the images itself"
         )
     configured = ib_device or envs.ATOM_MOONCAKE_IB_DEVICE
-    phys_idx = None
+    gpu_bdf = None
     if protocol.strip().lower() != "tcp" and not configured and device.type == "cuda":
-        phys_idx = _physical_index(device.index or 0)
+        # The GPU this engine's memory is on, whatever *_VISIBLE_DEVICES masks it.
+        gpu_bdf = gpu_pci_bdf(device.index or 0)
     devices = mooncake_hca.ib_device_filter(
         protocol,
         configured,
-        phys_idx,
+        gpu_bdf,
         enable_alternate_hca=enable_alternate_hca,
         hca_count=hca_count,
     )

@@ -89,6 +89,9 @@ class KVCacheTensor:
     replay_buf_k: torch.Tensor = None
     replay_buf_u: torch.Tensor = None
     replay_buf_g: torch.Tensor = None
+    # Flush scratch is local to this layer's pool, not transferred with state.
+    replay_flush_arrivals: torch.Tensor = None
+    replay_flush_wait: str | None = None
     # True when the tensors above are a hybrid's PER-REQUEST state (GDN/KDA
     # recurrent state) rather than paged KV. Only the GDN and KDA linear-attn
     # forwards set it (`gdn_attn.py`, `kimi_mla_gdn_attn.py`, and the rtpllm/

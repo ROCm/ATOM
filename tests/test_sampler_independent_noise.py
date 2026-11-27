@@ -276,7 +276,13 @@ def test_forward_resolves_the_policy_once_for_every_consumer(
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     def topk_topp_sample(
-        self, logits, temperatures, top_ks, top_ps, needs_independent_noise=False
+        self,
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        needs_independent_noise=False,
+        any_greedy=True,
     ):
         seen.append(("filtered", needs_independent_noise))
         return torch.zeros(logits.shape[0], dtype=torch.int)

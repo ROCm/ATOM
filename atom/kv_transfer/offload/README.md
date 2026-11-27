@@ -316,6 +316,19 @@ layout of its own and keeps the namespace that gave it, so native ATOM's V4.1
 tiers stay reachable across the change. The vLLM plugin, which had no V4.1
 tiers before, also hashes V4.1's `sliding_window` and `candidate_block_size`.
 
+A load-only tier (`kv_role: kv_consumer`) can stop being asked once what it
+holds is back in HBM, for example a recorded benchmark warmup after it was
+replayed: `POST /offload/lookups` with `{"enabled": false}` makes every DP
+engine start no tier lookup for new requests, and `true` resumes them. An
+answer a request already holds still loads, and a load planned before the
+switch re-takes its pin with one synchronous lookup when it is dispatched. A
+lookup that no request has consumed yet, answered or still in flight, is
+released, so that request prefills its prompt and is not held back waiting
+for the tier. The call
+answers 409 with each engine's reply unless all of them applied it. A tier
+that saves refuses to switch off: without a lookup its saves would store
+every prompt from token 0.
+
 ### MP lifetime and representation
 
 Engine group `0` contains ordinary PAGE views, where block ID `0` is valid

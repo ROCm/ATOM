@@ -100,6 +100,13 @@ pub struct RouterConfig {
     /// The admin port of each master of the Mooncake Store a worker offloads to.
     #[serde(default = "default_mooncake_admin_port")]
     pub mooncake_admin_port: u16,
+    /// How long a request waits for the stores its workers load from to answer.
+    #[serde(default = "default_kv_storage_deadline_ms")]
+    pub kv_storage_deadline_ms: u64,
+    /// What a token a worker loads from a store counts for in routing, against one on its
+    /// device; 0 asks no store.
+    #[serde(default)]
+    pub kv_storage_weight: f64,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -517,6 +524,10 @@ fn default_encode_timeout_secs() -> u64 {
     30
 }
 
+fn default_kv_storage_deadline_ms() -> u64 {
+    3
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -538,6 +549,8 @@ impl Default for RouterConfig {
             dp_aware: false,
             kv_events: false,
             mooncake_admin_port: default_mooncake_admin_port(),
+            kv_storage_deadline_ms: default_kv_storage_deadline_ms(),
+            kv_storage_weight: 0.0,
             api_key: None,
             metrics: None,
             log_dir: None,
