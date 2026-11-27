@@ -9,6 +9,7 @@ from dataclasses import dataclass, fields
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
+    Config,
     CUDAGraphMode,
     DCPConfig,
     DSparkConfig,
@@ -135,6 +136,7 @@ class EngineArgs:
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
@@ -185,6 +187,7 @@ class EngineArgs:
     spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
+    encoder_only: bool = False
     disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
     online_quant_config: dict | None = None
@@ -338,6 +341,13 @@ class EngineArgs:
             default=True,
             help="Enable prefix caching (default: enabled). "
             "Use --no-enable_prefix_caching to disable.",
+        )
+        parser.add_argument(
+            "--enable-mixed-prefill-decode",
+            action="store_true",
+            help="Pack prefill chunks and decode seqs into the same forward "
+            "pass (DeepSeek-V4 only; refused at launch elsewhere). Profiles "
+            "mixed workspace before sizing the KV cache. Off by default.",
         )
         parser.add_argument(
             "--port",
@@ -808,6 +818,14 @@ class EngineArgs:
             "CU-masked streams + shm coordination.",
         )
         parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="Serve only the model's vision encoder, on one GPU and without "
+            "an engine core: a chat request with images is answered with "
+            "ec_transfer_params, where a prefill server reads its image "
+            "embeddings, and no choices.",
+        )
+        parser.add_argument(
             "--disagg-prefill-max-num-seqs",
             type=int,
             default=None,
@@ -894,8 +912,9 @@ class EngineArgs:
                 "kv_lora_rank/v_head_dim.\n"
                 "  \"comm_backend\" (str, auto): 'auto' = 'mailbox' on gfx950 "
                 "with DCP > 1 unless decode TBO or plugin mode, else 'a2a'; "
-                "'a2a' = one "
-                "all-to-all; 'ag_rs' = AllGather LSE + ReduceScatter output; "
+                "'a2a' = one packed all-to-all or separate output/LSE "
+                "all-to-alls for head-major prefill; 'ag_rs' = AllGather LSE "
+                "+ ReduceScatter output; "
                 "'mailbox' = aiter's FlyDSL mailbox combine for decode (a2a "
                 "elsewhere).\n"
                 "The last three default to the NEW behaviour (and the middle "
@@ -1060,6 +1079,18 @@ class EngineArgs:
         logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
+
+    def create_encoder(self):
+        """The ``--encoder-only`` server's encoder, in place of an engine."""
+        from atom.model_engine.encoder_only import create_encoder_only
+
+        config_fields = {f.name for f in fields(Config)}
+        kwargs = self._get_engine_kwargs()
+        return create_encoder_only(
+            Config(
+                self.model, **{k: v for k, v in kwargs.items() if k in config_fields}
+            )
+        )
 
     _PARALLEL_CONFIG_FIELDS = (
         "data_parallel_size",

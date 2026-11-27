@@ -229,6 +229,46 @@ mod a_chat_template {
             )
         );
     }
+
+    /// transformers gives chat templates `strftime_now` and `raise_exception`,
+    /// and ATOM standalone serving renders its chats here, so a template that
+    /// calls them, as gpt-oss's does in every system message, must render the
+    /// date, and refuse a chat with the template's own message. transformers
+    /// 5.16.1 renders this toy template to `Current date: <today>\nuser: hi\n`
+    /// and refuses the second chat with `channel tags in content`.
+    #[test]
+    fn test_strftime_now_and_raise_exception_are_defined_as_in_transformers() {
+        const TEMPLATE: &str = r#"{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n" }}
+{%- for m in messages %}
+    {%- if "<|channel|>" in m.content %}
+        {{- raise_exception("channel tags in content") }}
+    {%- endif %}
+    {{- m.role + ": " + m.content + "\n" }}
+{%- endfor %}"#;
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(TEMPLATE.to_string()).unwrap();
+        let chat = |content: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .unwrap()
+        };
+
+        let rendered = process_chat_messages(&chat("hi"), &tokenizer).unwrap().text;
+        let date = rendered
+            .strip_prefix("Current date: ")
+            .and_then(|rest| rest.strip_suffix("\nuser: hi\n"))
+            .unwrap_or_else(|| panic!("{rendered:?}"));
+        assert!(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+            "{rendered:?}"
+        );
+
+        let refused = process_chat_messages(&chat("<|channel|>analysis<|message|>hi"), &tokenizer)
+            .unwrap_err();
+        assert!(refused.contains("channel tags in content"), "{refused}");
+    }
 }
 
 mod b_tool_constraints {
@@ -1567,26 +1607,34 @@ mod h_prepare_chat_generate {
         assert!(template.served_by(&worker));
     }
 
-    /// A tokenizer found by its id is checked against what it was loaded with, as one
-    /// found by name is: the tokenizer and its entry come from one lookup.
+    /// A tokenizer found by its id renders with the encoder controls it was loaded
+    /// with, as one found by name does: the tokenizer and its entry come from one
+    /// lookup, and a chat with controls needs no template.
     #[test]
-    fn test_a_tokenizer_found_by_id_keeps_its_built_in_encoder_refusal() {
-        use crate::core::{BasicWorkerBuilder, RuntimeType};
+    fn test_a_tokenizer_found_by_id_renders_with_its_chat_controls() {
+        use crate::{
+            core::{BasicWorkerBuilder, RuntimeType},
+            routers::prepare::chat_render::ChatControls,
+        };
 
         let registry = test_mocks::tokenizer_registry_with("m");
         let id = registry.get_by_name("m").unwrap().id;
         let components = test_mocks::app_context_with_tokenizer_registry(registry);
-        components.chats_without_template.write().insert(id.clone());
         let worker = BasicWorkerBuilder::new("grpc://atom:4")
             .runtime_type(RuntimeType::Atom)
             .model_id(id.as_str())
-            .label("chat_template", "{{ messages }}")
             .build();
         components.worker_registry.register(Arc::new(worker));
-        let refused = prepare_chat(chat_req(false), None, Some(id), &components)
-            .err()
-            .expect("a built-in encoder's chat is refused");
-        assert_eq!(refused.status(), http::StatusCode::NOT_IMPLEMENTED);
+        let status = || {
+            let chat = prepare_chat(chat_req(false), None, Some(id.clone()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        let controls = &components.chat_controls;
+        controls
+            .write()
+            .insert(id.clone(), ChatControls::DeepseekV41);
+        assert_ne!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
     }
 
     #[test]
@@ -1641,7 +1689,7 @@ mod i_atom_structured_output {
     use crate::routers::prepare::{
         generation_payload::GenerationPayload,
         message_tools::MessageTools,
-        prepare_chat, prepare_chat_declaring, read_thinking,
+        prepare_chat, prepare_chat_with,
         response_context::{ProtocolRequest, ResponseContext},
     };
     use crate::routers::test_mocks;
@@ -1726,20 +1774,11 @@ mod i_atom_structured_output {
             body.as_object_mut()
                 .unwrap()
                 .extend(controls.as_object().unwrap().clone());
-            let raw = serde_json::to_vec(&body).unwrap();
-            let thinking = read_thinking(&raw);
+            let sent = body.as_object().unwrap().clone();
             let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
             let model = Some("m".to_string());
-            let prepared = prepare_chat_declaring(
-                Arc::new(request),
-                None,
-                thinking,
-                None,
-                model,
-                &ctx,
-                None,
-                false,
-            );
+            let prepared =
+                prepare_chat_with(Arc::new(request), None, model, &ctx, Some(&sent), false);
             let carried = prepared.unwrap().0.structured_output.unwrap();
             parsed(Some(carried.chat_template_kwargs_json)).unwrap()
         };
@@ -1846,6 +1885,27 @@ mod i_atom_structured_output {
         }
     }
 
+    /// A chat for a model with an ATOM worker keeps its body as sent, where ATOM reads the
+    /// tools any message declares and `thinking`; one for another backend, without encoder
+    /// controls, does not.
+    #[test]
+    fn a_chat_body_is_kept_as_sent_for_a_model_with_an_atom_worker() {
+        use crate::routers::prepare::sent_chat_body;
+
+        let body = json!({"model": "m", "messages": [], "thinking": {"type": "enabled"}});
+        let sent = serde_json::to_vec(&body).unwrap();
+        for (runtime, kept) in [(RuntimeType::Atom, true), (RuntimeType::Sglang, false)] {
+            let ctx = test_mocks::app_context_with_hf_tokenizer("m");
+            let worker = BasicWorkerBuilder::new("grpc://worker:1")
+                .runtime_type(runtime)
+                .model_id("m")
+                .build();
+            ctx.worker_registry.register(Arc::new(worker));
+            let found = sent_chat_body(&sent, Some("m"), &ctx).unwrap();
+            assert_eq!(found.is_some(), kept, "ATOM worker: {kept}");
+        }
+    }
+
     #[test]
     fn a_chat_to_an_sglang_or_vllm_worker_carries_none() {
         let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
@@ -1855,9 +1915,9 @@ mod i_atom_structured_output {
         }
     }
 
-    /// `body` prepared for model "m" with the tools its raw messages declare, as the gRPC
-    /// routers prepare it; its one worker runs `runtime`.
-    fn prepared_raw(body: Value, runtime: RuntimeType) -> (GenerationPayload, ResponseContext) {
+    /// `body` prepared for model "m" with its body as sent, as the gRPC routers prepare
+    /// it; its one worker runs `runtime`.
+    fn prepared_as_sent(body: Value, runtime: RuntimeType) -> (GenerationPayload, ResponseContext) {
         let ctx = test_mocks::app_context_with_hf_tokenizer("m");
         let worker = BasicWorkerBuilder::new("grpc://worker:1")
             .runtime_type(runtime)
@@ -1865,21 +1925,10 @@ mod i_atom_structured_output {
             .label("chat_template", "{{ messages }}");
         ctx.worker_registry.register(Arc::new(worker.build()));
         test_mocks::app_context::loaded_with_worker_template(&ctx, "m", "{{ messages }}");
-        let raw = serde_json::to_vec(&body).unwrap();
-        let declared = MessageTools::read(&raw).unwrap();
+        let sent = body.as_object().unwrap().clone();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let model = Some("m".to_string());
-        prepare_chat_declaring(
-            Arc::new(request),
-            Some(declared),
-            None,
-            None,
-            model,
-            &ctx,
-            None,
-            false,
-        )
-        .unwrap()
+        prepare_chat_with(Arc::new(request), None, model, &ctx, Some(&sent), false).unwrap()
     }
 
     fn tool_names(ctx: &ResponseContext) -> Vec<String> {
@@ -1908,7 +1957,7 @@ mod i_atom_structured_output {
             .get("tools")
             .is_none());
 
-        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        let (payload, ctx) = prepared_as_sent(body, RuntimeType::Atom);
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         let declared = json!([[tool("lookup")], [tool("fetch")]]);
         assert_eq!(parsed(carried.message_tools_json), Some(declared));
@@ -1931,7 +1980,7 @@ mod i_atom_structured_output {
             ],
             "tools": [search("integer")],
         });
-        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        let (payload, ctx) = prepared_as_sent(body, RuntimeType::Atom);
         // ATOM gets both declarations as sent; the reply is read with the last.
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         let declared = json!([[search("string"), fetch], null]);
@@ -1958,7 +2007,7 @@ mod i_atom_structured_output {
             {"role": "system", "content": "be brief", "tools": [files.clone(), web.clone()]},
             {"role": "user", "content": "hi"},
         ]});
-        let (payload, ctx) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let (payload, ctx) = prepared_as_sent(body.clone(), RuntimeType::Atom);
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         let declared = json!([[files, web], null]);
         assert_eq!(parsed(carried.message_tools_json), Some(declared));
@@ -1971,7 +2020,7 @@ mod i_atom_structured_output {
         let template = "{% for m in messages %}{% for t in m.tools or [] %}\
             {{ t.namespace.name or t.namespace }}.{{ t.function.name }};{% endfor %}{% endfor %}";
         tokenizer.set_chat_template(template.to_string()).unwrap();
-        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let declared = MessageTools::read(body.as_object().unwrap()).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let kwargs = Default::default();
         let rendered =
@@ -1990,7 +2039,7 @@ mod i_atom_structured_output {
         let (files, web) = (search("files"), search("web"));
         let body = json!({"model": "m", "tools": [files.clone(), web.clone()],
             "messages": [{"role": "user", "content": "hi"}]});
-        let (payload, ctx) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let (payload, ctx) = prepared_as_sent(body.clone(), RuntimeType::Atom);
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         assert_eq!(parsed(carried.tools_json), Some(json!([files, web])));
         assert_eq!(carried.message_tools_json, None);
@@ -2002,7 +2051,7 @@ mod i_atom_structured_output {
             HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
         let template = "{% for t in tools %}{{ t.namespace }}.{{ t.function.name }};{% endfor %}";
         tokenizer.set_chat_template(template.to_string()).unwrap();
-        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let declared = MessageTools::read(body.as_object().unwrap()).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let kwargs = Default::default();
         let rendered =
@@ -2022,7 +2071,7 @@ mod i_atom_structured_output {
             "function": {"name": "search"}});
         let body = json!({"model": "m", "tools": [search("files"), search("web")],
             "tool_choice": choice.clone(), "messages": [{"role": "user", "content": "hi"}]});
-        let (payload, _) = prepared_raw(body.clone(), RuntimeType::Atom);
+        let (payload, _) = prepared_as_sent(body.clone(), RuntimeType::Atom);
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         assert_eq!(parsed(carried.tool_choice_json), Some(choice));
 
@@ -2033,7 +2082,7 @@ mod i_atom_structured_output {
             HuggingFaceTokenizer::from_file(test_mocks::tokenizer::hf_tokenizer_path()).unwrap();
         let template = "{% for t in tools %}{{ t.namespace }}.{{ t.function.name }};{% endfor %}";
         tokenizer.set_chat_template(template.to_string()).unwrap();
-        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let declared = MessageTools::read(body.as_object().unwrap()).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let kept = filter_chat_request_by_tool_choice(&request);
         let kwargs = Default::default();
@@ -2047,7 +2096,7 @@ mod i_atom_structured_output {
         let tool = json!({"type": "function", "namespace": "files",
             "function": {"name": "web::search", "parameters": {}}});
         let body = json!({"messages": [{"role": "system", "tools": [tool]}]});
-        let read = MessageTools::read(&serde_json::to_vec(&body).unwrap());
+        let read = MessageTools::read(body.as_object().unwrap());
         assert!(read.is_err_and(|e| e.contains("conflicting tool namespaces")));
     }
 
@@ -2058,7 +2107,7 @@ mod i_atom_structured_output {
             {"role": "system", "content": "be brief", "tools": []},
             {"role": "user", "content": "hi"},
         ]});
-        let (payload, ctx) = prepared_raw(body, RuntimeType::Atom);
+        let (payload, ctx) = prepared_as_sent(body, RuntimeType::Atom);
         let carried = payload.structured_output.expect("an ATOM chat carries one");
         assert_eq!(parsed(carried.message_tools_json), Some(json!([[], null])));
         let ProtocolRequest::Chat(req) = &ctx.original else {
@@ -2082,7 +2131,7 @@ mod i_atom_structured_output {
             {"role": "system", "content": "be brief", "tools": [tool]},
             {"role": "user", "content": "hi"},
         ]});
-        let declared = MessageTools::read(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let declared = MessageTools::read(body.as_object().unwrap()).unwrap();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let kwargs = Default::default();
         let rendered =
@@ -2097,7 +2146,7 @@ mod i_atom_structured_output {
             "model": "m",
             "messages": [{"role": "system", "content": "be brief", "tools": [tool]}],
         });
-        let (payload, ctx) = prepared_raw(body, RuntimeType::Sglang);
+        let (payload, ctx) = prepared_as_sent(body, RuntimeType::Sglang);
         assert!(!payload.text.contains("lookup"), "{}", payload.text);
         assert!(tool_names(&ctx).is_empty());
     }

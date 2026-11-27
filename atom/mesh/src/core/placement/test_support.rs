@@ -405,13 +405,10 @@ pub fn make_descriptor<'a>(
 ) -> RequestDescriptor<'a> {
     RequestDescriptor {
         model_id,
-        protocol: None,
         text,
         tokens,
         headers,
-        stream: false,
-        carries_media: false,
-        chat_template: None,
+        ..Default::default()
     }
 }
 

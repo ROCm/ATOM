@@ -26,6 +26,11 @@ from atom.model_ops.sparse_indexer_chunk import (
 )
 from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
+# Rows a band may have for a candidate-source layer's top-k over its picked
+# blocks (`indexer.top_k_within_candidates`): the workspace holds a compacted
+# plane this many rows tall, and a taller band keeps the whole-row top-k.
+CANDIDATE_TOPK_MAX_ROWS = 1024
+
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
     """Elements of the packed logits buffer: every decode row a PAGE pool of
@@ -65,6 +70,8 @@ class ScoreWorkspace(LogitsWorkspace):
     `max_tokens` bounds a forward's query rows and `columns` a block table's
     width: the two dimensions every later request is checked against.
     `pages` bounds the PAGE pool the FP4 plane's packed rows can see.
+    With `candidate_blocks`, the FP4 plane also holds the compacted plane a
+    candidate-source layer takes its top-k on (`candidate_scratch`).
     """
 
     def __init__(
@@ -123,6 +130,22 @@ class ScoreWorkspace(LogitsWorkspace):
         self._row_starts = torch.arange(
             max_tokens + 1, dtype=torch.int32, device=device
         )
+        # `min(max_tokens, CANDIDATE_TOPK_MAX_ROWS)` rows of `candidate_blocks`
+        # whole blocks each, and their lengths: sized here so the memory
+        # profile counts them, rather than drawn per band from headroom.
+        self.candidate_rows = (
+            min(max_tokens, CANDIDATE_TOPK_MAX_ROWS)
+            if self.packed and candidate_blocks
+            else 0
+        )
+        self._candidate_plane = torch.empty(
+            self.candidate_rows * candidate_blocks * self.block_rows,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._candidate_lengths = torch.empty(
+            self.candidate_rows, dtype=torch.int32, device=device
+        )
 
     def unit_table(self, ratio, tokens, width):
         """`[tokens, width]` int32 for `unit_table`'s output at this ratio."""
@@ -180,6 +203,17 @@ class ScoreWorkspace(LogitsWorkspace):
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
+
+    def candidate_scratch(self, rows, width):
+        """`([rows, width] fp32, [rows] int32)` views for a band's compacted
+        candidate plane and its row lengths, or None when the band does not
+        fit the reserved plane."""
+        if rows > self.candidate_rows or rows * width > self._candidate_plane.numel():
+            return None
+        return (
+            self._candidate_plane[: rows * width].view(rows, width),
+            self._candidate_lengths[:rows],
+        )
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""

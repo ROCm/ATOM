@@ -2,11 +2,12 @@
 """Yield target and draft KV views for allocation and imported-pool callers."""
 
 import logging
+from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
 
 
-def kv_cache_bindings(runner):
+def kv_cache_bindings(runner, module_context=nullcontext):
     """Yield modules and KV views for callers to key by ``module.layer_num``.
 
     Try an independent draft's builder first. Builders return None for unknown
@@ -20,9 +21,12 @@ def kv_cache_bindings(runner):
     for name, model, builder in models:
         logger.info("Binding KV cache for the %s model", name)
         for module in model.modules():
-            tensor = (
-                builder.build_kv_cache_tensor(module) if builder is not None else None
-            )
-            if tensor is None and builder is not runner.attn_metadata_builder:
-                tensor = runner.attn_metadata_builder.build_kv_cache_tensor(module)
-            yield module, tensor
+            with module_context(module):
+                tensor = (
+                    builder.build_kv_cache_tensor(module)
+                    if builder is not None
+                    else None
+                )
+                if tensor is None and builder is not runner.attn_metadata_builder:
+                    tensor = runner.attn_metadata_builder.build_kv_cache_tensor(module)
+                yield module, tensor

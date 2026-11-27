@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+pub(crate) mod chat_render;
 pub(crate) mod chat_template;
 pub(crate) mod fast_tokenizer;
 pub mod generation_payload;
@@ -93,16 +94,6 @@ fn lookup_tokenizer_entry(
         })
 }
 
-/// A chat prompt rendered outside the router, for a model whose template the
-/// router cannot render (ATOM's Python message encoders).
-#[derive(Debug, Clone)]
-pub struct RenderedChat {
-    pub text: String,
-    pub token_ids: Vec<u32>,
-    /// The channel opener the prompt ends on (`ResponseContext::prompt_opener`).
-    pub prompt_opener: Option<String>,
-}
-
 pub fn prepare_chat(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
@@ -112,41 +103,47 @@ pub fn prepare_chat(
     prepare_chat_with(req, headers, model_id, components, None, false)
 }
 
-/// `prepare_chat`, taking the prompt as `rendered` when it is given, and,
-/// with `reads_prompt_opener`, naming the opener a prompt it renders ends on
-/// (`ResponseContext::prompt_opener`; a rendered prompt names its own).
+/// A chat's body as the client `sent` it (JSON bytes), for `prepare_chat_with`,
+/// where `model` renders with an encoder of its own (`chat_render`) or has an ATOM
+/// worker, which reads the tools any message declares and `thinking`
+/// (`MessageTools`, `read_thinking`): the typed request drops or rewrites the
+/// fields these read (`thinking`, a system message's `tools`, `tool_choice`). Any
+/// other chat is not parsed again.
+pub fn sent_chat_body(
+    sent: &[u8],
+    model: Option<&str>,
+    components: &AppContext,
+) -> Result<Option<Arc<serde_json::Map<String, Value>>>, Response> {
+    let kept = model.is_some_and(|model| {
+        components.chat_controls_of(model).is_some()
+            || has_atom_worker(&components.worker_registry.get_by_model(model))
+    });
+    if !kept {
+        return Ok(None);
+    }
+    serde_json::from_slice(sent)
+        .map(|body| Some(Arc::new(body)))
+        .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+}
+
+/// Whether one of a model's `workers` is an ATOM worker.
+fn has_atom_worker(workers: &[Arc<dyn Worker>]) -> bool {
+    workers
+        .iter()
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+}
+
+/// `prepare_chat`, rendering the prompt with the chat's body as `sent` where the
+/// caller has it: an encoder reads it (`chat_render::render_chat`), and for a model
+/// with an ATOM worker, so do the tools its messages declare and its `thinking`.
+/// With `reads_prompt_opener`, names the opener the prompt ends on
+/// (`ResponseContext::prompt_opener`).
 pub fn prepare_chat_with(
     req: Arc<ChatCompletionRequest>,
     headers: Option<HeaderMap>,
     model_id: Option<String>,
     components: &AppContext,
-    rendered: Option<RenderedChat>,
-    reads_prompt_opener: bool,
-) -> Result<(GenerationPayload, ResponseContext), Response> {
-    prepare_chat_declaring(
-        req,
-        None,
-        None,
-        headers,
-        model_id,
-        components,
-        rendered,
-        reads_prompt_opener,
-    )
-}
-
-/// `prepare_chat_with`, with the tools its messages declare read from its raw body
-/// (`MessageTools::read`), without them the typed request's, and its `thinking`
-/// control (`read_thinking`), which the typed request has no field for.
-#[allow(clippy::too_many_arguments)]
-pub fn prepare_chat_declaring(
-    req: Arc<ChatCompletionRequest>,
-    message_tools: Option<MessageTools>,
-    thinking: Option<Value>,
-    headers: Option<HeaderMap>,
-    model_id: Option<String>,
-    components: &AppContext,
-    rendered: Option<RenderedChat>,
+    sent: Option<&serde_json::Map<String, Value>>,
     reads_prompt_opener: bool,
 ) -> Result<(GenerationPayload, ResponseContext), Response> {
     let model_id_str = model_id.as_deref().ok_or_else(|| {
@@ -159,15 +156,14 @@ pub fn prepare_chat_declaring(
     let tokenizer = entry.tokenizer.clone();
     let workers = components.worker_registry.get_by_model(model_id_str);
     // What its tokenizer was loaded with: a template file is a template, as
-    // --chat-template is; a built-in encoder renders without one.
+    // --chat-template is; a model with encoder controls renders without one.
     let id = entry.id;
+    let controls = components.chat_controls.read().get(&id).copied();
     let templated = components.router_config.chat_template.is_some()
         || components.tokenizer_template_files.read().contains_key(&id);
-    let built_in_encoder = components.chats_without_template.read().contains(&id);
-    // A prompt rendered outside the router needs no template.
-    if let Some(gap) = rendered
+    if let Some(gap) = controls
         .is_none()
-        .then(|| atom_chat_render_gap(&workers, templated, built_in_encoder))
+        .then(|| atom_chat_render_gap(&workers, templated))
         .flatten()
     {
         return Err(error::not_implemented(
@@ -182,13 +178,18 @@ pub fn prepare_chat_declaring(
         .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
-    let atom = workers
-        .iter()
-        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom);
-    // Only ATOM reads the tools a message declares.
-    let message_tools = atom
-        .then(|| message_tools.unwrap_or_else(|| MessageTools::of(&req)))
-        .filter(|declared| !declared.is_empty() || declared.1.is_some() || declared.2.is_some());
+    let atom = has_atom_worker(&workers);
+    // Only ATOM reads the tools a message declares, and `thinking`: from the chat as
+    // sent where the caller has it.
+    let message_tools = match (atom, sent) {
+        (false, _) => None,
+        (true, Some(sent)) => Some(
+            MessageTools::read(sent).map_err(|e| error::bad_request("invalid_message_tools", e))?,
+        ),
+        (true, None) => Some(MessageTools::of(&req)),
+    }
+    .filter(|declared| !declared.is_empty() || declared.1.is_some() || declared.2.is_some());
+    let thinking = sent.filter(|_| atom).and_then(read_thinking);
 
     let template_kwargs = if atom {
         let toggle = reasoning_toggle(&workers)
@@ -203,31 +204,27 @@ pub fn prepare_chat_declaring(
     } else {
         merged_template_kwargs(&body_ref, default_kwargs.as_ref())
     };
-    let rendered_here = rendered.is_none();
-    let (processed, token_ids, rendered_opener) = match rendered {
-        Some(rendered) => (
-            ProcessedMessages {
-                text: rendered.text,
-                stop_sequences: body_ref.stop.clone(),
-            },
-            rendered.token_ids,
-            Some(rendered.prompt_opener),
-        ),
-        None => {
-            let processed = staged("template", || {
-                process_chat_messages_with_kwargs(
-                    &body_ref,
-                    &*tokenizer,
-                    &template_kwargs,
-                    message_tools.as_ref(),
-                )
-            })
-            .map_err(|e| error::bad_request("process_messages_failed", e))?;
-            let encoding = staged("encode", || tokenizer.encode(&processed.text, false))
-                .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
-            (processed, encoding.token_ids().to_vec(), None)
-        }
+    let (text, rendered_opener) = match controls {
+        Some(_) => chat_render::render_chat(&body_ref, sent, &*tokenizer, controls)
+            .map(|(text, opener)| (text, Some(opener))),
+        None => staged("template", || {
+            process_chat_messages_with_kwargs(
+                &body_ref,
+                &*tokenizer,
+                &template_kwargs,
+                message_tools.as_ref(),
+            )
+        })
+        .map(|processed| (processed.text, None)),
+    }
+    .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let processed = ProcessedMessages {
+        text,
+        stop_sequences: body_ref.stop.clone(),
     };
+    let encoding = staged("encode", || tokenizer.encode(&processed.text, false))
+        .map_err(|e| error::internal_error("tokenization_failed", format!("{}", e)))?;
+    let token_ids = encoding.token_ids().to_vec();
 
     let tool_constraints = if let Some(tools) = body_ref.tools.as_ref() {
         generate_tool_constraints(tools, &req.tool_choice, &req.model)
@@ -237,7 +234,9 @@ pub fn prepare_chat_declaring(
     };
 
     let prompt_opener = match rendered_opener {
-        Some(opener) => opener,
+        // A prompt its encoder rendered names its own opener.
+        Some(opener) if atom || reads_prompt_opener => opener,
+        Some(_) => None,
         None if atom => {
             let markers = reasoning_open_markers(&workers)
                 .map_err(|e| error::internal_error("invalid_structured_output", e))?;
@@ -282,7 +281,8 @@ pub fn prepare_chat_declaring(
         structured_output,
     );
     (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
-    if rendered_here {
+    if controls.is_none() {
+        // Rendered with the template: only the ATOM workers serving it read these ids.
         let fingerprint = loaded_template(components, &id).ok_or_else(|| {
             let err = PlacementError::ChatTemplateChanged;
             placement_err_to_response(err, Some(model_id_str))
@@ -561,14 +561,11 @@ fn reasoning_controls(
     Ok((enabled, effort))
 }
 
-/// A chat's raw `body`'s `thinking` control, which the typed request has no field for.
-pub fn read_thinking(body: &[u8]) -> Option<Value> {
-    #[derive(serde::Deserialize)]
-    struct Raw {
-        #[serde(default)]
-        thinking: Option<Value>,
-    }
-    serde_json::from_slice::<Raw>(body).ok()?.thinking
+/// A chat's `thinking` control as `sent`, which the typed request has no field for.
+pub fn read_thinking(sent: &serde_json::Map<String, Value>) -> Option<Value> {
+    sent.get("thinking")
+        .filter(|value| !value.is_null())
+        .cloned()
 }
 
 /// The opener an ATOM worker of the model reports its replies start after with no

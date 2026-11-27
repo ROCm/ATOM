@@ -7,7 +7,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage},
@@ -24,33 +24,29 @@ pub struct MessageTools(
     pub Option<Arc<Value>>,
 );
 
-#[derive(Deserialize)]
-struct RawChat {
-    messages: Vec<RawMessage>,
-    #[serde(default)]
-    tools: Option<Vec<Value>>,
-    #[serde(default)]
-    tool_choice: Option<Value>,
-}
-
-#[derive(Deserialize)]
-struct RawMessage {
-    #[serde(default)]
-    tools: Option<Vec<Value>>,
-}
-
 impl MessageTools {
-    /// The tools each message of a chat's raw `body` declares, on whatever role.
-    pub fn read(body: &[u8]) -> Result<Self, String> {
-        let chat: RawChat =
-            serde_json::from_slice(body).map_err(|e| format!("Invalid message tools: {e}"))?;
+    /// The tools each message of a chat's body as `sent` declares, on whatever role.
+    pub fn read(sent: &Map<String, Value>) -> Result<Self, String> {
+        let tools = |value: Option<&Value>| match value {
+            Some(value) => Option::<Vec<Value>>::deserialize(value)
+                .map_err(|e| format!("Invalid message tools: {e}")),
+            None => Ok(None),
+        };
+        let Some(Value::Array(messages)) = sent.get("messages") else {
+            return Err("Invalid message tools: messages is not an array".to_string());
+        };
         let namespaced = |tools: &Vec<Value>| tools.iter().any(|t| namespace(t).is_some());
-        let top_level = chat.tools.filter(namespaced).map(Arc::new);
-        let choice = chat
-            .tool_choice
-            .filter(|c| c.is_object() && namespace(c).is_some());
+        let top_level = tools(sent.get("tools"))?.filter(namespaced).map(Arc::new);
+        let choice = (sent.get("tool_choice"))
+            .filter(|c| c.is_object() && namespace(c).is_some())
+            .cloned();
         let declared = Self(
-            Arc::new(chat.messages.into_iter().map(|m| m.tools).collect()),
+            Arc::new(
+                messages
+                    .iter()
+                    .map(|m| tools(m.get("tools")))
+                    .collect::<Result<_, _>>()?,
+            ),
             top_level,
             choice.map(Arc::new),
         );

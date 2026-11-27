@@ -121,7 +121,7 @@ impl EndpointRouter {
             tokens: input.tokens.as_deref(),
             headers: Some(&request.headers),
             stream: input.stream,
-            carries_media: input.carries_media,
+            media_count: input.media_count,
             chat_template: None,
         };
         let plan = planner.plan(&descriptor).await.map_err(|e| {

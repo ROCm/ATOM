@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
-use bytes::Bytes;
 use tracing::debug;
 
 use super::{
@@ -30,8 +29,8 @@ use crate::{
             handlers as responses_handlers,
             retrieve::{cancel_response_impl, get_response_impl},
         },
-        prepare::{inference::ParsedInference, message_tools::MessageTools, read_thinking},
-        RouterTrait,
+        prepare::{self, inference::ParsedInference},
+        RouterTrait, SentChatBody,
     },
 };
 
@@ -77,13 +76,14 @@ impl GrpcRouter {
         }
     }
 
+    /// Route a chat, its prompt rendered from its body as `sent` where the
+    /// caller has it (`prepare::sent_chat_body`).
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        message_tools: Option<MessageTools>,
-        thinking: Option<serde_json::Value>,
         model_id: Option<&str>,
+        sent: Option<SentChatBody>,
     ) -> Response {
         debug!(
             "Processing chat completion request for model: {}",
@@ -101,21 +101,13 @@ impl GrpcRouter {
             &self.retry_config,
             |_attempt| {
                 let request = Arc::clone(&request);
-                let message_tools = message_tools.clone();
-                let thinking = thinking.clone();
                 let headers = headers_cloned.clone();
                 let model_id = model_id_cloned.clone();
                 let components = Arc::clone(&components);
+                let sent = sent.clone();
                 async move {
                     pipeline
-                        .execute_chat_declaring(
-                            request,
-                            (message_tools, thinking),
-                            headers,
-                            model_id,
-                            components,
-                            None,
-                        )
+                        .execute_chat_with(request, headers, model_id, components, sent)
                         .await
                 }
             },
@@ -227,22 +219,6 @@ pub(super) fn atom_chat_refusal(
     body.logprobs.then(logprobs_refused)
 }
 
-/// The tools the raw chat `body`'s messages declare on any role, which ATOM reads; none
-/// for a model without ATOM workers.
-pub(super) fn declared_tools(
-    workers: &WorkerRegistry,
-    raw: &[u8],
-    model_id: Option<&str>,
-) -> Result<Option<MessageTools>, Response> {
-    if !atom_serves(workers, model_id) {
-        return Ok(None);
-    }
-    match MessageTools::read(raw) {
-        Ok(declared) => Ok(Some(declared)),
-        Err(e) => Err(error::bad_request("invalid_message_tools", e)),
-    }
-}
-
 /// ATOM gRPC workers take token ids alone, so a request's media would be dropped.
 pub(super) fn media_refused() -> Response {
     error::bad_request(
@@ -292,6 +268,27 @@ impl RouterTrait for GrpcRouter {
         self.route_generate_impl(headers, body, model_id).await
     }
 
+    fn sent_chat_body(
+        &self,
+        sent: &[u8],
+        model_id: Option<&str>,
+    ) -> Result<Option<SentChatBody>, Response> {
+        prepare::sent_chat_body(sent, model_id, &self.app_context)
+    }
+
+    async fn route_chat_as_sent(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        sent: Option<SentChatBody>,
+        model_id: Option<&str>,
+    ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
+        self.route_chat_impl(headers, body, model_id, sent).await
+    }
+
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
@@ -301,29 +298,7 @@ impl RouterTrait for GrpcRouter {
         if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
             return refused;
         }
-        self.route_chat_impl(headers, body, None, None, model_id)
-            .await
-    }
-
-    async fn route_chat_body(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        raw: Bytes,
-        model_id: Option<&str>,
-    ) -> Response {
-        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
-            return refused;
-        }
-        let message_tools = match declared_tools(&self.worker_registry, &raw, model_id) {
-            Ok(declared) => declared,
-            Err(refused) => return refused,
-        };
-        // ATOM's alone, as message tools are.
-        let thinking = message_tools.as_ref().and_then(|_| read_thinking(&raw));
-        drop(raw);
-        self.route_chat_impl(headers, body, message_tools, thinking, model_id)
-            .await
+        self.route_chat_impl(headers, body, model_id, None).await
     }
 
     async fn route_completion(

@@ -407,12 +407,15 @@ jobs:
               ;;
           esac
 
+          # LLM-Booster upload is off on schedule: checking out ROCm/LLM-Booster
+          # with LLM_BOOSTER_DEPLOY_KEY fails with "Repository not found" (since
+          # 2026-11-12). Set it back to true once the repo / deploy key work again.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             PUBLISH_TO_DASHBOARD=true
-            UPLOAD_TO_CUSTOM_DASHBOARD=true
+            UPLOAD_TO_CUSTOM_DASHBOARD=false
           else
             PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
-            UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-true}"
+            UPLOAD_TO_CUSTOM_DASHBOARD="${INPUT_UPLOAD_TO_CUSTOM_DASHBOARD:-false}"
           fi
           mapfile -t VLLM_META < <(python3 - <<'PY'
           import re

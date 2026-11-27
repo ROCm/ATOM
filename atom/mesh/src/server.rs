@@ -253,7 +253,7 @@ async fn kv_event_sources(State(state): State<Arc<AppState>>) -> Response {
 
 async fn kv_storage_sources(State(state): State<Arc<AppState>>) -> Response {
     match &state.context.kv_storage {
-        Some(storage) => Json(storage.status(&state.context.client).await).into_response(),
+        Some(storage) => Json(storage.status().await).into_response(),
         None => (StatusCode::NOT_FOUND, "KV events are off (--kv-events)").into_response(),
     }
 }
