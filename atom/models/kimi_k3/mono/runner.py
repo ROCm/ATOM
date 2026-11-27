@@ -504,13 +504,26 @@ class K3MonoDecodeRunner:
         raise_if_given_up("Kimi-K3 mono", self.rank, rows, waits, self.mailboxes)
 
     def _layer(self, build, plan, positions, prefix, blocks, add, add2, metadata):
+        from atom.model_ops.kimi_k3.attention_residual import ColumnTail
+
+        if plan.mono and not plan.ffn_only:
+            from atom.model_ops.kimi_k3.attention_residual import (
+                materialize_column_output,
+            )
+
+            add = materialize_column_output(add)
+            add2 = materialize_column_output(add2)
         if not plan.mono and not plan.ffn_only:
             rows = prefix.size(0)
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
             # a production module may hand back a tile-padded batch; the kernels
             # are built for an exact row count, so a layer that changed it would
             # mis-specialize every layer after it
-            widths = {t.size(0) for t in out if t is not None}
+            widths = {
+                (t.columns if isinstance(t, ColumnTail) else t).size(0)
+                for t in out
+                if t is not None
+            }
             if widths != {rows}:
                 raise MonoUnsupported(
                     f"layer {plan.layer_id} returned rows {sorted(widths)} for "
