@@ -17,6 +17,8 @@ import triton.language as tl
 from aiter.ops.topk import top_k_per_row_decode
 from triton.language.extra import libdevice
 
+from .candidate_table import kept_context, lift_candidate_selection
+
 
 def _blocks(width, block_size):
     """Candidate blocks a `width`-column row spans, checking the block is sane."""
@@ -120,25 +122,37 @@ def restrict_to_candidates_reference(logits, candidates, visible, block_size, ti
 
 @functools.cache
 def _gfx1250():
-    """gfx1250 takes the wider maxima grid and the 128-wide candidate tile;
-    other archs keep the values they were tuned with."""
+    """gfx1250 takes the 128-wide candidate tile; other archs keep the value
+    they were tuned with."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return get_gfx_runtime() == "gfx1250"
 
 
+@functools.cache
+def _maxima_grid():
+    """Programs in `_block_maxima_kernel`'s grid: 16384 on gfx1250 and gfx950,
+    2048 elsewhere."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return 16384 if get_gfx_runtime() in ("gfx1250", "gfx950") else 2048
+
+
 def _maxima_lanes(rows):
-    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid
-    (16384 on gfx1250).
+    """Programs per row for `_block_maxima_kernel`, `_maxima_grid()` in the
+    grid shared out over the rows.
 
     A tile is one load and one max, so extra lanes have little latency to hide
     and an idle one is pure launch cost: the grid wants to fill the machine
     once and no more. Within about 10% of the best lane count from 6 to 8191
     rows and 2k to 256k context. gfx1250 needs more programs in flight to keep
-    its loads coming, so its grid is wider.
+    its loads coming, so its grid is wider. gfx950 takes the same wider grid
+    for a different reason: a decode step's rows are not at one context. The
+    launch lasts as long as its longest row's lanes take, and the narrow grid
+    leaves that row few of them once a step has a few hundred rows. The
+    maxima are the same bytes at any lane count.
     """
-    target = 16384 if _gfx1250() else 2048
-    return min(256, max(1, target // max(rows, 1)))
+    return min(256, max(1, _maxima_grid() // max(rows, 1)))
 
 
 @triton.jit(do_not_specialize=["lanes"])
@@ -296,3 +310,109 @@ def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None
         PACKED=packed is not None,
     )
     return ends
+
+
+@triton.jit
+def _gather_candidates_kernel(
+    logits,
+    starts,
+    ends,
+    candidates,
+    plane,
+    lengths,
+    candidate_stride,
+    plane_stride,
+    count,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    COUNT: tl.constexpr,
+):
+    """Row r's chosen blocks, side by side in `plane` row r; their length.
+
+    Candidates are ascending with a `-1` tail and the newest visible block,
+    the only partly filled one, is last when kept, so the compacted row is
+    every kept block whole but the last, which runs to the row's end
+    (`kept_context`, as the candidate table bounds its rows).
+    """
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    slots = chunk * CHUNK + tl.arange(0, CHUNK)
+    blocks = tl.load(
+        candidates + row * candidate_stride + slots, slots < count, other=-1
+    )
+    end = tl.load(ends + row)
+    start = tl.load(starts + row).to(tl.int64)
+    columns = blocks[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    kept = (blocks[:, None] >= 0) & (columns < end)
+    scores = tl.load(logits + start + columns, kept, other=float("-inf"))
+    out = slots[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    tl.store(
+        plane + row.to(tl.int64) * plane_stride + out,
+        scores,
+        (slots < count)[:, None],
+    )
+    if chunk == 0:
+        every = tl.arange(0, COUNT)
+        ids = tl.load(
+            candidates + row * candidate_stride + every, every < count, other=-1
+        )
+        tl.store(lengths + row, kept_context(ids, end.to(tl.int32), BLOCK))
+
+
+_GATHER_CHUNK = 64
+
+
+def candidate_topk_launch(count):
+    """`_gather_candidates_kernel`'s launch constants for `count` candidate
+    blocks a row: its chunks per row and the padded count. Fixed for a
+    layer's run, so a caller with many bands works them out once."""
+    return triton.cdiv(count, _GATHER_CHUNK), triton.next_power_of_2(count)
+
+
+def top_k_within_candidates(
+    logits, starts, ends, candidates, block_size, out, k, plane, lengths, launch=None
+):
+    """Each packed row's top-k (`out`, ascending compressed-row ids, `-1`
+    padded) taken over the candidate blocks the row just picked off the same
+    logits, rather than over its whole row.
+
+    The same selection, for finite scores: every one of a row's top-k scores
+    lies in a block whose best score is at least the k-th, and fewer than `k`
+    blocks can have a best score above it. The row keeps its newest block and
+    its best others by that score, more than `k` blocks in all, so the kept
+    blocks hold every top-k score. Ties at the k-th score resolve alike too:
+    the block pick and the top-k both keep the smallest index first, so the
+    blocks holding the earliest tied scores are kept. Kept blocks are
+    ascending, so a compacted column order is the row's, and the stable
+    top-k orders its output as it would on the whole row. (The block maxima
+    skip NaN and cap +inf at the largest finite float, where the whole-row
+    top-k sees the raw values.)
+
+    `logits` is the flat packed buffer (row r at `starts[r]`, visible to
+    `ends[r]`), `candidates` the rows' `pick_candidate_blocks_packed` output.
+    `plane` (`[rows, count * block_size]` fp32) and `lengths` (`[rows]`
+    int32) are scratch (`ScoreWorkspace.candidate_scratch`); `launch` is
+    `candidate_topk_launch(count)`, worked out here when not given.
+    """
+    rows, count = candidates.shape
+    assert count > k, "the kept blocks need not hold the whole top-k"
+    chunks, padded = candidate_topk_launch(count) if launch is None else launch
+    if rows:
+        _gather_candidates_kernel[(rows, chunks)](
+            logits,
+            starts,
+            ends,
+            candidates,
+            plane,
+            lengths,
+            candidates.stride(0),
+            plane.stride(0),
+            count,
+            BLOCK=block_size,
+            CHUNK=_GATHER_CHUNK,
+            COUNT=padded,
+        )
+    top_k_per_row_decode(
+        plane, 1, lengths, out, rows, plane.stride(0), 1, k=k, stable=True
+    )
+    lift_candidate_selection(out, candidates, rows_per_block=block_size)
