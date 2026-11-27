@@ -65,6 +65,7 @@ from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
 from atom.models.deepseek_v41.mono.kernels import draft_ctx as dc
 from atom.models.deepseek_v41.mono.kernels import engram as eg
 from atom.models.deepseek_v41.mono.kernels import layer as kl
+from atom.models.deepseek_v41.mono.kernels import layer_pair as lp
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import UG_PART, Dims, kvrow_bytes
@@ -152,6 +153,9 @@ class RowsBuild:
     moe: object = None
     # K1 key -> the layer kernel of K1 and K2 in one launch (``_fuses``)
     layers: dict = field(default_factory=dict)
+    # (pair) K1 key -> the pair kernel of two such layers
+    # (``layer_pair``), where ``ATOM_MONO_PAIR`` asks for one (``layer_pair.pair_mode``)
+    pairs: dict = field(default_factory=dict)
     # a sharded step's column gathers (``_gather_cols``): ``col_gather.State``
     # -> its launcher
     gathers: dict = field(default_factory=dict)
@@ -556,10 +560,13 @@ class V41MonoDecodeRunner:
             key = replace(key, staged_answer=True)
             post = k2.build_layer_post(key)
         rest = [f for f in spilled if f is not built.layer_post]
+        # (pair) a spilled pair kernel dropped: its layers run apart
+        pairs = {k: f for k, f in built.pairs.items() if f not in rest}
+        rest = [f for f in rest if f not in built.pairs.values()]
         layers = {k: f for k, f in built.layers.items() if f not in rest}
         if len(built.layers) - len(layers) != len(rest):
             return None
-        return replace(built, layers=layers, layer_post=post, post_key=key)
+        return replace(built, layers=layers, pairs=pairs, layer_post=post, post_key=key)
 
     def _layer_blocks(self) -> list:
         """(spec, block) of every layer this runner runs, in order (the
@@ -624,6 +631,27 @@ class V41MonoDecodeRunner:
             )
             if self._fuses(s, spec, key, block)
             for ratio in (self._compress_ratio(spec, block),)
+        }
+
+    def _pair_mode(self) -> int:
+        """``ATOM_MONO_PAIR`` for the target's runner (0: off;
+        the draft's runner never pairs)."""
+        if type(self) is not V41MonoDecodeRunner:
+            return 0
+        return lp.pair_mode()
+
+    def _pair_builds(self, s: int, numa: bool = True) -> dict:
+        """(pair) K1 key -> the pair build of each pairable
+        ordinary layer build of an s-row step (``layer_pair.pairable``)."""
+        mode = self._pair_mode()
+        if not mode:
+            return {}
+        if s > lp.PAIR_MAX_TOKENS:
+            return {}
+        return {
+            key: lp.PairBuild(build, mode)
+            for (key, ratio), build in self._fused_builds(s, numa).items()
+            if not ratio and lp.pairable(build)
         }
 
     def _layer_capable(self) -> bool:
@@ -742,6 +770,10 @@ class V41MonoDecodeRunner:
         layers = {
             key: kl.build_layer(build) for key, build in self._fused_builds(s).items()
         }
+        pairs = {
+            key: lp.build_layer_pair(build)
+            for key, build in self._pair_builds(s).items()
+        }
         compress = (
             {}
             if self.compressor is None
@@ -756,6 +788,7 @@ class V41MonoDecodeRunner:
             layer_post=k2.build_layer_post(post_key),
             post_key=post_key,
             layers=layers,
+            pairs=pairs,
             gathers=gathers,
             compress=compress,
             head=None if self.lm_head is None else self.lm_head.build(s),
@@ -836,6 +869,7 @@ class V41MonoDecodeRunner:
         """Every kernel of ``build``, each with its ABI."""
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
         kernels += [(launcher, kl.ABI) for launcher in build.layers.values()]
+        kernels += [(launcher, lp.ABI) for launcher in build.pairs.values()]
         kernels += [(launcher, cg.ABI) for launcher in build.gathers.values()]
         kernels += [(launcher, cp.ABI) for launcher in build.compress.values()]
         if build.head is not None:
@@ -887,6 +921,12 @@ class V41MonoDecodeRunner:
         # and the FFN seam the attention seam's, so one of each suffices
         self.res_attn = hand(1, s, hc, h, dtype=bf)
         self.res_ffn = plain(1, s, hc, h, dtype=bf)
+        # (pair) the pair's own hand-off of its body a's FFN
+        # seam residual and gates to body b's attention seam (read on other
+        # XCDs in the launch): uncached, the pair's alone -- every single
+        # layer keeps the cached ``res_ffn`` / ``gates_ffn``
+        pairs = self._pair_mode() > 0
+        self.res_pair = hand(1, s, hc, h, dtype=bf) if pairs else None
         # layer 0's residual, its streams written from the embedding by its
         # seam (``AttnPreBuild.embed_in``)
         self.res_embed = hand(1, s, hc, h, dtype=bf)
@@ -894,6 +934,7 @@ class V41MonoDecodeRunner:
         # rank's vocab shard), layer 0's input
         self.embedded = plain(s, h, dtype=bf)
         self.gates_attn, self.gates_ffn = gates(hand), gates(plain)
+        self.gates_pair = gates(hand) if pairs else None
         # the layer kernel's window rows of this step (``kernels.layer``), laid
         # out as the pool's planes
         self.kvrow = (
@@ -1002,6 +1043,8 @@ class V41MonoDecodeRunner:
             # the layer kernel's hand-over flags past both, an indexing or
             # compressing build's past a plain one's
             *(kl.scratch_bytes(b) for b in self._fused_builds(s, numa=False).values()),
+            # (pair) a pair build's PND past them
+            *(lp.pair_scratch_bytes(b) for b in self._pair_builds(s, numa=False).values()),
         )
 
     def _zero_extents(self, s: int):
@@ -1099,15 +1142,27 @@ class V41MonoDecodeRunner:
         # its own rows of every column (gathered at the end)
         shards = self._shard(rows)
         sharded = False
-        for spec, block, weights, key in zip(
-            model.topology, model.layers, self.layers, self.build.keys
-        ):
+        items = list(zip(model.topology, model.layers, self.layers, self.build.keys))
+        paired = self._paired(rows, items)
+        skip = False
+        for i, (spec, block, weights, key) in enumerate(items):
+            if skip:
+                # (pair) run as the previous layer's pair's body b
+                skip = False
+                continue
             rope = model.global_rope if spec.ratio else model.window_rope
             fuses = self._fuses(rows, spec, key, block)
             if block.engram is not None:
                 state = self._engram(rows, spec, block, state, metadata, sharded)
             # this layer leaves its columns only, as every one past it
             sharded = shards
+            if fuses and i in paired and self._layer_pair(
+                items[i], items[i + 1], state, cache, step
+            ):
+                pre, post, comb = self.gates_ffn
+                state = SinglePassHCState(self.res_ffn, pre, self.ffn_out, post, comb)
+                skip = True
+                continue
             if fuses and self._layer(
                 spec, block, weights, key, state, cache, step, rope
             ):
@@ -1282,7 +1337,77 @@ class V41MonoDecodeRunner:
         )
         return res_out, gates
 
+    def _paired(self, rows: int, items) -> set:
+        """(pair) The layers that run with the next one as a pair
+        (``layer_pair``): greedily, two consecutive layers of one pairable
+        build, neither an Engram layer nor compressing nor producing candidates."""
+        pairs = self.build.pairs
+        if not pairs:
+            return set()
+
+        def ok(item):
+            spec, block, _, key = item
+            return (
+                key in pairs and block.engram is None
+                and self._fuses(rows, spec, key, block)
+                and self._compress_ratio(spec, block) == 0
+                and not spec.produces_candidates
+            )  # fmt: skip
+
+        out, i = set(), 0
+        while i + 1 < len(items):
+            if items[i][3] == items[i + 1][3] and ok(items[i]) and ok(items[i + 1]):
+                out.add(i)
+                i += 2
+            else:
+                i += 1
+        return out
+
+    def _layer_pair(self, item_a, item_b, state, cache, step) -> bool:
+        """(pair) Layers a and b (consecutive, one build) in one
+        launch (``layer_pair``): b's state is a's outputs (the runner's FFN
+        seam buffers). False (nothing run) where either has no layer kernel."""
+        model = self.model
+        spec_a, block_a, weights_a, key = item_a
+        spec_b, block_b, weights_b, _ = item_b
+        rope_a = model.global_rope if spec_a.ratio else model.window_rope
+        rope_b = model.global_rope if spec_b.ratio else model.window_rope
+        got_a = self._layer_args(spec_a, block_a, weights_a, key, state, cache, step, rope_a)
+        if got_a is None:
+            return False
+        # body a's FFN seam writes the pair's own uncached residual and
+        # gates, body b's attention seam reads them (``res_pair`` / ``gates_pair``)
+        p = torch.Tensor.data_ptr
+        pre, post, comb = self.gates_pair
+        got_a[1].update({
+            "res_out": p(self.res_pair), "pre_out": p(pre), "post_out": p(post),
+            "comb_out": p(comb),
+        })  # fmt: skip
+        state_b = SinglePassHCState(self.res_pair, pre, self.ffn_out, post, comb)
+        got_b = self._layer_args(spec_b, block_b, weights_b, key, state_b, cache, step, rope_b)
+        if got_b is None:
+            return False
+        args = {f"a_{n}": v for n, v in got_a[1].items()}
+        args.update({f"b_{n}": v for n, v in got_b[1].items()})
+        _run_compiled(
+            self.build.pairs[key], *lp.ABI.pack(args), torch.cuda.current_stream()
+        )
+        return True
+
     def _layer(self, spec, block, weights, key, state, cache, step, rope) -> bool:
+        """``_layer_args`` launched."""
+        got = self._layer_args(spec, block, weights, key, state, cache, step, rope)
+        if got is None:
+            return False
+        launcher, args = got
+        _run_compiled(
+            launcher,
+            *kl.ABI.pack(args),
+            torch.cuda.current_stream(),
+        )
+        return True
+
+    def _layer_args(self, spec, block, weights, key, state, cache, step, rope):
         """K1 and K2 in one launch (``kernels.layer``), a compressing layer's
         compressor between them; K2's outputs as ``_layer_post``'s. False (and
         nothing run) where the width has no such build (it spilled:
@@ -1292,12 +1417,12 @@ class V41MonoDecodeRunner:
         ratio = self._compress_ratio(spec, block)
         launcher = self.build.layers.get((key, ratio))
         if launcher is None:
-            return False
+            return None
         cargs = {name: 0 for name in kl.COMPRESS_ARGS}
         if ratio:
             cargs = self.compressor.layer_args(key.tokens, spec, cache, step, rope)
             if cargs is None:
-                return False
+                return None
         own, residual, gates = self._front_args(
             layer_id, key, weights, state, cache, step, rope
         )
@@ -1316,12 +1441,7 @@ class V41MonoDecodeRunner:
         args["moe_layer"] = MOE_TAG0 + layer_id
         args["queue_words"] = self._queue_words(layer_id)
         args["tl"] = self._timeline_ptr("layer", layer_id)
-        _run_compiled(
-            launcher,
-            *kl.ABI.pack(args),
-            torch.cuda.current_stream(),
-        )
-        return True
+        return launcher, args
 
     def _front_args(self, layer_id, key, weights, state, cache, step, rope):
         """K1's own arguments (its ABI up to the shared tail) -> (them, the

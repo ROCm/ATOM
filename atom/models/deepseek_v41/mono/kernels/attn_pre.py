@@ -592,11 +592,13 @@ def slice_direct_loads(c, c0, q):
     return res, cm, post, pre
 
 
-def slice_direct_loads_live(c, c0, q, live):
+def slice_direct_loads_live(c, c0, q, live, pend=None):
     """``slice_direct_loads`` for the entry prefetch
     (``slice_entry_prefetch``): the loads out of range where ``live`` is
     false (each buffer's resource sized to its S rows), and the pair's two
-    ``pend`` values too (``pend_value``'s, from ``pend``)."""
+    ``pend`` values too (``pend_value``'s, from ``pend``). (pair)
+    ``pend``: None loads them; "late" leaves them out (the caller polls them
+    later); else the two values, already polled."""
     a = c["args"]
     s = c["S"]
     split = slice_split(s)
@@ -625,7 +627,10 @@ def slice_direct_loads_live(c, c0, q, live):
     ]  # fmt: skip
     post = [f32("post_in", t * HC + o[j], s * HC * 4) for j in own]
     pre = [f32("pre_in", t * HC + o[j], s * HC * 4) for j in own]
-    pend = [bf("pend", t * HIDDEN + col + d, s * HIDDEN * 2) for d in range(2)]
+    if const_expr(isinstance(pend, str)):
+        return res, cm, post, pre
+    if const_expr(pend is None):
+        pend = [bf("pend", t * HIDDEN + col + d, s * HIDDEN * 2) for d in range(2)]
     return res, cm, post, pre, pend
 
 
@@ -837,7 +842,7 @@ def slice_wns(c, c0, live):
     return wns
 
 
-def slice_entry_prefetch(args, s, tp, bid, rank):
+def slice_entry_prefetch(args, s, tp, bid, rank, pend=None):
     """The layer kernel's seam A slice unit's first loads (sharded,
     ``slice_x8``, folding), issued at the kernel's entry, before its peer
     tables' loads (``peer_bases``, ``x8_dst``) whose readfirstlanes waited on
@@ -858,7 +863,7 @@ def slice_entry_prefetch(args, s, tp, bid, rank):
     wns = slice_wns(c, c0, live)
     fns = slice_fn_loads_live(c, task, live)
     rows = slice_direct_loads_live(
-        c, c0, fx.min(tid, slice_direct_threads(s) - 1), live
+        c, c0, fx.min(tid, slice_direct_threads(s) - 1), live, pend
     )  # fmt: skip
     # side-effecting empty asm: no pass sinks these loads past the tables'
     llvm.InlineAsmOp(None, [], "", "", has_side_effects=True)
@@ -2320,6 +2325,10 @@ def run_attn_pre(
     wqb_per_cta = dims.wqb_tasks // BLOCKS
     fused = c["fused"]
     slice_x8 = c.get("slice_x8", False)
+    # (pair) the pair's body b: pend polled here (``layer_pair``)
+    pend_late = c.get("pend_late")
+    # (pair) the destination's X8G base loaded by the caller
+    x8_dst_base = c.get("x8_dst_base")
     enter_stage("k1.slice")
     # a sharded seam (the layer kernel): this rank's quarter of the slices,
     # the same tasks its seam F runs (their SDONE local)
@@ -2338,8 +2347,18 @@ def run_attn_pre(
         if const_expr(slice_x8):
             # the destination rank's X8G, once a task (not every rank's held
             # through the fold: SGPRs)
-            c["x8_dst"] = preg(load_ptr64(c["x8_peers"], c["dst"]), 0, "x8g")
+            if const_expr(x8_dst_base is None):
+                c["x8_dst"] = preg(load_ptr64(c["x8_peers"], c["dst"]), 0, "x8g")
+            else:
+                c["x8_dst"] = preg(x8_dst_base, 0, "x8g")
         task = c["rank"] * own + unit % own
+        if const_expr(pend_late is not None):
+            # (pair) the entry prefetch left pend out: polled now,
+            # past the slice's other loads (``layer_pair``, mode 2)
+            assert entry_pre is not None
+            (pre_fns, pre_rows), pre_wns = entry_pre
+            pend_got = pend_late(unit < units, fx.min(unit, units - 1) % own)
+            entry_pre = ((pre_fns, (*pre_rows, pend_got)), pre_wns)
         if unit < units:
             if const_expr(entry_pre is not None):
                 # its first loads issued at the kernel's entry, before
@@ -2569,7 +2588,7 @@ def attn_pre_smem(key: AttnPreBuild) -> dict:
     return members
 
 
-def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers):
+def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers, bases=None):
     """K1's stage context ``c`` and the one its seam stages run on (``co``: a
     token-parallel build's own-rows view, else ``c``); ``lds`` the
     ``attn_pre_smem`` member views by name."""
@@ -2595,7 +2614,12 @@ def attn_pre_context(key, lds, mb, layout, scratch, args, rank, sym, peers):
     c["rank"], c["sym"] = rank, sym
     if const_expr(key.shard):
         peer = peer_offsets(s, dims)
-        shard_seam(c, peer, peer_bases(peers, key.tp), sym, key.tp, "pmixg")
+        # (pair) the caller's peer bases where it has them: one
+        # table load a launch (the pair's body b reuses body a's)
+        shard_seam(
+            c, peer, peer_bases(peers, key.tp) if bases is None else bases, sym,
+            key.tp, "pmixg",
+        )
         if const_expr(key.slice_x8):
             c["slice_x8"] = True
             c["x8_peers"] = peers

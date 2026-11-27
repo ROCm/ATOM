@@ -2542,6 +2542,8 @@ def reduce_pair(c, task, idx):
     """Thread ``idx``'s column pair of token idx / 64."""
     s, tp = c["S"], c["d"].ranks
     a = c["args"]
+    # (pair) the pair's body a: the columns to PND too (``layer_pair``)
+    pnd = c.get("pnd")
     if idx < s * RED_COLS // 2:
         t = idx // (RED_COLS // 2)
         col = task * RED_COLS + 2 * (idx % (RED_COLS // 2))
@@ -2551,6 +2553,11 @@ def reduce_pair(c, task, idx):
         )
         bo.buffer_store(acc0.to(fx.BFloat16), rsrc(a["out"]), t * HIDDEN + col)
         bo.buffer_store(acc1.to(fx.BFloat16), rsrc(a["out"]), t * HIDDEN + col + 1)
+        if const_expr(pnd is not None):
+            # this rank's columns, a tagged bf16 pair a (row, column pair):
+            # put_bf's index is the pair's element (= its first word)
+            per = RED_TASKS // tp * RED_COLS
+            c["put_bf"](pnd, t * per + (col - c["rank"] * per), [acc0, acc1])
 
 
 def moe_smem(s, rs, timeline):
