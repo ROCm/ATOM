@@ -29,7 +29,7 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Replay, SequenceStatus
+from atom.model_engine.sequence import Replay, SequenceStatus, SequenceType
 
 META = object()
 
@@ -147,6 +147,48 @@ def setup(monkeypatch, seq_factory):
 
 def _free(sched):
     return sched.block_manager.pool_occupancy()["free"]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_early_tier_load_preserves_mixed_decode_append_pages(
+    monkeypatch, seq_factory, mixed
+):
+    sched, _, (waiting,) = _make(
+        monkeypatch,
+        seq_factory,
+        blocks=5,
+        ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK=1.0,
+        ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC=1.0,
+    )
+    sched.enable_mixed_prefill_decode = mixed
+    decode = seq_factory([100, 101, 102, 103])
+    assert sched.block_manager.allocate(decode)
+    decode.num_cached_tokens = 4
+    decode.append_token(104)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    sched.running.append(decode)
+
+    if mixed:
+        sched.block_manager.reserved_decode_blocks = (
+            sched._prefill_limits().reserved_decode_blocks
+        )
+    parked = sched._early_load_tier_prefixes()
+
+    assert parked == (0 if mixed else 1)
+    if mixed:
+        assert not waiting.block_table
+        assert waiting.status == SequenceStatus.WAITING
+        assert sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(decode)
+        )
+        sched.block_manager.may_append(decode)
+        assert len(decode.block_table) == 2
+    else:
+        assert waiting.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert not sched.block_manager._has_page_units(
+            sched.block_manager.append_blocks_needed(decode)
+        )
 
 
 def test_hold_tick_parks_a_request_and_ships_its_load(setup):
@@ -350,7 +392,7 @@ def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
     class _Probe:
         num_cached_blocks = 1
 
-    sched._probe_hbm_prefix = lambda s: _Probe()
+    sched._probe_hbm_prefix = lambda s, **kw: _Probe()
 
     sched.schedule()
 
@@ -771,7 +813,7 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
@@ -803,10 +845,38 @@ def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched._prioritize_ready_remote_kv_requests()
     assert Counting.clears == 1
+    assert list(sched.waiting) == [owner, head]
+
+
+def test_settled_early_owner_passes_a_head_blocked_by_decode_reservation(
+    monkeypatch, seq_factory
+):
+    from test_mixed_budget_consistency import _decode
+
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    sched.schedule()
+    assert list(sched.waiting) == [head, owner]
+    sched.enable_mixed_prefill_decode = True
+    _decode(sched, 3)
+    limits = sched._prefill_limits()
+    assert limits.reserved_decode_blocks == 1
+    # Leave exactly enough free pages for the head, but not its decode peer.
+    bm = sched.block_manager
+    needed = head.num_blocks
+    while bm.kv.num_free > needed:
+        filler = seq_factory([99] * 4)
+        assert bm.allocate(filler, 0)
+    assert bm.can_allocate_memoized(head) >= 0
+    bm.reserved_decode_blocks = 1
+    assert bm.can_allocate_memoized(head) < 0
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
 
 
@@ -824,7 +894,7 @@ def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(
     monkeypatch.setattr(
         sched.block_manager,
         "can_allocate_memoized",
-        lambda seq: -1 if seq is head else original(seq),
+        lambda seq, **kw: -1 if seq is head else original(seq, **kw),
     )
     sched.waiting.extend([loading, head, done])
     sched.finished_recving_kv_req_ids = [done.id]

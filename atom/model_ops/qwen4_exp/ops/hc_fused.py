@@ -296,13 +296,20 @@ def _hc_gated_mean_tiled_kernel(
     )
 
 
-def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Tensor:
-    """Tiled `mix_gated_mean` for large batches (same rounding)."""
+def hc_gated_mean(
+    normed: torch.Tensor,
+    gate: torch.Tensor,
+    hc: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Tiled `mix_gated_mean` for large batches (same rounding); writes into
+    `out` (`[m, hidden]` rows) when given."""
     m, width = normed.shape
     hidden = width // hc
-    out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
     rb, bh = 4, 512
     if m and hidden % bh == 0 and gate.stride(0) == normed.stride(0):
+        if out is None:
+            out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
         _hc_gated_mean_tiled_kernel[(triton.cdiv(m, rb), hidden // bh)](
             normed,
             gate,
@@ -319,7 +326,8 @@ def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Te
         return out
     from atom.model_ops.qwen4_exp.ops.gated import mix_gated_mean
 
-    return mix_gated_mean(normed, gate, hc)
+    mixed = mix_gated_mean(normed, gate, hc)
+    return mixed if out is None else out.copy_(mixed)
 
 
 @triton.jit
@@ -574,13 +582,19 @@ def hc_combine_norm(
     hc: int,
     block_out: torch.Tensor | None = None,
     raw: torch.Tensor | None = None,
+    h_out: torch.Tensor | None = None,
 ):
-    """Deferred combine (optional) + grouped norm; returns (streams, normed)."""
+    """Deferred combine (optional) + grouped norm; returns (streams, normed).
+    The combined streams go to `h_out` (same strides as `h`) when given."""
     m, width = h.shape
     hidden = width // hc
     combine = block_out is not None
     normed = torch.empty_like(h)
-    h_new = torch.empty_like(h) if combine else h
+    h_new = h
+    if combine:
+        h_new = torch.empty_like(h) if h_out is None else h_out
+    # The kernels write h_new at h's strides.
+    assert h_new.stride() == h.stride(), "h_out strides must match h"
     ba = 1 << (hidden.bit_length() - 1)
     bb = hidden - ba
     if m >= COMBINE_NORM_ROWS_MIN_M and bb > 0 and bb & (bb - 1) == 0:

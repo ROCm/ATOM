@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.model_engine.dp_sync_gate import DPSyncGate
 from atom.model_engine.engine_stats import EngineStats
 
 ENGINE_CORE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_core.py"
@@ -42,7 +43,10 @@ def _extract(class_name: str, method: str):
         if isinstance(node, ast.FunctionDef) and node.name == method
     )
     scope: dict = {
-        "envs": SimpleNamespace(ATOM_METRICS_UPDATE_INTERVAL_S=1e9),
+        "envs": SimpleNamespace(
+            ATOM_METRICS_UPDATE_INTERVAL_S=1e9, ATOM_DP_SYNC_INTERVAL=1
+        ),
+        "DPSyncGate": DPSyncGate,
         "logger": SimpleNamespace(info=lambda *a, **k: None, exception=lambda *a: None),
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
@@ -71,6 +75,8 @@ class _Engine:
     """
 
     _report_backlog = False
+    _idle_when_blocked = False
+    _dp_group_hidden_work = False
 
     def __init__(self, schedule, interval_steps=INTERVAL_STEPS):
         self._schedule = list(schedule)
@@ -87,6 +93,9 @@ class _Engine:
             heartbeat_throughput=lambda now: None,
             is_finished=lambda: self._state is IDLE,
             prefill_delayer=None,
+            block_manager=SimpleNamespace(
+                complete_previous_checkpoint_batch=lambda: None
+            ),
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
@@ -125,7 +134,7 @@ class _Engine:
     def _report_held_kv_work(self):
         pass
 
-    def _sync_dp_state(self, local_unfinished, shutdown, offloaded):
+    def _sync_dp_state(self, local_unfinished, shutdown, offloaded, hidden=False):
         # Mirrors the real `local_unfinished`: STALLED has requests, so
         # the rank reports unfinished even though no forward will run.
         return (
@@ -133,6 +142,10 @@ class _Engine:
             False,
             self._state is OFFLOAD,
         )
+
+    def _validate_dp_sync_interval(self, interval):
+        # This single-engine harness has no peer interval to disagree with.
+        return interval
 
     def _process_engine_step(self):
         if self._state is not WORK:
