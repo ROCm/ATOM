@@ -115,12 +115,11 @@ impl DefaultPlanner {
         }
 
         let hash_ring = self.hash_ring_for(req.model_id);
-        let (worker, binding) = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
+        let chosen = apply_policy(&candidates, policy.as_ref(), req, hash_ring).await?;
 
         Ok(PlacementPlan::Single {
-            worker,
+            worker: chosen,
             policy_name: policy.name(),
-            binding,
             // The router releases the charge at the response's first frame, which a
             // non-streaming response sends only after decoding.
             prefill_tokens: if req.stream { prompt_tokens(req) } else { 0 },
@@ -156,17 +155,17 @@ impl DefaultPlanner {
             None
         };
         let prefill_candidates = match &decode_first {
-            Some((decode, _)) => on_decode_rank(prefill_candidates, decode.as_ref()),
+            Some(decode) => on_decode_rank(prefill_candidates, decode.as_ref()),
             None => prefill_candidates,
         };
-        let (prefill, prefill_binding) = apply_policy(
+        let prefill = apply_policy(
             &prefill_candidates,
             prefill_policy.as_ref(),
             req,
             hash_ring.clone(),
         )
         .await?;
-        let (decode, decode_binding) = match decode_first {
+        let decode = match decode_first {
             Some(decode) => decode,
             None => select_decode(hash_ring).await?,
         };
@@ -185,8 +184,6 @@ impl DefaultPlanner {
             decode,
             prefill_policy: prefill_policy.name(),
             decode_policy: decode_policy.name(),
-            prefill_binding,
-            decode_binding,
             prefill_tokens: prompt_tokens(req),
         })
     }

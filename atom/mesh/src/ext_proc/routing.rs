@@ -34,8 +34,6 @@ pub(super) enum ExecutionTarget {
         /// The request's headers, moved in at dispatch, for the policy's
         /// failure hook.
         headers: http::HeaderMap,
-        /// The selection's binding, for the policy's dispatch hooks.
-        binding: Option<u64>,
         _load: WorkerLoadGuard,
     },
     Pair(ExecutionLease),
@@ -56,12 +54,11 @@ impl ExecutionTarget {
             worker,
             policy,
             headers,
-            binding,
             ..
         } = self
         {
             *headers = std::mem::take(request_headers);
-            policy.on_dispatch(WORKER_REGULAR, Some(headers), worker, *binding);
+            policy.on_dispatch(WORKER_REGULAR, Some(headers), worker);
         }
     }
 
@@ -70,7 +67,6 @@ impl ExecutionTarget {
             worker,
             policy,
             headers,
-            binding,
             ..
         } = self
         {
@@ -81,7 +77,7 @@ impl ExecutionTarget {
             // An unhealthy outcome is a 5xx from the worker, no response, or an
             // upstream reset or timeout, even after the response started.
             if health == Some(false) {
-                policy.on_dispatch_failed(Some(headers), worker, *binding);
+                policy.on_dispatch_failed(Some(headers), worker);
             }
         }
         // PD worker outcomes belong to the individual HTTP attempts. A pair's
@@ -162,10 +158,8 @@ impl EndpointRouter {
                 e, model,
             ))
         })?;
-        let (worker, binding) = match plan {
-            PlacementPlan::Single {
-                worker, binding, ..
-            } => (worker, binding),
+        let worker = match plan {
+            PlacementPlan::Single { worker, .. } => worker,
             pair @ PlacementPlan::Pair { .. } => {
                 let executor = self.executor.as_ref().ok_or_else(|| {
                     ProcessingError::new(
@@ -205,7 +199,6 @@ impl EndpointRouter {
                 _load: load,
                 policy: self.policies.regular_policy(model),
                 headers: http::HeaderMap::new(),
-                binding,
             },
             address,
             api_key,

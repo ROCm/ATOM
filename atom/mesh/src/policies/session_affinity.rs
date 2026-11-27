@@ -4,11 +4,9 @@
 //! [`LeastSessionsPolicy`], which reads the live session counts the table
 //! passes in. Later requests stay on that worker until the idle TTL expires,
 //! the worker is unusable or not a candidate (another DP rank under idx2idx), or
-//! a request of the session fails. A failure counts
-//! only for a request placed on the session's current binding, on the worker it
-//! was sent to after DP rank mapping. Under ATOM PD idx2idx rank mapping, a
-//! failed prefill also releases the decode binding, although the decode was
-//! never sent.
+//! a request of the session fails on its bound worker. Under ATOM PD idx2idx
+//! rank mapping, a failed prefill also releases the decode binding, although
+//! the decode was never sent.
 //!
 //! `hard` always returns the bound worker. `soft` does too, unless the inner
 //! policy opts in via [`LoadBalancingPolicy::overrides_session_affinity`].
@@ -16,10 +14,7 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -91,17 +86,13 @@ impl WorkerIdentity {
 
 struct StickyAssignment {
     worker: WorkerIdentity,
-    /// Identifies this placement of the session. A request carries it from
-    /// selection to its dispatch and failure hooks, so a request placed before
-    /// the session moved cannot act on the new binding.
-    binding: u64,
     last_access: Instant,
     /// Where the session's last request was sent, after DP rank mapping.
     dispatched: Option<WorkerIdentity>,
     /// Why the session was last reassigned, until a request is sent.
     reassigned: Option<&'static str>,
-    /// A request of the session failed on the worker it was sent to, so the
-    /// next request, a retry included, is placed again.
+    /// A request of the session failed on its bound worker, so the next
+    /// request, a retry included, is placed again.
     failed: bool,
     /// Workers the session's requests failed on since its last hit. Placing
     /// it again leaves them out while another worker is healthy.
@@ -114,11 +105,10 @@ pub(crate) struct SessionTable {
     /// Bindings each worker holds, kept with `assignments` so placing a session
     /// does not scan the table. An idle binding counts until a sweep drops it.
     counts: std::sync::Mutex<HashMap<WorkerIdentity, usize>>,
-    next_binding: AtomicU64,
 }
 
 impl SessionTable {
-    /// Bind `key` to `worker` and return the new binding. A rebound session
+    /// Bind `key` to `worker`. A rebound session
     /// keeps where its last request was sent, so the next dispatch can tell
     /// whether the worker changed.
     fn assign(
@@ -127,8 +117,7 @@ impl SessionTable {
         worker: WorkerIdentity,
         now: Instant,
         reassigned: Option<&'static str>,
-    ) -> u64 {
-        let binding = self.next_binding.fetch_add(1, Ordering::Relaxed);
+    ) {
         // The entry's shard lock is held while the count changes, so a sweep
         // cannot drop the binding in between.
         match self.assignments.entry(key.to_string()) {
@@ -140,7 +129,6 @@ impl SessionTable {
                     *counts.entry(worker.clone()).or_insert(0) += 1;
                 }
                 entry.worker = worker;
-                entry.binding = binding;
                 entry.last_access = now;
                 entry.reassigned = reassigned;
                 entry.failed = false;
@@ -149,7 +137,6 @@ impl SessionTable {
                 *self.counts().entry(worker.clone()).or_insert(0) += 1;
                 entry.insert(StickyAssignment {
                     worker,
-                    binding,
                     last_access: now,
                     dispatched: None,
                     reassigned,
@@ -158,7 +145,6 @@ impl SessionTable {
                 });
             }
         }
-        binding
     }
 
     fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<WorkerIdentity, usize>> {
@@ -235,12 +221,12 @@ impl SessionTable {
         self.assignments.len()
     }
 
-    /// Release `key`'s binding after a request placed on `binding` failed on
-    /// `worker`. A request placed before the session moved keeps the new
-    /// binding, whenever it fails.
-    fn mark_failed(&self, key: &str, worker: &WorkerIdentity, binding: Option<u64>) {
+    /// Release `key`'s binding after a request failed on `worker`, if it is the
+    /// bound worker. A late failure on a worker the session has left keeps the
+    /// new binding.
+    fn mark_failed(&self, key: &str, worker: &WorkerIdentity) {
         if let Some(mut entry) = self.assignments.get_mut(key) {
-            if binding == Some(entry.binding) {
+            if entry.worker == *worker {
                 entry.failed = true;
                 if !entry.avoid.contains(worker) {
                     entry.avoid.push(worker.clone());
@@ -249,22 +235,13 @@ impl SessionTable {
         }
     }
 
-    /// Record where a request of `key` placed on `binding` was sent. Returns
+    /// Record where a request of `key` was sent. Returns
     /// why the session moved when this worker differs from the one its previous
     /// request was sent to.
-    fn record_dispatch(
-        &self,
-        key: &str,
-        worker: WorkerIdentity,
-        binding: Option<u64>,
-    ) -> Option<&'static str> {
+    fn record_dispatch(&self, key: &str, worker: WorkerIdentity) -> Option<&'static str> {
         let mut entry = self.assignments.get_mut(key)?;
-        // A request placed before the session moved does not move it back.
-        if binding != Some(entry.binding) {
-            return None;
-        }
-        // Without a reassignment, only rank mapping can move a pinned session: a
-        // request placed on an earlier binding returned above.
+        // Without a reassignment, rank mapping moved the pinned session, or another
+        // in-flight request of the session took the reassignment.
         let reason = entry
             .reassigned
             .take()
@@ -382,12 +359,6 @@ impl SessionAffinityPolicy {
         }
     }
 
-    /// The session's current binding.
-    #[cfg(test)]
-    pub(crate) fn binding(&self, key: &str) -> Option<u64> {
-        self.table.assignments.get(key).map(|entry| entry.binding)
-    }
-
     #[cfg(test)]
     pub(crate) fn scope_label(&self) -> &'static str {
         self.scope.as_str()
@@ -418,11 +389,9 @@ impl SessionAffinityPolicy {
 
     /// The bound worker serves the request when the session is not idle for
     /// too long, no request failed since it was placed, and the worker is
-    /// usable. A hit forgets the workers the session failed on. One entry
-    /// lock covers the check and the binding read, so a placement in between
-    /// cannot hand this request the new binding for the old worker. Returns
-    /// the worker's index and the binding.
-    fn hit(&self, key: &str, workers: &[Arc<dyn Worker>], now: Instant) -> Option<(usize, u64)> {
+    /// usable. A hit forgets the workers the session failed on. Returns the
+    /// worker's index.
+    fn hit(&self, key: &str, workers: &[Arc<dyn Worker>], now: Instant) -> Option<usize> {
         let mut assignment = self.table.assignments.get_mut(key)?;
         if assignment.failed || self.is_expired(&assignment, now) {
             return None;
@@ -430,17 +399,13 @@ impl SessionAffinityPolicy {
         let index = healthy_index(workers, &assignment.worker)?;
         assignment.last_access = now;
         assignment.avoid.clear();
-        Some((index, assignment.binding))
+        Some(index)
     }
 
     /// Counts a hit and routes the request to its bound worker.
-    fn served(&self, (index, binding): (usize, u64)) -> (Option<usize>, RouteDecision) {
+    fn served(&self, index: usize) -> (Option<usize>, RouteDecision) {
         MeshMetrics::record_session_affinity(AFFINITY_HIT, self.scope.as_str());
-        let decision = RouteDecision {
-            binding: Some(binding),
-            ..RouteDecision::branch(AFFINITY_HIT)
-        };
-        (Some(index), decision)
+        (Some(index), RouteDecision::branch(AFFINITY_HIT))
     }
 
     fn miss_result(&self, key: &str, now: Instant) -> &'static str {
@@ -493,9 +458,9 @@ impl SessionAffinityPolicy {
         workers: &[Arc<dyn Worker>],
         now: Instant,
         result: &'static str,
-    ) -> u64 {
+    ) {
         let reassigned = (result != AFFINITY_NEW).then_some(result);
-        let binding = self.table.assign(
+        self.table.assign(
             key,
             WorkerIdentity::from_worker(&workers[worker_index]),
             now,
@@ -505,7 +470,6 @@ impl SessionAffinityPolicy {
             self.enforce_capacity(now, key);
         }
         MeshMetrics::record_session_affinity(result, self.scope.as_str());
-        binding
     }
 
     /// Places `key` with the inner policy, away from the workers it failed on
@@ -541,45 +505,36 @@ impl SessionAffinityPolicy {
             return (None, decision);
         };
         let result = self.miss_result(key, now);
-        let binding = self.record_placement(key, selected, workers, now, result);
+        self.record_placement(key, selected, workers, now, result);
         let decision = if self.inner.reports_session_result() {
             RouteDecision::branch(result)
         } else {
             decision
         };
-        let decision = RouteDecision {
-            binding: Some(binding),
-            ..decision
-        };
         (Some(selected), decision)
     }
 
     /// Soft mode: the inner policy sees the bound worker of `hit` as
-    /// `preferred_worker` and may pick another, which rebinds the session
-    /// with a new binding. Keeping the worker keeps the binding `hit` read.
+    /// `preferred_worker` and may pick another, which rebinds the session.
     async fn commit_soft_move(
         &self,
         key: &str,
-        hit: (usize, u64),
+        hit: usize,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
         now: Instant,
     ) -> (Option<usize>, RouteDecision) {
         let mut delegated = info.clone();
-        delegated.preferred_worker = Some(hit.0);
+        delegated.preferred_worker = Some(hit);
         let (chosen, decision) = self.inner.select_with_decision(workers, &delegated).await;
         let Some(chosen) = chosen else {
             return (None, decision);
         };
-        if chosen == hit.0 {
+        if chosen == hit {
             return self.served(hit);
         }
         let _assign_guard = self.assign_lock.lock().await;
-        let binding = self.record_placement(key, chosen, workers, now, AFFINITY_REBIND);
-        let decision = RouteDecision {
-            binding: Some(binding),
-            ..decision
-        };
+        self.record_placement(key, chosen, workers, now, AFFINITY_REBIND);
         (Some(chosen), decision)
     }
 }
@@ -645,7 +600,7 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
             if self.allows_soft_move() {
                 return self.commit_soft_move(&key, hit, workers, info, now).await;
             }
-            self.inner.on_session_hit(workers, info, hit.0);
+            self.inner.on_session_hit(workers, info, hit);
             return self.served(hit);
         }
 
@@ -665,38 +620,32 @@ impl LoadBalancingPolicy for SessionAffinityPolicy {
         pool: &'static str,
         headers: Option<&http::HeaderMap>,
         worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
     ) {
-        self.inner.on_dispatch(pool, headers, worker, binding);
+        self.inner.on_dispatch(pool, headers, worker);
         let Some(key) = self.binding_key(headers) else {
             return;
         };
-        if let Some(reason) =
-            self.table
-                .record_dispatch(&key, WorkerIdentity::from_worker(worker), binding)
+        if let Some(reason) = self
+            .table
+            .record_dispatch(&key, WorkerIdentity::from_worker(worker))
         {
             MeshMetrics::record_session_worker_change(pool, reason);
         }
     }
 
-    /// A failed request placed on the session's current binding releases it:
-    /// the next request, a retry included, is placed again (`rebind`, or
-    /// `expired` after the idle timeout), away from every worker the session
-    /// failed on since its last hit while another one is healthy. The worker
-    /// avoided is the one the request was sent to, after DP rank mapping; under
-    /// ATOM PD idx2idx, a failed prefill also releases the decode binding,
-    /// although the decode was never sent. A request placed before the session
-    /// moved keeps the new binding, whenever it fails.
-    fn on_dispatch_failed(
-        &self,
-        headers: Option<&http::HeaderMap>,
-        worker: &Arc<dyn Worker>,
-        binding: Option<u64>,
-    ) {
-        self.inner.on_dispatch_failed(headers, worker, binding);
+    /// A failure on the session's bound worker releases the binding: the next
+    /// request, a retry included, is placed again (`rebind`, or `expired`
+    /// after the idle timeout), away from every worker the session failed on
+    /// since its last hit while another one is healthy. Under ATOM PD idx2idx,
+    /// a failed prefill also releases the decode binding, although the decode
+    /// was never sent. A late failure on a worker the session has left keeps
+    /// the new binding; one from an older placement on the worker the session
+    /// is bound to again releases it, at the cost of one extra rebind.
+    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
+        self.inner.on_dispatch_failed(headers, worker);
         if let Some(key) = self.binding_key(headers) {
             self.table
-                .mark_failed(&key, &WorkerIdentity::from_worker(worker), binding);
+                .mark_failed(&key, &WorkerIdentity::from_worker(worker));
         }
     }
 
@@ -853,7 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_placed_before_a_sweep_keeps_the_sessions_new_binding() {
+    async fn an_older_failure_after_a_sweep_places_the_session_again() {
         let policy = dp_sticky(SessionAffinityConfig {
             ttl_secs: 30,
             ..SessionAffinityConfig::default()
@@ -861,9 +810,7 @@ mod tests {
         let workers = workers();
         let workers = &workers[..1];
         let session_a = header_map(&[("x-session-id", "session-a")]);
-        let (_, stale) = policy
-            .select_with_decision(workers, &info(&session_a))
-            .await;
+        policy.select_worker(workers, &info(&session_a)).await;
         let idle = Instant::now() - Duration::from_secs(31);
         policy.set_last_access("session-a", idle);
         *policy.last_sweep.lock().unwrap() = idle;
@@ -872,15 +819,16 @@ mod tests {
         assert!(!bound(&policy, "session-a"));
 
         // session-a returns to the same worker, then its request from before
-        // the sweep fails there.
+        // the sweep fails there: the worker check cannot tell the placements
+        // apart, so the session is placed once more.
         assert_eq!(
             route(&policy, workers, &session_a).await,
             (Some(0), AFFINITY_NEW)
         );
-        policy.on_dispatch_failed(Some(&session_a), &workers[0], stale.binding);
+        policy.on_dispatch_failed(Some(&session_a), &workers[0]);
         assert_eq!(
             route(&policy, workers, &session_a).await,
-            (Some(0), AFFINITY_HIT)
+            (Some(0), AFFINITY_REBIND)
         );
     }
 
@@ -1066,7 +1014,7 @@ mod tests {
         let workers = workers();
         let headers = header_map(&[("x-session-id", "session-1")]);
         assert_eq!(route(&policy, &workers, &headers).await.0, Some(0));
-        policy.on_dispatch_failed(Some(&headers), &workers[0], policy.binding("session-1"));
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
         // The inner policy picks its first candidate, which is now worker 1.
         assert_eq!(route(&policy, &workers, &headers).await.0, Some(1));
     }
@@ -1088,36 +1036,21 @@ mod tests {
             route(&policy, &workers, &headers).await,
             (Some(0), "random")
         );
-        policy.on_dispatch(
-            "regular",
-            Some(&headers),
-            &workers[0],
-            policy.binding("session-1"),
-        );
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
 
         workers[1].set_healthy(true);
         assert_eq!(
             route(&policy, &workers, &headers).await,
             (Some(0), AFFINITY_HIT)
         );
-        policy.on_dispatch(
-            "regular",
-            Some(&headers),
-            &workers[0],
-            policy.binding("session-1"),
-        );
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
 
         workers[0].set_healthy(false);
         assert_eq!(
             route(&policy, &workers, &headers).await,
             (Some(1), "random")
         );
-        policy.on_dispatch(
-            "regular",
-            Some(&headers),
-            &workers[1],
-            policy.binding("session-1"),
-        );
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
 
         assert_eq!(
             affinity_samples(&handle.render()),
@@ -1271,18 +1204,16 @@ mod tests {
 
         // A PD relay request reserves decode worker 0; its decode is sent
         // after its prefill.
-        let (reserved, stale) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(reserved, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         // Meanwhile another request of the session hits worker 0 and fails,
         // and the next one is placed on worker 1 and sent there.
-        let (_, failed) = policy.select_with_decision(&workers, &info).await;
-        policy.on_dispatch_failed(Some(&headers), &workers[0], failed.binding);
-        let (moved, rebind) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(moved, Some(1));
-        policy.on_dispatch("decode", Some(&headers), &workers[1], rebind.binding);
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        policy.on_dispatch("decode", Some(&headers), &workers[1]);
         // The first request's decode is now sent to worker 0 and fails.
-        policy.on_dispatch("decode", Some(&headers), &workers[0], stale.binding);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], stale.binding);
+        policy.on_dispatch("decode", Some(&headers), &workers[0]);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
 
         assert_eq!(
             route(&policy, &workers, &headers).await,
@@ -1291,41 +1222,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_soft_move_gets_a_binding_that_an_earlier_request_cannot_release() {
+    async fn a_soft_move_keeps_its_binding_when_a_request_left_behind_fails() {
         let policy = soft_around(Arc::new(MoveOffPreferred));
         let workers = workers();
         let headers = header_map(&[("x-session-id", "session-1")]);
         let info = info(&headers);
 
-        let (placed, stale) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(placed, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         // The inner policy moves the session off worker 0.
-        let (moved, soft) = policy.select_with_decision(&workers, &info).await;
-        assert_eq!(moved, Some(1));
-        assert_ne!(soft.binding, stale.binding);
-        policy.on_dispatch("regular", Some(&headers), &workers[1], soft.binding);
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        policy.on_dispatch("regular", Some(&headers), &workers[1]);
         // The request placed before the move is sent to worker 0 and fails.
-        policy.on_dispatch("regular", Some(&headers), &workers[0], stale.binding);
-        policy.on_dispatch_failed(Some(&headers), &workers[0], stale.binding);
+        policy.on_dispatch("regular", Some(&headers), &workers[0]);
+        policy.on_dispatch_failed(Some(&headers), &workers[0]);
         assert!(!released(&policy, "session-1"));
         // The moved request's failure releases the session.
-        policy.on_dispatch_failed(Some(&headers), &workers[1], soft.binding);
+        policy.on_dispatch_failed(Some(&headers), &workers[1]);
         assert!(released(&policy, "session-1"));
-    }
-
-    #[tokio::test]
-    async fn a_soft_mode_hit_returns_the_sessions_binding() {
-        let policy = soft_around(Arc::new(MoveOffPreferred));
-        // With one worker the inner policy keeps the bound one.
-        let all = workers();
-        let workers = &all[..1];
-        let headers = header_map(&[("x-session-id", "session-1")]);
-        let info = info(&headers);
-
-        assert_eq!(policy.select_worker(workers, &info).await, Some(0));
-        let (kept, hit) = policy.select_with_decision(workers, &info).await;
-        assert_eq!((kept, hit.branch), (Some(0), AFFINITY_HIT));
-        assert!(hit.binding.is_some());
-        assert_eq!(hit.binding, policy.binding("session-1"));
     }
 }

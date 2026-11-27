@@ -174,7 +174,6 @@ mod tests {
                 worker: worker.clone(),
                 policy: Arc::new(crate::policies::RoundRobinPolicy::new()),
                 headers: http::HeaderMap::new(),
-                binding: None,
             },
         });
         (lifecycle, worker)
