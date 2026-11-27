@@ -35,9 +35,9 @@ from typing import Any
 import torch
 
 from atom.ec_transfer.base import EcStoreFull, dtype_name, handle_mismatch
-from atom.kv_transfer.offload.mooncake_store.nic import gpu_pci_bdf
 from atom.utils import envs, mooncake_hca
 from atom.utils.network import get_ip
+from atom.utils.pci_topology import gpu_pci_bdf
 
 logger = logging.getLogger("atom")
 
@@ -53,7 +53,10 @@ DEFAULT_PROTOCOL = "rdma"
 _SLOT_FIELDS = 4  # generation, address, length, ack: int64 each
 _SLOT = _SLOT_FIELDS * 8  # bytes of a slot
 _ALIGN = 64  # entry start alignment in the pool
-DEFAULT_SLOTS = 4096  # entries E can hold at once, whatever their size
+# One slot per this many pool bytes: an entry is at least one image's rows
+# (hundreds of KiB), so space runs out before slots do; the table is 1/2048
+# of the region.
+BYTES_PER_SLOT = 64 << 10
 
 
 def _open_engine(
@@ -125,8 +128,20 @@ class _Entry:
     created: float
 
 
+def default_slots(size_bytes: int) -> int:
+    """Slots for a region of ``size_bytes``: one per ``BYTES_PER_SLOT``."""
+    return max(1, size_bytes // BYTES_PER_SLOT)
+
+
+def slot_table_bytes(slots: int) -> int:
+    """Bytes the table of ``slots`` takes at the front of E's region."""
+    return -(-slots * _SLOT // _ALIGN) * _ALIGN
+
+
 class MooncakeEcWriter:
-    """E's registered pool: stores rows under a key for P to read."""
+    """E's registered region of ``size_bytes``: a slot table, then a pool that
+    stores rows under a key for P to read. ``slots`` defaults to one per
+    ``BYTES_PER_SLOT`` of the region."""
 
     def __init__(
         self,
@@ -134,15 +149,21 @@ class MooncakeEcWriter:
         device: torch.device | str,
         *,
         protocol: str = DEFAULT_PROTOCOL,
-        slots: int = DEFAULT_SLOTS,
+        slots: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        # One registration: the slot table, then the pool.
-        self._region = torch.zeros(
-            slots * _SLOT + size_bytes, dtype=torch.uint8, device=device
-        )
+        if slots is None:
+            slots = default_slots(size_bytes)
+        table = slot_table_bytes(slots)
+        if table >= size_bytes:
+            raise ValueError(
+                f"a {size_bytes} byte region leaves no pool after {slots} slots"
+            )
+        # One registration of exactly size_bytes (E sizes it in whole GiB):
+        # the slot table, then the pool.
+        self._region = torch.zeros(size_bytes, dtype=torch.uint8, device=device)
         self._slots = self._region[: slots * _SLOT].view(torch.int64).view(slots, -1)
-        self._buf = self._region[slots * _SLOT :]
+        self._buf = self._region[table:]
         self._engine, self.session = _open_engine(self._region.device, protocol)
         _register(self._engine, self._region)
         self._lease_s = envs.ATOM_EC_LEASE_S
