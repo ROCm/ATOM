@@ -542,6 +542,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             return 0, factor
         return num_cached_blocks, factor
 
+    def receive_rewrites_prefix(self, seq) -> bool:
+        params = seq.kv_transfer_params or {}
+        if self.is_producer or not params.get("do_remote_prefill"):
+            return False
+        # The same slice `update_state_after_alloc` hands the worker: any
+        # cached prefix is skipped, or none of it is.
+        skipped, _ = self._receive_prefix(seq, 1, self._remote_page_geometry(params))
+        return skipped == 0
+
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         params = seq.kv_transfer_params or {}
         if self.is_producer or not params.get("do_remote_prefill"):

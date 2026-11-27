@@ -65,6 +65,11 @@ class KVBlockPool(ABC):
     #: a sequence back while `fetch_pending`), rather than `fetch` in line.
     async_fetch: bool = False
 
+    #: Whether other pools copy out what this one publishes, whether or not it
+    #: fetches itself: an indexed block may be read from outside this process
+    #: at any time, so its bytes have to stay as published.
+    read_by_other_pools: bool = False
+
     # ------------------------------- counts -------------------------------- #
     @property
     @abstractmethod
@@ -203,9 +208,16 @@ class KVBlockPool(ABC):
         """Whether a background copy for `owner` is still in flight."""
         return False
 
-    def poll_fetches(self) -> None:
+    def wait_fetch(self, owner: Hashable, timeout_s: float) -> bool:
+        """Wait at most `timeout_s` for `owner`'s background copy to finish.
+        True once none is in flight for it: landed or failed, either way
+        `poll_fetches` has what to do with it."""
+        return True
+
+    def poll_fetches(self, new_pass: bool = True) -> None:
         """Index what finished background copies brought in. Once per
-        scheduling pass, before any prefix walk."""
+        scheduling pass, before any prefix walk (`new_pass`), and again within
+        a pass by a scheduler that waited for copies it had just started."""
 
     def take_block_copies(self) -> tuple[tuple[int, int], ...]:
         """Whole-block copies (source id, destination id) the batch being

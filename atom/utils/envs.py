@@ -1531,6 +1531,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
+    # A pool the DP ranks share (`umbp_pool`): start a waiting request's copy
+    # from another rank's pool on any scheduler tick, and keep a request whose
+    # copy is in flight out of the prefillable count. 0 starts the copy when
+    # admission or the prefillable probe first reaches the request.
+    "ATOM_POOL_EARLY_COPY": lambda: os.getenv("ATOM_POOL_EARLY_COPY", "1") == "1",
+    # With the early copy: a rank whose waiting requests are all mid-copy has
+    # the group hold its prefill for it (within the delayer's bounds). 0 counts
+    # that rank as blocked, so the group fires and it runs a dummy prefill.
+    "ATOM_POOL_COPY_HOLDS_PREFILL": lambda: (
+        os.getenv("ATOM_POOL_COPY_HOLDS_PREFILL", "1") == "1"
+    ),
+    # A pool the DP ranks share: on a pass where no rank of the group has
+    # anything to run and this rank's waiting requests are all mid-copy, wait
+    # this long at most (milliseconds) for those copies and admit what landed
+    # in the same pass. Otherwise the pass runs a dummy step on every rank and
+    # the copy is only seen after it. 0 never waits.
+    "ATOM_POOL_COPY_WAIT_MS": lambda: _int_env("ATOM_POOL_COPY_WAIT_MS", 300),
+    # A pool the DP ranks share: a pass waits this long at most (milliseconds,
+    # one budget a pass) for the copies its waiting requests are held back
+    # for, indexes what landed and schedules those requests in the same pass.
+    # A copy takes milliseconds, a pass ends in a step of hundreds: without
+    # the wait a request whose prefix is copied in starts one step late. 0
+    # never waits: a copy is indexed at the top of the next pass.
+    "ATOM_POOL_COPY_INPASS_WAIT_MS": lambda: _int_env(
+        "ATOM_POOL_COPY_INPASS_WAIT_MS", 20
+    ),
+    # A pool the DP ranks share: the prefill delayer's pending tokens count a
+    # waiting request past its prefix hit in this rank's pool (the admission
+    # probe), not at its whole prompt. Fuller prefill forwards, later first
+    # tokens. Off: the upper bound every other configuration uses.
+    "ATOM_POOL_PROBED_PENDING": lambda: (
+        os.getenv("ATOM_POOL_PROBED_PENDING", "0") == "1"
+    ),
+    # A pool the DP ranks share: when a waiting request's prefix is asked for
+    # from other ranks, mark what this rank already holds of it as just used.
+    # Under eviction pressure that part is this rank's oldest copy of the
+    # prefix and would be evicted to make room for the rest.
+    "ATOM_POOL_REFRESH_LOCAL_PREFIX": lambda: (
+        os.getenv("ATOM_POOL_REFRESH_LOCAL_PREFIX", "1") == "1"
+    ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(

@@ -465,7 +465,7 @@ and catches it; set it when chasing a corruption that does not reproduce.
 
 ## KV pool backend
 
-No variables. The paged KV pool is the engine's own unless a KV connector
+The paged KV pool is the engine's own unless a KV connector
 provides it (`KVConnectorBase.kv_pool_memory`,
 `KVConnectorSchedulerBase.make_block_pool`). The `umbp_pool` connector hands it to
 a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
@@ -478,6 +478,29 @@ are documented in `atom/kv_transfer/pool/umbp/settings.py`. It serves
 DeepSeek-V4.1 under data-parallel attention (one runner per engine rank) and
 needs a MORI build whose UMBP L1 client copies into held slots (`Fetch` with
 `dst_slots`); startup refuses other models and tensor-parallel attention.
+
+Two engines may attach to one UMBP server, each under its own `namespace`; one
+that sees only its own devices names where they stand among the server's
+(`device_offset`). That is how a Mooncake P/D pair shares the pool: each
+engine runs `{"kv_connector": "multi", "connectors": [<mooncake leg>, <umbp_pool
+leg>]}` (DeepSeek-V4.1 admits `multi` of exactly those two, for either
+`kv_role`). The prefill engine copies a prefix another rank holds, a decode
+rank's included, and rebuilds the request state by replay; the decode engine
+receives each request whole from its producer, takes no prefix from the pool
+for it, and publishes what it received and what it generates.
+
+The variables below apply only with a pool the DP ranks share. A prefix another
+rank holds is copied into this rank's pool in the background while the request
+waits; they say when that copy starts and what the group does meanwhile.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_POOL_EARLY_COPY** | bool | true | Start a waiting request's prefix copy on any scheduler tick, before the prefill delayer decides, and keep a request whose copy is in flight out of the prefillable count. `0` starts the copy when admission or the prefillable probe first reaches the request. |
+| **ATOM_POOL_COPY_HOLDS_PREFILL** | bool | true | With the early copy: the DP group holds its prefill, within the delayer's bounds and for at most 8 ticks, for a rank whose waiting requests are all mid-copy. `0` counts that rank as blocked, so the group fires and the rank runs a dummy prefill. |
+| **ATOM_POOL_COPY_INPASS_WAIT_MS** | int | 20 | A pass waits this long at most, in all, for the copies its waiting requests are held back for, indexes what landed and schedules those requests in the same pass. A copy takes milliseconds and a pass ends in a step of hundreds, so without the wait a request whose prefix is copied in starts one step late. Each copy is waited for once: one that outlasts the budget stays in flight and is indexed by a later pass. `0` never waits and indexes a copy at the top of the next pass. The pool's `fetched ... blocks from peer pools` log line says in which pass each copy was indexed. |
+| **ATOM_POOL_COPY_WAIT_MS** | int | 300 | On a pass where no rank of the DP group has prefill to admit or a request decoding, and this rank's waiting requests are all mid-copy, wait this long at most for those copies and admit what landed in the same pass; otherwise the pass ends in a dummy step on every rank and the copy is seen only after it. A copy that misses the bound is not waited for again. `0` never waits. |
+| **ATOM_POOL_PROBED_PENDING** | bool | false | The prefill delayer's pending-token count takes a waiting request past its prefix hit in this rank's pool (the memoised admission probe) instead of at its whole prompt: fuller prefill forwards, later first tokens. |
+| **ATOM_POOL_REFRESH_LOCAL_PREFIX** | bool | true | When a waiting request's prefix is asked for from other ranks, mark what this rank already holds of it as just used, so the room made for the rest is not taken from it. |
 
 ## State checkpoints
 

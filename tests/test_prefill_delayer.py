@@ -393,6 +393,28 @@ class TestAlignmentGate:
         )
         assert d._stat_fire_fill == 1
 
+    def test_rank_whose_prefill_is_arriving_holds_full_peers(self):
+        # The same group, but what waits on this rank is mid-copy from another
+        # rank's pool and admittable within a step: neither blocked nor a
+        # straggler, so the full peers hold for it, up to the TTFT bound.
+        d = make_delayer(dp_size=8, ttft_max_ticks=5, stall_ticks=10)
+        skip_first(d)
+        peers = _add_rank({0: 7, 1: 7 * MAX_BATCHED, 2: 7 * 16, ARRIVED: 1})
+
+        def arriving():
+            return call(
+                d,
+                prefillable=False,
+                waiting_requests=4,
+                prefill_arriving=True,
+                reduce=peers,
+            )
+
+        assert arriving() is False
+        assert d._reduce_buf[BLOCKED] == 0 and d._reduce_buf[UNREACHABLE] == 0
+        fired = [arriving() for _ in range(6)]
+        assert True in fired and d._stat_fire_fill == 0
+
     def test_blocked_rank_pending_does_not_fill_the_forward(self):
         # This rank is blocked with a full budget of waiting tokens; its one
         # prefillable peer holds 300. Aligned, but the forward is underfilled:

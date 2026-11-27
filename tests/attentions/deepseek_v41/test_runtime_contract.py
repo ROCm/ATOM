@@ -274,6 +274,88 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
         )
 
 
+UMBP_POOL = {
+    "kv_connector": "umbp_pool",
+    "kv_connector_extra_config": {"address": "unix:///unused"},
+}
+
+
+def multi_config(*connectors):
+    return {"kv_connector": "multi", "connectors": list(connectors)}
+
+
+def replay_config(kv_transfer_config, **overrides):
+    """A shared pool's blocks carry PAGE only: every hit on one replays."""
+    return runtime_config(
+        kv_transfer_config=kv_transfer_config,
+        enable_encoder_swa_bounded_replay=True,
+        kv_cache_block_size=256,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_mooncake_pd_runs_over_the_shared_umbp_pool(role):
+    mooncake = {"kv_connector": "mooncake", "kv_role": role}
+    validate_runtime_config(replay_config(multi_config(mooncake, UMBP_POOL)))
+    # Either order names the same two legs.
+    validate_runtime_config(replay_config(multi_config(UMBP_POOL, mooncake)))
+    # As deployed: one DP-attention rank a GPU, each with its own pool.
+    validate_runtime_config(
+        replay_config(
+            multi_config(mooncake, UMBP_POOL),
+            enable_dp_attention=True,
+            parallel_config=SimpleNamespace(data_parallel_size=4),
+        )
+    )
+    # The pool's own condition holds under P/D too: the prefill engine's hit on
+    # another rank's blocks has no STATE but the one it replays.
+    with pytest.raises(ValueError, match="shared UMBP L1 pool without encoder SWA"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config=multi_config(mooncake, UMBP_POOL))
+        )
+
+
+def test_the_pd_leg_over_the_pool_keeps_its_explicit_role():
+    with pytest.raises(ValueError, match="without an explicit kv_role"):
+        validate_runtime_config(
+            replay_config(multi_config({"kv_connector": "mooncake"}, UMBP_POOL))
+        )
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        # The pool beside a tier, or beside nothing, is not a P/D deployment.
+        [UMBP_POOL],
+        [UMBP_POOL, {"kv_connector": "mooncake_store"}],
+        [UMBP_POOL, {"kv_connector": "lmcache_mp"}],
+        # P/D takes one companion: a tier or the pool.
+        [
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            UMBP_POOL,
+            {"kv_connector": "mooncake_store"},
+        ],
+        [
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+        ],
+        [{"kv_connector": "moriio", "kv_role": "kv_producer"}, UMBP_POOL],
+    ],
+)
+def test_other_composites_with_the_pool_are_still_refused(connectors):
+    with pytest.raises(ValueError, match="multi: mooncake plus one offload tier"):
+        validate_runtime_config(replay_config(multi_config(*connectors)))
+
+
+@pytest.mark.parametrize("tier", ["lmcache_mp", "mooncake_store"])
+def test_the_composites_admitted_before_still_are(tier):
+    producer = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    validate_runtime_config(
+        replay_config(multi_config(producer, {"kv_connector": tier}))
+    )
+
+
 def vllm_plugin_config(**overrides):
     """A config the way the vLLM plugin builds one for V4.1.
 

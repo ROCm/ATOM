@@ -667,6 +667,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             and all(c.is_offload for c in self._connectors[1:])
         )
 
+    def receive_rewrites_prefix(self, seq: Any) -> bool:
+        # Asked before `get_num_new_matched_tokens` names a winner, so of
+        # every sub: only a P/D consumer leg answers True.
+        return any(c.receive_rewrites_prefix(seq) for c in self._connectors)
+
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         winner = self._load_winner.get(seq.id)
         if winner is None:
