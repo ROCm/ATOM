@@ -177,7 +177,8 @@ class PagedAttentionCache:
         self.prefill_window_staging = prefill_window_staging
         self.packed = geometry.packed
         self.window_fp8 = geometry.window_fp8
-        # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
+        # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`, or by
+        # `sparse_attn_v41_paged_2src_bf16` where AITER has no MXFP8 attention
         self.kv_fp8 = geometry.kv_dtype == "fp8"
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         if self.window_fp8:

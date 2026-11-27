@@ -41,7 +41,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
 CORE_PREPARE_DIGEST = "9aa3c02a741f9b0b"
-CORE_FORWARD_DIGEST = "d2595ca4d9fa74a9"
+CORE_FORWARD_DIGEST = "4598a274e076a316"
 
 
 @pytest.fixture
@@ -348,8 +348,9 @@ def test_fp8_kv_attends_with_a_bf16_query_where_aiter_has_no_mxfp8_attention(
     source, decode, native
 ):
     """With AITER's MXFP8 sparse attention unavailable (gfx942), the cache
-    hands out no MXFP8 query and core's `_attend` and the plugin's
-    `_attend_block` both take the BF16-query attention over the FP8 planes."""
+    hands out no MXFP8 query, and core's `_attend` and the plugin's
+    `_attend_block` follow it to the BF16-query attention over the FP8
+    planes."""
     tokens, heads, dim = 3, 2, 64
     chosen = []
 
@@ -393,7 +394,10 @@ def test_fp8_kv_attends_with_a_bf16_query_where_aiter_has_no_mxfp8_attention(
         write_window=Mock(),
         rope_quant_window=Mock(return_value=(object(), object())),
     )
-    cache.query_fp8 = lambda query, a8w4=False: query_fp8(cache, query, a8w4=a8w4)
+    handed = []
+    cache.query_fp8 = lambda query, a8w4=False: (
+        handed.append(query_fp8(cache, query, a8w4=a8w4)) or handed[-1]
+    )
     owner = SimpleNamespace(
         spec=SimpleNamespace(layer_id=0, kv_owner=0),
         attn_sink=torch.zeros(heads),
@@ -419,6 +423,9 @@ def test_fp8_kv_attends_with_a_bf16_query_where_aiter_has_no_mxfp8_attention(
         attend = _undecorated(PLUGIN, "_attend_block", scope)
         attend(owner, torch.empty_like(query), None, None, cache, step, None, None)
     ((name, attending),) = chosen
+    # The cache alone decides: no MXFP8 pair also means the BF16 query is the
+    # one rotated in place.
+    assert len(handed) == 1 and (handed[0] is None) is not native
     if native:
         assert name == "mxfp8"
         assert [part.dtype for part in attending] == [

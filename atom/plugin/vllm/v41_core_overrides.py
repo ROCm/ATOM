@@ -30,7 +30,6 @@ from atom.model_ops.attentions.deepseek_v41.backend import (
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
-    native_fp8_attention,
     sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src_bf16,
 )
@@ -604,7 +603,7 @@ def _attend_block(
     if cache.packed and not a8w4:
         pool = (pool, cache.ring_view(self.spec.layer_id))
     kwargs = {"out": flat_query}
-    if a8w4 or (cache.kv_fp8 and native_fp8_attention(query)):
+    if query_fp8 is not None:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
         if a8w4:

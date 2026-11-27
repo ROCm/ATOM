@@ -179,10 +179,11 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
 
 @pytest.fixture
 def a8w8_runtime(monkeypatch):
-    """Load the real validator with only the external AITER query stubbed."""
-    query = Mock(return_value="opus")
-    api = ModuleType("aiter.ops.mla_sparse_prefill")
-    api.get_mla_sparse_prefill_v41_backend = query
+    """Load the real validator with only its capability query stubbed; how
+    that query asks AITER is pinned in `test_fp8_cache.py`."""
+    query = Mock(return_value=True)
+    api = ModuleType("atom.model_ops.attentions.deepseek_v41.fp8_attention")
+    api.native_fp8_attention_on = query
     name = "atom.models.deepseek_v41.draft_kv"
     path = Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/draft_kv.py"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -237,7 +238,7 @@ def test_explicit_fp8_draft_uses_public_capability(
     cfg.kv_cache_dtype = target_dtype
     cfg.tensor_parallel_size = tp
     cfg.enable_dp_attention = dpa
-    a8w8_runtime.return_value = backend
+    a8w8_runtime.return_value = backend is not None
     setting = DSparkConfig(draft_kv_dtype="fp8")
     if backend is None:
         with pytest.raises(ValueError, match="AITER V4.1 A8W8.*draft_kv_dtype=auto"):
@@ -245,16 +246,7 @@ def test_explicit_fp8_draft_uses_public_capability(
     else:
         setting.validate_draft_kv(cfg)
     a8w8_runtime.assert_called_once_with(
-        torch.device("cuda"),
-        (1, 64 if dpa else 64 // tp, 512),
-        unified_kv_dtype=torch.float8_e4m3fn,
-        softmax_scale=512**-0.5,
-        q_dtype=torch.float8_e4m3fn,
-        q_scale_dtype=torch.float8_e8m0fnu,
-        unified_kv_scale_dtype=torch.float8_e8m0fnu,
-        kv_dtype=torch.float8_e4m3fn,
-        kv_scale_dtype=torch.float8_e8m0fnu,
-        layout="contiguous",
+        torch.device("cuda"), 64 if dpa else 64 // tp, 512
     )
     assert cfg.kv_cache_dtype == target_dtype
 

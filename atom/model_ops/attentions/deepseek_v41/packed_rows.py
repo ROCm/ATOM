@@ -34,6 +34,12 @@ def _e2m1(code):
 
 
 @triton.jit
+def _fp8_byte(words, k: tl.constexpr, step):
+    raw = ((words >> (8 * k)) & 0xFF).to(tl.uint8)
+    return (raw.to(FP8_TL_DTYPE, bitcast=True).to(tl.float32) * step).to(tl.bfloat16)
+
+
+@triton.jit
 def _read_plane(values, scales, rows, dims, valid, D: tl.constexpr, FP4: tl.constexpr):
     rows = rows.to(tl.int64)
     if FP4:
@@ -49,18 +55,32 @@ def _read_plane(values, scales, rows, dims, valid, D: tl.constexpr, FP4: tl.cons
             other=0,
         )
         scale = code.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        result = (value * scale).to(tl.bfloat16)
     else:
-        raw = tl.load(
-            values + rows[:, None] * D + dims[None, :], valid[:, None], other=0
+        # A whole MXFP8 row (`dims` is all D). Byte-wide loads compile to one
+        # load per value on gfx942, and made the in-register attention 5.4x
+        # slower at 8192 tokens on MI308X; 32-bit words keep the loads
+        # vectorized, and the joins restore the element order exactly.
+        W: tl.constexpr = D // 4
+        G: tl.constexpr = D // 32
+        R: tl.constexpr = valid.shape[0]
+        words = tl.load(
+            values.to(tl.pointer_type(tl.uint32))
+            + rows[:, None] * W
+            + tl.arange(0, W)[None, :],
+            valid[:, None],
+            other=0,
         )
-        value = raw.to(FP8_TL_DTYPE, bitcast=True).to(tl.float32)
         code = tl.load(
-            scales + rows[:, None] * (D // 32) + dims[None, :] // 32,
+            scales + rows[:, None] * G + tl.arange(0, G)[None, :],
             valid[:, None],
             other=127,
         )
-        scale = _e8m0(code)
-    return (value * scale).to(tl.bfloat16)
+        step = tl.reshape(tl.broadcast_to(_e8m0(code)[:, :, None], (R, G, 8)), (R, W))
+        even = tl.join(_fp8_byte(words, 0, step), _fp8_byte(words, 2, step))
+        odd = tl.join(_fp8_byte(words, 1, step), _fp8_byte(words, 3, step))
+        result = tl.reshape(tl.join(even, odd), (R, D))
+    return result
 
 
 @triton.jit
@@ -174,22 +194,31 @@ def _gather_prefix(
     window_scale,
     D: tl.constexpr,
     PLANAR: tl.constexpr,
+    TAGGED: tl.constexpr,
 ):
     i = tl.program_id(0) * 16 + tl.arange(0, 16)
-    start = tl.load(ptr + first)
-    count = tl.load(ptr + end) - start
+    dims = tl.arange(0, D)
+    if TAGGED:
+        start = tl.load(ptr + first)
+        count = tl.load(ptr + end) - start
+    else:
+        start = 0
+        count = CAPACITY
     valid = (i < count) & (i < CAPACITY)
     row = tl.load(addresses + start + i, valid, other=0)
-    if PLANAR:
+    if not TAGGED:
+        value = _read_plane(pool, main_scale, row, dims, valid, D, False)
+    elif PLANAR:
         fp8 = (row & 1) != 0
-        dims = tl.arange(0, D)
         main = _read_plane(pool, main_scale, row >> 1, dims, valid & ~fp8, D, True)
         swa = _read_plane(window, window_scale, row >> 1, dims, valid & fp8, D, False)
         value = tl.where(fp8[:, None], swa, main)
     else:
-        value = load_mixed_rows(pool, row, tl.arange(0, D), valid, D)
+        value = load_mixed_rows(pool, row, dims, valid, D)
     tl.store(
-        out + i[:, None] * D + tl.arange(0, D)[None, :], value, i[:, None] < CAPACITY
+        out + i.to(tl.int64)[:, None] * D + dims[None, :],
+        value,
+        i[:, None] < CAPACITY,
     )
 
 
@@ -217,4 +246,28 @@ def gather_prefix_rows(pool, addresses, ptr, output, first, end):
             window_scale,
             output.shape[1],
             planar,
+            True,
+        )
+
+
+def decode_rows(source, rows, output):
+    """Decode the MXFP8 `(data, scale)` rows that int32 `rows` [N] names, in
+    order, into BF16 `output` [N, D]: `_gather_prefix` with untagged rows of
+    one plane pair."""
+    data, scale = source
+    if output.shape[0]:
+        _gather_prefix[(triton.cdiv(output.shape[0], 16),)](
+            data,
+            rows,
+            None,
+            output,
+            0,
+            0,
+            output.shape[0],
+            scale,
+            None,
+            None,
+            output.shape[1],
+            True,
+            False,
         )

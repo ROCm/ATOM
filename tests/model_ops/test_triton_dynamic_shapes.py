@@ -302,6 +302,34 @@ def test_packed_gather_bounds_reuse_kernel():
             assert torch.all(backing[capacity:] == 7)
 
 
+def test_fp8_unique_rows_reuse_kernels():
+    from atom.model_ops.attentions.deepseek_v41 import fp8_attention as m
+    from atom.model_ops.attentions.deepseek_v41 import packed_rows
+    from atom.model_ops.attentions.deepseek_v41.fp8_sparse_attention import _planes
+    from atom.model_ops.blockscale import quantize_fp8
+
+    torch.manual_seed(45)
+    x = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
+    source = tuple(v.contiguous() for v in quantize_fp8(x))
+    ref = quantize_fp8(x, dequantize=True)
+    kernels = (m._mark_named, m._renumber, m._order_marked, packed_rows._gather_prefix)
+    with one_variant(*kernels):
+        for rows, entries in (
+            (1, 1),
+            (15, 1),
+            (16, 15),
+            (17, 16),
+            (33, 17),
+            (128, 128),
+        ):
+            planes = _planes(tuple(plane[:rows] for plane in source))
+            indices = torch.randint(rows, (entries,), device="cuda", dtype=torch.int32)
+            indptr = torch.tensor([0, entries], device="cuda", dtype=torch.int32)
+            decoded, local = m._unique_rows(planes, indices, indptr, 64)
+            assert decoded.shape[0] == indices.unique().numel()
+            assert torch.equal(decoded[local.long()], ref[indices.long()])
+
+
 def test_cached_kv_large_lengths_keep_a_single_integer_signature():
     from atom.model_ops import triton_fused_qkv_quant as m
 

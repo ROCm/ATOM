@@ -2,6 +2,7 @@
 """The FP8 cache: contiguous source planes read by AITER sparse attention."""
 
 import functools
+import logging
 from dataclasses import replace
 
 import pytest
@@ -110,7 +111,7 @@ def test_v41_attention_matches_its_dequantized_reference(heads, planar):
         "in_kernel",
         "in_kernel_whole",
         "unique",
-        "per_entry",
+        "past_bound",
         "ring",
     ],
 )
@@ -121,10 +122,10 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
     against V4's reference on the dequantized rows: the in-register kernel
     split and whole (the in-kernel sink, which graph capture reaches once a
     bucket fills the CUs), the prefill gather with its rows decoded once, the
-    per-entry gather past the scratch bound, a decode-sized ring gathered by
-    row, and the BF16 entry, which takes the in-register kernel when V4 would
-    split the keys and the gather otherwise. Eight heads is one TP8 rank of
-    the 64-head Flash model."""
+    gather handing rows past the scratch bound and a decode-sized ring to the
+    in-register kernel, and the BF16 entry, which takes the in-register
+    kernel when V4 would split the keys and the gather otherwise. Eight heads
+    is one TP8 rank of the 64-head Flash model."""
     from atom.model_ops.attentions.deepseek_v41 import fp8_attention
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
@@ -137,7 +138,7 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
         return tuple(v.contiguous() for v in values)
 
     # A source no larger than its selection is decoded whole (prefill); a
-    # larger one is a ring, gathered like the CSA pool (decode).
+    # larger one is a ring (decode).
     extend_rows = 4096 if path == "ring" else tokens + 128
     pool, extend = rows(4096), rows(extend_rows)
     prefix_counts = [0, 1, 37, 512, 300, 64, 129]
@@ -152,9 +153,8 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
     def indptr(counts):
         return torch.tensor([0, *counts], device=device).cumsum(0).int()
 
-    if path == "per_entry":
-        # Fewer scratch rows than the step references: no unique decode,
-        # query ranges tiled to the bound.
+    if path == "past_bound":
+        # Fewer scratch rows than the step references.
         monkeypatch.setattr(fp8_attention, "_SCRATCH_ROWS", 256)
     query = torch.randn(tokens, heads, dim, device=device).bfloat16()
     sink = torch.randn(heads, device=device)
@@ -170,23 +170,23 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
         dim**-0.5,
     )
     taken = []
+    for name in (
+        "sparse_attn_v41_paged_2src_fp8kv",
+        "sparse_attn_v41_paged_2src_gather",
+    ):
+        impl = getattr(fp8_attention, name)
+        monkeypatch.setattr(
+            fp8_attention,
+            name,
+            lambda *a, impl=impl, name=name, **kw: (
+                taken.append(name) or impl(*a, **kw)
+            ),
+        )
     if path.startswith("entry"):
         # Seven tokens split on any real device; the split count is what the
         # entry's choice turns on.
         splits = 5 if path == "entry_split" else 1
         monkeypatch.setattr(fp8_attention, "_csa_num_splits", lambda *_: splits)
-        for name in (
-            "sparse_attn_v41_paged_2src_fp8kv",
-            "sparse_attn_v41_paged_2src_gather",
-        ):
-            impl = getattr(fp8_attention, name)
-            monkeypatch.setattr(
-                fp8_attention,
-                name,
-                lambda *a, impl=impl, name=name, **kw: (
-                    taken.append(name) or impl(*a, **kw)
-                ),
-            )
         attend = fp8_attention.sparse_attn_v41_paged_2src_bf16
     elif path == "in_kernel":
         attend = fp8_attention.sparse_attn_v41_paged_2src_fp8kv
@@ -197,14 +197,22 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
     else:
         attend = fp8_attention.sparse_attn_v41_paged_2src_gather
     actual = attend(*args)
-    if path.startswith("entry"):
-        assert taken == [
-            (
-                "sparse_attn_v41_paged_2src_fp8kv"
-                if path == "entry_split"
-                else "sparse_attn_v41_paged_2src_gather"
-            )
-        ]
+    gather, in_kernel = (
+        "sparse_attn_v41_paged_2src_gather",
+        "sparse_attn_v41_paged_2src_fp8kv",
+    )
+    assert (
+        taken
+        == {
+            "entry_split": [in_kernel],
+            "entry_whole": [gather],
+            "in_kernel": [in_kernel],
+            "in_kernel_whole": [in_kernel],
+            "unique": [gather],
+            "past_bound": [gather, in_kernel],
+            "ring": [gather, in_kernel],
+        }[path]
+    )
     expected = sparse_attn_v4_paged_2src_reference(
         query.float(),
         fp8_attention.dequantize_rows(*fp8_attention._split(pool, dim)),
@@ -221,10 +229,11 @@ def test_v41_bf16_query_attention_matches_its_dequantized_reference(
 
 @pytest.mark.parametrize("backend", ["opus", None])
 def test_native_fp8_attention_asks_aiter_once_per_device_and_shape(
-    monkeypatch, backend
+    monkeypatch, caplog, backend
 ):
     """AITER decides from the live device, not from the build's `GPU_ARCHS`;
-    a device it does not serve, gfx942 or any other, takes the BF16 query."""
+    a device it does not serve, gfx942 or any other, takes the BF16 query,
+    and the log says which attention the cache took, once."""
     with atom_without_aiter() as load:
         fp8_attention = load("atom.model_ops.attentions.deepseek_v41.fp8_attention")
     asked = []
@@ -234,15 +243,24 @@ def test_native_fp8_attention_asks_aiter_once_per_device_and_shape(
         return backend
 
     monkeypatch.setattr(fp8_attention, "get_mla_sparse_prefill_v41_backend", ask)
-    fp8_attention._native_fp8_attention.cache_clear()
+    caches = (fp8_attention.native_fp8_attention_on, fp8_attention._announced)
+    for cache in caches:
+        cache.cache_clear()
     try:
-        for rows in ((5, 8, 512), (1, 7, 8, 512)):
-            query = torch.empty(rows, dtype=torch.bfloat16)
-            assert fp8_attention.native_fp8_attention(query) is (backend is not None)
+        with caplog.at_level(logging.INFO, logger="atom"):
+            for rows in ((5, 8, 512), (1, 7, 8, 512)):
+                query = torch.empty(rows, dtype=torch.bfloat16)
+                native = fp8_attention.native_fp8_attention(query)
+                assert native is (backend is not None)
     finally:
-        fp8_attention._native_fp8_attention.cache_clear()
+        for cache in caches:
+            cache.cache_clear()
     ((device, q_shape, dtypes),) = asked
     assert (device, q_shape) == (torch.device("cpu"), (1, 8, 512))
     assert dtypes["layout"] == "contiguous"
-    assert dtypes["unified_kv_dtype"] == dtypes["q_dtype"] == torch.float8_e4m3fn
+    # the tensors ATOM hands AITER, whose FP8 encoding follows the device
+    fp8 = fp8_attention.FP8_DTYPE
+    assert dtypes["unified_kv_dtype"] == dtypes["q_dtype"] == dtypes["kv_dtype"] == fp8
+    (record,) = [r for r in caplog.records if "FP8 KV attention" in r.getMessage()]
+    assert ("BF16 query" in record.getMessage()) is (backend is None)
     assert dtypes["unified_kv_scale_dtype"] == torch.float8_e8m0fnu

@@ -3,63 +3,36 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """Sparse attention reading MXFP8 CSA and SWA planes directly, BF16 query.
 
-The kernel loads each selected row's FP8 values as 32-bit words and its
-E8M0 group-32 codes once per group, decodes them in registers to BF16, and runs the arithmetic of V4's BF16 CSA
-kernels: the same tiles, dot products, online softmax, split-KV policy, split
-combine and sink. No scratch, no host reads.
+The kernel decodes each selected row in registers with `_read_plane`, and
+runs the arithmetic of V4's BF16 CSA kernels: the same tiles, dot products,
+online softmax, split-KV policy, split combine and sink. No scratch, no host
+reads.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.blockscale_kernels.quantization import FP8_TL_DTYPE
 from atom.model_ops.v4_kernels.paged_2src import (
+    _BLOCK_H,
+    _BLOCK_K,
     _COMBINE_BLOCK_DC,
+    _NUM_STAGES,
+    _NUM_WARPS,
+    _SPLIT_BLOCK_K,
     _csa_num_splits,
     _sparse_attn_v4_split_combine_kernel,
 )
-from atom.model_ops.v4_kernels.pool_index import row_offset
 
-from .packed_rows import _e8m0
-
-_BLOCK_H = 16
-_BLOCK_K = 32
-_SPLIT_BLOCK_K = 16
-_NUM_WARPS = 4
-_NUM_STAGES = 1
+from .packed_rows import _read_plane
 
 
-@triton.jit
-def _fp8_byte(words, k: tl.constexpr, step):
-    raw = ((words >> (8 * k)) & 0xFF).to(tl.uint8)
-    return (raw.to(FP8_TL_DTYPE, bitcast=True).to(tl.float32) * step).to(tl.bfloat16)
-
-
-@triton.jit
-def _mxfp8_rows(data, scale, slot, valid, d_offs, D: tl.constexpr):
-    # Byte-wide loads compile to one load per value on gfx942; words keep the
-    # loads vectorized, and the joins restore the element order exactly.
-    W: tl.constexpr = D // 4
-    G: tl.constexpr = D // 32
-    BK: tl.constexpr = valid.shape[0]
-    row = tl.where(valid, slot, 0)
-    words = tl.load(
-        data.to(tl.pointer_type(tl.uint32))
-        + row_offset(row, W)[:, None]
-        + tl.arange(0, W)[None, :],
-        mask=valid[:, None],
-        other=0,
-    )
-    code = tl.load(
-        scale + row_offset(row, G)[:, None] + tl.arange(0, G)[None, :],
-        mask=valid[:, None],
-        other=127,
-    )
-    step = tl.reshape(tl.broadcast_to(_e8m0(code)[:, :, None], (BK, G, 8)), (BK, W))
-    even = tl.join(_fp8_byte(words, 0, step), _fp8_byte(words, 2, step))
-    odd = tl.join(_fp8_byte(words, 1, step), _fp8_byte(words, 3, step))
-    return tl.reshape(tl.join(even, odd), (BK, D))
+def _planes(source):
+    """Byte views of an MXFP8 `(data, scale)` plane pair; unlike AITER's
+    wrapper, the BF16-query attention takes no legacy packed rows."""
+    if not all(plane.is_contiguous() for plane in source):
+        raise ValueError("KV data and scale planes must each be contiguous")
+    return tuple(plane.view(torch.uint8) for plane in source)
 
 
 @triton.jit
@@ -140,7 +113,9 @@ def _mxfp8_2src_kernel(
         in_range = k_pos < p_hi
         slot = tl.load(kv_indices_prefix_ptr + p_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0)
-        kv = _mxfp8_rows(pool_data, pool_scale, slot, valid, d_offs, D)
+        kv = _read_plane(
+            pool_data, pool_scale, tl.where(valid, slot, 0), d_offs, valid, D, False
+        )
         m_i, l_i, acc = _attend_rows(q, kv, valid, h_mask, m_i, l_i, acc, qk_scale)
 
     e_lo = tl.maximum(lo, p_len) - p_len
@@ -150,7 +125,9 @@ def _mxfp8_2src_kernel(
         in_range = k_pos < e_hi
         slot = tl.load(kv_indices_extend_ptr + e_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0)
-        kv = _mxfp8_rows(kv_data, kv_scale, slot, valid, d_offs, D)
+        kv = _read_plane(
+            kv_data, kv_scale, tl.where(valid, slot, 0), d_offs, valid, D, False
+        )
         m_i, l_i, acc = _attend_rows(q, kv, valid, h_mask, m_i, l_i, acc, qk_scale)
 
     if NUM_SPLITS == 1:
@@ -209,8 +186,8 @@ def sparse_attn_v41_paged_2src_fp8kv(
         return out
     if query.dtype != torch.bfloat16 or query.stride(-1) != 1 or out.stride(-1) != 1:
         raise ValueError("FP8-KV attention takes a BF16 query with unit dim stride")
-    pool_data, pool_scale = (plane.view(torch.uint8) for plane in pool)
-    kv_data, kv_scale = (plane.view(torch.uint8) for plane in kv)
+    pool_data, pool_scale = _planes(pool)
+    kv_data, kv_scale = _planes(kv)
     head_blocks = triton.cdiv(heads, _BLOCK_H)
     if num_splits is None:
         num_splits = _csa_num_splits(
