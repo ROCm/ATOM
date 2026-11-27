@@ -728,9 +728,14 @@ class Scheduler:
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
         self.stop_token_ids = config.stop_token_ids
+        # Built before the block manager: a connector may provide its pool.
+        from atom.utils.forward_context import get_kvconnector
+
+        self.kv_connector = get_kvconnector("scheduler", config)
         self.block_manager = BlockManager(
             config,
             state_runtime=state_runtime,
+            kv_connector=self.kv_connector,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -913,9 +918,6 @@ class Scheduler:
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
         self._checkpoint_holds: dict[int, int] = {}
 
-        from atom.utils.forward_context import get_kvconnector
-
-        self.kv_connector = get_kvconnector("scheduler", config)
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -1423,6 +1425,10 @@ class Scheduler:
                 SequenceStatus.ABORTED,
                 SequenceStatus.WAITING_FOR_REMOTE_KVS,
             ):
+                continue
+            if self.block_manager.shared_prefix_pending(seq):
+                # Phase 2 parks it among the prefix waiters until its prefix
+                # lands from another rank's pool.
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -2087,7 +2093,13 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
+        # Prefixes other pools copied in since the last pass become hits now,
+        # before any walk of this one.
+        self.block_manager.kv.poll_fetches()
         result = self._schedule()
+        # Here for the same reason as the tick: what this pass decided about
+        # blocks reaches the pool's backend once, whichever return was taken.
+        self.block_manager.kv.flush()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -2312,6 +2324,12 @@ class Scheduler:
             if len(self.running) >= self.max_num_seqs:
                 self.waiting.appendleft(seq)
                 break
+
+            # Its prefix is still being copied in from another rank's pool:
+            # admitting it now would recompute what is about to land.
+            if self.block_manager.shared_prefix_pending(seq):
+                prefix_waiters.append(seq)
+                continue
 
             admission_ready = getattr(self.kv_connector, "admission_ready", None)
             if callable(admission_ready) and not admission_ready(seq):
@@ -4896,6 +4914,12 @@ class Scheduler:
         self.engine_stats.update_throughput(
             num_generation_tokens=num_new_generation_tokens
         )
+        # Blocks this pass filled and released become visible to the pool's
+        # backend (and through it to other engine ranks) here.
+        # Demoted blocks became readable on this batch's device; publish them
+        # now that the forward carrying their copies was issued.
+        self.block_manager.kv.settle()
+        self.block_manager.kv.flush()
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):

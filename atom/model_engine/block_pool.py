@@ -9,6 +9,7 @@ from heapq import heapify, heappop, heappush
 from itertools import chain, islice, zip_longest
 
 from atom.model_engine.kv_block import Block
+from atom.model_engine.kv_block_pool import KVBlockPool
 
 
 @dataclass(frozen=True)
@@ -25,8 +26,11 @@ class BlockRetirement:
     moved_to: int
 
 
-class BlockPool:
+class BlockPool(KVBlockPool):
     """Paged blocks with ref counts and a content-addressed index.
+
+    ATOM's own `KVBlockPool`: the bookkeeping lives in this process, over a
+    tensor this process allocated.
 
     `BlockManager` owns the one instance, over the compressed KV blocks. This
     was split out when a second pool existed — the sliding window was its own
@@ -91,7 +95,12 @@ class BlockPool:
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
         residues: int = 1,
+        reserve_null_block: bool = False,
     ):
+        if reserve_null_block:
+            # The `KVBlockPool` signature carries it; this pool's block tables
+            # never point a padding entry at a raw checkpoint image.
+            raise NotImplementedError("BlockPool reserves no null block")
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
             raise ValueError(f"unknown prefix cache policy: {cache_policy!r}")
@@ -177,6 +186,11 @@ class BlockPool:
     @property
     def num_used(self) -> int:
         return len(self._used)
+
+    @property
+    def num_usable_blocks(self) -> int:
+        """Blocks that can be handed out: all of them (no reserved null block)."""
+        return self.num_blocks
 
     @property
     def num_indexed(self) -> int:
@@ -281,6 +295,10 @@ class BlockPool:
         """The index's own `dict.get`: block id or None, for C-speed lookups
         of a whole chain with `map`. Read it per walk, not once per pool."""
         return self._hash_to_block_id.get
+
+    def count_used(self, block_ids: list[int], n: int) -> int:
+        """How many of the first `n` of `block_ids` (distinct) are held."""
+        return len(self.used_among(block_ids, n))
 
     def used_among(self, block_ids: list[int], n: int) -> set[int]:
         """Which of the first `n` of `block_ids` (distinct) some live sequence

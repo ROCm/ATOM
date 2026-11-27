@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -68,6 +68,9 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 logger = logging.getLogger("atom")
 
@@ -298,6 +301,17 @@ class MultiConnector(KVConnectorBase):
         # resolve, not raise `AttributeError`.
         self._state_tier = None
 
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
+        """The pool memory of whichever sub provides the pool (at most one)."""
+        provided = [
+            memory
+            for connector in self._connectors
+            if (memory := connector.kv_pool_memory(config, rank)) is not None
+        ]
+        if len(provided) > 1:
+            raise ValueError("at most one sub-connector may provide the KV pool")
+        return provided[0] if provided else None
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -422,6 +436,20 @@ class MultiConnector(KVConnectorBase):
 
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
+
+    def make_block_pool(
+        self, config: Any, num_blocks: int, **kwargs: Any
+    ) -> KVBlockPool | None:
+        """The block pool of whichever sub provides the pool (at most one)."""
+        provided = [
+            pool
+            for connector in self._connectors
+            if (pool := connector.make_block_pool(config, num_blocks, **kwargs))
+            is not None
+        ]
+        if len(provided) > 1:
+            raise ValueError("at most one sub-connector may provide the KV pool")
+        return provided[0] if provided else None
 
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""

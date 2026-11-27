@@ -19,9 +19,12 @@ Two roles are defined:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+
+if TYPE_CHECKING:
+    from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 
 
 class KVConnectorBase(ABC):
@@ -98,6 +101,16 @@ class KVConnectorBase(ABC):
         """
         return []
 
+    def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
+        """Provide the paged KV pool's memory, or None to leave it to the runner.
+
+        A connector that takes the pool over (`atom/kv_transfer/pool`) returns a
+        `KVPoolMemory`: where the bytes come from, how they divide into blocks
+        and when the device has finished writing them. Asked once, before the
+        pool is allocated. Transfer and offload connectors keep None.
+        """
+        return None
+
 
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface.
@@ -130,6 +143,25 @@ class KVConnectorSchedulerBase(ABC):
     def update_state_after_alloc(self, seq: Any) -> None:
         """Update internal state after the scheduler allocates blocks."""
         ...
+
+    def make_block_pool(
+        self,
+        config: Any,
+        num_blocks: int,
+        *,
+        on_evict: Any = None,
+        on_remap: Any = None,
+        cache_policy: str = "lru",
+        protected_ratio: float = 0.5,
+        reserve_null_block: bool = False,
+    ) -> KVBlockPool | None:
+        """Provide the scheduler's block pool, or None for ATOM's own.
+
+        The counterpart of `KVConnectorBase.kv_pool_memory`: a `KVBlockPool`
+        deciding which block a request gets and what is evicted, over memory
+        the worker side provided. Asked once, while `BlockManager` is built.
+        """
+        return None
 
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Preserve completions unless the backend consumes chunked P/D metadata."""

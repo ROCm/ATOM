@@ -253,11 +253,17 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # (source, destination) paged blocks whose whole content is copied before
+    # the batch: a private block demoted into the shared part of a split pool.
+    block_copies: tuple[tuple[int, int], ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.block_copies
         )
 
 

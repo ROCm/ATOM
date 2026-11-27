@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -22,8 +23,8 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.kv_block_pool import KVBlockPool, make_block_pool
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     checkpoint_copy_ops_per_batch,
@@ -218,6 +219,7 @@ class BlockManager:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        kv_connector: Any = None,
     ):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
@@ -279,14 +281,23 @@ class BlockManager:
         # both or a prefix hit could be honoured by one pool and not the other.
         # Under MiniMax-M3 index sharding, logical block j takes a block of
         # lane j % P (`_fresh_block`): the block id names its index's owner,
-        # one of the P = TP ranks (`index_shard.index_shard_world`).
-        self.kv = BlockPool(
+        # one of the P = TP ranks (`index_shard.index_shard_world`). A pool a
+        # connector provides (umbp_pool) hands out the ids its backend grants,
+        # so it has one lane, and `make_block_pool` refuses it under sharding.
+        self.kv: KVBlockPool = make_block_pool(
+            config,
             num_blocks,
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
             residues=config.tensor_parallel_size if dcp_config.index_shard else 1,
+            kv_connector=kv_connector,
+        )
+        # Sequences whose prompt chain a content-sharing pool was already asked
+        # for (`_fetch_shared_prefix`), by the seed it was asked under.
+        self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
+            WeakKeyDictionary()
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -585,6 +596,7 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            block_copies=self.kv.take_block_copies(),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -661,7 +673,8 @@ class BlockManager:
         """
         if not self._ensure_page_units(self._span_demand(position, position + 1)):
             raise AssertionError("No PAGE unit available for a fresh KV block")
-        block_id = self.kv.pop(position % self.kv.residues)
+        lanes = self.kv.residues
+        block_id = self.kv.pop(position % lanes) if lanes > 1 else self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
 
@@ -1423,6 +1436,8 @@ class BlockManager:
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        if self.kv.shares_content and self.enable_prefix_caching:
+            self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
         if self.fast_prefix_walk:
             hashes, ids = self._hit_walk(seq, prompt)
@@ -1440,6 +1455,53 @@ class BlockManager:
         return _PrefixWalk(
             seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
         )
+
+    def _fetch_shared_prefix(self, seq: Sequence) -> None:
+        """Have the pool bring in what other pools hold of `seq`'s prompt.
+
+        Once per sequence and cache seed, before its first walk: the blocks
+        arrive free and indexed, so the walk that follows hits them like any
+        local prefix and `allocate` claims them. Only the part of the chain
+        past the local hit is asked for, and never the last hash block, which
+        the walk does not match either.
+        """
+        if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return
+        self._shared_prefix_asked[seq] = seq.cache_seed
+        n = self._n_hash_blocks(seq) - 1
+        if n <= 0:
+            return
+        chain = chained_block_hashes(
+            seq.token_ids, self.hash_block_size, 0, n, seq.cache_seed
+        )
+        get = self.kv.index_get
+        local = 0
+        while local < n and get(chain[local]) is not None:
+            local += 1
+        if local == n:
+            return
+        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+        if self.kv.async_fetch:
+            # Copied in the background; the scheduler holds the sequence back
+            # while it is in flight (`shared_prefix_pending`).
+            self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            return
+        self.kv.fetch(chain[local:], tokens_of)
+
+    def shared_prefix_pending(self, seq: Sequence) -> bool:
+        """Whether `seq` should wait for its prefix to arrive from other pools.
+
+        Starts the copy on the first ask (`_fetch_shared_prefix`, which a
+        walk would otherwise start), so the scheduler can ask before probing.
+        """
+        if not (
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and self.kv.async_fetch
+        ):
+            return False
+        self._fetch_shared_prefix(seq)
+        return self.kv.fetch_pending(seq.id)
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
@@ -1888,6 +1950,7 @@ class BlockManager:
                 seq,
                 self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
+        self.kv.prepare(self.num_pool_blocks(len(seq)) - len(seq.block_table))
         for position in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block(position))
         seq.num_cached_tokens = num_cached_blocks * hbs

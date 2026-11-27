@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The `umbp_pool` connector provides the KV pool; the engine asks connectors
+for it before falling back to its own (atom/kv_transfer/pool)."""
+
+import types
+
+import pytest
+import test_umbp_l1_pool as umbp_tests
+from conftest import MockConfig, _MockHFConfig
+from test_umbp_l1_pool import make_pool
+
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.pool.umbp import pool as umbp_pool
+from atom.kv_transfer.pool.umbp.connector import UmbpPoolConnectorScheduler
+from atom.kv_transfer.pool.umbp.pool import UmbpBlockPool
+from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.kv_block_pool import LocalPoolMemory, make_pool_memory
+
+ADDRESS = "unix:///tmp/umbp-l1/server.sock"
+# The L1 service fixture, the Python model and then the real one.
+l1 = umbp_tests.l1
+
+
+def transfer(**extra):
+    return {
+        "kv_connector": "umbp_pool",
+        "kv_connector_extra_config": {"address": ADDRESS, **extra},
+    }
+
+
+def config_with(kv_transfer_config, architectures=("DeepseekV41ForCausalLM",), tp=1):
+    """A config the connector accepts unless told otherwise: DeepSeek-V4.1
+    under data-parallel attention."""
+    return MockConfig(
+        kv_transfer_config=kv_transfer_config,
+        hf_config=_MockHFConfig(list(architectures)),
+        tensor_parallel_size=tp,
+    )
+
+
+class TestSettings:
+    def test_defaults(self):
+        s = UmbpPoolSettings.from_transfer_config(transfer())
+        assert (s.address, s.namespace, s.group, s.fetch, s.share_ratio) == (
+            ADDRESS,
+            "atom",
+            "",
+            True,
+            1.0,
+        )
+        assert s.session_migrate_margin is None
+
+    def test_the_address_is_required(self):
+        with pytest.raises(ValueError, match="address"):
+            UmbpPoolSettings.from_transfer_config({"kv_connector": "umbp_pool"})
+
+    @pytest.mark.parametrize("ratio", [0, -0.1, 1.5])
+    def test_the_share_ratio_is_a_share(self, ratio):
+        with pytest.raises(ValueError, match="share_ratio"):
+            UmbpPoolSettings.from_transfer_config(transfer(share_ratio=ratio))
+
+    def test_fetch_accepts_text(self):
+        assert not UmbpPoolSettings.from_transfer_config(transfer(fetch="false")).fetch
+
+
+class TestRegistry:
+    def test_registered_under_its_name(self):
+        assert KVConnectorFactory.canonical_name("umbp_pool") == "umbp_pool"
+
+    def test_routing_learns_that_ranks_load_from_each_other(self):
+        sharing = KVConnectorFactory.pool_sharing(
+            config_with(transfer(session_migrate_margin=0.1))
+        )
+        assert sharing == {"loads": True, "session_migrate_margin": 0.1}
+
+    def test_no_fetching_means_no_loads_and_no_moves(self):
+        sharing = KVConnectorFactory.pool_sharing(
+            config_with(transfer(fetch=False, session_migrate_margin=0.1))
+        )
+        assert sharing == {"loads": False, "session_migrate_margin": None}
+
+    def test_found_inside_multi(self):
+        cfg = {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                transfer(),
+            ],
+        }
+        assert KVConnectorFactory.pool_sharing(config_with(cfg))["loads"]
+
+    def test_other_connectors_share_no_pool(self):
+        cfg = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        assert KVConnectorFactory.pool_sharing(config_with(cfg)) is None
+
+
+class TestProvidesThePool:
+    @pytest.fixture
+    def shared_pools(self, l1, monkeypatch):
+        made = []
+
+        def make(config, settings, num_blocks, **kwargs):
+            made.append(num_blocks)
+            return make_pool(l1, f"conn{len(made)}", num_blocks, **kwargs)
+
+        monkeypatch.setattr(umbp_pool, "make_umbp_l1_pool", make)
+        return made
+
+    def test_whole_pool_by_default(self, shared_pools):
+        # The same pool at every ratio: at 1 its private part is empty.
+        conn = UmbpPoolConnectorScheduler(config_with(transfer()))
+        pool = conn.make_block_pool(None, 8)
+        assert isinstance(pool, UmbpBlockPool)
+        assert pool.offset == 0 and pool.private.num_blocks == 0
+        assert shared_pools == [8]
+
+    def test_a_share_ratio_splits_the_pool(self, shared_pools):
+        conn = UmbpPoolConnectorScheduler(config_with(transfer(share_ratio=0.25)))
+        pool = conn.make_block_pool(None, 8)
+        assert isinstance(pool, UmbpBlockPool)
+        assert pool.offset == 6 and shared_pools == [2]
+
+    def test_block_manager_takes_the_connectors_pool(self, shared_pools):
+        cfg = MockConfig(
+            num_kvcache_blocks=16, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        conn = UmbpPoolConnectorScheduler(config_with(transfer(share_ratio=0.5)))
+        bm = BlockManager(cfg, kv_connector=conn)
+        assert isinstance(bm.kv, UmbpBlockPool)
+
+    def test_without_a_providing_connector_the_pool_is_atoms(self):
+        cfg = MockConfig(
+            num_kvcache_blocks=16, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        # A connector that moves KV but provides no pool (the base class's answer).
+        mover = types.SimpleNamespace(make_block_pool=lambda *a, **k: None)
+        assert isinstance(BlockManager(cfg, kv_connector=mover).kv, BlockPool)
+        assert isinstance(BlockManager(cfg).kv, BlockPool)
+
+    def test_runner_memory_falls_back_to_its_own(self):
+        assert isinstance(make_pool_memory(None, 0, kv_connector=None), LocalPoolMemory)
+
+        class Provider:
+            def kv_pool_memory(self, config, rank):
+                return "theirs"
+
+        assert make_pool_memory(None, 0, kv_connector=Provider()) == "theirs"
+
+
+class TestRefusedAtStartup:
+    def config(self, architectures, tp=1):
+        return config_with(transfer(), architectures, tp)
+
+    def test_a_model_without_the_pool_layout(self):
+        with pytest.raises(ValueError, match="supports"):
+            UmbpPoolConnectorScheduler(self.config(["LlamaForCausalLM"]))
+
+    def test_tensor_parallel_attention(self):
+        with pytest.raises(ValueError, match="data-parallel attention"):
+            UmbpPoolConnectorScheduler(self.config(["DeepseekV41ForCausalLM"], tp=2))
+
+    def test_deepseek_v41_under_dp_attention(self):
+        UmbpPoolConnectorScheduler(self.config(["DeepseekV41ForCausalLM"]))

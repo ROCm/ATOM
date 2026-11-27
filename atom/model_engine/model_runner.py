@@ -760,6 +760,9 @@ class ModelRunner:
     # allocator (`KVConnectorFactory.allocate_kv_pool`), which the allocation
     # cross-check in `allocate_kv_cache` cannot see.
     _kv_pool_outside_torch_bytes: int = 0
+    # The pool's memory provider (`_kv_pool_memory`), resolved on first use.
+    # A class default, as above, so a runner built without `__init__` has it.
+    _kv_pool_memory_provider = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -786,6 +789,9 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # Where the paged pool's bytes come from, resolved on first use
+        # (`_kv_pool_memory`).
+        self._kv_pool_memory_provider = None
         self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
@@ -2297,18 +2303,34 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
+            # Nothing to carve when every builder allocates its own (V4.1):
+            # its arena comes from the same provider later, and asking for
+            # zero bytes here would claim the provider's one pool for nothing.
+            memory = self._kv_pool_memory() if total else None
             # A connector whose peer maps this rank's KV pool allocates it in
-            # exportable memory, outside the torch allocator.
+            # exportable memory, outside the torch allocator (MoRIIO fabric).
             shared = (
                 KVConnectorFactory.allocate_kv_pool(self.config, total, self.device)
-                if self.config.kv_transfer_config
+                if total and self.config.kv_transfer_config
                 else None
             )
+            if shared is not None and memory.shares_blocks:
+                # Two owners of one allocation: the pool provider would hand
+                # another process memory it did not allocate.
+                raise NotImplementedError(
+                    "a KV pool provider (umbp_pool) beside a connector that "
+                    "allocates the pool in exportable memory (MoRIIO fabric) is "
+                    "not supported yet"
+                )
             self._kv_pool_outside_torch_bytes = 0 if shared is None else total
             buf = (
                 shared
                 if shared is not None
-                else torch.zeros(total, dtype=torch.uint8, device=self.device)
+                else (
+                    memory.allocate(total, self.device)
+                    if total
+                    else torch.zeros(0, dtype=torch.uint8, device=self.device)
+                )
             )
         elif buf.numel() < total:
             raise ValueError(
@@ -2317,6 +2339,35 @@ class ModelRunner:
             )
         regions = [buf[o : o + n] for o, n in zip(offsets, sizes)]
         return buf, regions, builders
+
+    def _kv_pool_memory(self):
+        """Where the paged pool's bytes come from: the KV connector's provider
+        if it takes the pool over (`KVConnectorBase.kv_pool_memory`), else this
+        process's own allocation."""
+        memory = self._kv_pool_memory_provider
+        if memory is None:
+            from atom.model_engine.kv_block_pool import (
+                LocalPoolMemory,
+                make_pool_memory,
+            )
+
+            # Ask the connector only when one that provides the pool is
+            # configured (`KVConnectorFactory.pool_sharing`): every other
+            # connector would answer None, and building it here is not this
+            # path's business.
+            if (
+                self.config.kv_transfer_config
+                and KVConnectorFactory.pool_sharing(self.config) is not None
+            ):
+                memory = make_pool_memory(
+                    self.config,
+                    self.rank,
+                    kv_connector=get_kvconnector("worker", self.config),
+                )
+            else:
+                memory = LocalPoolMemory()
+            self._kv_pool_memory_provider = memory
+        return memory
 
     def _back_paged_pools(self, blocks: int, buf=None):
         """Back every builder's paged pool and publish what comes back.
@@ -2436,6 +2487,32 @@ class ModelRunner:
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
             transfer_tensors.set_block_count(num_kvcache_blocks)
+        if (
+            self._kv_pool_memory().shares_blocks
+            and not self.attn_metadata_builder.state_transfer().replays
+        ):
+            # Another rank's block carries PAGE only; without bounded replay a
+            # hit would need a STATE checkpoint it lacks.
+            raise NotImplementedError(
+                "a pool shared across ranks needs encoder SWA bounded "
+                "replay (--enable-encoder-swa-bounded-replay)"
+            )
+        if pool.numel():
+            # A backend that moves blocks itself has to know where a block's
+            # bytes are; the PAGE regions are that, in the scheduler's ids.
+            self._kv_pool_memory().bind_layout(
+                pool,
+                transfer_tensors.block_regions if transfer_tensors is not None else (),
+                num_kvcache_blocks,
+            )
+        else:
+            # A builder that allocates its own arena (DeepSeek-V4.1) took it
+            # from the same provider in `allocate_per_req_cache` and names
+            # its PAGE regions itself: its transfer tensors exist only under a
+            # kv_transfer_config.
+            layout = self.attn_metadata_builder.owned_pool_layout()
+            if layout is not None:
+                self._kv_pool_memory().bind_layout(*layout, num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as
@@ -2461,7 +2538,8 @@ class ModelRunner:
         # parallel reconciliation — so this mirrors the budget by construction
         # rather than re-deriving it.
         expected_kv_bytes = self.pool_plan.total_reserved_bytes
-        if expected_kv_bytes > 0:
+        # A pool another process allocated is not in this allocator's numbers.
+        if expected_kv_bytes > 0 and self._kv_pool_memory().counted_by_torch:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the
             # measured `post_alloc - pre_alloc` includes allocator alignment
@@ -3680,6 +3758,8 @@ class ModelRunner:
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
+        # Before the early return: decodes write the pool too.
+        self._kv_pool_memory().writes_issued()
         if batch.total_seqs_num_prefill <= 0:
             return
         connector = get_kvconnector()

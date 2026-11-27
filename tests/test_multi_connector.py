@@ -36,6 +36,9 @@ from atom.kv_transfer.disaggregation.types import (
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
 
+    def make_block_pool(self, config, num_blocks, **kwargs):
+        return None  # keeps ATOM's own pool, as `KVConnectorSchedulerBase` does
+
     def __init__(
         self,
         *,
@@ -224,6 +227,9 @@ class FakeWorkerSub:
 
     def get_finished_recv_blocks(self):
         return self._recv_blocks
+
+    def kv_pool_memory(self, config, rank):
+        return None
 
 
 def _sched(connectors):
@@ -1059,3 +1065,33 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+class _PoolProvider:
+    """A sub that provides the KV pool, as `umbp_pool` does."""
+
+    def make_block_pool(self, config, num_blocks, **kwargs):
+        return ("pool", num_blocks, kwargs.get("reserve_null_block"))
+
+    def kv_pool_memory(self, config, rank):
+        return ("memory", rank)
+
+
+def test_the_one_pool_provider_supplies_the_pool_and_its_memory():
+    sched = _sched([FakeSchedSub(), _PoolProvider()])
+    assert sched.make_block_pool(None, 8, reserve_null_block=True) == (
+        "pool",
+        8,
+        True,
+    )
+    worker = _worker([FakeWorkerSub(), _PoolProvider()])
+    assert worker.kv_pool_memory(None, 3) == ("memory", 3)
+    assert _sched([FakeSchedSub()]).make_block_pool(None, 8) is None
+    assert _worker([FakeWorkerSub()]).kv_pool_memory(None, 0) is None
+
+
+def test_two_pool_providers_are_refused():
+    with pytest.raises(ValueError, match="at most one"):
+        _sched([_PoolProvider(), _PoolProvider()]).make_block_pool(None, 8)
+    with pytest.raises(ValueError, match="at most one"):
+        _worker([_PoolProvider(), _PoolProvider()]).kv_pool_memory(None, 0)
