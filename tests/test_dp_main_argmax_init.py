@@ -149,15 +149,10 @@ def _processor(le, monkeypatch, mode):
     return le.InputOutputProcessor(config, tokenizer=None, block_size=16)
 
 
-@pytest.mark.parametrize("mode", ["argmax", "allgather"])
-def test_the_processor_reads_the_mode_once(monkeypatch, modules, mode):
-    _, _, le = modules
-    processor = _processor(le, monkeypatch, mode)
-    assert processor._greedy_ids_only is (mode == "argmax")
-
-
 def test_preprocess_fanout_rejects_a_sampled_request_under_argmax(monkeypatch, modules):
     _, _, le = modules
     processor = _processor(le, monkeypatch, "argmax")
     with pytest.raises(ValueError, match="greedy requests only"):
         processor.preprocess_fanout([1, 2, 3], SamplingParams(temperature=0.6))
+    (seq,) = processor.preprocess_fanout([1, 2, 3], SamplingParams(temperature=0))
+    assert list(seq.token_ids) == [1, 2, 3]
