@@ -10,10 +10,14 @@ for ``wqkv_a``) and the quantize launch in front of the shared expert goes:
 on a dense shared expert (draft layers, rows MegaMoE does not fuse) and on a
 target layer whose routed MegaMoE call computes it (``shared_in``).
 
-CPU: where the pair is asked for and where it goes. GPU: the seam's pair is
-``quantize_fp8`` of its BF16 norm byte for byte, and the dense shared expert
-on real checkpoint weights gives the same bytes from the pair as from the BF16
-rows.
+On the dense shared expert, SiLU-mul and the quantize in front of ``w2``
+also run as one launch (AITER ``silu_mul_mxfp8``), the same codes and scales.
+
+CPU: where the pair is asked for and where it goes; which experts take
+``silu_mul_mxfp8``. GPU: the seam's pair is ``quantize_fp8`` of its BF16 norm
+byte for byte; ``silu_mul_mxfp8`` is ``silu_and_mul`` + ``quantize_fp8`` byte
+for byte; the dense shared expert on real checkpoint weights gives the bytes
+of the unfused chain.
 """
 
 import json
@@ -82,6 +86,7 @@ def test_the_dense_shared_expert_feeds_the_pair_to_gate_up(monkeypatch):
     expert.w2.native_a8_group_rows = 32
     expert.w2.quant_type = SimpleNamespace(value=None)
     expert.w2.runs_bf16 = False
+    expert.w2.weight = torch.empty(0, dtype=torch.bfloat16)  # not silu_mul_mxfp8
     expert.swiglu_limit = 10.0
     expert.use_fused_clamp_act_mul = False
     monkeypatch.setattr(v4, "aiter_silu_and_mul", lambda out, c, limit: out.zero_())
@@ -97,6 +102,87 @@ def test_the_dense_shared_expert_feeds_the_pair_to_gate_up(monkeypatch):
     expert(x)
     ((args, kwargs),) = expert.gate_up_proj.calls
     assert args[0] is x and kwargs == {}
+
+
+def _s2_expert(monkeypatch, available=True, **w2):
+    """An expert whose w2 is a native MXFP8 GEMM of input width 64."""
+    import atom.models.deepseek_v4 as v4
+
+    monkeypatch.setattr(v4, "silu_mul_mxfp8_available", lambda: available)
+    expert = _expert()
+    expert.gate_up_proj.weight = torch.empty(128, 16, dtype=torch.float8_e4m3fn)
+    values = {
+        "native_a8_group_rows": 32,
+        "runs_bf16": False,
+        "weight": torch.empty(16, 64, dtype=torch.float8_e4m3fn),
+    }
+    values.update(w2)
+    expert.w2 = SimpleNamespace(**values)
+    return expert
+
+
+@pytest.mark.parametrize(
+    "available, w2, expected",
+    [
+        (True, {}, True),  # V4.1's native MXFP8 w2 on gfx950
+        (False, {}, False),  # not gfx950, or an AITER without the op
+        (True, {"native_a8_group_rows": None}, False),  # per-channel / 128x128
+        (True, {"runs_bf16": True}, False),  # BF16 fallback w2
+        (True, {"weight": torch.empty(16, 64, dtype=torch.bfloat16)}, False),
+        (True, {"weight": torch.empty(16, 48, dtype=torch.float8_e4m3fn)}, False),
+        (True, {"weight": torch.empty(16, 96, dtype=torch.float8_e4m3fn)}, False),
+    ],
+)
+def test_which_shared_experts_fuse_silu_mul_and_w2s_quant(
+    monkeypatch, available, w2, expected
+):
+    expert = _s2_expert(monkeypatch, available, **w2)
+    assert expert.w2_takes_silu_mul_mxfp8() is expected
+
+
+def test_the_dense_shared_expert_runs_silu_mul_mxfp8_into_w2(monkeypatch):
+    """Where w2 takes it, one silu_mul_mxfp8 launch makes w2's input pair; a
+    gated call (``weights``) keeps silu_and_mul and w2's own quant."""
+    import atom.models.deepseek_v4 as v4
+
+    rows, dim, inter = 3, 16, 64
+    expert = _s2_expert(monkeypatch)
+    combined = torch.randn(rows, 2 * inter, dtype=torch.bfloat16)
+    expert.gate_up_proj = _Recorder(combined)
+    expert.gate_up_proj.weight = torch.empty(2 * inter, dim)
+    w2 = _Recorder(torch.zeros(rows, dim, dtype=torch.bfloat16))
+    for k, v in vars(expert.w2).items():
+        setattr(w2, k, v)
+    w2.quant_type = SimpleNamespace(value=None)
+    expert.w2 = w2
+    expert.swiglu_limit = 10.0
+    expert.use_fused_clamp_act_mul = False
+    pair = (
+        torch.zeros(rows, inter, dtype=torch.float8_e4m3fn),
+        torch.zeros(rows, inter // 32, dtype=torch.float8_e8m0fnu),
+    )
+    fused = []
+    monkeypatch.setattr(
+        v4, "silu_mul_mxfp8_fuse", lambda c, limit: fused.append((c, limit)) or pair
+    )
+    unfused = []
+    monkeypatch.setattr(
+        v4, "aiter_silu_and_mul", lambda out, c, limit: unfused.append(1) or out
+    )
+    x = torch.randn(rows, dim, dtype=torch.bfloat16)
+
+    expert(x)
+    ((c, limit),) = fused
+    assert c is combined and limit == 10.0 and not unfused
+    ((args, kwargs),) = w2.calls
+    assert args[0] is pair[0] and kwargs == {"x_scale": pair[1]}
+
+    fused.clear()
+    w2.calls.clear()
+    expert(x, torch.ones(rows, 1, dtype=torch.bfloat16))
+    assert not fused and unfused == [1]
+    ((args, kwargs),) = w2.calls
+    assert args[0].dtype == torch.bfloat16 and kwargs == {}
 
 
 def _v4_moe(cls=V4MoE, **values):
@@ -446,17 +532,72 @@ def _checkpoint_expert(prefix):
     return expert
 
 
+_CHECKPOINT_EXPERTS = [
+    "layers.10.ffn.shared_experts",
+    "layers.39.ffn.shared_experts",
+    "mtp.0.ffn.shared_experts",
+    "mtp.2.ffn.shared_experts",
+]
+
+
 @_gpu
-@pytest.mark.parametrize(
-    "prefix", ["layers.10.ffn.shared_experts", "mtp.0.ffn.shared_experts"]
-)
+@pytest.mark.parametrize("prefix", _CHECKPOINT_EXPERTS)
 def test_the_dense_shared_expert_on_the_seams_pair_is_bit_identical(prefix):
-    """Real shared-expert weights (a target layer, a draft layer): the dense
-    chain from the FFN seam's pair gives the bytes it gives from the BF16
-    rows it quantizes itself."""
+    """Real shared-expert weights (target layers, draft layers): the dense
+    chain from the FFN seam's pair, with SiLU-mul and w2's quant in one
+    ``silu_mul_mxfp8`` launch where it runs, gives the bytes of the unfused
+    chain on the BF16 rows (quantize x, gate_up, silu_and_mul, quantize, w2)."""
+    from atom.model_ops.activation import silu_mul_mxfp8_available
+
     run, expert = _seam(), _checkpoint_expert(prefix)
+    assert expert.w2_takes_silu_mul_mxfp8() is silu_mul_mxfp8_available()
     for rows in _ROWS:
         normed, fp8, scale = run(rows, 3, True, fuse_quant=True)[1]
+        expert.w2_takes_silu_mul_mxfp8 = lambda: False
         reference = expert(normed)
+        del expert.w2_takes_silu_mul_mxfp8
         assert torch.isfinite(reference.float()).all(), rows
+        assert _bytes_equal(expert(normed), reference), rows
         assert _bytes_equal(expert(normed, x_fp8=fp8, x_scale=scale), reference), rows
+
+
+def _combined(rows, width, seed, limit):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    spread = torch.exp(torch.randn(rows, 1, device="cuda", generator=g) * 1.5)
+    c = torch.randn(rows, 2 * width, device="cuda", generator=g) * spread
+    if rows > 4:
+        edge = torch.tensor([limit, -limit, 1.5 * limit, -3 * limit], device="cuda")
+        c[0].zero_()  # amax floor
+        c[1, :64] = edge.repeat(16)  # at and beyond the clamp
+        c[2] *= 1e-30  # tiny magnitudes
+        c[3, :width] = -c[3, :width].abs() * 1e3  # silu ~ 0
+    return c.to(torch.bfloat16)
+
+
+@_gpu
+@pytest.mark.parametrize("limit", [10.0, 0.0])
+@pytest.mark.parametrize("width", [2304, 320, 576, 32])
+def test_silu_mul_mxfp8_is_silu_and_mul_then_quantize_fp8(width, limit):
+    """The fused op against the two launches it replaces, byte for byte:
+    V4.1-Flash's 2304 (and the 320 / 576 of TP8 / TP4), clamp on and off,
+    1 to 16384 rows, three seeds, zero / clamped / tiny rows."""
+    from aiter import silu_and_mul
+
+    from atom.model_ops.activation import (
+        silu_mul_mxfp8_available,
+        silu_mul_mxfp8_fuse,
+    )
+    from atom.model_ops.blockscale import quantize_fp8
+
+    if not silu_mul_mxfp8_available():
+        pytest.skip("needs gfx950 and AITER's silu_mul_mxfp8")
+    rows_list = [r for r in _ROWS + [16384] if width == 2304 or r <= 2048]
+    for rows in rows_list:
+        for seed in (1, 2, 3):
+            c = _combined(rows, width, seed * 1000 + rows, limit or 10.0)
+            mid = torch.empty(rows, width, dtype=torch.bfloat16, device="cuda")
+            silu_and_mul(mid, c, limit)
+            ref_fp8, ref_scale = quantize_fp8(mid)
+            fp8, scale = silu_mul_mxfp8_fuse(c, limit)
+            assert _bytes_equal(fp8, ref_fp8), (rows, seed)
+            assert _bytes_equal(scale, ref_scale), (rows, seed)

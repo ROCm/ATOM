@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
+import functools
 from typing import Optional
+
+import torch
 from torch import nn
 import torch.nn.functional as F
 from aiter import silu_and_mul
@@ -12,6 +14,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from aiter import (
     QuantType,
+    dtypes,
 )
 
 
@@ -53,6 +56,45 @@ def mxfp4_act_mul_quant_fuse(
     (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
 
     return x, x_scale
+
+
+@functools.cache
+def silu_mul_mxfp8_available() -> bool:
+    """Whether AITER's ``silu_mul_mxfp8`` (``module_dsv41_seg_fuse``) can run
+    here: the kernel is built for gfx950 alone, and older AITER lacks the op."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        return False
+    try:
+        import aiter.ops.dsv41_seg_fuse  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def silu_mul_mxfp8_fuse_fake(
+    x: torch.Tensor, limit: float = 0.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    width = x.shape[-1] // 2
+    lead = x.shape[:-1]
+    return (
+        x.new_empty((*lead, width), dtype=dtypes.fp8),
+        x.new_empty((*lead, width // 32), dtype=torch.float8_e8m0fnu),
+    )
+
+
+@torch_compile_guard(gen_fake=silu_mul_mxfp8_fuse_fake, mutates_args=[])
+def silu_mul_mxfp8_fuse(
+    x: torch.Tensor, limit: float = 0.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[gate | up]`` BF16 -> the group-32 MXFP8 pair of
+    ``silu_and_mul(x, limit)`` in one launch, bit for bit ``silu_and_mul``
+    followed by ``quantize_fp8`` of its BF16 result (AITER
+    ``silu_mul_mxfp8``). Callers check ``silu_mul_mxfp8_available``."""
+    from aiter.ops.dsv41_seg_fuse import silu_mul_mxfp8
+
+    return silu_mul_mxfp8(x.contiguous(), limit)
 
 
 class SiluAndMul(nn.Module):

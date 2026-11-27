@@ -74,6 +74,10 @@ from atom.model_loader.weight_utils import local_model_dir
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.activation import (
+    silu_mul_mxfp8_available,
+    silu_mul_mxfp8_fuse,
+)
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
@@ -2936,6 +2940,23 @@ class Expert(nn.Module):
             and gate_up.weight.dtype == torch.float8_e4m3fn
         )
 
+    def w2_takes_silu_mul_mxfp8(self) -> bool:
+        """Whether SiLU-mul and ``w2``'s input quant run as one launch (AITER
+        ``silu_mul_mxfp8``): a native group32 FP8 ``w2``, which would quantize
+        the BF16 ``silu_and_mul`` output to exactly that MXFP8 pair itself, and
+        a ``[gate | up]`` output twice ``w2``'s (padded) input width, a
+        multiple of 32."""
+        w2 = self.w2
+        width = int(w2.weight.shape[-1])
+        return (
+            w2.native_a8_group_rows is not None
+            and not w2.runs_bf16
+            and w2.weight.dtype == torch.float8_e4m3fn
+            and width % 32 == 0
+            and int(self.gate_up_proj.weight.shape[0]) == 2 * width
+            and silu_mul_mxfp8_available()
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
@@ -2974,6 +2995,11 @@ class Expert(nn.Module):
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
             return self.w2(x_fp8, x_scale=x_scale)
+        if weights is None and self.w2_takes_silu_mul_mxfp8():
+            # One launch for silu_and_mul + w2's quantize_fp8 of its BF16
+            # output; the same codes and E8M0 scales.
+            act_fp8, act_scale = silu_mul_mxfp8_fuse(combined, self.swiglu_limit)
+            return self.w2(act_fp8, x_scale=act_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),
             dtype=dtype,
