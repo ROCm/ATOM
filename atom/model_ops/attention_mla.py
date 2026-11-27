@@ -3753,11 +3753,6 @@ class MLAAttention(nn.Module):
                 and self.dcp_prefill_qrep
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
-            # BF16 absorb + shuffled-KV fused rope: let the K-up GEMM store q_nope
-            # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so
-            # the rope kernel skips the q_nope read/rewrite entirely. Retain the
-            # provisional M>=64 threshold pending an isolated GPU sweep; q_out
-            # can be BF16 or FP8, and the latter rounds through BF16 in Gluon.
             q_out_prestored = None
             absorb_into_q_out = (
                 use_qrep
@@ -3775,6 +3770,10 @@ class MLAAttention(nn.Module):
                 and kv_cache.numel() > 0
                 and attn_metadata.slot_mapping.numel() == q.shape[0]
             ):
+                # BF16 absorb + shuffled-KV fused rope: the K-up GEMM stores q_nope
+                # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so the
+                # rope kernel skips the q_nope read/rewrite. M>=64 is provisional
+                # pending an isolated GPU sweep; an FP8 q_out rounds through BF16.
                 q_out_prestored = torch.empty(
                     (
                         q.shape[0],
