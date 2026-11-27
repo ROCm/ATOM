@@ -27,6 +27,7 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_commit,
     replayssm_flush_wait,
     replayssm_materialize,
+    replayssm_materialize_batch,
 )
 from atom.utils import envs
 
@@ -47,6 +48,7 @@ class ReplaySSMRuntime:
         self.cache_len = 0
         self.max_query_len = 0
         self.engaged = False
+        self.materialize_layers: _MaterializeLayerBatch | None = None
 
     def reset(self) -> None:
         self.write_pos = None
@@ -55,6 +57,7 @@ class ReplaySSMRuntime:
         self.cache_len = 0
         self.max_query_len = 0
         self.engaged = False
+        self.materialize_layers = None
 
 
 _RUNTIME = ReplaySSMRuntime()
@@ -306,6 +309,46 @@ def _commit_accepted(
         )
 
 
+class _MaterializeLayerBatch:
+    """Own one immutable pointer-table generation and its backing tensors."""
+
+    def __init__(self, layers, stream):
+        self.layers = layers
+        self.stream = stream.cuda_stream
+        self.layouts = tuple(
+            tuple((t.shape, t.stride(), t.dtype, t.device) for t in row)
+            for row in layers
+        )
+        self.addresses = tuple(tuple(t.data_ptr() for t in row) for row in layers)
+        self.ptrs = None
+        if all(layout == self.layouts[0] for layout in self.layouts[1:]):
+            self.ptrs = torch.tensor(
+                self.addresses, dtype=torch.int64, device=layers[0][0].device
+            )
+            # Retirement can precede completion of the last raw-pointer use.
+            for row in layers:
+                for tensor in row:
+                    tensor.record_stream(stream)
+            self.ptrs.record_stream(stream)
+
+    def matches(self, layers, stream):
+        if self.stream != stream.cuda_stream or len(layers) != len(self.layers):
+            return False
+        for row, addresses, layouts in zip(layers, self.addresses, self.layouts):
+            for tensor, address, (shape, stride, dtype, device) in zip(
+                row, addresses, layouts
+            ):
+                if (
+                    tensor.data_ptr() != address
+                    or tensor.shape != shape
+                    or tensor.stride() != stride
+                    or tensor.dtype != dtype
+                    or tensor.device != device
+                ):
+                    return False
+        return True
+
+
 def _materialize_track_states(
     linear: Any,
     slot_idx: torch.Tensor,
@@ -314,20 +357,41 @@ def _materialize_track_states(
 ) -> None:
     """Write each tracked step's SSM state into its radix track slot.
 
-    One launch per GDN layer, all on the device: untracked rows carry step -1
-    and the kernel skips them, so no mask is read back to the host.
+    Compatible eager layers share a launch. Graph capture and heterogeneous
+    layouts keep the per-layer route. Every live pool accessor still runs for
+    its layer mapping and HiCache readiness wait.
     """
     if not track_idx.is_contiguous():
         track_idx = track_idx.contiguous()
     if not steps.is_contiguous():
         steps = steps.contiguous()
     pool = linear.req_to_token_pool
-    for layer_num, (buf_k, buf_u, buf_g, _) in _RUNTIME.bufs.items():
+    layers = tuple(
+        (pool.mamba2_layer_cache(layer_num).temporal, *bufs[:3])
+        for layer_num, bufs in _RUNTIME.bufs.items()
+    )
+    if not layers or slot_idx.numel() == 0:
+        return
+    if not torch.cuda.is_current_stream_capturing():
+        stream = torch.cuda.current_stream(layers[0][0].device)
+        batch = _RUNTIME.materialize_layers
+        if batch is None or not batch.matches(layers, stream):
+            batch = _MaterializeLayerBatch(layers, stream)
+            _RUNTIME.materialize_layers = batch
+        if batch.ptrs is not None:
+            replayssm_materialize_batch(
+                batch.ptrs,
+                *layers[0],
+                _RUNTIME.write_pos,
+                slot_idx,
+                track_idx,
+                steps,
+                _RUNTIME.max_query_len,
+            )
+            return
+    for row in layers:
         replayssm_materialize(
-            pool.mamba2_layer_cache(layer_num).temporal,
-            buf_k,
-            buf_u,
-            buf_g,
+            *row,
             _RUNTIME.write_pos,
             slot_idx,
             track_idx,
