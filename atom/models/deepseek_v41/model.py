@@ -96,6 +96,9 @@ class Block(nn.Module):
         # Set with the packs: attention's fused MXFP8 norm output, where the
         # HIP kernel can write row-major scales (`fuse_quant_supported`).
         self.hc_fuse_quant = False
+        # Set with the packs: the FFN seam's MXFP8 norm output too, for a
+        # shared expert that reads it (`MoE.takes_mxfp8_input`).
+        self.hc_ffn_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -128,6 +131,14 @@ class Block(nn.Module):
             and fuse_quant_supported()
             and self.attn.wqkv_a.native_a8_group_rows is not None
             and not self.attn.wqkv_a.runs_bf16
+        )
+        # The shared expert's gate_up reads the same pair of the FFN input
+        # (bit for bit what it would quantize x to) on target and draft layers,
+        # through the routed MegaMoE call where that computes it.
+        self.hc_ffn_fuse_quant = (
+            self.hc_ffn_fn_packed is not None
+            and fuse_quant_supported()
+            and self.ffn.takes_mxfp8_input()
         )
 
     def attention_forward(self, normed, cache, step, rope):
@@ -188,6 +199,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=self.hc_ffn_fuse_quant,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
@@ -218,6 +230,9 @@ class Block(nn.Module):
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
+        if isinstance(normed, tuple):
+            # (bf16, fp8, e8m0): the shared expert reads the MXFP8 pair.
+            return self.finish_ffn(self.ffn(*normed), residual, pre, post, comb)
         return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
 
 

@@ -41,6 +41,9 @@ fused into the routed experts) can hand it to the routed call
 (``attach_mega_shared_expert``): with ``shared_in`` (ROCm/aiter#8491) AITER
 computes it inside the small-input kernel where that kernel can, and otherwise
 runs it dense on the caller's stream; the call returns ``routed + shared``.
+A caller that already has the MXFP8 pair of the layer's input (V4.1's FFN
+seam writes it with the norm) passes it through ``moe_forward_shared_mxfp8``,
+and the shared expert reads it instead of quantizing the rows.
 
 Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
 cache keyed by shape/quant/mtpr); the capacities are built in the same order
@@ -210,8 +213,11 @@ def _shared_expert_input_cls():
     from atom.model_ops.blockscale import quantize_fp8
 
     class LazySharedExpertInput(base):
-        def __init__(self, x, gate_up, gate_up_scale, down, down_scale, dense):
-            self._x, self._x_mxfp8 = x, None
+        def __init__(
+            self, x, gate_up, gate_up_scale, down, down_scale, dense, x_mxfp8=None
+        ):
+            # x_mxfp8: x's pair made already (`moe_forward_shared_mxfp8`).
+            self._x, self._x_mxfp8 = x, x_mxfp8
             super().__init__(
                 None, None, gate_up, gate_up_scale, down, down_scale, dense
             )
@@ -258,16 +264,96 @@ def attach_mega_shared_expert(layer, shared_expert) -> bool:
     return True
 
 
-def _shared_expert_input(shared_expert, x: torch.Tensor):
+def _shared_expert_input(shared_expert, x: torch.Tensor, x_mxfp8=None):
+    """``x_mxfp8``: the ``(fp8, e8m0)`` pair of ``x`` the caller already has
+    (bit for bit ``quantize_fp8(x)``); both the fused call and the dense
+    fallback read it instead of quantizing x."""
+    if x_mxfp8 is not None and x_mxfp8[0].shape[0] != x.shape[0]:
+        x_mxfp8 = None  # not these rows: quantize x as without one
     gate_up, down = shared_expert.gate_up_proj, shared_expert.w2
+    if x_mxfp8 is None:
+        dense = lambda: shared_expert(x)
+    else:
+        dense = lambda: shared_expert(x, x_fp8=x_mxfp8[0], x_scale=x_mxfp8[1])
     return _shared_expert_input_cls()(
         x,
         gate_up.weight,
         gate_up.weight_scale,
         down.weight,
         down.weight_scale,
-        dense=lambda: shared_expert(x),
+        dense=dense,
+        x_mxfp8=x_mxfp8,
     )
+
+
+def _moe_forward_shared_mxfp8(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    from atom.config import get_current_atom_config
+
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    # Bytes across the op boundary: Inductor cannot functionalize a mutating
+    # op that carries an E8M0 tensor (as in linear's per_1x128_e8m0_quant).
+    object.__setattr__(
+        layer,
+        "_mega_shared_x_mxfp8",
+        (x_fp8.view(torch.float8_e4m3fn), x_scale.view(torch.float8_e8m0fnu)),
+    )
+    try:
+        return layer.forward_impl(hidden_states, router_logits)
+    finally:
+        object.__setattr__(layer, "_mega_shared_x_mxfp8", None)
+
+
+def _moe_forward_shared_mxfp8_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def moe_forward_shared_mxfp8(
+    experts,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+) -> torch.Tensor:
+    """``experts(hidden_states, router_logits)`` (FusedMoE's ``moe_forward``
+    op) on a layer with an attached shared expert, which reads ``x_fp8`` /
+    ``x_scale`` (``hidden_states``' MXFP8 pair, bit for bit
+    ``quantize_fp8(hidden_states)``) instead of quantizing the rows itself."""
+    return _moe_forward_shared_mxfp8_op(
+        hidden_states,
+        experts._routing_logits(hidden_states, router_logits),
+        x_fp8.view(torch.uint8),
+        x_scale.view(torch.uint8),
+        experts.layer_name,
+    )
+
+
+def _register_moe_forward_shared_mxfp8():
+    from atom.utils.custom_register import direct_register_custom_op
+
+    return direct_register_custom_op(
+        op_name="moe_forward_shared_mxfp8",
+        op_func=_moe_forward_shared_mxfp8,
+        mutates_args=["hidden_states"],
+        fake_impl=_moe_forward_shared_mxfp8_fake,
+        tags=(torch.Tag.needs_fixed_stride_order,),
+    )
+
+
+_moe_forward_shared_mxfp8_op = _register_moe_forward_shared_mxfp8()
 
 
 def _max_tokens_hint(fc, *, pcp_merge: bool) -> int | None:
@@ -559,7 +645,11 @@ def run_mega_moe(
     shared = (
         {}
         if shared_expert is None
-        else {"shared_in": _shared_expert_input(shared_expert, x)}
+        else {
+            "shared_in": _shared_expert_input(
+                shared_expert, x, getattr(layer, "_mega_shared_x_mxfp8", None)
+            )
+        }
     )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at

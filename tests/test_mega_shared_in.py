@@ -72,11 +72,13 @@ def aiter_weights(monkeypatch):
 class _Expert:
     def __init__(self):
         self.calls = []
+        self.pairs = []
         weight = SimpleNamespace(weight=torch.zeros(4), weight_scale=torch.zeros(1))
         self.gate_up_proj = self.w2 = weight
 
-    def __call__(self, x):
+    def __call__(self, x, x_fp8=None, x_scale=None):
         self.calls.append(x.shape[0])
+        self.pairs.append((x_fp8, x_scale))
         return x * 2
 
 
@@ -105,6 +107,28 @@ def test_x_is_quantized_only_when_the_kernel_reads_it(aiter_weights):
     assert torch.equal(unfused.dense(), x * 2)
     assert unfused.used_dense and expert.calls == [6]
     assert aiter_weights.quantized == 1
+
+
+def test_the_callers_pair_replaces_the_quantize_launch(aiter_weights):
+    """A pair of x the caller already has (V4.1's FFN seam) is what the kernel
+    reads and what the dense fallback reads: x is not quantized at all."""
+    aiter_weights.install()
+    expert, x = _Expert(), torch.randn(6, 64)
+    pair = (x.to(torch.float8_e4m3fn), torch.zeros(6, 2))
+
+    fused = mega._shared_expert_input(expert, x, pair)
+    assert fused.x_fp8 is pair[0] and fused.x_scale is pair[1]
+    assert aiter_weights.quantized == 0
+
+    unfused = mega._shared_expert_input(expert, x, pair)
+    assert torch.equal(unfused.dense(), x * 2)
+    assert expert.pairs == [pair] and aiter_weights.quantized == 0
+
+    # A pair of other rows is not x's: x is quantized as without one.
+    other = mega._shared_expert_input(expert, x, (pair[0][:5], pair[1][:5]))
+    assert other.x_fp8 is not pair[0] and aiter_weights.quantized == 1
+    other.dense()
+    assert expert.pairs[-1] == (None, None)
 
 
 def test_attached_only_on_a_mega_layer_every_routed_call_reaches(aiter_weights):

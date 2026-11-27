@@ -699,9 +699,12 @@ def test_an_attached_shared_expert_goes_into_the_routed_call(runtime, monkeypatc
     passes none."""
 
     class SharedExpertInput:
-        def __init__(self, x, gate_up, gate_up_scale, down, down_scale, dense):
+        def __init__(
+            self, x, gate_up, gate_up_scale, down, down_scale, dense, x_mxfp8=None
+        ):
             self.weights = (gate_up, gate_up_scale, down, down_scale)
             self.dense = dense
+            self.x_mxfp8 = x_mxfp8
 
     monkeypatch.setattr(mega, "_shared_expert_input_cls", lambda: SharedExpertInput)
     runtime.run(_context(32))
@@ -716,3 +719,10 @@ def test_an_attached_shared_expert_goes_into_the_routed_call(runtime, monkeypatc
     assert shared_in.weights == (weight.weight, weight.weight_scale) * 2
     assert torch.equal(shared_in.dense(), torch.ones(32, 8, dtype=torch.bfloat16))
     assert expert.rows == [32]
+    assert shared_in.x_mxfp8 is None
+
+    # moe_forward_shared_mxfp8 holds the caller's MXFP8 pair of x on the layer.
+    pair = (torch.zeros(32, 8, dtype=torch.uint8), torch.zeros(32, 1))
+    layer._mega_shared_x_mxfp8 = pair
+    runtime.run(_context(32), layer=layer)
+    assert runtime.shared_in[-1].x_mxfp8 is pair
