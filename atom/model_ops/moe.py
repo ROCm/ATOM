@@ -5434,6 +5434,128 @@ class FusedMoE(torch.nn.Module):
         target.copy_(value[0])
         return True
 
+    # The FP8 schemes a weight sync can requantize an expert shard into. Both
+    # quantize w1, w3 and w2 on their own, keep their scales row-major, and lay
+    # the weights out with `shuffle_weights`' default, which is what
+    # `shuffle_expert_slices` re-establishes per slice. MXFP8 (per_1x32) is held
+    # gate/up-interleaved with shuffled E8M0 scales, and per_Tensor shares one
+    # scale between w1 and w3, so neither can be rewritten one shard at a time.
+    _SYNC_REQUANTIZED_TYPES = (QuantType.per_1x128, QuantType.per_Token)
+
+    def requantizes_synced_experts(self) -> bool:
+        """Whether a weight sync can write full-precision expert weights into
+        this layer's FP8 buffers, through `requantize_expert_shard`.
+
+        An FNUZ-normalized checkpoint and a fused shared expert are left out:
+        the first holds scales rewritten by `normalize_e4m3fn_to_e4m3fnuz`, the
+        second a slot `shared_expert_staging` filled after the routed experts.
+        """
+        method = self.quant_method
+        return (
+            isinstance(method, Fp8MoEMethod)
+            and method.quant_type in self._SYNC_REQUANTIZED_TYPES
+            and not method.need_normalize_e4m3fn_to_e4m3fnuz
+            and self.w13_weight.element_size() == 1
+            and self.num_fused_shared_experts == 0
+            and self.shared_expert_staging is None
+        )
+
+    def requantize_expert_shard(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+        *,
+        rank_local: bool = False,
+    ) -> None:
+        """Quantize one full-precision expert shard into *param*, the way
+        online quantization filled it at load: this rank's slice quantized on
+        its own, weight and scale written in place.
+
+        *loaded_weight* is the whole checkpoint tensor, as `weight_loader`
+        takes it, unless *rank_local* says it is this rank's slice already.
+        The slice is left row-major; the caller re-establishes the expert
+        layout once every shard of the expert has arrived.
+        """
+        quant_type = self.quant_method.quant_type
+        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if expert_id == -1:
+            return
+        inter = self.intermediate_size_per_partition
+
+        def quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return quant_weight_online(
+                weight.contiguous(),
+                online_quant_type=quant_type,
+                online_quant_dtype=self.quant_method.quant_dtype,
+            )
+
+        if shard_id in ("w1", "w3"):
+            if param is not self.w13_weight:
+                raise ValueError(f"{shard_id} belongs in w13_weight")
+            if not rank_local:
+                rows = loaded_weight.shape[0] // self.tp_size
+                loaded_weight = loaded_weight.narrow(0, rows * self.tp_rank, rows)
+            weight, scale = quantize(loaded_weight[:inter])
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=0,
+                expert_data=self.w13_weight.data[expert_id],
+                shard_id=shard_id,
+                loaded_weight=weight,
+                tp_rank=self.tp_rank,
+                load_full=True,
+            )
+            self._load_quant_weight_scale(
+                expert_data=self.w13_weight_scale.data[expert_id],
+                shard_dim=0,
+                shard_id=shard_id,
+                loaded_weight=scale,
+                tp_rank=self.tp_rank,
+                quant_type=quant_type,
+                load_full=True,
+            )
+            return
+
+        if shard_id != "w2" or param is not self.w2_weight:
+            raise ValueError(f"shard {shard_id!r} does not belong in w2_weight")
+        # Per-channel FP8 scales a w2 row over its whole input dim, which TP
+        # splits: the load all-gathers it first (`_online_quant`). The whole
+        # tensor is here, so it is quantized whole and `_load_w2` takes the
+        # rank's columns, as it does at load.
+        whole_row = quant_type == QuantType.per_Token and self.tp_size > 1
+        if whole_row:
+            if rank_local:
+                raise NotImplementedError(
+                    f"{self.layer_name}: a per-channel FP8 w2 under TP{self.tp_size} "
+                    f"is scaled over the whole row, which a rank-local shard does "
+                    f"not hold; send one tensor per expert"
+                )
+            weight, scale = quantize(loaded_weight)
+        else:
+            if not rank_local:
+                cols = loaded_weight.shape[1] // self.tp_size
+                loaded_weight = loaded_weight.narrow(1, cols * self.tp_rank, cols)
+            weight, scale = quantize(loaded_weight[:, :inter])
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=1,
+            expert_data=self.w2_weight.data[expert_id],
+            shard_id="w2",
+            loaded_weight=weight,
+            tp_rank=self.tp_rank,
+            load_full=not whole_row,
+        )
+        self._load_quant_weight_scale(
+            expert_data=self.w2_weight_scale.data[expert_id],
+            shard_dim=1,
+            shard_id="w2",
+            loaded_weight=scale,
+            tp_rank=self.tp_rank,
+            quant_type=quant_type,
+            # A per-channel scale is along the output dim, which TP does not split.
+            load_full=False if quant_type == QuantType.per_Token else not whole_row,
+        )
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,

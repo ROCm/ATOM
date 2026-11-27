@@ -39,6 +39,7 @@ from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.model_ops import moe as moe_module
 from atom.model_ops.moe import Fp8MoEMethod, FusedMoE
 from atom.model_ops.utils import shuffle_weights
+from atom.quantization.quark.utils import quant_weight_online
 from atom.rollout import weight_sync
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.selector import Family
@@ -630,3 +631,296 @@ def test_the_ipc_entry_point_routes_experts_too(monkeypatch):
     assert torch.equal(moe.w13_weight.data, reference.w13_weight.data)
     assert torch.equal(moe.w2_weight.data, reference.w2_weight.data)
     assert runner._ipc_buffer is None
+
+
+# ── FP8 experts, requantized by the sync ──────────────────────────────────
+
+FP8_HIDDEN = 256
+# Whole intermediate size; under TP2 a rank holds 128, the smallest a 128x128
+# block-scaled layer accepts (`Fp8MoEMethod.create_weights`).
+FP8_INTERMEDIATE = 256
+
+
+def _fp8_method(quant_type):
+    method = object.__new__(Fp8MoEMethod)
+    method.quant_type = quant_type
+    method.quant_dtype = dtypes.fp8
+    method.block_quant = quant_type in (QuantType.per_1x128, QuantType.per_1x32)
+    method.channel_quant = quant_type == QuantType.per_Token
+    method.need_normalize_e4m3fn_to_e4m3fnuz = False
+    return method
+
+
+class _Fp8FusedMoEDouble(_FusedMoEDouble):
+    """An online-quantized FusedMoE's FP8 buffers, after its post-load processing."""
+
+    requantizes_synced_experts = FusedMoE.requantizes_synced_experts
+    requantize_expert_shard = FusedMoE.requantize_expert_shard
+    _load_quant_weight_scale = FusedMoE._load_quant_weight_scale
+    _SYNC_REQUANTIZED_TYPES = FusedMoE._SYNC_REQUANTIZED_TYPES
+
+    def __init__(self, quant_type, *, tp_size=1, tp_rank=0):
+        nn.Module.__init__(self)
+        inter = FP8_INTERMEDIATE // tp_size
+        self.w13_weight = nn.Parameter(
+            torch.zeros(
+                NUM_EXPERTS, 2 * inter, FP8_HIDDEN, dtype=dtypes.fp8, device=DEVICE
+            ),
+            requires_grad=False,
+        )
+        self.w2_weight = nn.Parameter(
+            torch.zeros(
+                NUM_EXPERTS, FP8_HIDDEN, inter, dtype=dtypes.fp8, device=DEVICE
+            ),
+            requires_grad=False,
+        )
+        if quant_type == QuantType.per_Token:
+            scales = ((NUM_EXPERTS, 2 * inter), (NUM_EXPERTS, FP8_HIDDEN))
+        else:
+            scales = (
+                (NUM_EXPERTS, 2 * inter // 128, FP8_HIDDEN // 128),
+                (NUM_EXPERTS, FP8_HIDDEN // 128, inter // 128),
+            )
+        self.w13_weight_scale = nn.Parameter(
+            torch.ones(scales[0], device=DEVICE), requires_grad=False
+        )
+        self.w2_weight_scale = nn.Parameter(
+            torch.ones(scales[1], device=DEVICE), requires_grad=False
+        )
+        self.layer_quant_config = SimpleNamespace(
+            quant_dtype=dtypes.fp8, quant_type=quant_type
+        )
+        self.quant_method = _fp8_method(quant_type)
+        self.layer_name = "layers.0.mlp.experts"
+        self.intermediate_size_per_partition = inter
+        self.expert_map = None
+        self.num_redundant_experts = 0
+        self.num_fused_shared_experts = 0
+        self.global_num_experts = NUM_EXPERTS
+        self.local_num_experts = NUM_EXPERTS
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.use_ep = False
+
+
+def _fp8_trainer_tensors(seed):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    tensors = []
+    for expert_id in range(NUM_EXPERTS):
+        for proj, shape in (
+            ("gate_proj", (FP8_INTERMEDIATE, FP8_HIDDEN)),
+            ("up_proj", (FP8_INTERMEDIATE, FP8_HIDDEN)),
+            ("down_proj", (FP8_HIDDEN, FP8_INTERMEDIATE)),
+        ):
+            tensors.append(
+                (
+                    f"layers.0.mlp.experts.{expert_id}.{proj}.weight",
+                    (torch.randn(shape, generator=generator) * 0.02).to(torch.bfloat16),
+                )
+            )
+    return tensors
+
+
+def _quantize(weight, quant_type):
+    return quant_weight_online(
+        weight.to(DEVICE).contiguous(),
+        online_quant_type=quant_type,
+        online_quant_dtype=dtypes.fp8,
+    )
+
+
+def _fp8_reference(tensors, quant_type, *, tp_size=1, tp_rank=0):
+    """What the load's online quantization leaves for these weights, worked out
+    without the layer: this rank's rows of w1 and w3 and columns of w2, each
+    quantized on its own -- except a per-channel w2 under TP, scaled over the
+    whole row the load gathers -- stacked, then shuffled as the load does."""
+    weights = dict(tensors)
+    rows = FP8_INTERMEDIATE // tp_size
+    own = slice(rows * tp_rank, rows * (tp_rank + 1))
+    w13, w13_scale, w2, w2_scale = [], [], [], []
+    for e in range(NUM_EXPERTS):
+        halves = [
+            _quantize(
+                weights[f"layers.0.mlp.experts.{e}.{proj}.weight"][own], quant_type
+            )
+            for proj in ("gate_proj", "up_proj")
+        ]
+        w13.append(torch.cat([q for q, _ in halves]))
+        w13_scale.append(torch.cat([s for _, s in halves]))
+        down = weights[f"layers.0.mlp.experts.{e}.down_proj.weight"]
+        if quant_type == QuantType.per_Token and tp_size > 1:
+            q, s = _quantize(down, quant_type)
+            q = q[:, own]
+        else:
+            q, s = _quantize(down[:, own], quant_type)
+        w2.append(q)
+        w2_scale.append(s)
+    w13 = nn.Parameter(torch.stack(w13), requires_grad=False)
+    w2 = nn.Parameter(torch.stack(w2), requires_grad=False)
+    shuffle_weights(w13, w2)
+    squeeze = quant_type == QuantType.per_Token
+    return (
+        w13.data,
+        torch.stack([s.squeeze(-1) if squeeze else s for s in w13_scale]),
+        w2.data,
+        torch.stack([s.squeeze(-1) if squeeze else s for s in w2_scale]),
+    )
+
+
+def _fp8_sync_target(quant_type, **tp):
+    """A layer holding some other FP8 weights, through the post-load shuffle."""
+    moe = _Fp8FusedMoEDouble(quant_type, **tp)
+    old = _fp8_reference(_fp8_trainer_tensors(999), quant_type, **tp)
+    for param, value in zip(
+        (moe.w13_weight, moe.w13_weight_scale, moe.w2_weight, moe.w2_weight_scale),
+        old,
+    ):
+        param.data.copy_(value)
+    return moe
+
+
+def _fp8_state(moe):
+    return (
+        moe.w13_weight.data.view(torch.uint8),
+        moe.w13_weight_scale.data,
+        moe.w2_weight.data.view(torch.uint8),
+        moe.w2_weight_scale.data,
+    )
+
+
+def _assert_matches(moe, reference):
+    for got, want in zip(_fp8_state(moe), reference):
+        want = want.view(torch.uint8) if want.element_size() == 1 else want
+        assert torch.equal(got, want)
+
+
+_FP8_CASES = [
+    pytest.param(QuantType.per_1x128, {}, id="per_1x128"),
+    pytest.param(QuantType.per_Token, {}, id="per_Token"),
+    pytest.param(QuantType.per_1x128, {"tp_size": 2, "tp_rank": 1}, id="per_1x128-tp2"),
+    pytest.param(QuantType.per_Token, {"tp_size": 2, "tp_rank": 1}, id="per_Token-tp2"),
+]
+
+
+@pytest.mark.parametrize("quant_type, tp", _FP8_CASES)
+def test_an_fp8_sync_matches_a_fresh_online_quantization(quant_type, tp):
+    """Weights, scales and layout, byte for byte. Before the sync could
+    requantize, these weights were cast into the buffers under the old scales
+    -- or, since #3058, refused."""
+    tensors = _fp8_trainer_tensors(21)
+    moe = _fp8_sync_target(quant_type, **tp)
+
+    updated = _Runner(_ModelDouble(moe)).update_weights(tensors)
+
+    assert updated == 3 * NUM_EXPERTS
+    _assert_matches(moe, _fp8_reference(tensors, quant_type, **tp))
+
+
+@pytest.mark.parametrize("quant_type, tp", _FP8_CASES[:2])
+def test_two_fp8_syncs_both_land_in_the_same_buffers(quant_type, tp):
+    moe = _fp8_sync_target(quant_type, **tp)
+    runner = _Runner(_ModelDouble(moe))
+    before = [t.data_ptr() for t in _fp8_state(moe)]
+
+    for seed in (22, 23):
+        tensors = _fp8_trainer_tensors(seed)
+        runner.update_weights(tensors)
+        _assert_matches(moe, _fp8_reference(tensors, quant_type, **tp))
+
+    assert [t.data_ptr() for t in _fp8_state(moe)] == before
+
+
+@pytest.mark.parametrize("quant_type, tp", _FP8_CASES)
+def test_fused_fp8_tensors_land_where_the_per_expert_ones_do(quant_type, tp):
+    """A fused tensor is this rank's shard: under TP2, its rows of gate and of
+    up, and its columns of down. A per-channel w2 under TP is scaled over the
+    whole row, which that shard does not hold (refused below), so there
+    down_proj goes one tensor per expert."""
+    per_expert = _fp8_trainer_tensors(24)
+    weights = dict(per_expert)
+    tp_size, tp_rank = tp.get("tp_size", 1), tp.get("tp_rank", 0)
+    rows = FP8_INTERMEDIATE // tp_size
+    own = slice(rows * tp_rank, rows * (tp_rank + 1))
+
+    def expert(e, proj):
+        return weights[f"layers.0.mlp.experts.{e}.{proj}.weight"]
+
+    gate_up = torch.stack(
+        [
+            torch.cat([expert(e, "gate_proj")[own], expert(e, "up_proj")[own]])
+            for e in range(NUM_EXPERTS)
+        ]
+    )
+    if quant_type == QuantType.per_Token and tp_size > 1:
+        down = [(name, t) for name, t in per_expert if ".down_proj." in name]
+    else:
+        down = [
+            (
+                "layers.0.mlp.experts.down_proj",
+                torch.stack(
+                    [expert(e, "down_proj")[:, own] for e in range(NUM_EXPERTS)]
+                ),
+            )
+        ]
+    moe = _fp8_sync_target(quant_type, **tp)
+
+    _Runner(_ModelDouble(moe)).update_weights(
+        [("layers.0.mlp.experts.gate_up_proj", gate_up), *down]
+    )
+
+    _assert_matches(moe, _fp8_reference(per_expert, quant_type, **tp))
+
+
+def test_a_global_fused_tensor_under_tp_is_refused():
+    """`requantize_expert_shard` takes each expert's leading rows of a
+    rank-local shard, so a global gate_up_proj was written as rank 0's rows on
+    rank 1 too, with nothing said."""
+    moe = _fp8_sync_target(QuantType.per_1x128, tp_size=2, tp_rank=1)
+    before = [t.clone() for t in _fp8_state(moe)]
+    gate_up = torch.ones(
+        NUM_EXPERTS, 2 * FP8_INTERMEDIATE, FP8_HIDDEN, dtype=torch.bfloat16
+    )
+
+    with pytest.raises(NotImplementedError, match="this rank's"):
+        _Runner(_ModelDouble(moe)).update_weights(
+            [("layers.0.mlp.experts.gate_up_proj", gate_up)]
+        )
+    assert all(torch.equal(a, b) for a, b in zip(_fp8_state(moe), before))
+
+
+def test_an_fp8_expert_sent_to_an_fp8_layer_is_refused():
+    """Requantized, its FP8 values would be read as the weight and the scale
+    they were stored under dropped; experts' scales are not synced."""
+    moe = _fp8_sync_target(QuantType.per_1x128)
+    before = [t.clone() for t in _fp8_state(moe)]
+    tensors = [(name, t.to(dtypes.fp8)) for name, t in _fp8_trainer_tensors(26)]
+
+    with pytest.raises(NotImplementedError, match="requantizes from full precision"):
+        _Runner(_ModelDouble(moe)).update_weights(tensors)
+    assert all(torch.equal(a, b) for a, b in zip(_fp8_state(moe), before))
+
+
+def test_a_rank_local_per_channel_w2_under_tp_is_refused():
+    """A fused down_proj holds this rank's columns; a per-channel scale needs
+    the whole row."""
+    moe = _fp8_sync_target(QuantType.per_Token, tp_size=2, tp_rank=1)
+    down = torch.zeros(
+        NUM_EXPERTS, FP8_HIDDEN, FP8_INTERMEDIATE // 2, dtype=torch.bfloat16
+    )
+
+    with pytest.raises(NotImplementedError, match="whole row"):
+        _Runner(_ModelDouble(moe)).update_weights(
+            [("layers.0.mlp.experts.down_proj", down)]
+        )
+
+
+def test_an_mxfp8_layer_is_still_refused():
+    """Gate/up-interleaved weights with shuffled E8M0 scales: not a layout a
+    sync rewrites one shard at a time."""
+    moe = _Fp8FusedMoEDouble(QuantType.per_1x128)
+    moe.quant_method = _fp8_method(QuantType.per_1x32)
+    before = _expert_bytes(moe)
+
+    with pytest.raises(WeightReloadRefused, match="full-precision write cannot"):
+        _Runner(_ModelDouble(moe)).update_weights(_fp8_trainer_tensors(25))
+    assert _expert_bytes(moe) == before, "refused before anything was written"
