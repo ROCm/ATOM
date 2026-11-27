@@ -988,6 +988,28 @@ def test_key_spellings():
     assert probe == "ns/probe/w2/abc" and not probe.startswith("ns/w")
 
 
+def test_keys_are_the_ones_atomesh_looks_up():
+    # atom/mesh/src/kv_storage/keys.rs asserts the same digests and keys.
+    for chunk_tokens, want in [
+        (16, "b4f719a070effaaae20d233b3341c77d"),
+        (64, "a1aef9c4be290e35c90734297b3e6c8a"),
+        (256, "368bbb8bdb74a66c980c2a9762fef7fa"),
+    ]:
+        assert keys.chunk_hash_chain(range(chunk_tokens), chunk_tokens).hex() == want
+    namespace = "atomkv1-0123456789abcdef01234567"
+    hashes = keys.chunk_hash_chain([(i * 7919) % 150000 for i in range(53)], 16)
+    digests = (
+        "48a73da894d8d0ef643123150b31991e",
+        "a53c74ba1da5cce48218d8a3729dc7a1",
+        "bdff5c9bb8a712526c9ad1e28caa2a8e",
+    )
+    for rank in (0, 1):
+        assert keys.chunk_keys(namespace, rank, 8, hashes, 0, 3) == [
+            f"{namespace}/w{rank}of8/{digest}" for digest in digests
+        ]
+    assert len(hashes) == 3 * keys.DIGEST_BYTES
+
+
 # --- client ------------------------------------------------------------------
 
 
