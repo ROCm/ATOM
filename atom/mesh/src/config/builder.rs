@@ -181,6 +181,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn atom_pd_concurrent(mut self, enable: bool) -> Self {
+        self.config.atom_pd_concurrent = enable;
+        self
+    }
+
     pub fn host<S: Into<String>>(mut self, host: S) -> Self {
         self.config.host = host.into();
         self
