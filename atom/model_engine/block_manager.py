@@ -817,7 +817,7 @@ class BlockManager:
         """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
-        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+        from atom.distributed.dcp_layout import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
             np.array([seq_len]),

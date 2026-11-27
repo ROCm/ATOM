@@ -484,6 +484,31 @@ def test_a_rewritten_generation_prompt_replaces_the_stored_turn(tok):
     assert len(_stored(seg)) == 1
 
 
+def test_a_turn_too_large_to_store_keeps_the_turn_it_extends(tok):
+    from atom.model_engine.byte_lru import ENTRY_OVERHEAD
+
+    rng = random.Random(24)
+    first = _long_conversation(rng, 2) + "<|Assistant|>"
+    second = first + _text(rng, 3000) + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
+    third = first + _text(rng, 20) + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
+
+    def run(budget, prompts):
+        seg = SegmentTokenizer.maybe_create(tok, budget)
+        seg._verified = seg_mod._VERIFY_FIRST
+        for p in prompts:
+            assert seg._encode_cached(p) == tok.encode(p)
+            assert seg._lru.bytes <= budget
+        return seg
+
+    # One byte short of keeping `second`, which would replace `first`.
+    [entry] = _stored(run(10**7, [first, second]))
+    seg = run(entry.payload_bytes + ENTRY_OVERHEAD - 1, [first, second])
+    assert [e.text for e in _stored(seg)] == [first]
+    hits = seg._stats[4]
+    assert seg._encode_cached(third) == tok.encode(third)
+    assert seg._stats[4] == hits + 1
+
+
 def test_a_fork_keeps_the_stored_prompt_it_left(tok):
     seg = SegmentTokenizer.maybe_create(tok, 10**7)
     seg._verified = seg_mod._VERIFY_FIRST

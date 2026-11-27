@@ -111,6 +111,8 @@ class PPEngineCoreProc(EngineCore):
                 else:
                     if self.has_pending_kv_work():
                         self._run_then_publish_kv_events(self._advance_idle_kv_transfer)
+                    else:
+                        self._wait_for_input()
                     yield_gil()
         finally:
             self._drain_kv_work_at_exit()
