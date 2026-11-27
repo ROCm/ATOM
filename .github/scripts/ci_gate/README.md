@@ -47,6 +47,25 @@ Defined once and used everywhere:
   decides.
 - **Changed paths** (`ChangedPaths`) are every path the PR adds, removes or
   renames from / to. When the file list is cut short, nothing is ruled out.
+- **A suite is relevant to a change** when the change can alter what the
+  suite's PR run executes (`suites.py`). Of the product code (`PRODUCT_DIRS`,
+  the packages `pyproject.toml` declares) each suite takes what it tests:
+  ATOM Test all of it but the plugins and ATOMesh, the plugin and ATOMesh
+  suites `atom/plugin/**` and `atom/mesh/**`, the rest left to ATOM Test and
+  the runs on `main`. Everything else a run executes or reads is its **run
+  definition**, and which files that is cannot be proven from the
+  repository's text (a run may compute a name), so the lists err on the side
+  of running: every area a PR run may execute (`RUN_AREAS`: the packaging
+  files, `scripts/`, `docker/`, the CI's scripts, actions and data) counts for
+  every suite, with the suite's own workflow and the workflows its run reads;
+  a suite leaves a path out only by a reviewed ignore entry. Other workflows,
+  CPU unit tests, docs, tools, recipes and `atomrl/` start no suite.
+  `tests/test_ci_gate_suites.py` holds this together: every file of the
+  repository is classified once (product, run area, workflow, or not run, with
+  why), and what `tests/ci_gate_relevance.py` can derive of each run (the
+  files its PR-run steps name, followed through the scripts, Dockerfiles and
+  actions it executes) must be covered by the suite's list and never classified
+  as not run.
 - **A PR changes its suite's CI definition** (`changes_ci_definition`) when it
   changes a path relevant to the suite outside `PRODUCT_DIRS`: the run that
   tested it then ran the PR's own definition, so its pass counts once the PR
@@ -112,11 +131,17 @@ else can write:
 - The repository's default workflow permissions go to read, and "Allow GitHub
   Actions to create and approve pull requests" off: else a PR's own workflow
   can approve it.
+- `.github/CODEOWNERS` names its owners: until then no file has one, and any
+  write user's approval authorizes heavy CI and a self-changed CI definition.
 
 ## Boundaries
 
 What the gate does not decide, on purpose:
 
+- The plugin and ATOMesh suites test their own code (`atom/plugin/**`,
+  `atom/mesh/**`); a change to the rest of `atom` is ATOM Test's and the runs
+  on `main`'s. The product code does not import the plugins (where it does,
+  that import is the defect).
 - Runs are matched to a PR by commit: another PR with the same head commit,
   based on a branch whose CI definition was changed, produces runs that count
   for this one (GitHub does not say which PR a fork's run belongs to, nor list

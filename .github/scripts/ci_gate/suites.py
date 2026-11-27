@@ -1,7 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
-"""The heavy-CI suites the evaluator writes a Status for.
+"""The heavy-CI suites the evaluator writes a Status for, and which changes
+each one tests.
+
+A change is relevant to a suite when it can alter what the suite's PR run
+executes. Outside the product code, which files a run executes cannot be
+proven from the repository's text (a name can be computed at run time), so
+the lists err on the side of running: every area a PR run may execute
+(RUN_AREAS) counts for every suite, and a suite leaves a path out only by a
+reviewed ignore entry. Of the product code, each suite takes the part it
+tests. tests/test_ci_gate_suites.py classifies every file of the repository
+and checks each list against what it can derive of each run.
 
 While each suite's workflow still runs its old ci-gate job, the path lists
 here repeat that job's CI_GATE_PATHS_IGNORE / CI_GATE_PATHS_INCLUDE;
@@ -32,6 +42,32 @@ class Suite:
     old_gate_job: str
 
 
+# What the repository ships: the packages pyproject.toml declares.
+PRODUCT_DIRS = ("atom/",)
+
+# Where, besides the product code, a suite's PR run may execute or read
+# something: how the product is installed, the CI's scripts, actions, data and
+# images. A workflow file is not here: it defines its own runs, so each suite
+# lists its own and those its run reads.
+RUN_AREAS = (
+    "setup.py",
+    "pyproject.toml",
+    "MANIFEST.in",
+    "README.md",  # pyproject.toml's readme: installing reads it
+    ".gitattributes",
+    "scripts/**",
+    "docker/**",
+    ".github/scripts/**",
+    ".github/actions/**",
+    ".github/benchmark/**",
+    ".github/runner-config.yml",
+    ".github/workflows/golden_outputs/**",
+)
+# Docs beside the Python product code: nothing imports or installs them.
+# (ATOMesh's tests build its README in: its suite ignores no docs.)
+_PRODUCT_DOCS = "atom/*.md"
+
+
 def _suite(
     key: str,
     workflow_file: str,
@@ -39,11 +75,15 @@ def _suite(
     title: str,
     labels: tuple[str, ...],
     *,
-    ignore: tuple[str, ...] = (),
-    include: tuple[str, ...] = (),
+    own_code: tuple[str, ...],
+    reads_workflows: tuple[str, ...] = (),
+    ignore: tuple[str, ...],
     smoke_job: str | None = None,
     old_gate_job: str,
 ) -> Suite:
+    workflows = tuple(
+        f".github/workflows/{w}" for w in (workflow_file, *reads_workflows)
+    )
     return Suite(
         key=key,
         workflow_file=workflow_file,
@@ -54,22 +94,12 @@ def _suite(
         stale_merge_job=f"{title} Result (not run: merge commit not against main)",
         labels=frozenset(labels),
         ignore_globs=ignore,
-        include_globs=include,
+        include_globs=own_code + RUN_AREAS + workflows,
         smoke_job=smoke_job,
         old_signal_job="Check Pre Checkin Signal",
         old_gate_job=old_gate_job,
     )
 
-
-# What the repository ships: the packages pyproject.toml declares. What else
-# a suite's run executes defines how the run tests them.
-PRODUCT_DIRS = ("atom/",)
-
-_PLUGIN_INCLUDE = (
-    "atom/plugin/**",
-    ".github/scripts/plugin_ci/**",
-    "docker/atom_release.dockerfile",
-)
 
 SUITES: tuple[Suite, ...] = (
     _suite(
@@ -78,27 +108,8 @@ SUITES: tuple[Suite, ...] = (
         "ATOM Test",
         "ATOM Test",
         ("ci:full", "ci:atom"),
-        ignore=(
-            "**/*.md",
-            "docs/**",
-            ".claude/**",
-            "atomrl/**",
-            ".github/workflows/atomrl-*.yaml",
-            "atom/plugin/**",
-            "atom/mesh/**",
-            ".github/benchmark/models_atomesh.yaml",
-            ".github/scripts/atomesh/**",
-            ".github/workflows/atomesh-*.yaml",
-            ".github/workflows/atom-review-bot*.yml",
-            ".github/scripts/atomesh_*.sh",
-            ".github/dashboard/atomesh_*.html",
-            ".github/workflows/atom-vllm-*.yaml",
-            ".github/workflows/atom-sglang-*.yaml",
-            ".github/benchmark/oot_models_accuracy.json",
-            ".github/benchmark/sglang_models_accuracy.json",
-            "LICENSE",
-            ".gitignore",
-        ),
+        own_code=("atom/**",),
+        ignore=(_PRODUCT_DOCS, "atom/plugin/**", "atom/mesh/**"),
         smoke_job="Offline inference smoke test",
         old_gate_job="ATOM Test Gate",
     ),
@@ -108,16 +119,10 @@ SUITES: tuple[Suite, ...] = (
         "ATOM SGLang Test",
         "ATOM SGLang Test",
         ("ci:full", "ci:sglang"),
-        include=_PLUGIN_INCLUDE
-        + (
-            ".github/workflows/atom-sglang-test.yaml",
-            ".github/scripts/atom_sglang_test.sh",
-            ".github/workflows/docker-release.yaml",
-            ".github/benchmark/sglang_models_accuracy.json",
-            "docker/sglang_release.dockerfile",
-        ),
+        own_code=("atom/plugin/**",),
+        reads_workflows=("docker-release.yaml",),  # its SGLang pin
         ignore=(
-            "**/*.md",
+            _PRODUCT_DOCS,
             "atom/plugin/vllm/**",
             "atom/plugin/rtpllm/**",
             ".github/scripts/plugin_ci/run_vllm_ci.sh",
@@ -131,17 +136,9 @@ SUITES: tuple[Suite, ...] = (
         "ATOM vLLM Test",
         "ATOM vLLM Test",
         ("ci:full", "ci:vllm"),
-        include=_PLUGIN_INCLUDE
-        + (
-            ".github/workflows/atom-vllm-test.yaml",
-            ".github/scripts/atom_oot_test.sh",
-            ".github/scripts/check_mtp_acceptance.sh",
-            ".github/benchmark/oot_models_accuracy.json",
-            "docker/vllm_release.dockerfile",
-            "docker/patches/**",
-        ),
+        own_code=("atom/plugin/**",),
         ignore=(
-            "**/*.md",
+            _PRODUCT_DOCS,
             "atom/plugin/sglang/**",
             "atom/plugin/rtpllm/**",
             ".github/scripts/plugin_ci/run_sglang_ci.sh",
@@ -155,13 +152,8 @@ SUITES: tuple[Suite, ...] = (
         "Atomesh Accuracy Validation",
         "ATOMesh Accuracy",
         ("ci:full", "ci:mesh"),
-        include=(
-            "atom/mesh/**",
-            ".github/workflows/atomesh-accuracy-validation.yaml",
-            ".github/scripts/accuracy_to_dashboard.py",
-            ".github/scripts/atomesh_pd_accuracy.sh",
-            ".github/benchmark/models_accuracy.json",
-        ),
+        own_code=("atom/mesh/**",),
+        ignore=(),  # its tests build README.md in (include_str!)
         old_gate_job="ATOMesh Accuracy Gate",
     ),
 )

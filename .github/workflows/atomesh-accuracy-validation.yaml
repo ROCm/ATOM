@@ -84,12 +84,26 @@ jobs:
         env:
           CI_GATE_WORKFLOW: atomesh-accuracy-validation.yaml
           CI_GATE_LABELS: ci:full,ci:mesh
+          # A PR runs it when it changes ATOMesh, any area a PR run may
+          # execute (ci_gate/suites.py RUN_AREAS) or this workflow, or carries
+          # ci:mesh / ci:full. Changes to the rest of ATOM are covered by ATOM
+          # Test and the nightly. tests/test_ci_gate_suites.py keeps this
+          # equal to ci_gate/suites.py.
           CI_GATE_PATHS_INCLUDE: |
             atom/mesh/**
+            setup.py
+            pyproject.toml
+            MANIFEST.in
+            README.md
+            .gitattributes
+            scripts/**
+            docker/**
+            .github/scripts/**
+            .github/actions/**
+            .github/benchmark/**
+            .github/runner-config.yml
+            .github/workflows/golden_outputs/**
             .github/workflows/atomesh-accuracy-validation.yaml
-            .github/scripts/accuracy_to_dashboard.py
-            .github/scripts/atomesh_pd_accuracy.sh
-            .github/benchmark/models_accuracy.json
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash ./.github/scripts/check_heavy_ci_gate.sh

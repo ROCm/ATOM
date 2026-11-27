@@ -389,13 +389,23 @@ def _workflow_gate_env(filename):
         # Code both plugins share runs both.
         ("atom-vllm-test.yaml", "atom/plugin/register.py", (), "true"),
         ("atom-sglang-test.yaml", "atom/plugin/register.py", (), "true"),
+        # Every area a PR run may execute counts for every suite.
         ("atom-vllm-test.yaml", "docker/vllm_release.dockerfile", (), "true"),
-        ("atom-sglang-test.yaml", "docker/vllm_release.dockerfile", (), "false"),
+        ("atom-sglang-test.yaml", "docker/vllm_release.dockerfile", (), "true"),
+        ("atom-sglang-test.yaml", "scripts/x.sh", (), "true"),
         # Scripts and files outside atom/plugin/ that the plugin CI runs.
         ("atom-vllm-test.yaml", ".github/scripts/atom_oot_test.sh", (), "true"),
         ("atom-vllm-test.yaml", ".github/scripts/check_mtp_acceptance.sh", (), "true"),
         ("atom-sglang-test.yaml", ".github/scripts/atom_sglang_test.sh", (), "true"),
         ("atom-sglang-test.yaml", ".github/workflows/docker-release.yaml", (), "true"),
+        # How ATOM is installed, and the gate the run itself goes through.
+        ("atom-sglang-test.yaml", "setup.py", (), "true"),
+        (
+            "atom-vllm-test.yaml",
+            ".github/actions/evaluate-test-gate/action.yml",
+            (),
+            "true",
+        ),
         # The plugin's label still asks for its CI on any change.
         ("atom-vllm-test.yaml", "atom/model_engine/scheduler.py", ("ci:vllm",), "true"),
         (
@@ -421,6 +431,30 @@ def test_plugin_ci_runs_for_plugin_paths_or_its_label(
     )
 
     assert result["should_run"] == should_run
+
+
+@pytest.mark.parametrize(
+    "changed_files",
+    [
+        # Moved out of the product code: the rename's old side is the change.
+        "tools/scheduler.py\tatom/model_engine/scheduler.py",
+        # GitHub lists at most 3000 files: the rest may be anything.
+        "\n".join(f"docs/page{i}.md\t" for i in range(3000)),
+    ],
+    ids=["rename-out-of-atom", "file-list-cut-short"],
+)
+def test_atom_test_gate_rules_out_nothing_it_cannot_see(tmp_path, changed_files):
+    env = _workflow_gate_env("atom-test.yaml")
+    result = _run_gate(
+        tmp_path,
+        review_decision="APPROVED",
+        allowed=env["CI_GATE_LABELS"],
+        changed_files=changed_files,
+        paths_ignore=env["CI_GATE_PATHS_IGNORE"],
+        paths_include=env["CI_GATE_PATHS_INCLUDE"],
+    )
+
+    assert result["should_run"] == "true"
 
 
 def _previous_run(**updates):
