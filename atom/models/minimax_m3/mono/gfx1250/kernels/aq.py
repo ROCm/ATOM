@@ -203,7 +203,12 @@ def launch_aq1(
     init_blocks: Constexpr[int] = 0, local_keep: Constexpr[int] = 0, max_rows: Constexpr[int] = 64,
     local_max: Constexpr[int] = 1024, slot_keys: Constexpr[int] = 64, ipf_kib: Constexpr[int] = 0,
     owner_fast: Constexpr[int] = 1, merge_par: Constexpr[int] = 0, sc_groups: Constexpr[int] = 2,
+    owner_v2: Constexpr[int] = 0, kchain: Constexpr[int] = 0,
 ):  # fmt: skip
+    """``kchain`` 1: the QKV GEMM sums K as the tuned ``gemm_a8w8 ..._sk4_fsk`` does -- each K split one chain of
+    WMMA steps from a zero accumulator (the split's K-waves hand the accumulator on through LDS, in K order), the
+    splits summed in split order, one bf16 rounding -- instead of the K-waves' wave-order sum (0, the fused chain's
+    order). For a layer whose QKV production runs that GEMM (the first decoder layer)."""
     cfg = (tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol, 0)
     err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
     if err is not None:
@@ -239,8 +244,16 @@ def launch_aq1(
     per_thr = tile_m * CPR // block
     assert sc_groups in (2, 3), "aq: the score role's compute groups (2: waves 0-3, 8-11; 3: all 12 waves)"
     lds_bytes = aq1_lds_bytes(cfg, ql, niq, ring, sc_groups)
+    # kchain: the accumulator hand-off between K-waves, past everything else (the activation slab is still read)
+    RELAY = lds_bytes
+    RELAY_PITCH = (D // ns) * 4
+    if kchain:
+        lds_bytes += tile_m * RELAY_PITCH
     # the grid is co-resident at 2 workgroups a CU (320 KB of LDS a CU): its workgroups wait on each other
     assert lds_bytes <= 160 * 1024, f"aq: {lds_bytes} B of LDS a workgroup (2 a CU need <= 160 KB)"
+    # owner_v2: the request's block-table row in LDS past the exchange's lists ((waves + 6) x 16 keys x 8 B)
+    PT_OFF = 4096
+    assert not owner_v2 or (owner_fast and xchg and PT_OFF + local_max * world * 4 <= RELAY), "aq: owner_v2"
     P_ROW = cols * 4 + P_PAD
     P_PLANE = tile_m * P_ROW
     p_units = tile_m * cols // 4
@@ -266,7 +279,7 @@ def launch_aq1(
         f"_d{depth}_c{wcpol}"
         f"_h{heads_i}_q{ql}_r{rank_cp}w{world}_g{ring}_s{n_score}{'_tl' if tl else ''}"
         f"{f'_x{topk}i{init_blocks}l{local_keep}m{max_rows}' if xchg else ''}{f'_pf{ipf_kib}' if ipf_kib else ''}{'' if owner_fast else '_ow0'}"
-        f"{'_mp' if merge_par else ''}{f'_sg{sc_groups}' if sc_groups != 2 else ''}"
+        f"{'_mp' if merge_par else ''}{f'_sg{sc_groups}' if sc_groups != 2 else ''}{'_ov2' if owner_v2 else ''}{'_kc' if kchain else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -465,13 +478,43 @@ def launch_aq1(
                     lds_store_b128(lds_idx, a_lds_off(u), val)
             _lds_barrier()
             rocdl.sched_barrier(0)
-            for i in range_constexpr(steps_w):
-                st = inflight.pop(0)
-                if const_expr(i + depth < steps_w):
-                    inflight.append(load_b_step(i + depth))
-                    rocdl.sched_barrier(0)
-                afr = [load_a_frag(mi, i) for mi in range_constexpr(mbw)]
-                compute_step(st, afr)
+
+            def run_steps(fl):
+                for i in range_constexpr(steps_w):
+                    st = fl.pop(0)
+                    if const_expr(i + depth < steps_w):
+                        fl.append(load_b_step(i + depth))
+                        rocdl.sched_barrier(0)
+                    afr = [load_a_frag(mi, i) for mi in range_constexpr(mbw)]
+                    compute_step(st, afr)
+
+            if const_expr(kchain):
+                # one chain a K split: K-wave s continues the accumulator K-wave s - 1 left in LDS
+                def relay_off(mi, j):
+                    row = (mblk0 + mi) * 16 + lane16
+                    col = (w_n * nbw + j) * 16 + kgrp * 8
+                    return RELAY + row * RELAY_PITCH + col * 4
+
+                for stage in range_constexpr(kw):
+                    if w_k == stage:
+                        if const_expr(stage > 0):
+                            for mi in range_constexpr(mbw):
+                                for j in range_constexpr(nbw):
+                                    off = relay_off(mi, j)
+                                    lo = Vec(lds_load_b128(lds_idx, off)).bitcast(fx.Float32)
+                                    hi = Vec(lds_load_b128(lds_idx, off + 16)).bitcast(fx.Float32)
+                                    acc[mi][j].store(lo.shuffle(hi, list(range(8))))
+                        run_steps(list(inflight))
+                        if const_expr(stage < kw - 1):
+                            for mi in range_constexpr(mbw):
+                                for j in range_constexpr(nbw):
+                                    off = relay_off(mi, j)
+                                    v = Vec(acc[mi][j].load())
+                                    lds_store_b128(lds_idx, off, v.shuffle(v, [0, 1, 2, 3]).bitcast(fx.Int32))
+                                    lds_store_b128(lds_idx, off + 16, v.shuffle(v, [4, 5, 6, 7]).bitcast(fx.Int32))
+                    _lds_barrier()
+            else:
+                run_steps(inflight)
             stamp(1, 0)
 
             is_q = head < NQ
@@ -512,6 +555,8 @@ def launch_aq1(
                 c4 = u % U_ROW
                 tot = None
                 for k in range_constexpr(kw):
+                    if const_expr(kchain and k < kw - 1):
+                        continue  # kchain: the last K-wave holds the split's whole chain
                     part = Vec(lds_load_b128(lds_idx, k * P_PLANE + r * P_ROW + c4 * 16)).bitcast(fx.Float32)
                     tot = part if tot is None else tot + part
                 g = ((kpart * i32_mpad + m0 + r) * N + head * D + npart * cols) // 4 + c4
@@ -1015,6 +1060,19 @@ def launch_aq1(
                     # ---- the shard: wave w polls / re-arms / packs tiles w, w + W, ... (W = 12 waves), keeps
                     # their top-16 (descending, lanes 0-15) and leaves it in LDS as list w
                     lst_u8 = fx.recast_iter(fx.Uint8, arena.base_ptr)
+                    if const_expr(owner_v2):
+                        if hh == rank_cp:
+                            # the request's block-table row (every page the owner can pick) into LDS while the scores
+                            # are computed; read past the merge instead of a global load (the barrier after the
+                            # shard lists orders these stores before wave 0's reads)
+                            nbt_ = (length_ + 127) // 128
+                            nbt_ = (nbt_ < i32_global).select(nbt_, i32_global)
+                            nbt_ = (nbt_ < fx.Int32(local_max * world)).select(nbt_, fx.Int32(local_max * world))
+                            bts_rs = _rsrc(fx.Int64(fx.ptrtoint(arg_bt)), nbt_ * 4)
+                            # one entry a load: a 16-B load that crosses the row's end reads zeros as a whole
+                            for e1_ in range(tid, nbt_, fx.Int32(block)):
+                                v1_ = fx.Int32(buffer_load(bts_rs, e1_, vec_width=1, dtype=T.i32))
+                                fx.ptr_store(Vec.from_elements([v1_], fx.Int32), _lds_i32(lst_u8, PT_OFF + e1_ * 4, 1))
 
                     def shard_list(nslots):
                         offs = [(wave + waves * ts_b) * 32 + lane for ts_b in range_constexpr(nslots)]
@@ -1165,85 +1223,160 @@ def launch_aq1(
                             rtag = rcall % 32767 + 1
                             bank = (rcall % 2) * world * max_rows
                             own_rs = peer_rs  # Peers[rank] is this rank's own mailbox
-                            # register c: shard 2c's keys in lanes 0-15, shard 2c + 1's reversed in lanes 16-31
-                            srcs = [((bank + ((lane + 32 * c) // topk) * max_rows + sel_r) * slot_keys
-                                     + (lane < 16).select(lane, 31 - lane)) * 2 for c in range_constexpr(2)]
-                            reals = [(lane + 32 * c) < world * topk for c in range_constexpr(2)]
+                            if const_expr(owner_v2):
+                                # ---- owner_v2: shard s's 16 keys (sent sorted, descending) read reversed into lanes
+                                # 0-15 of register s (ascending), merged into the running top-16 (descending) as soon
+                                # as all 16 words carry this round's tag; the top-16 of a total order does not depend
+                                # on the merge order, so the bytes are the all-at-once merge's
+                                causal_len = length_ - ql + token + 1
+                                valid_blocks = (causal_len + 127) // 128
+                                m_start = valid_blocks - local_keep
+                                m_start = (m_start < zero_).select(zero_, m_start)
+                                lo16 = lane < 16
+                                vsrc = [((bank + s_ * max_rows + sel_r) * slot_keys + (15 - lane)) * 2
+                                        for s_ in range_constexpr(world)]
 
-                            def rload():
-                                return tuple(Vec(buffer_load(own_rs, reals[c].select(srcs[c], fx.Int32(0)),
-                                                             vec_width=2, dtype=T.i32, cache_modifier=SCOPE_SYS))
-                                             for c in range_constexpr(2))
+                                def vload():
+                                    return tuple(Vec(buffer_load(own_rs, lo16.select(vsrc[s_], fx.Int32(0)), vec_width=2,
+                                                                 dtype=T.i32, cache_modifier=SCOPE_SYS))
+                                                 for s_ in range_constexpr(world))
 
-                            def rlate(ws):
-                                m_ = fx.Int32(0)
-                                for c in range_constexpr(2):
-                                    tg = (fx.Int32(ws[c][1]) >> 17) & fx.Int32(0x7FFF)
-                                    m_ = m_ | fx.Int32(rocdl.ballot(T.i32, reals[c] & (tg != rtag)))
-                                return m_ != zero_
+                                def vin(wv_, s_):
+                                    tgv_ = (fx.Int32(wv_[s_][1]) >> 17) & fx.Int32(0x7FFF)
+                                    return fx.Int32(rocdl.ballot(T.i32, lo16 & (tgv_ == rtag))) == fx.Int32(0xFFFF)
 
-                            ws = rload()
-                            late = rlate(ws)
-                            rit = zero_
-                            while late & (rit < i32_maxit):
-                                rocdl.s_sleep(POLL_SLEEP)
+                                def vkey(wv_, s_):
+                                    kh_v = lo16.select(fx.Int32(wv_[s_][1]) & fx.Int32(0x1FFFF), zero_)
+                                    kl_v = lo16.select(fx.Int32(wv_[s_][0]), zero_)
+                                    blk_v = (kl_v & fx.Int32(0xFFFF)) - 1
+                                    real_v = (kh_v != zero_) | (kl_v != zero_)
+                                    sc_v = ((kh_v & fx.Int32(0xFFFF)) << 16) | ((kl_v >> 16) & fx.Int32(0xFFFF))
+                                    bits_v = sc_v ^ (sc_v < zero_).select(fx.Int32(-0x80000000), fx.Int32(-1))
+                                    val_v = force(bits_v.bitcast(fx.Float32), blk_v, real_v, m_start)
+                                    return pack(val_v, blk_v + 1, real_v)
+
+                                def vsort_asc(ka_v):
+                                    # a full 16-key bitonic sort into ascending lanes 0-15 (an unsorted sender only)
+                                    for kk_v, js_v in ((2, (1,)), (4, (2, 1)), (8, (4, 2, 1)), (16, (8, 4, 2, 1))):
+                                        for jx_v in js_v:
+                                            ka_v = cx(ka_v, jx_v, lbit_b[jx_v] != lbit_b[kk_v])
+                                    return ka_v
+
+                                def vmerge(rh_v, rl_v, key_v):
+                                    # sorted ascending? (checked beside the merge; never false for AQ's / tl.topk's lists)
+                                    ck_v = k64(key_v[0], key_v[1])
+                                    nk_v = k64(fx.Int32(gpu.shuffle_down(key_v[0], 1, WAVE)),
+                                               fx.Int32(gpu.shuffle_down(key_v[1], 1, WAVE)))
+                                    badv_ = fx.Int32(rocdl.ballot(T.i32, (lane < 15) & (ck_v > nk_v)))
+                                    mh_v, ml_v = sort16([kmax((rh_v, rl_v), key_v)], [True])[0]
+                                    if badv_ != zero_:
+                                        mh_v, ml_v = sort16([kmax((rh_v, rl_v), vsort_asc(key_v))], [True])[0]
+                                    return mh_v, ml_v
+
+                                run_h = zero_
+                                run_l = zero_
+                                got_ = zero_
+                                wv = vload()
+                                rit = zero_
+                                while (got_ != fx.Int32((1 << world) - 1)) & (rit < i32_maxit):
+                                    for s_ in range_constexpr(world):
+                                        if (((got_ >> s_) & fx.Int32(1)) == zero_) & vin(wv, s_):
+                                            run_h, run_l = vmerge(run_h, run_l, vkey(wv, s_))
+                                            got_ = got_ | fx.Int32(1 << s_)
+                                    if got_ != fx.Int32((1 << world) - 1):
+                                        rocdl.s_sleep(POLL_SLEEP)
+                                        wv = vload()
+                                    rit = rit + 1
+                                late = got_ != fx.Int32((1 << world) - 1)
+                                if late & (lane == 0):
+                                    fx.atomic_add(fx.recast_iter(fx.Int32, fx.inttoptr(
+                                        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                                        fx.Int64(fx.ptrtoint(arg_tmo)))), fx.Int32(1), syncscope="agent")
+                                if lane == 0:
+                                    buffer_store(rcall, recv_rs, sel_r, cache_modifier=SCOPE_DEV)
+                                stamp(2, 0)
+                                m_hi = run_h
+                                m_lo = run_l
+                            else:
+                                # register c: shard 2c's keys in lanes 0-15, shard 2c + 1's reversed in lanes 16-31
+                                srcs = [((bank + ((lane + 32 * c) // topk) * max_rows + sel_r) * slot_keys
+                                         + (lane < 16).select(lane, 31 - lane)) * 2 for c in range_constexpr(2)]
+                                reals = [(lane + 32 * c) < world * topk for c in range_constexpr(2)]
+
+                                def rload():
+                                    return tuple(Vec(buffer_load(own_rs, reals[c].select(srcs[c], fx.Int32(0)),
+                                                                 vec_width=2, dtype=T.i32, cache_modifier=SCOPE_SYS))
+                                                 for c in range_constexpr(2))
+
+                                def rlate(ws):
+                                    m_ = fx.Int32(0)
+                                    for c in range_constexpr(2):
+                                        tg = (fx.Int32(ws[c][1]) >> 17) & fx.Int32(0x7FFF)
+                                        m_ = m_ | fx.Int32(rocdl.ballot(T.i32, reals[c] & (tg != rtag)))
+                                    return m_ != zero_
+
                                 ws = rload()
                                 late = rlate(ws)
-                                rit = rit + 1
-                            if late & (lane == 0):
-                                fx.atomic_add(fx.recast_iter(fx.Int32, fx.inttoptr(
-                                    fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
-                                    fx.Int64(fx.ptrtoint(arg_tmo)))), fx.Int32(1), syncscope="agent")
-                            if lane == 0:
-                                buffer_store(rcall, recv_rs, sel_r, cache_modifier=SCOPE_DEV)
-                            stamp(2, 0)
-                            # owner_fast: the poll's last read already holds every key (each 8-B word carries its own
-                            # tag and is single-copy atomic), so no second system-scope read (production re-reads
-                            # because its waves poll only one copy of each key). owner_fast 0: the re-read (A/B arm).
-                            if const_expr(not owner_fast):
-                                ws = rload()
-                            causal_len = length_ - ql + token + 1
-                            btab = fx.recast_iter(fx.Int32, arg_bt)
-                            valid_blocks = (causal_len + 127) // 128
-                            m_start = valid_blocks - local_keep
-                            m_start = (m_start < zero_).select(zero_, m_start)
-                            cand = []
-                            pgs = []
-                            for c in range_constexpr(2):
-                                kh_ = reals[c].select(fx.Int32(ws[c][1]) & fx.Int32(0x1FFFF), zero_)
-                                kl_ = reals[c].select(fx.Int32(ws[c][0]), zero_)
-                                blk_ = (kl_ & fx.Int32(0xFFFF)) - 1
-                                real = (kh_ != zero_) | (kl_ != zero_)
-                                sc32 = ((kh_ & fx.Int32(0xFFFF)) << 16) | ((kl_ >> 16) & fx.Int32(0xFFFF))
-                                bits = sc32 ^ (sc32 < zero_).select(fx.Int32(-0x80000000), fx.Int32(-1))
-                                val = force(bits.bitcast(fx.Float32), blk_, real, m_start)
-                                # the candidate's page, read now (in flight during the merge) and carried with the key,
-                                # so the emit has no dependent table read after the merge
-                                if const_expr(owner_fast):
-                                    # the candidate's page, read now (in flight during the merge); the merge carries
-                                    # only the candidate's slot (lane + 32 c), and the winner's page is picked from
-                                    # the slot afterwards, so the merge does not wait for the read
-                                    pgs.append(real.select(fx.Int32(btab[real.select(blk_, zero_)]), zero_))
-                                cand.append((*pack(val, blk_ + 1, real), lane + fx.Int32(32 * c)))
-                            # every sender's 16 keys come sorted (AQ's bitonic list, production's tl.topk) and the
-                            # re-pinning is idempotent, so the registers are bitonic: lanes 0-15 non-increasing,
-                            # 16-31 non-decreasing. Checked; if not, the full sort.
-                            bad_b = zero_
-                            for c in range_constexpr(2):
-                                ck_b = k64(cand[c][0], cand[c][1])
-                                nk_b = k64(fx.Int32(gpu.shuffle_down(cand[c][0], 1, WAVE)),
-                                           fx.Int32(gpu.shuffle_down(cand[c][1], 1, WAVE)))
-                                ok_b = (((lane & 15) == 15) | ((lane < 16) & (ck_b >= nk_b))
-                                        | ((lane >= 16) & (ck_b <= nk_b)))
-                                bad_b = bad_b | fx.Int32(rocdl.ballot(T.i32, ok_b == fx.Boolean(False)))
-                            m_hi = zero_
-                            m_lo = zero_
-                            m_pg = zero_
-                            if bad_b == zero_:
-                                m_hi, m_lo, m_pg = merge16(*sort16([cx(cand[0], 16, nbit_b[16]),
-                                                                    cx(cand[1], 16, nbit_b[16])], [True, False]), True)
-                            else:
-                                m_hi, m_lo, m_pg = merge16(*top16(cand, [True, False]), True)
+                                rit = zero_
+                                while late & (rit < i32_maxit):
+                                    rocdl.s_sleep(POLL_SLEEP)
+                                    ws = rload()
+                                    late = rlate(ws)
+                                    rit = rit + 1
+                                if late & (lane == 0):
+                                    fx.atomic_add(fx.recast_iter(fx.Int32, fx.inttoptr(
+                                        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                                        fx.Int64(fx.ptrtoint(arg_tmo)))), fx.Int32(1), syncscope="agent")
+                                if lane == 0:
+                                    buffer_store(rcall, recv_rs, sel_r, cache_modifier=SCOPE_DEV)
+                                stamp(2, 0)
+                                # owner_fast: the poll's last read already holds every key (each 8-B word carries its own
+                                # tag and is single-copy atomic), so no second system-scope read (production re-reads
+                                # because its waves poll only one copy of each key). owner_fast 0: the re-read (A/B arm).
+                                if const_expr(not owner_fast):
+                                    ws = rload()
+                                causal_len = length_ - ql + token + 1
+                                btab = fx.recast_iter(fx.Int32, arg_bt)
+                                valid_blocks = (causal_len + 127) // 128
+                                m_start = valid_blocks - local_keep
+                                m_start = (m_start < zero_).select(zero_, m_start)
+                                cand = []
+                                pgs = []
+                                for c in range_constexpr(2):
+                                    kh_ = reals[c].select(fx.Int32(ws[c][1]) & fx.Int32(0x1FFFF), zero_)
+                                    kl_ = reals[c].select(fx.Int32(ws[c][0]), zero_)
+                                    blk_ = (kl_ & fx.Int32(0xFFFF)) - 1
+                                    real = (kh_ != zero_) | (kl_ != zero_)
+                                    sc32 = ((kh_ & fx.Int32(0xFFFF)) << 16) | ((kl_ >> 16) & fx.Int32(0xFFFF))
+                                    bits = sc32 ^ (sc32 < zero_).select(fx.Int32(-0x80000000), fx.Int32(-1))
+                                    val = force(bits.bitcast(fx.Float32), blk_, real, m_start)
+                                    # the candidate's page, read now (in flight during the merge) and carried with the key,
+                                    # so the emit has no dependent table read after the merge
+                                    if const_expr(owner_fast):
+                                        # the candidate's page, read now (in flight during the merge); the merge carries
+                                        # only the candidate's slot (lane + 32 c), and the winner's page is picked from
+                                        # the slot afterwards, so the merge does not wait for the read
+                                        pgs.append(real.select(fx.Int32(btab[real.select(blk_, zero_)]), zero_))
+                                    cand.append((*pack(val, blk_ + 1, real), lane + fx.Int32(32 * c)))
+                                # every sender's 16 keys come sorted (AQ's bitonic list, production's tl.topk) and the
+                                # re-pinning is idempotent, so the registers are bitonic: lanes 0-15 non-increasing,
+                                # 16-31 non-decreasing. Checked; if not, the full sort.
+                                bad_b = zero_
+                                for c in range_constexpr(2):
+                                    ck_b = k64(cand[c][0], cand[c][1])
+                                    nk_b = k64(fx.Int32(gpu.shuffle_down(cand[c][0], 1, WAVE)),
+                                               fx.Int32(gpu.shuffle_down(cand[c][1], 1, WAVE)))
+                                    ok_b = (((lane & 15) == 15) | ((lane < 16) & (ck_b >= nk_b))
+                                            | ((lane >= 16) & (ck_b <= nk_b)))
+                                    bad_b = bad_b | fx.Int32(rocdl.ballot(T.i32, ok_b == fx.Boolean(False)))
+                                m_hi = zero_
+                                m_lo = zero_
+                                m_pg = zero_
+                                if bad_b == zero_:
+                                    m_hi, m_lo, m_pg = merge16(*sort16([cx(cand[0], 16, nbit_b[16]),
+                                                                        cx(cand[1], 16, nbit_b[16])], [True, False]), True)
+                                else:
+                                    m_hi, m_lo, m_pg = merge16(*top16(cand, [True, False]), True)
                             stamp(7, 0)
                             # ---- indices + the NVFP4 page-128 table row (_emit_sparse_block_table_row, a page a block)
                             nsel = (valid_blocks < topk).select(valid_blocks, fx.Int32(topk))
@@ -1262,7 +1395,11 @@ def launch_aq1(
                             has_tail = fx.Int32(rocdl.ballot(T.i32, is_tail)) != zero_
                             earlier = fx.Int32(fx.math.ctpop(full_m & lane_lt))
                             bslot = is_full.select(earlier, n_full)
-                            if const_expr(owner_fast):
+                            if const_expr(owner_v2):
+                                pt_ = Vec(fx.ptr_load(_lds_i32(lst_u8, PT_OFF + bvalid.select(tidx, zero_) * 4, 1),
+                                                      result_type=fx.Vector.make_type(1, fx.Int32)))
+                                page = bvalid.select(fx.Int32(pt_[0]), zero_)
+                            elif const_expr(owner_fast):
                                 # btab[tidx]: the winner's candidate slot m_pg -> lane m_pg % 32 of register m_pg / 32
                                 sl_ = m_pg & fx.Int32(31)
                                 pg_w = (m_pg >= fx.Int32(32)).select(fx.Int32(gpu.shuffle_idx(pgs[1], sl_, WAVE)),

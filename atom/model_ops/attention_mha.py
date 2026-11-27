@@ -45,6 +45,33 @@ def claim_qkv_splitk_partials(qkv: torch.Tensor | None) -> torch.Tensor | None:
     return splitk_partials(qkv)
 
 
+# AQ launches recorded in the tuned QKV GEMM's K order (`qkv_production_k_order`).
+AQ_STATS = {"aq_k_chain": 0}
+# The first layer's QKV on AQ in the tuned GEMM's K order (aq0). Read at each call (a graph recording keeps what it
+# ran); off: the QKV linear on the same MXFP8 input, i.e. production's quantize_fp8 + GEMM.
+AQ_K_CHAIN = True
+_K_CHAIN_LOGGED: set = set()
+
+
+def _k_chain_refused(why: str) -> None:
+    """Log once why the first layer's QKV did not take AQ in the GEMM's K order."""
+    if why not in _K_CHAIN_LOGGED:
+        _K_CHAIN_LOGGED.add(why)
+        import logging
+
+        logging.getLogger("atom").info("first-layer QKV on AQ (K order): not taken: %s", why)
+
+
+@cache
+def _aq_takes_k_chain() -> bool:
+    """Whether aiter's AQ can sum the QKV GEMM's K in the tuned GEMM's order."""
+    try:
+        from atom.models.minimax_m3.mono.gfx1250.aq import flydsl_aq1
+    except ImportError:
+        return False
+    return "k_chain" in inspect.signature(flydsl_aq1).parameters
+
+
 @cache
 def aiter_qknorm_takes_dense_layers() -> bool:
     """Whether aiter fused_qknorm_idxrqknorm inserts a layer without index heads
@@ -1696,6 +1723,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             and qkv.dtype == torch.float8_e4m3fn
         )
         self._fused_x_scale = q_scale if fused else None
+        if getattr(self, "qkv_production_k_order", False) and not fused:
+            _k_chain_refused(
+                f"the attention got no MXFP8 QKV input (qkv "
+                f"{None if qkv is None else qkv.dtype}, chain linear "
+                f"{self.fused_qkv_linear is not None})"
+            )
         if fused:
             if q_scale is None:
                 raise RuntimeError(
@@ -1812,6 +1845,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self._aq1_scores = None
         linear = self.fused_qkv_linear[0]
         num_tokens = x.shape[0]
+        if getattr(self, "qkv_production_k_order", False):
+            conds = {
+                "kv_nvfp4": bool(self.kv_nvfp4),
+                "index_scale": self.index_scale is not None,
+                "index_topk": not self.skip_index_topk,
+                "x_scale_dtype": x_scale.dtype in (torch.float8_e8m0fnu, torch.uint8),
+                "w_dtype": linear.weight.dtype == torch.float8_e4m3fn,
+                "w_shuffled": bool(getattr(linear.weight, "is_shuffled", False)),
+                "w_rows1": getattr(linear, "native_a8_group_rows", None) == 1,
+            }
+            bad = [k for k, v in conds.items() if not v]
+            if bad:
+                _k_chain_refused(f"preconditions {bad}")
         if not (
             self.kv_nvfp4
             and self.index_scale is not None
@@ -1846,7 +1892,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         index_q = torch.empty(
             (num_tokens, self.index_q_size), dtype=torch.bfloat16, device=x.device
         )
+        # A layer whose QKV production is the separate MXFP8 GEMM (the first
+        # layer) keeps that GEMM's K order: only AQ in that order takes it, and
+        # anything else returns to the QKV linear (`None`).
+        k_chain = getattr(self, "qkv_production_k_order", False)
+        if k_chain and not AQ_K_CHAIN:
+            return None
         aq1 = self._aq1_decode(num_tokens)
+        if k_chain and (aq1 is None or not _aq_takes_k_chain()):
+            _k_chain_refused(f"aq1 {'none' if aq1 is None else 'ok'} ({num_tokens} rows), "
+                             f"aiter k_chain {_aq_takes_k_chain()}")
+            return None
         if aq1 is not None:
             # One request's decode step under the indexer CP: the chain and this
             # rank's index scores in one launch (aiter flydsl_aq1, the same bytes);
@@ -1857,6 +1913,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             # full AQ: the candidate exchange in the same launch (its selection
             # replaces the scores)
             exchange = self._aq_exchange(num_tokens, max_seq_len, x.device)
+            if k_chain and exchange is None:
+                _k_chain_refused(f"no exchange ({num_tokens} rows)")
+                return None
+            if k_chain:
+                AQ_STATS["aq_k_chain"] += 1
             scores = None
             if exchange is None:
                 blocks = -(-max_seq_len // 128)
@@ -1898,6 +1959,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 sm_scale=self.scale,
                 scores=scores,
                 exchange=exchange,
+                **({"k_chain": True} if k_chain else {}),
             )
             self._aq1_scores = (
                 index_q.data_ptr(),

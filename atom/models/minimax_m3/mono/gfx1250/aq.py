@@ -43,6 +43,11 @@ RING_AQ1 = 4  # AQ1 (no exchange) keeps its depth
 # 2 = the previous split (RING), for the one-server A/B
 SC_GROUPS = 3
 RING_S3 = 4
+# the owner's merge (11-27, MONO): 1 = each shard's 16 keys merged into the running top-16 as soon as they arrive (the
+# last shard's merge is the only one after the last arrival) and the winners' pages read from the request's block
+# table, staged in LDS while the scores are computed; 0 = all four shards polled, then decoded and merged, pages read
+# from global memory (the previous order, for the one-server A/B). Same top-16 (a total order), same bytes.
+OWNER_V2 = 1
 MAXIT = 20_000_000
 _SCRATCH: dict = {}
 
@@ -116,9 +121,14 @@ def flydsl_aq1(
     index_cache, index_scale, q_out, index_q_out, eps, *,
     num_index_heads, block_table, seq_lens, max_seq_len, rank, world, max_query_len, sm_scale, scores,
     n_score: int | None = None, maxit: int = MAXIT, scratch=None, timeline=None, exchange=None,
+    k_chain: bool = False,
 ):  # fmt: skip
     """One AQ1 launch. Arguments as ``mxfp8_qkv_norm_rope_nvfp4_insert`` + ``cp_scores_fp4`` (``scores``: fp32
-    [heads, tokens, ceil(blocks / world)], slots past the live blocks left unwritten)."""
+    [heads, tokens, ceil(blocks / world)], slots past the live blocks left unwritten).
+
+    ``k_chain``: the QKV GEMM in the tuned ``gemm_a8w8 ..._sk4_fsk``'s K order (each K split one WMMA chain from
+    zero, splits summed in split order) instead of the fused chain's (its K-waves summed in wave order): the bytes of
+    a layer whose QKV production runs that GEMM."""
     import flydsl.expr as fx
 
     from .kernels.aq import launch_aq1
@@ -163,7 +173,8 @@ def flydsl_aq1(
             int(timeline is not None), int(xchg),
             *((exchange["topk"], exchange["init_blocks"], exchange["local_keep"], exchange["max_rows"], LOCAL_MAX,
                exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)), IPF_KIB if xchg else 0,
-            OWNER_FAST, int(MERGE_PAR) if xchg else 0, int(SC_GROUPS) if xchg else 2)
+            OWNER_FAST, int(MERGE_PAR) if xchg else 0, int(SC_GROUPS) if xchg else 2,
+            int(OWNER_V2) if xchg and OWNER_FAST else 0, int(bool(k_chain)))
     _run_compiled(
         launch_aq1,
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),

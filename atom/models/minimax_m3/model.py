@@ -32,6 +32,7 @@ from atom.model_ops.base_attention import (
     _flydsl_explicit_plan_api,
     _flydsl_output_quant_api,
 )
+from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
@@ -1914,6 +1915,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            if (
+                getattr(self.self_attn, "qkv_production_k_order", False)
+                and getattr(self.self_attn, "fused_qkv_chain", False)
+                and _linear_consumes_mxfp8(self.self_attn.qkv_proj)
+            ):
+                # The first layer's QKV on the attention's MXFP8 seam: its input
+                # quantized here with the QKV linear's own quant (the same bits).
+                # The attention runs it in AQ with the QKV GEMM's own K order, or
+                # else runs the QKV linear on it, as production does.
+                hidden_states, hidden_states_scale = quantize_fp8(hidden_states)
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
@@ -2004,6 +2015,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+            if (
+                getattr(self.self_attn, "qkv_production_k_order", False)
+                and getattr(self.self_attn, "fused_qkv_chain", False)
+                and _linear_consumes_mxfp8(self.self_attn.qkv_proj)
+            ):
+                # as in forward: the first layer's QKV on the attention's MXFP8 seam
+                hidden_states, hidden_states_scale = quantize_fp8(hidden_states)
         elif mxfp8 and _linear_consumes_mxfp8(self.self_attn.qkv_proj):
             hidden_states, hidden_states_scale, residual = (
                 sp_fused_allreduce_gemma_rms_norm_mxfp8_quant(
@@ -2200,6 +2218,21 @@ class MiniMaxM3Model(nn.Module):
         for idx in range(self.start_layer, self.end_layer - 1):
             if isinstance(self.layers[idx], MiniMaxM3DecoderLayer):
                 self.layers[idx]._next_layer = weakref.ref(self.layers[idx + 1])
+        # The first layer's QKV runs the separate MXFP8 QKV GEMM (its input is the
+        # embedding's norm, not a fused all-reduce norm): where AQ takes it, AQ must
+        # sum K in that GEMM's order (`_fused_qkv_chain`).
+        first = self.layers[self.start_layer] if get_pp_group().is_first_rank else None
+        impl = getattr(getattr(getattr(first, "self_attn", None), "attn", None), "impl", None)
+        if impl is not None:
+            # the decoder layer reads the flag off its attention module, the impl off itself
+            first.self_attn.qkv_production_k_order = True
+            impl.qkv_production_k_order = True
+            logging.getLogger("atom").info(
+                "MiniMax-M3 first layer: QKV in the GEMM's K order on AQ where it takes "
+                "it (fused_qkv_chain %s, MXFP8 QKV %s)",
+                getattr(first.self_attn, "fused_qkv_chain", False),
+                _linear_consumes_mxfp8(first.self_attn.qkv_proj),
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

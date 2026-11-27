@@ -172,11 +172,12 @@ def decode_graph_stats() -> dict[str, int]:
     """`DECODE_GRAPH_STATS` with the embedding lookups (`embed_head.EMBED_STATS`),
     the explicit FlyDSL plan refreshes (`base_attention.FLYDSL_PLAN_STATS`) and
     `STEP_STATS`."""
+    from atom.model_ops.attention_mha import AQ_STATS
     from atom.model_ops.base_attention import FLYDSL_PLAN_STATS
     from atom.model_ops.embed_head import EMBED_STATS
 
     plan = {f"plan_{k}": v for k, v in FLYDSL_PLAN_STATS.items()}
-    return {**DECODE_GRAPH_STATS, **EMBED_STATS, **plan, **STEP_STATS, **host_nl.STATS}
+    return {**DECODE_GRAPH_STATS, **EMBED_STATS, **plan, **AQ_STATS, **STEP_STATS, **host_nl.STATS}
 
 
 def _greedy_no_noise() -> bool:
