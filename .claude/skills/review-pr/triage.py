@@ -1534,6 +1534,39 @@ def derive(files, title="", raw_diff=""):
                  raw_diff or ""):
         hit("self-described-workaround", "N6")
 
+    # N7 -- a mode/model/switch-specific attribute added to a common engine object.
+    # Anchored on ATOM#3353 (merged 4cc9fbe7): InputOutputProcessor gained
+    # `self._greedy_ids_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"`, and four unrelated
+    # test doubles had to be patched with `_greedy_ids_only = False`; the next test that
+    # built a processor without __init__ broke non-GPU UT on main with AttributeError.
+    # Two shapes: (a) a boolean of one mode value of one switch stored on a model_engine
+    # object -- plain tunables (`self.x = envs.ATOM_X`) are deliberately not matched, they
+    # are 10 of the 11 env-backed attributes on main; (b) a new private attribute on a
+    # model_engine object patched into two or more existing test files, the leak signal
+    # the PR itself carried.
+    mode_attr = re.compile(r"self\.\w+\s*=\s*envs\.ATOM_\w+\s*(?:==|!=|\bnot in\b|\bin\b)")
+    new_attrs, mode_hit = set(), False
+    for p_, f_ in files.items():
+        if not p_.startswith("atom/model_engine/"):
+            continue
+        for l in f_["add"]:
+            new_attrs.update(re.findall(r"self\.(_\w+)\s*=(?!=)", l))
+            mode_hit |= bool(mode_attr.search(l))
+    # Only test files the PR did not create: a new test for the new feature setting its own
+    # field is the feature's test; an existing, unrelated test double needing the field
+    # patched in is the leak. Measured over the last 40 merged PRs, counting new files too
+    # fired on generic names (`dtype`, `ids`) in 4 of them.
+    created = set(re.findall(r"(?m)^diff --git a/\S+ b/(\S+)\nnew file mode", raw_diff or ""))
+    patched = {}
+    for p_, f_ in files.items():
+        if p_.startswith("tests/") and p_ not in created:
+            body = "\n".join(f_["add"])
+            for a in new_attrs:
+                if re.search(r"(?:\.|\b)" + re.escape(a) + r"\s*=(?!=)", body):
+                    patched.setdefault(a, set()).add(p_)
+    if mode_hit or any(len(v) >= 2 for v in patched.values()):
+        hit("mode-specific-attr-on-common-object", "N7")
+
     # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
@@ -1572,7 +1605,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
 )}
 
 ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 B7 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
-             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8 N1 N2 N3 N4 N5 N6")
+             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8 N1 N2 N3 N4 N5 N6 N7")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
