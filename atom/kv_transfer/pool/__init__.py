@@ -19,7 +19,4 @@ def register_backends(factory) -> None:
         # A block moves between ranks as the bytes of its PAGE regions, whatever
         # they encode, so NVFP4 KV and index pages move as any other page.
         moves_nvfp4_pages=True,
-        # ... and so does a DSpark draft's own pool, whose regions are merged
-        # into the block's: its dtype does not enter either.
-        moves_own_dtype_draft=True,
     )
