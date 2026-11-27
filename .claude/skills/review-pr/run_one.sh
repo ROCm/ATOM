@@ -141,8 +141,28 @@ fail() {  # <class> <exit-code> <message...>
   exit "$code"
 }
 
-# Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
-python3 "$SKILL/check_prompts.py" >/dev/null || fail flow 4 "prompts drifted from SKILL.md -- regenerate the prompt copies (check_prompts.py)"
+# Fail fast if check_prompts.py refuses. Drift is two of its checks; the rest guard the
+# wiring around the review -- the fail classes, the run budget, OWNERS, the runner label,
+# _publish.py's permission closure, the citation gating. Reporting
+# every one of them as "prompts drifted" -- with the output that named the real one sent
+# to /dev/null -- sends the owner to regenerate files that were never the problem. It
+# happened: aiter#8255's review aborted on 2026-11-19 with that message against a tree
+# whose prompts were verbatim-identical to SKILL.md.
+# >>> prompt-gate (selftest extracts and runs this block verbatim)
+_cp_out="$(python3 "$SKILL/check_prompts.py" 2>&1)" || {
+  printf '%s\n' "$_cp_out" >&2
+  # Both greps `|| true`: this script runs under `set -euo pipefail`, where a grep that
+  # matches nothing fails the whole pipeline and takes the assignment -- and the script --
+  # with it. That is the case these lines exist for, so without it the fallback below is
+  # unreachable and the run dies with no classified status at all, which is the failure
+  # this block was written to end.
+  _why="$(printf '%s' "$_cp_out" | grep -m3 '^❌' | tr '\n' ';' | sed 's/;$//' || true)"
+  # A crash before any check prints a traceback and no ❌. If a later crash follows a
+  # reported check failure, keep that ❌ as the reason; otherwise use the last output line.
+  [ -n "$_why" ] || _why="$(printf '%s' "$_cp_out" | grep -v '^$' | tail -1 || true)"
+  fail flow 4 "check_prompts.py refused: ${_why:-no output; run it by hand}"
+}
+# <<< prompt-gate
 
 # GLM health-gate: a review is worthless if the backend is down, and a dead GLM otherwise
 # hangs ~40s per agent call and dies silently mid-review. When a direct endpoint is configured
