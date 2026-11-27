@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025 ATOM Project Contributors
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter import topk_select
@@ -13,7 +13,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.distributed.ulysses_sp import sp_gather_rows, sp_is_enabled
-from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
+from atom.model_ops.lm_head_argmax import lm_head_argmax_pack, lm_head_draw_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -178,17 +178,14 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            # The masked lookup too, over the whole table: a speculative step
+            # can leave the -1 truncation sentinel in `input_ids`, and a raw
+            # F.embedding hands it to index_select, whose bounds assert takes
+            # the rank down (a Kimi-K3 DP8EP8 decode, attention TP1, DSpark).
+            # Only a draft slot can carry it, and verify rejects that draft: an
+            # anchor is the last emitted token or a committed id, never the -1.
+            y = replicated_embedding(x, self.weight)
         return y
-        # if self.tp_size > 1:
-        #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
-        #     # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-        #     x = mask * (x - self.vocab_start_idx)
-        # y = F.embedding(x, self.weight)
-        # if self.tp_size > 1:
-        #     y.masked_fill_(~mask.unsqueeze(1), 0)
-        #     y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
-        # return y
 
 
 class ReplicatedEmbedding(nn.Module):
@@ -235,7 +232,22 @@ def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     return torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)
 
 
+def dp_shards_vocab(tp_size: int, num_embeddings: int) -> bool:
+    """A DP-sharded `ATOM_DP_LM_HEAD_MODE` is on, the head is pure DP (TP 1),
+    and the vocab splits evenly over a DP group of more than one rank."""
+    if envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all", "argmax"):
+        return False
+    if tp_size != 1:
+        return False
+    world = get_dp_group().world_size
+    return world > 1 and num_embeddings % world == 0
+
+
 class ParallelLMHead(VocabParallelEmbedding):
+    # the model's logits are this head of its final rows, so a decode verify
+    # may take its argmax ids instead (``verify_head``); a head whose logits
+    # are not (more than this projection) says False
+    logits_are_head = True
 
     def __init__(
         self,
@@ -252,36 +264,31 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        # Static, read on every forward (`_can_use_dp_sharded_head`).
+        self.dp_shards_vocab = not is_plugin_mode() and dp_shards_vocab(
+            self.tp_size, self.num_embeddings
+        )
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
             forward_context: ForwardContext = get_forward_context()
             context = forward_context.context
             attn_metadata = forward_context.attn_metadata
-            # context = get_context()
             if context.is_prefill and not context.is_draft:
-                # The scheduled requests' last tokens only: a padding request
-                # has none.
-                bs = context.scheduled_bs
-                last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
-                # Under Ulysses SP, x is this rank's token shard.
-                x = sp_gather_rows(x, last_indices)
+                if attn_metadata.is_mixed:
+                    x = x[attn_metadata.sampled_token_indices].contiguous()
+                else:
+                    # The scheduled requests' last tokens only: a padding
+                    # request has none.
+                    bs = context.scheduled_bs
+                    last_indices = attn_metadata.cu_seqlens_q[1 : bs + 1] - 1
+                    # Under Ulysses SP, x is this rank's token shard.
+                    x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
             if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
-        logits = tgemm.mm(x, self.weight, self.bias)
-        if self.tp_size > 1:
-            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-            logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
-            # all_logits = (
-            #     [torch.empty_like(logits) for _ in range(self.tp_size)]
-            #     if self.tp_rank == 0
-            #     else None
-            # )
-            # dist.gather(logits, all_logits, 0)
-            # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
-        return logits
+        return self.gather_logits(self.local_logits(x))
 
     def compute_argmax_token(
         self, x: torch.Tensor, *, out: torch.Tensor
@@ -328,7 +335,23 @@ class ParallelLMHead(VocabParallelEmbedding):
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
-        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        return self.argmax_of_logits(self.local_logits(x), out=out)
+
+    def local_logits(self, x: torch.Tensor, out: torch.Tensor | None = None):
+        """``x``'s logits over this rank's vocab shard [N, vocab/tp] (into
+        ``out`` where given)."""
+        return tgemm.mm(x, self.weight, self.bias, out=out)
+
+    def argmax_of_logits(self, logits: torch.Tensor, *, out: torch.Tensor, draw=None):
+        """``compute_argmax_token`` from this rank's logits [N, vocab/tp] (its
+        vocab shard's, the TP path's) -> ``out``; ``draw``
+        (``verify_ids.HeadDraw``): its drawing rows' draws instead, the same on
+        every rank."""
+        if draw is not None:
+            packed = lm_head_draw_pack(
+                logits, self.vocab_start_idx, draw, self.num_embeddings
+            )
+            return out.copy_(self._best_of_ranks(packed))
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
@@ -339,6 +362,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
+        return out.copy_(self._best_of_ranks(packed))
+
+    def _best_of_ranks(self, packed: torch.Tensor) -> torch.Tensor:
+        """The ids [N] (fp32) of the ranks' packed bests [N, 2] (value, id)."""
+        if self.tp_size <= 1:
+            return packed[:, 1]
         # Custom, like the logits path above: `graph_capture()` arms only that
         # one, and a draft pass records this. The RCCL path is what made the
         # head un-capturable on HIP at TP > 1.
@@ -346,8 +375,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         gathered = get_tp_group().all_gather(packed, dim=0, use_custom=use_custom)
         gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
-        token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return out.copy_(token)
+        return gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)
+
+    def gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """The full logits from this rank's [N, vocab/tp] (``forward``'s TP
+        path: one all-gather)."""
+        if self.tp_size <= 1:
+            return logits
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        return tensor_model_parallel_all_gather(logits, use_custom=use_custom)
 
     def _vocab_shard_logits(
         self, x: torch.Tensor, rank: int, world: int
@@ -368,7 +404,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         return group.device_communicator.all_gather(shard, -1)
 
     # ------------------------------------------------------------------
-    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
+    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all, or greedy ids
+    # under ATOM_DP_LM_HEAD_MODE=argmax).
     #
     # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
     # (pure DP) and the DP group is size > 1. The lm_head weight is currently
@@ -381,22 +418,15 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
         Every DP rank must reach the SAME verdict from globally-synced state, or
-        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
-        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The exchange
+        (all-gather, all2all or greedy ids) is ATOM_DP_LM_HEAD_MODE's there.
 
         `is_prefill` below is per-rank, which is safe only because
         `running_tokens_are_unified` is the DP-reduced form of the same
         question: a prefilling peer drives it False on every rank, so no rank
         can answer True here while another answers False.
         """
-        dp_group = get_dp_group()
-        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
-        if (
-            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
-            or self.tp_size != 1
-            or dp_group.world_size <= 1
-            or self.num_embeddings % dp_group.world_size != 0
-        ):
+        if not self.dp_shards_vocab:
             return False
         # Per-step: all ranks at one height. `is_draft` is its own question,
         # not shorthand for the flag below -- a drafter states uniformity per
@@ -420,7 +450,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         - ``"argmax"``: reduce each shard to a packed ``(max, global_id)`` and
           all-gather only ``[Σrows, 2]``, then pick the winner -> ``[local_rows]``
-          ids, still packed as fp32 (drafting; the caller narrows into its own).
+          ids, still packed as fp32 (drafting, or the decode head under
+          ``ATOM_DP_LM_HEAD_MODE=argmax``; the caller narrows into its own).
         - ``"all2all"`` / ``"allgather"``: exchange full-vocab logits ->
           ``[local_rows, vocab]`` (the decode head).
         """

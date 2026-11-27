@@ -259,6 +259,27 @@ def test_bind_qsa_caches_uses_explicit_layer_mapping(model_type, pool_layer):
     assert model._atom_qwen4_exp_qsa_bound is True
 
 
+def test_qsa_side_caches_include_kv_padding_page():
+    layer = _QsaLayer(layer_num=48)
+    model = SimpleNamespace(
+        modules=lambda: [layer], parameters=lambda: iter([torch.zeros(1)])
+    )
+    pool = _Pool(layers=1)
+    pool._bufs[0] = (torch.zeros(128, 2, 4), torch.zeros(128, 2, 4))
+    fb = SimpleNamespace(token_to_kv_pool=pool, page_size=64)
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            model_type="qwen4_exp_mtp", indexer_compress_ratio=4, indexer_head_dim=8
+        )
+    )
+    bind_qsa_caches(model, fb, config)
+    k, v, raw, compressed = layer.bound
+    assert k.shape[0] == v.shape[0] == raw.shape[0] == compressed.shape[0] == 2
+    # The last physical page remains addressable despite pool.size == 64.
+    raw[1].fill_(7)
+    assert raw[1].min() == 7
+
+
 def test_target_qsa_missing_layer_does_not_fall_back_to_zero():
     layer = _QsaLayer(layer_num=48)
     model = SimpleNamespace(

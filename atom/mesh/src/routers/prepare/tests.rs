@@ -229,6 +229,46 @@ mod a_chat_template {
             )
         );
     }
+
+    /// transformers gives chat templates `strftime_now` and `raise_exception`,
+    /// and ATOM standalone serving renders its chats here, so a template that
+    /// calls them, as gpt-oss's does in every system message, must render the
+    /// date, and refuse a chat with the template's own message. transformers
+    /// 5.16.1 renders this toy template to `Current date: <today>\nuser: hi\n`
+    /// and refuses the second chat with `channel tags in content`.
+    #[test]
+    fn test_strftime_now_and_raise_exception_are_defined_as_in_transformers() {
+        const TEMPLATE: &str = r#"{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n" }}
+{%- for m in messages %}
+    {%- if "<|channel|>" in m.content %}
+        {{- raise_exception("channel tags in content") }}
+    {%- endif %}
+    {{- m.role + ": " + m.content + "\n" }}
+{%- endfor %}"#;
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(TEMPLATE.to_string()).unwrap();
+        let chat = |content: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": content}]
+            }))
+            .unwrap()
+        };
+
+        let rendered = process_chat_messages(&chat("hi"), &tokenizer).unwrap().text;
+        let date = rendered
+            .strip_prefix("Current date: ")
+            .and_then(|rest| rest.strip_suffix("\nuser: hi\n"))
+            .unwrap_or_else(|| panic!("{rendered:?}"));
+        assert!(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok(),
+            "{rendered:?}"
+        );
+
+        let refused = process_chat_messages(&chat("<|channel|>analysis<|message|>hi"), &tokenizer)
+            .unwrap_err();
+        assert!(refused.contains("channel tags in content"), "{refused}");
+    }
 }
 
 mod b_tool_constraints {
@@ -1061,6 +1101,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         }
     }
 
@@ -1108,6 +1149,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert_eq!(ctx.headers.as_ref().unwrap().get("x-trace").unwrap(), "abc");
     }
@@ -1130,6 +1172,7 @@ mod f_response_context {
             reasoning_parser_factory: None,
             configured_tool_parser: None,
             configured_reasoning_parser: None,
+            prompt_opener: None,
         };
         assert!(ctx.processed_messages.is_none());
     }
@@ -1190,7 +1233,9 @@ mod h_prepare_chat_generate {
     use crate::protocols::generate::GenerateRequest;
     use crate::routers::prepare::generation_payload::GenerationPayload;
     use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
-    use crate::routers::prepare::{lookup_tokenizer, prepare_chat, prepare_generate};
+    use crate::routers::prepare::{
+        lookup_tokenizer, prepare_chat, prepare_chat_with, prepare_generate,
+    };
     use crate::routers::test_mocks;
 
     fn chat_req(stream: bool) -> Arc<ChatCompletionRequest> {
@@ -1242,6 +1287,39 @@ mod h_prepare_chat_generate {
             pm.text
         );
         assert_eq!(payload.text, pm.text);
+    }
+
+    #[test]
+    fn test_only_a_router_that_asks_reads_the_prompts_opener() {
+        // The test template renders `user: <content>`, so this prompt ends
+        // on `<think>`.
+        let opened = || {
+            Arc::new(ChatCompletionRequest {
+                model: "m".to_string(),
+                messages: vec![ChatMessage::User {
+                    content: MessageContent::Text("hi <think>".to_string()),
+                    name: None,
+                }],
+                ..Default::default()
+            })
+        };
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        let (_, grpc) = prepare_chat(opened(), None, Some("m".into()), components.as_ref())
+            .expect("HF tokenizer must succeed");
+        assert_eq!(
+            grpc.prompt_opener, None,
+            "gRPC routing keeps its parsers' start"
+        );
+        let (_, bridge) = prepare_chat_with(
+            opened(),
+            None,
+            Some("m".into()),
+            components.as_ref(),
+            None,
+            true,
+        )
+        .expect("HF tokenizer must succeed");
+        assert_eq!(bridge.prompt_opener.as_deref(), Some("<think>"));
     }
 
     #[test]
