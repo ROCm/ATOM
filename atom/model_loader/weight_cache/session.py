@@ -171,7 +171,7 @@ def serve_notices(stop, use) -> None:
         stop(True)
         why = None
     except Exception as e:  # noqa: BLE001 - told to whoever asks for a load
-        why = str(e)
+        why = str(e) or repr(e)
     use(False)
     with contextlib.suppress(OSError):  # the daemon may have gone
         _send(_control, {"serves": True, "rewrite": why})
@@ -213,6 +213,9 @@ def weights_status() -> dict | None:
     return {
         "model_path": state.get("model"),
         "stopped": bool(said.get("stopped")),
+        # A server could not go on with the weights as loaded and is stopped:
+        # a load of that checkpoint has it try again.
+        "server_not_resumed": bool(said.get("unfollowed")),
         "servers": said.get("clients"),
         "daemon_pid": state.get("daemon_pid"),
     }
@@ -237,7 +240,7 @@ def _listen(conn: socket.socket, stop, use) -> None:
                 owed = False
             why = None
         except Exception as e:  # noqa: BLE001 - told to the daemon
-            why = str(e)
+            why = str(e) or repr(e)  # never empty: that reads as done
         logger.info(
             f"{_TAG} the daemon's weights are "
             f"{'stopped' if told['event'] == 'stop' else 'to be used'}"

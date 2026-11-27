@@ -158,7 +158,7 @@ def test_stopped_weights_hold_the_engine_until_they_are_in_use_again():
     # weights, and it recomputes its context.
     _run(engine, WEIGHTS_STOPPED_CMD, {}, runners)
     _run(engine, WEIGHTS_IN_USE_CMD, {"changed": True}, runners)
-    assert asked[-1] == ("weights_changed", ())
+    assert asked[-1] == ("weights_changed", ()) and not engine._generation_paused
     batch, active = sched.schedule()
     assert batch.total_seqs_num_prefill == 2
     assert sorted(active) == sorted(seq.id for seq in seqs)

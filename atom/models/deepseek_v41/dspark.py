@@ -373,26 +373,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
             )
             dist.all_reduce(row, group=get_tp_group().device_group)
         else:
-            row = embed(ids)
+            row = embed.weight[ids]  # not its forward: this runs outside one too
         return row.flatten()
 
-    @torch.inference_mode()  # they were made in a forward: written only there
+    @torch.inference_mode()  # the row was made in a forward: written only there
     def refresh_derived_weights(self) -> None:
-        """What the first draft steps made of the weights and kept (the noise
-        row, `_context_kv_fusion`, `_draft_kv_tail_fusion`), made again of the
-        weights as they are now and written where it is: a recorded graph or
-        a mono launch may hold its address."""
+        """What the first draft steps made of the weights and kept, of the
+        weights as they are now: the noise row where it is (a recorded graph
+        may hold its address); the context `wkv` fusion and the tail norms are
+        made again by the next step, which reads them eagerly."""
         if self._noise_row is not None:
             self._noise_row.copy_(self._read_noise_row())
-        layers = self.context_layers
-        fused = self.__dict__.get("_context_kv_fused")
-        if fused:
-            shards = [a.wkv_shard for a in layers]
-            fused[0].copy_(torch.cat([s.weight for s in shards]))
-            fused[1].copy_(torch.cat([s.weight_scale for s in shards]))
-        tail = self.__dict__.get("_draft_kv_tail")
-        if tail:
-            tail[0].copy_(torch.stack([a.kv_norm.weight for a in layers]))
+        self.__dict__.pop("_context_kv_fused", None)
+        self.__dict__.pop("_draft_kv_tail", None)
 
     def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an

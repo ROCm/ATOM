@@ -3523,7 +3523,9 @@ class ModelRunner:
         """Return once everything this rank sent to its device has run: a
         weight cache daemon's `stop` waits for it. ``rewrite``: the weights it
         maps are about to hold other values; raises where mono kernels may
-        run, which keep copies of them (``_takes_weight_updates``)."""
+        run, which keep copies of them (``_takes_weight_updates``), and under
+        pipeline parallelism, whose later stages neither stop with the first
+        one nor refresh before it goes on."""
         mono = self.config.hf_config.architectures[0] in mono_decode_installers
         mono = mono or type(self.verify_head).__module__.startswith("atom.mono")
         if rewrite and mono and envs.ATOM_MONO_ENABLE:
@@ -3531,6 +3533,8 @@ class ModelRunner:
                 "mono kernels may keep copies of the weights (ATOM_MONO_ENABLE=0 "
                 "serves without them)"
             )
+        if rewrite and self.config.pipeline_parallel_size > 1:
+            raise RuntimeError("pipeline stages do not stop and go on together")
         torch.cuda.synchronize(self.device)
 
     @torch.inference_mode()  # what a forward made is written only there

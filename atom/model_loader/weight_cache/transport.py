@@ -480,6 +480,7 @@ class _Server:
                 with self._lock:
                     clients, idle_s = dict(self.clients), self._idle_for()
                     gpus, stopped = list(self.holders), self.stopped
+                    unfollowed = self.unfollowed
                 poisoned = {}
                 for gpu in gpus:
                     with contextlib.suppress(Exception):
@@ -491,6 +492,7 @@ class _Server:
                         "idle_s": idle_s,
                         "poisoned": poisoned,
                         "stopped": stopped,
+                        "unfollowed": unfollowed,
                     },
                 )
                 return

@@ -2320,6 +2320,7 @@ def test_stop_and_load_reach_the_servers_that_have_the_weights(cache_dir, monkey
         assert session.weights_status() == {
             "model_path": None,
             "stopped": True,
+            "server_not_resumed": False,
             "servers": 0,
             "daemon_pid": None,
         }
@@ -2352,7 +2353,9 @@ def test_a_server_that_could_not_go_on_with_other_weights_is_told_again(
         _wait_for(lambda: not d.server.cannot_stop(), 5)
         assert d.server.stop() == []
         assert "kept the old ones" in d.server.resume(changed=True)[0]
-        assert d.server.unfollowed
+        # Not stopped for others, and `status` says one server is.
+        status = session.weights_status()
+        assert not status["stopped"] and status["server_not_resumed"]
         # Whatever the next `use` says, its engines hear that they changed.
         assert d.server.resume(changed=False) == [] and not d.server.unfollowed
         assert told[-2:] == [True, True]
@@ -2524,7 +2527,6 @@ def test_stopped_weights_no_server_has_are_not_kept(one_gpu_daemon):
 def test_a_runner_has_its_modules_derive_again_what_they_made_of_the_weights(
     monkeypatch,
 ):
-    runner = gpu_stack_import("atom.model_engine.model_runner").ModelRunner
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     done = []
 
@@ -2534,63 +2536,54 @@ def test_a_runner_has_its_modules_derive_again_what_they_made_of_the_weights(
 
     model, draft = nn.Sequential(Keeps(), nn.Linear(1, 1)), Keeps()
     rank = SimpleNamespace(model=model, drafter=SimpleNamespace(model=draft), device=0)
-    runner.weights_changed(rank)
-    assert done == [model[0], draft]
-    del rank.drafter  # a launch without one
-    runner.weights_changed(rank)
-    assert done[2:] == [model[0]]
+    with atom_without_aiter() as load_module:
+        runner = load_module("atom.model_engine.model_runner").ModelRunner
+        runner.weights_changed(rank)
+        assert done == [model[0], draft]
+        del rank.drafter  # a launch without one
+        runner.weights_changed(rank)
+        assert done[2:] == [model[0]]
+        # Pipeline stages neither stop nor go on together: no other weights
+        # under them, though they take a stop.
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["x"]), pipeline_parallel_size=2
+        )
+        staged = SimpleNamespace(config=config, verify_head=None, device=0)
+        with pytest.raises(RuntimeError, match="pipeline stages"):
+            runner.await_forwards(staged, True)
+        runner.await_forwards(staged)
 
 
 def test_v41_dspark_derives_again_what_its_first_draft_steps_kept():
-    dspark = gpu_stack_import("atom.models.deepseek_v41.dspark").DeepseekV41DSpark
-
-    def stage(v):
-        shard = SimpleNamespace(
-            weight=torch.full((2, 4), v), weight_scale=torch.full((1, 1), v)
-        )
-        norm = SimpleNamespace(weight=torch.full((4,), v))
-        return SimpleNamespace(wkv_shard=shard, kv_norm=norm)
-
-    layers = [stage(1.0), stage(2.0)]
-    with torch.inference_mode():  # as a draft step makes them
-        fused = (torch.zeros(4, 4), torch.zeros(2, 1), 16, 4)
-        tail, row = (torch.zeros(2, 4), 1e-6), torch.zeros(3)
+    with torch.inference_mode():  # as a draft step makes it
+        row = torch.zeros(3)
     draft = SimpleNamespace(
-        context_layers=layers,
-        _context_kv_fused=fused,
-        _draft_kv_tail=tail,
+        _context_kv_fused=("fused",),
+        _draft_kv_tail=("tail",),
         _noise_row=row,
         _read_noise_row=lambda: torch.ones(3),
     )
-    dspark.refresh_derived_weights(draft)
-    # The tensors a recorded graph may hold the addresses of, with other values.
-    assert draft._context_kv_fused is fused and draft._noise_row is row
-    assert fused[0][:, 0].tolist() == [1, 1, 2, 2]
-    assert fused[1].flatten().tolist() == [1, 2]
-    assert tail[0][:, 0].tolist() == [1, 2] and row.tolist() == [1, 1, 1]
-    # Nothing kept yet (no draft step so far, or a model it does not fuse for).
-    idle = SimpleNamespace(
-        context_layers=layers, _context_kv_fused=None, _noise_row=None
-    )
-    dspark.refresh_derived_weights(idle)
+    with atom_without_aiter() as load_module:
+        dspark = load_module("atom.models.deepseek_v41.dspark").DeepseekV41DSpark
+        dspark.refresh_derived_weights(draft)
+        # The row a recorded graph may hold the address of, with other values;
+        # the next step makes the fusions again.
+        assert draft._noise_row is row and row.tolist() == [1, 1, 1]
+        assert not hasattr(draft, "_context_kv_fused")
+        assert not hasattr(draft, "_draft_kv_tail")
+        # Nothing kept yet: no draft step so far.
+        dspark.refresh_derived_weights(SimpleNamespace(_noise_row=None))
 
 
 def test_v41_dspark_reads_the_noise_row_where_the_table_is(monkeypatch):
-    mod = gpu_stack_import("atom.models.deepseek_v41.dspark")
-    read = mod.DeepseekV41DSpark._read_noise_row
     table = torch.arange(12.0).reshape(4, 3)
     config = SimpleNamespace(dspark_noise_token_id=2)
-    # One rank holds the whole table.
-    whole = nn.Embedding.from_pretrained(table)
-    draft = SimpleNamespace(embed=whole, config=config, _embed_peer=None)
-    assert read(draft).tolist() == [6, 7, 8]
-    # Its owner ranks' shards, mapped.
-    draft._embed_peer = lambda ids, out: table[ids] + 1
-    assert read(draft).tolist() == [7, 8, 9]
 
-    # A sharded table without the mapping: this rank's rows, summed over the
-    # ranks of the TP group.
-    class Sharded(nn.Embedding):
+    class Table(nn.Embedding):
+        def forward(self, ids):  # it is read outside a forward too
+            raise AssertionError("looked up through its forward")
+
+    class Sharded(Table):
         tp_size, vocab_start_idx, vocab_end_idx = 2, 2, 4
 
     seen = []
@@ -2599,13 +2592,26 @@ def test_v41_dspark_reads_the_noise_row_where_the_table_is(monkeypatch):
         seen.append((lo, hi))
         return weight[ids - lo]
 
-    monkeypatch.setattr(mod, "VocabParallelEmbedding", Sharded)
-    monkeypatch.setattr(mod, "masked_embedding", masked)
-    monkeypatch.setattr(mod, "get_tp_group", lambda: SimpleNamespace(device_group=1))
-    monkeypatch.setattr(mod.dist, "all_reduce", lambda row, group: row.add_(group))
-    shard = Sharded.from_pretrained(table[2:])
-    draft = SimpleNamespace(embed=shard, config=config, _embed_peer=None)
-    assert read(draft).tolist() == [7, 8, 9] and seen == [(2, 4)]
+    with atom_without_aiter() as load_module:
+        mod = load_module("atom.models.deepseek_v41.dspark")
+        read = mod.DeepseekV41DSpark._read_noise_row
+        # One rank holds the whole table.
+        whole = Table.from_pretrained(table)
+        draft = SimpleNamespace(embed=whole, config=config, _embed_peer=None)
+        assert read(draft).tolist() == [6, 7, 8]
+        # Its owner ranks' shards, mapped.
+        draft._embed_peer = lambda ids, out: table[ids] + 1
+        assert read(draft).tolist() == [7, 8, 9]
+        # A sharded table without the mapping: this rank's rows, summed over
+        # the ranks of the TP group.
+        tp = SimpleNamespace(device_group=1)
+        monkeypatch.setattr(mod, "VocabParallelEmbedding", Sharded)
+        monkeypatch.setattr(mod, "masked_embedding", masked)
+        monkeypatch.setattr(mod, "get_tp_group", lambda: tp)
+        monkeypatch.setattr(mod.dist, "all_reduce", lambda row, group: row.add_(group))
+        shard = Sharded.from_pretrained(table[2:])
+        draft = SimpleNamespace(embed=shard, config=config, _embed_peer=None)
+        assert read(draft).tolist() == [7, 8, 9] and seen == [(2, 4)]
 
 
 def test_the_command_line_does_not_change_weights(cache_dir):

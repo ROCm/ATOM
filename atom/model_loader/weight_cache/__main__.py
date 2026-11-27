@@ -60,6 +60,8 @@ def _status(launches: dict) -> None:
                         line += ", WEIGHTS MODIFIED by a client (will refuse to serve)"
                     if r.get("stopped"):
                         line += ", STOPPED (a load fills them)"
+                    if r.get("unfollowed"):
+                        line += ", A SERVER COULD NOT GO ON (load the checkpoint again)"
                 except Exception as e:  # noqa: BLE001
                     line += f", not answering ({e})"
             else:
