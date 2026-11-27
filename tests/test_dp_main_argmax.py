@@ -149,7 +149,7 @@ def test_forward_takes_the_modes_exchange(monkeypatch, mode, ctx, dp_meta, expec
     monkeypatch.setattr(
         eh, "get_dp_group", lambda: types.SimpleNamespace(world_size=DP)
     )
-    meta = types.SimpleNamespace(cu_seqlens_q=torch.tensor([0, 1, 2]))
+    meta = types.SimpleNamespace(cu_seqlens_q=torch.tensor([0, 1, 2]), is_mixed=False)
     monkeypatch.setattr(
         eh,
         "get_forward_context",
