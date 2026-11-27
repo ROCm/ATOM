@@ -202,7 +202,7 @@ def launch_aq1(
     n_score: Constexpr[int], tl: Constexpr[int] = 0, xchg: Constexpr[int] = 0, topk: Constexpr[int] = 16,
     init_blocks: Constexpr[int] = 0, local_keep: Constexpr[int] = 0, max_rows: Constexpr[int] = 64,
     local_max: Constexpr[int] = 1024, slot_keys: Constexpr[int] = 64, ipf_kib: Constexpr[int] = 0,
-    owner_fast: Constexpr[int] = 1,
+    owner_fast: Constexpr[int] = 1, merge_par: Constexpr[int] = 0,
 ):  # fmt: skip
     cfg = (tile_m, ns, ks, kw, wm, wn, depth, astage, wcpol, 0)
     err = chain_config_error(tile_m, ns, ks, kw, wm, wn, depth, astage)
@@ -263,6 +263,7 @@ def launch_aq1(
         f"_d{depth}_c{wcpol}"
         f"_h{heads_i}_q{ql}_r{rank_cp}w{world}_g{ring}_s{n_score}{'_tl' if tl else ''}"
         f"{f'_x{topk}i{init_blocks}l{local_keep}m{max_rows}' if xchg else ''}{f'_pf{ipf_kib}' if ipf_kib else ''}{'' if owner_fast else '_ow0'}"
+        f"{'_mp' if merge_par else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -1064,17 +1065,40 @@ def launch_aq1(
                         else:
                             shard_list(1)
                     _lds_barrier()
+                    l16 = lane & 15
+
+                    def lget(lw_b, li_b):
+                        v_ = Vec(fx.ptr_load(_lds_i32(lst_u8, (lw_b * 16 + li_b) * 8, 2),
+                                             result_type=fx.Vector.make_type(2, fx.Int32)))
+                        return fx.Int32(v_[1]), fx.Int32(v_[0])
+
+                    if const_expr(merge_par):
+                        stamp(5, 0)
+                        # the first merge level on waves 0 .. npair-1 at once (wave p: lists 2p, 2p + 1 -> list
+                        # waves + p, descending for even p, ascending for odd p), then wave 0 merges those as before.
+                        # The top-16 under the keys' total order does not depend on the merge tree.
+                        npair = (ntiles > 8).select(fx.Int32(6), fx.Int32(4))
+                        if (ntiles > 4) & (wave < npair):
+                            ap0_b = kmax(lget(2 * wave, l16), lget(2 * wave + 1, 15 - l16))
+                            a_hi = ap0_b[0]
+                            a_lo = ap0_b[1]
+                            if (wave % 2) == zero_:
+                                a_hi, a_lo = sort16([(a_hi, a_lo)], [True])[0]
+                            else:
+                                a_hi, a_lo = sort16([(a_hi, a_lo)], [False])[0]
+                            if lane < 16:
+                                fx.ptr_store(Vec.from_elements([a_lo, a_hi], fx.Int32),
+                                             _lds_i32(lst_u8, ((waves + wave) * 16 + lane) * 8, 2))
+                        _lds_barrier()
                     if wave == 0:
                         # ---- the 12 lists: pairs (list 2p descending, list 2p + 1 reversed) -> 6 -> 3 -> 2 -> 1
-                        stamp(5, 0)
-                        l16 = lane & 15
-
-                        def lget(lw_b, li_b):
-                            v_ = Vec(fx.ptr_load(_lds_i32(lst_u8, (lw_b * 16 + li_b) * 8, 2),
-                                                 result_type=fx.Vector.make_type(2, fx.Int32)))
-                            return fx.Int32(v_[1]), fx.Int32(v_[0])
+                        if const_expr(not merge_par):
+                            stamp(5, 0)
 
                         def pairs(np_b, dirs_b):
+                            if const_expr(merge_par and np_b > 2):
+                                # the pairs' merges are done (lists waves + p, in dirs_b's order)
+                                return [lget(waves + pp_b, l16) for pp_b in range_constexpr(np_b)]
                             return sort16([kmax(lget(2 * pp_b, l16), lget(2 * pp_b + 1, 15 - l16))
                                            for pp_b in range_constexpr(np_b)], dirs_b)
 

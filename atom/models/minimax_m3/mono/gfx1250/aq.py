@@ -30,8 +30,14 @@ IPF_KIB = 0
 # 1: the owner merges the keys its poll read and carries each candidate's page through the merge (no second
 # mailbox read, no table read after the merge). 0: the previous order, kept for the one-server A/B.
 OWNER_FAST = 1
+# the exchange's first list-merge level on several waves (1) or on wave 0 alone (0, the previous order): a module
+# attribute read at each eager / capture call, for the one-server A/B
+MERGE_PAR = 1
 N_SCORE_X = 112  # with the exchange: 368 QKV + 112 score + 32 exchange = 512 workgroups, all co-resident
-RING = 4
+# key-ring slots a score wave: 6 holds a 500K workgroup's 5 blocks a compute group, all issued at entry (4: the
+# previous depth, for the one-server A/B). LDS 124 KB a workgroup at 6, 2 a CU still fit
+RING = 6
+RING_AQ1 = 4  # AQ1 (no exchange) keeps its depth
 MAXIT = 20_000_000
 _SCRATCH: dict = {}
 
@@ -147,11 +153,12 @@ def flydsl_aq1(
     dummy = sc["err"]
     eps_bits = struct.unpack("<i", struct.pack("<f", float(eps)))[0]
     stream = torch.cuda.current_stream(x.device)
-    spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, astage, wcpol, max_query_len, int(rank), int(world), RING, n_score,
+    spec = (tile_m, ns, ks, kw, wm, wn, depth, niq, astage, wcpol, max_query_len, int(rank), int(world),
+            RING if xchg else RING_AQ1, n_score,
             int(timeline is not None), int(xchg),
             *((exchange["topk"], exchange["init_blocks"], exchange["local_keep"], exchange["max_rows"], LOCAL_MAX,
                exchange["slot_keys"]) if xchg else (16, 0, 0, 64, LOCAL_MAX, 64)), IPF_KIB if xchg else 0,
-            OWNER_FAST)
+            OWNER_FAST, int(MERGE_PAR) if xchg else 0)
     _run_compiled(
         launch_aq1,
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(slab),
