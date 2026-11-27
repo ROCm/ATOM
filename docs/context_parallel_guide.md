@@ -296,7 +296,7 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 | `-dcp N` / `--decode-context-parallel-size N` | `1` | Enable DCP with size `N`. `world = tp`; requires `tp % N == 0` |
 | `--dcp-config '{...}'` | see below | JSON dict of the four DCP knobs (`interleave_size`, `enable_query_replication`, `enable_project_before_merge`, `comm_backend`). Unknown keys raise. See [`--dcp-config`](#--dcp-config-the-four-dcp-knobs) |
 | `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
-| `--enable_prefix_caching` | off | Supported with DCP |
+| `--enable_prefix_caching` | on; `--no-enable_prefix_caching` disables it | Supported with DCP |
 | `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
 
 | Goal (8 GPUs) | Command |
@@ -431,19 +431,27 @@ for fp4 and for `-dcp 1`.
 
 ### `comm_backend`
 
-All backends compute the same thing and are **mathematically equivalent but not
-bitwise identical** (different summation order, and `a2a` round-trips the fp32
-LSE through two 16-bit halves of a bf16 buffer).
+The backends implement the same LSE-weighted sum, with floating-point
+differences from accumulation order. Packed `a2a`
+bit-preserves fp32 LSE in two 16-bit slots when its buffer is bf16/fp16.
+Head-major prefill instead sends LSE as plain fp32 in a separate all-to-all.
+It requires PBM, `ATOM_MLA_ABSORB_BF16=1`, an `a2a` or `mailbox` backend,
+and more than 32 prefill rows (mailbox uses A2A for prefill). Eligible BF16
+prefills of at most 32 rows retain the packed tail and its single collective.
+This keeps the measured small-prefill range off the extra LSE collective.
+The default FP8 `W_V_dcp`, FP4 and fused output quantization keep the packed
+layout at every row count.
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
 | `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
-| `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `a2a` | packed output and LSE share one all-to-all, including eligible BF16 prefills of at most 32 rows; head-major prefill above 32 rows exchanges output and LSE separately, then combines locally | 1 packed / 2 head-major |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
 | `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
-Byte counts are about the same; what `a2a` saves is one collective's launch and
-sync.
+Packed `a2a` saves one collective launch and synchronization compared with
+`ag_rs`. Head-major prefill instead avoids packing the output and sends its
+LSE separately.
 
 `mailbox` needs aiter `78a14ae5d` or later (aiter PR #6972 and #7943) and
 FlyDSL >= 0.5.0. That is required, not detected: an aiter without
@@ -587,19 +595,27 @@ hold a **per-request recurrent state** rather than a paged cache, so there is
 nothing for DCP to shard there and that state stays replicated — the per-GPU
 memory DCP frees on K3 is the MLA share only, not the whole attention footprint.
 
-**Query-head width is the K3-specific constraint.** K3 has 96 query heads, so at
-`-tp 8` each rank owns 12 and the DCP decode gathers `12 × dcp`: 24 at dcp2, 48
-at dcp4, 96 at dcp8. aiter's `mla_decode_fwd` dispatches natively on 16 / 32 / 64
-/ 128 heads only; the remaining multiples of 16 (48, 80, 96, 112) are folded onto
-the 16-head kernel, and that fold reinterprets head groups as extra sequence rows
-(`total_s *= ori_nhead // 16`) without touching `kv_indptr`, which desynchronises
-the row-to-global-position mapping the round-robin causal mask depends on. So the
-**gathered** width is padded up to the next natively dispatched one (24 → 32,
-48 → 64, 96 → 128) by `mla_dcp_kernel_num_heads`. The pad lives entirely inside
-`_forward_decode` — applied after the all-gather and stripped before the
-cross-rank LSE combine — so it never costs collective traffic. Widths past 128
-fall back to the folded kernel with a warning; lower `-dcp` or raise `-tp` if you
-hit it.
+**Query-head width depends on the dispatch path.** K3 has 96 query heads, so
+at `-tp 8` each rank owns 12 and DCP uses `12 × dcp` group-wide heads: 24 at
+dcp2, 48 at dcp4 and 96 at dcp8. Persistent decode rounds to a multiple of 16
+up to 128: 24 becomes 32, while 48 and 96 are retained. AITER selects a native
+kernel or a head fold based on the architecture and dtypes. A fold rebuilds
+query/KV indptrs to preserve the round-robin position mapping.
+Non-persistent decode uses its dtype-specific table (16/32/128 for bf16,
+16/128 for fp8), so its gathered 96 is padded to 128.
+
+Sparse prefill selects its width separately. The eligible persistent path
+queries AITER for native support at candidate multiples of 16. BF16 keeps the
+established 16/32/64/128 buckets, so 48 pads to 64 and 96 pads to 128.
+Only the 128-head BF16 width binds the small-prefill head-group path.
+Folded or unknown persistent support uses those
+same buckets and rebuilds each layer's plan; non-persistent prefill keeps its
+16/128 table unless the eligible FP8 gqa64 route applies. Beyond 128,
+DCP decode warns and passes the rounded width to aiter; sparse prefill also
+warns and returns a rounded, unverified width. These widths are outside the
+range validated for these ATOM DCP paths. Subsequent dispatch depends on the
+aiter version and configuration; support is not guaranteed. Lower `-dcp` or
+raise `-tp` rather than relying on a fallback.
 
 DeepSeek-R1 never needed this: 128 heads at `-tp 8` is 16 per rank, and the dcp8
 gather lands on 128 exactly.
@@ -621,33 +637,39 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA attention under DCP handles this, where aiter runs DCP
+Native sparse MLA / DSA **decode** under DCP handles this, where aiter runs DCP
 decode persistent (`dcp_persistent_supported`; validated on gfx950), by rebuilding
-the persistent work/reduce metadata after every **full IndexShare layer**
-compacts its rank-local top-k. The rebuild consumes that layer's
-`dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
-indptr, and work plan. This makes the persistent descriptors and the actual
-sparse regions agree without rebuilding metadata on shared layers.
+the persistent work/reduce metadata after each full IndexShare layer compacts its
+rank-local top-k. Following shared layers reuse its indices, compact indptr and
+work plan.
 
-The implementation is scoped to native, non-speculative serving with page size
-1: decode is q_len=1, while sparse prefill is represented as per-token
-virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
-speculative sparse DCP paths without the per-layer rebuild) remain
+Persistent **sparse prefill** builds a work plan at the selected prefill head
+width. An owning layer patches its KV ranges only when AITER confirms native,
+unfolded support for the actual query and KV dtypes at that width. Folded or
+unknown plans are rebuilt from that layer's compacted indices; shared layers
+reuse the preceding owner's plan. The eligible gfx950 FP8 gqa64
+non-persistent prefill path needs neither a work plan nor per-layer patches.
+
+The decode configuration described here is native, non-speculative serving
+with page size 1 and q_len=1. Sparse prefill uses per-token virtual q_len=1 rows.
+Paths without persistent LSE support or the required per-layer rebuild remain
 non-persistent and round a gathered 64 up to **128**.
 
 **Sparse prefill's persistent path is not fp8-only.** Unlike the fp8-and-fp8
 requirement above (which is specifically about decode's gqa=64 kernel), sparse
 *prefill*'s persistent mode has no KV-dtype gate at all:
-`mla_dcp_sparse_prefill_is_persistent()` only checks DCP world size, per-layer
-metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
-those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
-one of those (e.g. gfx942, or DCP≤1) still pads to 128.
+`mla_dcp_sparse_prefill_is_persistent()` checks backend support, DCP world size,
+per-layer metadata rebuild, and page size. Width selection additionally queries
+AITER with the query/KV dtypes: gfx942 BF16 can run persistently while folding
+its heads into 16-head pseudo-batches. Those plans require per-layer rebuilds.
+The native-plan decision is cached with the layer's configured width and dtypes
+at initialization; small-prefill head groups rebuild their own descriptors.
 
-**GLM-5.2 is the model that benefits** (decode, and `q` sparse prefill steps):
-64 query heads at `-tp 8` is 8 per rank, so `-dcp 8` gathers exactly 64 and
-now dispatches the native persistent gqa64 kernel instead of padding to 128.
-`-tp 4 -dcp 4` has the same gathered width and uses the same persistent gqa64
-path.
+GLM-5.2 has 64 query heads: on the `q` transport, `-tp 8 -dcp 8` and `-tp 4 -dcp 4` both gather
+64. On gfx950, decode uses the persistent gqa64 path and eligible FP8 sparse
+prefill uses the native non-persistent gqa64 kernel by default. On gfx942,
+BF16 persistent prefill retains 64 heads and rebuilds folded plans per owner;
+FP8 may select a wider native width. This does not claim gfx942 model qualification.
 
 **Validated** (native ATOM, MI355 gfx950, GLM-5.2-MXFP4, fp8 KV, no
 speculative decode): both `-tp 8 -dcp 8` and `-tp 4 -dcp 4` complete CUDA graph
@@ -764,8 +786,8 @@ MLA rows; see the [recipe](../recipes/DSpark.md)).
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
-| Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 | Native sparse / DSA prefill on the `q` transport (bf16 KV, or fp8 KV with `ATOM_DCP_SPARSE_PREFILL=q` or a step `auto` keeps on `q`) and q_len=1 decode (fp8 KV) rebuild persistent metadata, where aiter runs DCP decode persistent (validated on gfx950), per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| Kimi-K3 gathered head width | On the `q` transport, TP8/DCP8 gathers 96 real heads. Native FP8 prefill may retain 96; BF16 prefill pads to 128. Decode and folded routes follow their own tables and AITER support. Widths above 128 are unverified. The `kv` transport attends only local heads. |
+| gathered head width 64 | Eligible decode rebuilds persistent metadata per full IndexShare layer. Native persistent `q` prefill patches whole-row plans; folded plans and small BF16 head groups rebuild. Eligible FP8 non-persistent `q` prefill needs no plan. The `kv` transport uses the dcp=1 plan. See [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64). |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

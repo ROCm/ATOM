@@ -256,6 +256,7 @@ pub mod names {
     pub const WORKER_POOL_SIZE: &str = "mesh_worker_pool_size";
     pub const WORKER_CONNECTIONS_ACTIVE: &str = "mesh_worker_connections_active";
     pub const WORKER_REQUESTS_ACTIVE: &str = "mesh_worker_requests_active";
+    pub const WORKER_PREFILL_TOKENS: &str = "mesh_worker_prefill_tokens";
     pub const WORKER_HEALTH: &str = "mesh_worker_health";
     pub const WORKER_HEALTH_CHECKS_TOTAL: &str = "mesh_worker_health_checks_total";
     pub const WORKER_SELECTION_TOTAL: &str = "mesh_worker_selection_total";
@@ -429,6 +430,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::WORKER_REQUESTS_ACTIVE,
         kind: MetricKind::Gauge,
         help: "Currently running requests per worker",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::WORKER_PREFILL_TOKENS,
+        kind: MetricKind::Gauge,
+        help: "Prompt tokens charged to a worker (url@rank) whose prefill has not finished; only HTTP P/D prefills and streaming HTTP requests with counted or estimated tokens are charged",
         status: MetricStatus::Active,
     },
     MetricSpec {

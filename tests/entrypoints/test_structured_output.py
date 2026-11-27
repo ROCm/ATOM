@@ -26,8 +26,8 @@ pytest.importorskip("jsonschema")
 @pytest.fixture(autouse=True)
 def _structured_output_installed(monkeypatch):
     """These cases stub the engine and the grammar backend: they describe a
-    deployment with the optional extra, whatever this environment installed.
-    The extra's absence is covered in test_structured_output_availability.py."""
+    deployment with the backend available, whatever this environment installed.
+    Its absence is covered in test_structured_output_availability.py."""
     from atom import structured_output
 
     monkeypatch.setattr(structured_output, "available", lambda: True)

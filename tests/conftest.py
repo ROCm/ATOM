@@ -27,6 +27,10 @@ ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 if ATOM_ROOT not in sys.path:
     sys.path.insert(0, ATOM_ROOT)
 
+# Admission refuses sampled requests under ATOM_DP_LM_HEAD_MODE=argmax: run from
+# the default whatever the shell sets; a test of a mode sets it itself.
+os.environ.pop("ATOM_DP_LM_HEAD_MODE", None)
+
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
 from atom.config import Config
@@ -91,6 +95,7 @@ class MockConfig:
             "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
+            "enable_mixed_prefill_decode": False,
             "enable_dynamic_chunking": False,
             "dynamic_chunking_smooth_factor": 0.75,
             "dynamic_chunking_min_chunk_size": 4096,

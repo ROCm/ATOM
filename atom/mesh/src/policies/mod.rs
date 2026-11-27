@@ -41,8 +41,8 @@ pub struct RouteDecision {
     pub match_ratio: Option<f64>,
     /// Expected prefix cache hit ratio on the selected worker, reconciled with the
     /// cached tokens its response reports. `cache_aware`'s tree branches set it only
-    /// when the selected worker is the best candidate, its KV event branches always;
-    /// other policies leave it None.
+    /// when the selected worker is the best candidate, its KV event branch unless the
+    /// store the worker loads from does not answer; other policies leave it None.
     pub estimated_hit_ratio: Option<f64>,
     /// The session binding the selection was placed on, for policies that pin
     /// sessions. The router passes it back to [`LoadBalancingPolicy::on_dispatch`]

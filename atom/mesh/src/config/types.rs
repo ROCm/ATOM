@@ -203,6 +203,10 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// ATOM PD relay: open D's leg together with P's and send P's KV metadata
+    /// late (`--atom-pd-concurrent`; D needs `ATOM_PD_LATE_KV=1`).
+    #[serde(default)]
+    pub atom_pd_concurrent: bool,
 
     pub policy: PolicyConfig,
     /// Session table layered on every policy. Prefill and decode each get a table.
@@ -221,6 +225,13 @@ pub struct RouterConfig {
     /// The admin port of each master of the Mooncake Store a worker offloads to.
     #[serde(default = "default_mooncake_admin_port")]
     pub mooncake_admin_port: u16,
+    /// How long a request waits for the stores its workers load from to answer.
+    #[serde(default = "default_kv_storage_deadline_ms")]
+    pub kv_storage_deadline_ms: u64,
+    /// What a token a worker loads from a store counts for in routing, against one on its
+    /// device; 0 asks no store.
+    #[serde(default)]
+    pub kv_storage_weight: f64,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -634,6 +645,10 @@ fn default_mooncake_admin_port() -> u16 {
     9003
 }
 
+fn default_kv_storage_deadline_ms() -> u64 {
+    3
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -656,6 +671,8 @@ impl Default for RouterConfig {
             dp_aware: false,
             kv_events: false,
             mooncake_admin_port: default_mooncake_admin_port(),
+            kv_storage_deadline_ms: default_kv_storage_deadline_ms(),
+            kv_storage_weight: 0.0,
             api_key: None,
             metrics: None,
             log_dir: None,
@@ -673,6 +690,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            atom_pd_concurrent: false,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
@@ -768,6 +786,12 @@ impl RouterConfig {
                 self.atom_pd_rank_mapping_policy,
                 AtomPdRankMappingPolicy::Idx2Idx
             )
+    }
+
+    /// Whether the HTTP PD router dispatches an ATOM relay's decode leg
+    /// concurrently with prefill: `--atom-pd-concurrent` on the ATOM backend.
+    pub fn atom_pd_concurrent_dispatch(&self) -> bool {
+        matches!(self.backend, BackendType::Atom) && self.atom_pd_concurrent
     }
 
     /// Create a new configuration with mode and policy
