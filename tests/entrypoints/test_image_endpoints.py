@@ -224,9 +224,10 @@ class TestAnthropicTranslation:
                 {"type": "text", "text": "b"},
             ]
         )
+        # Tool results first: they answer the call before this message.
         assert messages == [
-            {"role": "user", "content": "a\nb"},
             {"role": "tool", "tool_call_id": "t1", "content": "x\ny"},
+            {"role": "user", "content": "a\nb"},
         ]
 
 
