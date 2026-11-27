@@ -62,6 +62,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine import host_nl
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
@@ -156,6 +157,32 @@ from atom.utils.tbo import (
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
+
+# What the decode graph recordings hold, counted while recording: the LM head
+# recorded into the decode graph, and recordings whose hidden states are the
+# final norm's own output (no copy into `forward_vars["outputs"]`).
+DECODE_GRAPH_STATS = {"lm_head_in_graph": 0, "hidden_from_graph": 0}
+# Per step, outside the graphs: steps whose drafter anchor ids came from the
+# verify launch, and the deferred D2H copies' flushes, behind the next
+# forward's staging event or (a receive first) an event of their own.
+STEP_STATS = {"verify_next_ids": 0, "d2h_flush_staged": 0, "d2h_flush_on_demand": 0}
+
+
+def decode_graph_stats() -> dict[str, int]:
+    """`DECODE_GRAPH_STATS` with the embedding lookups (`embed_head.EMBED_STATS`),
+    the explicit FlyDSL plan refreshes (`base_attention.FLYDSL_PLAN_STATS`) and
+    `STEP_STATS`."""
+    from atom.model_ops.base_attention import FLYDSL_PLAN_STATS
+    from atom.model_ops.embed_head import EMBED_STATS
+
+    plan = {f"plan_{k}": v for k, v in FLYDSL_PLAN_STATS.items()}
+    return {**DECODE_GRAPH_STATS, **EMBED_STATS, **plan, **STEP_STATS, **host_nl.STATS}
+
+
+def _greedy_no_noise() -> bool:
+    on = host_nl.on("VERIFY_GREEDY_NO_NOISE")
+    host_nl.STATS["nl_off_verify_noise"] += int(not on)
+    return on
 
 
 def max_schedulable_decode_bs(
@@ -298,10 +325,17 @@ class tokenIDProcessor:
         self,
         gpu_tensor: torch.Tensor,
         cpu_tensor_handle,
-        data_ready: torch.cuda.Event,
+        data_ready: torch.cuda.Event | None,
         copy_done: torch.cuda.Event | None = None,
         gpu_logprobs: torch.Tensor | None = None,
     ):
+        """Copy ``gpu_tensor`` (and its logprobs) to the host behind
+        ``data_ready``; None defers the copy to `flush_deferred_sends`."""
+        if data_ready is None:
+            self._deferred_ids.append(
+                (gpu_tensor, cpu_tensor_handle, copy_done, gpu_logprobs)
+            )
+            return
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
@@ -339,7 +373,48 @@ class tokenIDProcessor:
             )
         return buf[:n].view(gpu_tensor.shape)
 
+    def flush_deferred_sends(self, ready: torch.cuda.Event | None = None) -> None:
+        """Enqueue the deferred D2H copies (a step's sampled ids, verify
+        counts and drafts) behind ``ready``: an event the forward stream
+        recorded after their sources were written. The runner hands over the
+        next forward's staging event (`_mark_staging_h2d_enqueued`), so a
+        decode step records no event of its own for them; a receive that comes
+        first flushes behind an event recorded on the current stream then."""
+        queues = (self.spec_status_queue, self._draft_token_ids_queue)
+        if not self._deferred_ids and not any(q.has_deferred() for q in queues):
+            return
+        if ready is None:
+            ready = torch.cuda.Event()
+            ready.record()
+        else:
+            STEP_STATS["d2h_flush_staged"] += 1
+            if STEP_STATS["d2h_flush_staged"] in (1, 1000, 10000):
+                logger.info("deferred D2H copies: %s", STEP_STATS)
+        deferred, self._deferred_ids = self._deferred_ids, []
+        for gpu_tensor, handle, copy_done, gpu_logprobs in deferred:
+            self.send_to_cpu_async(gpu_tensor, handle, ready, copy_done, gpu_logprobs)
+        for queue in queues:
+            queue.flush(ready)
+
+    def _flush_before_receive(self, queue: D2HQueue | None = None) -> None:
+        """A receive that comes before the staging flush: enqueue the copies it
+        waits for now, behind an event recorded on the current stream."""
+        if queue is None:
+            if not self._deferred_ids:
+                return
+            deferred, self._deferred_ids = self._deferred_ids, []
+            ready = torch.cuda.Event()
+            ready.record()
+            for gpu_tensor, handle, copy_done, gpu_logprobs in deferred:
+                self.send_to_cpu_async(gpu_tensor, handle, ready, copy_done, gpu_logprobs)
+        elif queue.has_deferred():
+            queue.flush()
+        else:
+            return
+        STEP_STATS["d2h_flush_on_demand"] += 1
+
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
+        self._flush_before_receive()
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
         cpu_tensor, copy_done, _ = cpu_tensor_handle[0]
@@ -358,26 +433,34 @@ class tokenIDProcessor:
             return None
         return self.logprobs_cpu.pop(0)
 
-    def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
+    def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor, defer=False):
         # The next replay of this draft output follows a whole target forward.
         # Preserve side-stream overlap; no reverse wait on the forward stream.
-        self._draft_token_ids_queue.send(gpu_tensor)
+        # `defer`: the next forward's staging event orders the copy after the
+        # draft pass (`flush_deferred_sends`).
+        self._draft_token_ids_queue.send(gpu_tensor, defer=defer)
+
+    def _fence_draft_ids(self, copy_done: torch.cuda.Event) -> None:
         # A drafter whose ids live in persistent storage (no clone after its
         # graph) rewrites it on its next pass: that pass waits, device side,
         # on this copy (the ids' only reader off the forward stream).
         block = getattr(getattr(self, "drafter", None), "block", None)
         if block is not None and hasattr(block, "reader_fence"):
-            block.reader_fence(self._draft_token_ids_queue.last_copy_event())
+            block.reader_fence(copy_done)
 
     def recv_draft_token_ids(self) -> np.ndarray:
+        self._flush_before_receive(self._draft_token_ids_queue)
         output = self._draft_token_ids_queue.receive()
         return np.array([], dtype=np.int32) if output is None else output
 
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        self._flush_before_receive(self.spec_status_queue)
         return self.spec_status_queue.receive() or (None, None)
 
     def _wait_for_pending_copies(self) -> None:
         """Wait for every queued D2H before its entry (and source) is dropped."""
+        if hasattr(self, "spec_status_queue"):
+            self.flush_deferred_sends()
         for _, copy_done, _ in getattr(self, "token_ids_cpu", ()):
             copy_done.synchronize()
         for name in ("_draft_token_ids_queue", "spec_status_queue"):
@@ -405,7 +488,10 @@ class tokenIDProcessor:
         self._draft_token_ids_queue = D2HQueue(
             self._output_request_capacity * max(self.num_spec_tokens, 1),
             self.async_copy_stream,
+            on_copy=self._fence_draft_ids,
         )
+        # `send_to_cpu_async` copies waiting for `flush_deferred_sends`.
+        self._deferred_ids: list[tuple] = []
         self.spec_status_queue = SpecStatusQueue(
             self._output_request_capacity, self.async_copy_stream
         )
@@ -464,7 +550,7 @@ class tokenIDProcessor:
         self,
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
-        sync_event: torch.cuda.Event,
+        sync_event: torch.cuda.Event | None,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
@@ -852,10 +938,10 @@ class tokenIDProcessor:
                 # Received by `take_deferred_output`; this step's drafts still
                 # go down below, behind the previous step's.
                 self._early_taken = None
-                self.send_draft_token_ids_to_cpu(draft_token_ids)
+                self.send_draft_token_ids_to_cpu(draft_token_ids, defer=host_nl.on("DEFER_D2H"))
                 return early[2]
             token_ids = self.recv_draft_token_ids()
-            self.send_draft_token_ids_to_cpu(draft_token_ids)
+            self.send_draft_token_ids_to_cpu(draft_token_ids, defer=host_nl.on("DEFER_D2H"))
             ret = (
                 token_ids
                 if self.prev_req_ids is not None
@@ -1130,6 +1216,7 @@ class ModelRunner:
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
+        # The step's D2H copies wait for it when `host_nl.DEFER_D2H` is off (rF13b's).
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
@@ -1867,8 +1954,13 @@ class ModelRunner:
         direct copies and grouped publishers. Late V4 TBO preparation resumes
         this epoch and records the completion again after its uploads.
         Independent subsystem uploads retain their own completion protocols.
+
+        The event it records also orders the previous step's deferred D2H
+        copies (`TokenIDProcessor.flush_deferred_sends`): it comes after that
+        step's sampling and drafting on this stream.
         """
         self.h2d_owner.finish()
+        self.tokenID_processor.flush_deferred_sends(self.h2d_owner.completion)
 
     def _record_forward_vars_event(self):
         """Mark the current slot's forward as done on the GPU stream. Paired
@@ -3495,17 +3587,33 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
-                logits = self.req_graph.replay(key=graph_key)
+                # The recording's logits (None when its LM head is not in it)
+                # and its final norm's output, which the recording holds; None
+                # from a replay that wrote `outputs` itself (DeepSeek-V4 mono's
+                # eager step).
+                replayed = self.req_graph.replay(key=graph_key)
+                logits, hidden_states = (
+                    replayed
+                    if replayed is not None
+                    else (None, self.forward_vars["outputs"])
+                )
                 # The recording ends with the drafter's context KV write
                 # (`_draft_kv_graph_supported`): `forward` must not issue it again.
                 self._step_draft_kv_done = self._draft_kv_in_graph
-                hidden_states = self.forward_vars["outputs"][:running_tokens]
+                hidden_states = hidden_states[:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 lm_head_graph = getattr(self, "lm_head_graph", None)
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
-                elif lm_head_graph is not None and lm_head_graph.has(graph_key):
+                elif (
+                    lm_head_graph is not None
+                    and lm_head_graph.has(graph_key)
+                    and hidden_states.data_ptr()
+                    == self.forward_vars["outputs"].data_ptr()
+                ):
+                    # rF13b's: the LM head's own recording, which reads `outputs`
+                    # (`host_nl.LM_HEAD_IN_GRAPH` / `HIDDEN_FROM_GRAPH` off)
                     logits = lm_head_graph.replay(key=graph_key)
                 else:
                     logits = self.model.compute_logits(hidden_states)
@@ -3566,6 +3674,8 @@ class ModelRunner:
             md.num_spec_steps,
             greedy_eps=SAMPLER_EPS,
             cond_rates=cond_rates,
+            next_ids=host_nl.on("VERIFY_NEXT_IDS"),
+            greedy_no_noise=_greedy_no_noise(),
         )
 
     def _constrain_required_channel(
@@ -3647,6 +3757,8 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         ids_agree = False
+        # Each request's last kept token, when the sampler hands it over.
+        fused_next_ids = None
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3713,7 +3825,11 @@ class ModelRunner:
         ) is not None:
             # Sampled and verified in one launch, with noise every rank draws
             # alike: the ids agree across ranks without a broadcast.
-            sampled_tokens, verdict = fused
+            sampled_tokens, verdict, fused_next_ids = fused
+            if fused_next_ids is not None:
+                STEP_STATS["verify_next_ids"] += 1
+            else:
+                host_nl.STATS["nl_off_next_gather"] += 1
             channel = None
             ids_agree = True
             num_bonus_tokens, num_reject_tokens, anchors = verdict
@@ -3807,13 +3923,20 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
-        self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
+        # A deferred step's D2H copies (ids, verify counts, drafts) record no
+        # event here: they wait for the next forward's staging event
+        # (`TokenIDProcessor.flush_deferred_sends`), which the forward stream
+        # records after this step's sampling and drafting anyway.
+        defer_d2h = host_nl.on("DEFER_D2H")
+        if not defer_d2h:
+            self.forward_done_event.record()  # rF13b's
+            host_nl.STATS["nl_off_d2h_event"] += 1
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,
-            self.forward_done_event,
+            None if defer_d2h else self.forward_done_event,
             sampled_logprobs,
             channel_states=channel_states,
         )
@@ -3823,18 +3946,25 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
-            next_token_ids = torch.gather(
-                sampled_tokens.view(bs, batch.num_spec_step + 1),
-                1,
-                next_token_locs.view(-1, 1),
-            ).view(bs)
+            next_token_ids = (
+                fused_next_ids
+                if fused_next_ids is not None
+                else torch.gather(
+                    sampled_tokens.view(bs, batch.num_spec_step + 1),
+                    1,
+                    next_token_locs.view(-1, 1),
+                ).view(bs)
+            )
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                self.tokenID_processor.spec_status_queue.send(
-                    spec_counts, ready=self.forward_done_event
-                )
+                if defer_d2h:
+                    self.tokenID_processor.spec_status_queue.send(spec_counts, defer=True)
+                else:
+                    self.tokenID_processor.spec_status_queue.send(
+                        spec_counts, ready=self.forward_done_event
+                    )
                 # Async verdict: the next step shifts its metadata by
                 # these on the device. Held, so the allocator keeps them.
                 self.tokenID_processor.prev_spec_counts_gpu = spec_counts
@@ -4642,17 +4772,19 @@ class ModelRunner:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         # A decode step's whole forward per request bucket (`ReqGraph`), its
-        # logits too when `logits_in_graph`. Under TBO decode a bucket that
-        # splits (`decode_bucket_splits`) is recorded split, its micro-batches
-        # cut at the bucket, so a decode the group splits replays it
-        # (`ForwardMode.decide`). Token graphs have no such recording: under
-        # TR_HYBRID a split decode runs eagerly.
+        # logits too where the LM head can be recorded (`bucket_logits`). Under
+        # TBO decode a bucket that splits (`decode_bucket_splits`) is recorded
+        # split, its micro-batches cut at the bucket, so a decode the group
+        # splits replays it (`ForwardMode.decide`). Token graphs have no such
+        # recording: under TR_HYBRID a split decode runs eagerly.
         self.req_graph = ReqGraph()
-        # At TP > 1 the LM head (GEMM + all-gather) stays out of the decode
-        # graph (`logits_in_graph`), but each bucket records it as its own
-        # small graph when the custom all-gather, which a graph can hold,
-        # serves its logits (`_lm_head_gather_capturable`): one launch after
-        # the decode graph's instead of the eager LM head.
+        # Each recording hands its final norm's output to `run_model` as the
+        # step's hidden states, uncopied. The pool gives a recording's memory
+        # to later recordings once nothing references it, so these hold it.
+        self._graph_hidden_states = []
+        # rF13b's LM-head recording a bucket (TP > 1, a graph-capturable logits
+        # all-gather), replayed after the decode graph by a step whose recording
+        # holds no LM head (`host_nl.LM_HEAD_IN_GRAPH` off).
         self.lm_head_graph = ReqGraph() if self.world_size > 1 else None
         self.tbo_decode_graphs = self.config.enable_tbo_decode and not tr_hybrid
         if self.config.enable_tbo_decode and tr_hybrid and self.rank == 0:
@@ -4660,7 +4792,6 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        logits_in_graph = self.world_size == 1
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4796,6 +4927,13 @@ class ModelRunner:
                         in_hipgraph=True,
                     )
 
+                    # The LM head goes into the recording unless its TP
+                    # all-gather is the NCCL fallback, which a graph cannot hold.
+                    bucket_logits = (
+                        self.world_size == 1
+                        or self._lm_head_gather_capturable(running_tokens)
+                    )
+
                     # Warmup
                     model_positions = (
                         self._mrope_positions_view(running_tokens)
@@ -4814,7 +4952,7 @@ class ModelRunner:
                         self.drafter.compute_draft_kv(
                             model_positions, outputs[:running_tokens], None
                         )
-                    if logits_in_graph:
+                    if bucket_logits:
                         self.model.compute_logits(outputs[:running_tokens])
 
                     if tr_hybrid:
@@ -4842,26 +4980,41 @@ class ModelRunner:
                     ):
                         # The drafter's aux capture hook runs inside the
                         # forward and writes its own buffers (in-graph).
-                        def full_forward(n=running_tokens, pos=model_positions):
-                            outputs[:n] = self.model(input_ids[:n], pos)
+                        def full_forward(
+                            n=running_tokens, pos=model_positions, lm=bucket_logits
+                        ):
+                            # `host_nl` switches, read at each recording / warm-up
+                            from_graph = host_nl.on("HIDDEN_FROM_GRAPH")
+                            if not host_nl.on("LM_HEAD_IN_GRAPH"):
+                                lm = self.world_size == 1  # rF13b's `logits_in_graph`
+                            hidden = self.model(input_ids[:n], pos)
+                            if not from_graph:
+                                # rF13b's: the final norm copied into `outputs`
+                                outputs[:n] = hidden
+                                hidden = outputs[:n]
+                            if torch.cuda.is_current_stream_capturing():
+                                if from_graph:
+                                    self._graph_hidden_states.append(hidden)
+                                DECODE_GRAPH_STATS["hidden_from_graph"] += int(from_graph)
+                                DECODE_GRAPH_STATS["lm_head_in_graph"] += int(lm)
                             if draft_kv_in_graph:
                                 # Reads the aux taps the forward just wrote
                                 # and the step's positions / slot mapping,
                                 # all at the addresses every replay fills.
-                                self.drafter.compute_draft_kv(pos, outputs[:n], None)
-                            if logits_in_graph:
-                                return self.model.compute_logits(outputs[:n])
-                            return None
+                                self.drafter.compute_draft_kv(pos, hidden, None)
+                            logits = self.model.compute_logits(hidden) if lm else None
+                            return logits, hidden
 
                         self.req_graph.record(
                             full_forward, key=request_bucket(bs, max_q_len)
                         )
                         if (
                             self.lm_head_graph is not None
-                            and not logits_in_graph
                             and self._lm_head_gather_capturable(running_tokens)
                         ):
-                            # Warm once eagerly, then record the LM head alone.
+                            # rF13b's LM-head recording, for the steps whose
+                            # decode recording holds no LM head: warm once
+                            # eagerly, then record it alone.
                             self.model.compute_logits(outputs[:running_tokens])
 
                             def lm_head(n=running_tokens):
@@ -4904,6 +5057,8 @@ class ModelRunner:
                     "draft KV write recorded in %d decode graphs",
                     len(self.req_graph.keys()),
                 )
+            if self.rank == 0 and not tr_hybrid:
+                logger.info("decode graph recordings: %s", decode_graph_stats())
             self._record_prefill_graphs()
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)

@@ -2164,9 +2164,12 @@ class MiniMaxM3Model(nn.Module):
         quant_config = atom_config.quant_config
 
         if get_pp_group().is_first_rank:
+            # The whole table on every TP rank: a step's embedding is a local
+            # lookup, without the all-reduce that opens every decode step.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                full_table=True,
             )
         else:
             self.embed_tokens = PPMissingLayer()

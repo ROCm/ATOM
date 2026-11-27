@@ -367,6 +367,9 @@ def _flydsl_attention(
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
         plan_workgroup_budget=workgroup_budget,
+        # `plan_free` below reads the context lengths, not the plan: a step
+        # need not refresh it (the refresh was a planner launch a step).
+        refresh=not page_groups or not _host_nl_on("PLAN_NO_REFRESH"),
     )
     exp_sums, max_logits, partials = _flydsl_plan_scratch(
         plan, 1, group, head_dim, q.dtype, q.device, plan_cache_owner=plan_cache_owner
@@ -515,3 +518,10 @@ def prefill_rows(cu_seqlens_q: torch.Tensor, prefix_lens: torch.Tensor, rows: in
     )
     seq = prefix_lens.to(torch.int32)[req] + (tok - cu[req]) + 1
     return req, torch.where(live, seq, 0)
+
+
+def _host_nl_on(piece: str) -> bool:
+    """`atom.model_engine.host_nl`'s switch (read at the recording that runs this op)."""
+    from atom.model_engine import host_nl
+
+    return host_nl.on(piece)

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -19,6 +21,13 @@ from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
+
+logger = logging.getLogger("atom")
+
+# Embedding lookups issued, by kind: `embed_full_table` (a rank's own row from
+# the whole table, no all-reduce) and `embed_sharded` (the shard's rows, summed
+# by an all-reduce). Counted per call, so a graph recording counts its own.
+EMBED_STATS = {"embed_full_table": 0, "embed_sharded": 0}
 
 
 @triton.jit
@@ -178,6 +187,7 @@ def masked_embedding(
     vocab_start_idx: int,
     vocab_end_idx: int,
 ) -> torch.Tensor:
+    EMBED_STATS["embed_sharded"] += 1
     return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
 
 
@@ -209,16 +219,65 @@ def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # matching vLLM's VocabParallelEmbedding (which masks the same -1 to 0) so the
     # unverified -1 slots — whose output is discarded/corrected by async
     # spec-decode — see the same value native does. No accuracy change.
+    EMBED_STATS["embed_full_table"] += 1
     return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
 
 
+def replicated_lookup_exact(table: torch.Tensor) -> bool:
+    """Whether a rank's own row equals the all-reduce of the vocab-sharded
+    lookups bit for bit: that sum adds the other ranks' zero rows to it, which
+    returns its bits unless an entry is +-0 (-0 + 0 is +0), subnormal (a
+    flush-to-zero add) or NaN."""
+    tiny = torch.finfo(table.dtype).tiny
+    rows = max(1, (1 << 26) // max(1, table.shape[-1]))
+    for chunk in table.split(rows):
+        if bool(((chunk.abs() < tiny) | chunk.isnan()).any()):
+            return False
+    return True
+
+
+def _vocab_lookup_fake(x, weight, table, vocab_start_idx, vocab_end_idx):
+    return torch.empty(x.numel(), weight.shape[1], dtype=weight.dtype, device=weight.device)
+
+
+@torch_compile_guard(gen_fake=_vocab_lookup_fake)
+def vocab_lookup(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    table: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    """A TP rank's embedding lookup when it holds the whole ``table``: its own rows from the table with no all-reduce
+    (`host_nl.EMBED_FULL_TABLE`), or else rF13b's shard lookup (``weight``) + all-reduce, chosen per call (a graph
+    recording keeps the one it ran)."""
+    from atom.model_engine import host_nl
+
+    if host_nl.on("EMBED_FULL_TABLE"):
+        return replicated_embedding(x, table)
+    y = masked_embedding(x, weight, vocab_start_idx, vocab_end_idx)
+    return get_tp_group().all_reduce(y, ca_fp8_quant=False)
+
+
 class VocabParallelEmbedding(nn.Module):
+    """The vocab sharded over TP: a rank looks up its shard's rows (zero for
+    the others) and the all-reduce sums the ranks' rows.
+
+    ``full_table``: every rank also holds the whole table and looks a row up
+    itself, with no all-reduce, for ``(tp - 1) / tp`` of the table in memory.
+    The sum it replaces adds zeros to the one rank's row, which returns that
+    row's bits for any table without zeros or NaN (`replicated_lookup_exact`
+    checks the loaded table and keeps the all-reduce otherwise). ``weight``
+    stays the rank's shard, a view into the table, for the callers that
+    address it by ``vocab_start_idx`` (a drafter sharing this embedding).
+    """
 
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
         prefix: str = "",
+        full_table: bool = False,
     ):
         super().__init__()
         self.prefix = prefix
@@ -229,12 +288,30 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
-        self.weight = atom_parameter(
-            torch.empty(self.num_embeddings_per_partition, embedding_dim),
-        )
+        self.replicated_lookup = False
+        if full_table and self.tp_size > 1:
+            table = torch.empty(num_embeddings, embedding_dim)
+            self.register_buffer("table", table, persistent=False)
+            shard = table[self.vocab_start_idx : self.vocab_end_idx]
+        else:
+            self.table = None
+            shard = torch.empty(self.num_embeddings_per_partition, embedding_dim)
+        self.weight = atom_parameter(shard)
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.table is not None:
+            # The whole table; the shard (`param`) is a view into it.
+            assert self.table.size() == loaded_weight.size()
+            self.table.copy_(loaded_weight)
+            self.replicated_lookup = replicated_lookup_exact(self.table)
+            if not self.replicated_lookup:
+                logger.warning(
+                    "%s: the table has zero or NaN entries; keeping the "
+                    "sharded lookup and its all-reduce",
+                    self.prefix or "embedding",
+                )
+            return
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
@@ -245,7 +322,11 @@ class VocabParallelEmbedding(nn.Module):
     @mark_trace
     def forward(self, x: torch.Tensor):
         # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.replicated_lookup:
+            y = vocab_lookup(
+                x, self.weight, self.table, self.vocab_start_idx, self.vocab_end_idx
+            )
+        elif self.tp_size > 1:
             y = masked_embedding(
                 x, self.weight, self.vocab_start_idx, self.vocab_end_idx
             )
