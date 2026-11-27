@@ -45,6 +45,7 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "distributed/pp_host_fence/SOURCE-BINDING.json",
 ]
 
 [project.entry-points."vllm.platform_plugins"]

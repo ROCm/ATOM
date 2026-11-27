@@ -28,6 +28,7 @@ def test_a_failed_megamoe_close_still_releases_everything(monkeypatch):
     monkeypatch.setattr(mr.torch.cuda, "empty_cache", lambda: calls.append("empty"))
     runner = SimpleNamespace(
         still_running=True,
+        _pp_host_fence=None,
         vision_embeddings=SimpleNamespace(clear=lambda: None),
         structured_compile_executor=None,
         req_graph=object(),
@@ -39,5 +40,39 @@ def test_a_failed_megamoe_close_still_releases_everything(monkeypatch):
     with pytest.raises(RuntimeError, match="close failed"):
         mr.ModelRunner.exit(runner)
     assert calls == ["sp_close", "close_mega_transports", "destroy", "empty"]
+    assert runner.req_graph is None
+    assert not hasattr(runner, "kv_cache") and not hasattr(runner, "model")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_ipc_close_precedes_dist_teardown_even_on_failure(monkeypatch, fail):
+    calls = []
+
+    def close_ipc():
+        calls.append("ipc_close")
+        if fail:
+            raise RuntimeError("IPC drain failed")
+
+    monkeypatch.setenv("ATOM_MORI_V2", "0")
+    monkeypatch.setattr(mr, "get_kvconnector", lambda: None)
+    monkeypatch.setattr(mr, "destroy_dist_env", lambda: calls.append("destroy"))
+    monkeypatch.setattr(mr.torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    runner = SimpleNamespace(
+        still_running=True,
+        _pp_host_fence=SimpleNamespace(close=close_ipc),
+        vision_embeddings=SimpleNamespace(clear=lambda: None),
+        structured_compile_executor=None,
+        req_graph=object(),
+        kv_cache=object(),
+        model=object(),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="IPC drain failed"):
+            mr.ModelRunner.exit(runner)
+    else:
+        mr.ModelRunner.exit(runner)
+    mr.ModelRunner.exit(runner)
+    assert calls == ["ipc_close", "destroy", "empty"]
+    assert not runner.still_running
     assert runner.req_graph is None
     assert not hasattr(runner, "kv_cache") and not hasattr(runner, "model")

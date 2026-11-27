@@ -447,6 +447,7 @@ def test_mixed_profile_is_not_charged_to_graph_pools(
         runner_module.KVConnectorFactory, "kv_budget_reserve_bytes", lambda config: 0
     )
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    runner._pp_host_fence = None
     runner.device = "cpu"
     runner.block_size = 4
     runner.pool_plan = PoolPlan.empty()
