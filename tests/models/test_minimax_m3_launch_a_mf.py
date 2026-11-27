@@ -19,13 +19,16 @@ class _FakeAiterMf(types.ModuleType):
         self.tables = []  # num_valid_rows of each mf_table call
         self.launches = []  # table of each flydsl_mf call
         self.roles = []  # roles of each flydsl_mf call
+        self.builds = []  # scratch build of each mf_scratch call
+        self.kws = []  # keyword arguments of each flydsl_mf call
 
     class MfOutputs:
         def __init__(self, device):
             self.device = device
             self.shared = torch.zeros(8, 4)  # the launch's shared output (the glue epilogue's addend)
 
-    def mf_scratch(self, device):
+    def mf_scratch(self, device, build=None):
+        self.builds.append(build)
         return {}
 
     def mf_table(self, gate_w, bias, gu_w, gu_s, dn_w, dn_s, outs, scratch, num_valid_rows=None):
@@ -35,6 +38,7 @@ class _FakeAiterMf(types.ModuleType):
     def flydsl_mf(self, x, x_scale, w, w_scale, res, norm_w, eps, inbox, ctr, slot, rank, tab, **kw):
         self.launches.append(tab)
         self.roles.append(kw.get("roles", 7))
+        self.kws.append(kw)
         return torch.zeros(8, 4), torch.zeros(8, 4)
 
 
@@ -56,6 +60,7 @@ def env(monkeypatch):
         types.SimpleNamespace(_dual_stream_is_active=lambda moe, m: True),
     )
     monkeypatch.setattr(mf, "_takes", lambda moe: True)
+    monkeypatch.setattr(mf, "receiver_quant", lambda: False)
     monkeypatch.setattr(mf, "ENABLED", True)
     monkeypatch.setattr(mf, "_TABLES", {})
     monkeypatch.setattr(mf, "_OUTPUTS", {}, raising=False)
@@ -163,3 +168,27 @@ def test_router_gate_up_when_tail_runs_down(env, monkeypatch):
     state["nv"] = torch.tensor([8], dtype=torch.int32)
     mf.run(_call())
     assert fake.roles == [3]  # router + gate_up: the shared down runs in P6's tail launch
+
+
+def test_receiver_quant_builds_its_own_scratch(env, monkeypatch):
+    fake, state = env
+    monkeypatch.setattr(mf, "receiver_quant", lambda: True)
+    assert mf.run(_call()) is not None
+    assert fake.builds == [("bq",)]  # the bq build's hand-off copies never mix with the plain build's
+    assert fake.kws[-1].get("bq") is True
+    monkeypatch.setattr(mf, "receiver_quant", lambda: False)
+    mf.run(_call())
+    assert fake.builds == [("bq",), None]  # a second table: plain build, its own scratch
+    assert "bq" not in fake.kws[-1]
+
+
+def test_receiver_quant_switch_and_capability(monkeypatch):
+    monkeypatch.setattr(mf, "RECEIVER_QUANT", False)
+    assert mf.receiver_quant() is False
+    monkeypatch.setattr(mf, "RECEIVER_QUANT", True)
+    fake_k = types.ModuleType("atom.models.minimax_m3.mono.gfx1250.kernels.mf")
+    monkeypatch.setitem(sys.modules, "atom.models.minimax_m3.mono.gfx1250.kernels.mf", fake_k)
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.kernels", types.SimpleNamespace(mf_gfx1250=fake_k))
+    assert mf.receiver_quant() is False  # an aiter without the MXFP8 hand-off: rF12's launch
+    fake_k.T_X8 = 21
+    assert mf.receiver_quant() is True

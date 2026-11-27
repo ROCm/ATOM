@@ -100,11 +100,12 @@ def _num_valid_rows(m: int, dev: torch.device):
     return ok, nv
 
 
-def _tables(moe, nv):
+def _tables(moe, nv, build=None):
     """The MoE's launch table for the count tensor ``nv`` (None: every row real), built once a (MoE, count
-    tensor) outside any capture (a warm-up call precedes the capture); None when the MoE is not the shape the
-    launch takes, or inside a capture for a count tensor no eager call met."""
-    key = (id(moe), 0 if nv is None else nv.data_ptr())
+    tensor, build) outside any capture (a warm-up call precedes the capture); None when the MoE is not the shape
+    the launch takes, or inside a capture for a count tensor no eager call met. ``build`` (None or "bq", see
+    ``run``) has its own scratch: the hand-off copies of two builds never mix."""
+    key = (id(moe), 0 if nv is None else nv.data_ptr(), build)
     if key in _TABLES:
         return _TABLES[key]
     if torch.cuda.is_current_stream_capturing():
@@ -129,7 +130,8 @@ def _tables(moe, nv):
             dn.weight.data.view(torch.uint8),
             dn.weight_scale.data.view(torch.uint8),
         )
-        tab = mf_table(*keep, outs, mf_scratch(dev), num_valid_rows=nv)
+        scratch = mf_scratch(dev) if build is None else mf_scratch(dev, build=(build,))
+        tab = mf_table(*keep, outs, scratch, num_valid_rows=nv)
         _register_shared_down(outs, dn)
         got = (tab, outs, keep + (nv,))
     else:
@@ -163,6 +165,22 @@ def _register_shared_down(outs, dn) -> None:
     SHARED_DOWN[outs.shared.data_ptr()] = desc
 
 
+# The receivers write the MXFP4 token rows and x as MXFP8 for the shared gate_up once, and the gate_up skips the h
+# copy only an in-launch down reads (aiter ``mf`` ``bq``; bit-exact). On; off gives rF12's launch.
+RECEIVER_QUANT = True
+
+
+def receiver_quant() -> bool:
+    """``RECEIVER_QUANT`` and an aiter MF launch that has ``bq`` (its kernel module defines the MXFP8 hand-off)."""
+    if not RECEIVER_QUANT:
+        return False
+    try:
+        from atom.models.minimax_m3.mono.gfx1250.kernels import mf as mf_gfx1250
+    except ImportError:
+        return False
+    return hasattr(mf_gfx1250, "T_X8")
+
+
 def run(call):
     from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
     from atom.models.minimax_m3 import launch_a
@@ -179,7 +197,8 @@ def run(call):
         and _dual_stream_is_active(moe, m)
     ):
         nv_ok, nv = _num_valid_rows(m, call.x.device)
-        got = _tables(moe, nv) if nv_ok else None
+        bq = receiver_quant()
+        got = _tables(moe, nv, "bq" if bq else None) if nv_ok else None
         if got is not None:
             from atom.models.minimax_m3.mono.gfx1250.mf import flydsl_mf
 
@@ -202,6 +221,7 @@ def run(call):
                 maxit=launch_a.k5_maxit(),
                 # router + gate_up when the shared down runs in the tail launch, else the whole shared expert
                 roles=3 if outs.shared.data_ptr() in shared_down_registry() else 7,
+                **({"bq": True} if bq else {}),
             )
             launch_a.set_moe_front(moe, out, outs)
             return out, res_out

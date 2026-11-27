@@ -30,6 +30,8 @@ def mf_scratch(device: torch.device, build=None):
             rp=torch.zeros((K.RPBUF,), dtype=torch.uint8, device=device),
             cnt=torch.zeros((K.GRID,), dtype=torch.int32, device=device),
             err=torch.zeros((4,), dtype=torch.int32, device=device),
+            # bq: x as MXFP8 for the gate_up (3 copies, armed)
+            x8=torch.full((K.NCOPY * K.X8COPY,), 0xFF, dtype=torch.uint8, device=device),
         )
     return _SCRATCH[key]
 
@@ -77,6 +79,7 @@ def mf_table(gate_w, bias, gu_w, gu_s, dn_w, dn_s, outs: MfOutputs, scratch, num
     words[K.T_RP] = scratch["rp"].data_ptr()
     words[K.T_HP] = outs.h.data_ptr()
     words[K.T_HSP] = outs.hs.data_ptr()
+    words[K.T_X8] = scratch["x8"].data_ptr()
     return torch.tensor(words, dtype=torch.int64, device=gate_w.device)
 
 
@@ -104,9 +107,13 @@ def flydsl_mf(
     rmode: int = 0,
     shell: int = 0,
     stream=None,
+    bq: bool = False,
 ):
     """Stage O's operands at 8 rows (x [8, 2048] E4M3 + E8M0 row scales; o_proj in the decode GEMM's layout) and the
-    layer's table. Returns (out, res_out); the routes, rows and shared output land in the table's outputs."""
+    layer's table. Returns (out, res_out); the routes, rows and shared output land in the table's outputs.
+    ``bq`` (bit-exact): the receivers write the MXFP4 rows and the gate_up's MXFP8 x (``kernels/mf_gfx1250.py``
+    ``launch_mf``). Its table needs its own scratch (``mf_scratch(device, build=("bq",))``): the hand-off copies of
+    two builds must never mix."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -121,7 +128,8 @@ def flydsl_mf(
         res_out = torch.empty((m, 6144), dtype=torch.bfloat16, device=x.device)
     if stream is None:
         stream = current_stream_arg()
-    spec = (k, 1.702, 1.0, 7.0, 1, roles, max_rows, 0 if timeline is None else 1, int(poll_sleep), int(rmode), int(shell))
+    spec = (k, 1.702, 1.0, 7.0, 1, roles, max_rows, 0 if timeline is None else 1, int(poll_sleep), int(rmode), int(shell),
+            int(bool(bq)))
     args = (
         ptr_arg(x), ptr_arg(x_scale), ptr_arg(w), ptr_arg(w_scale), ptr_arg(res), ptr_arg(norm_w),
         ptr_arg(out), ptr_arg(res_out), flyc.from_c_void_p(fx.Int32, int(ctr)), ptr_arg(tab, fx.Int64),

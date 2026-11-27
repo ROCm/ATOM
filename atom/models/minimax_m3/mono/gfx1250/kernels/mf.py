@@ -138,6 +138,10 @@ TLW = 8  # timeline stamps a workgroup
 LR_X = 0
 LR_P = R_SPLIT * R_XB  # 98304: partials [split][tok][16] f32
 LR_END = LR_P + R_SPLIT * ROWS * 16 * 4
+# bq: x as MXFP8 for the shared gate_up, published once by the receivers (quantize_fp8's bytes, sentinel words):
+# E4M3 [8, 6144], then the E8M0 of each 32-value block in the low byte of a dword [8][192]
+X8Q = ROWS * HIDDEN
+X8COPY = X8Q + ROWS * (HIDDEN // 32) * 4  # 55296 B = 3456 16-B chunks
 # gate_up (one K split a workgroup)
 LG_X = 0  # x MXFP8 B fragments of the split [step 12][jj 4][kgrp 2][tok 8] x 16 B
 LG_SC = S_STEPS * 4 * 16 * 16  # 12288: x E8M0 words [tok][step]
@@ -152,8 +156,9 @@ LD_END = LD_SC + ROWS * D_STEPS * 4
 
 # device table (int64 words), one a MoE layer (the scratch words are shared by every layer of a rank)
 (T_RW, T_RB, T_NVR, T_GW, T_GS, T_DW, T_DS, T_IDS, T_WTS, T_XQ, T_XS, T_SH, T_XB, T_LG, T_HB, T_CNT,
- T_ERR, T_GP, T_RP, T_HP, T_HSP) = range(21)
-T_WORDS = 21  # T_HP / T_HSP: the layer's plain h (E4M3 [8, 768]) / hs (E8M0 [8, 24]) for a later launch's down
+ T_ERR, T_GP, T_RP, T_HP, T_HSP, T_X8) = range(22)
+T_WORDS = 22  # T_HP / T_HSP: the layer's plain h (E4M3 [8, 768]) / hs (E8M0 [8, 24]) for a later launch's down
+# T_X8 (bq): x as MXFP8 for the gate_up (3 copies, X8COPY each)
 POLL_SLEEP = 1  # data-as-flag polls: each consumer polls only the words it reads (SYNC: s_sleep 1-4 equal)
 
 
@@ -190,10 +195,15 @@ def launch_mf(
     psleep: Constexpr[int] = POLL_SLEEP,
     rmode: Constexpr[int] = 0,
     shell: Constexpr[int] = 0,
+    bq: Constexpr[int] = 0,
     arg_tl: fx.Pointer = None,
 ):
     """Stage O's arguments (rows fixed at 8) + ``arg_tab``: the layer's table (``T_*`` int64 words).
     ``roles`` (debug): bit 0 router, bit 1 gate_up, bit 2 down (a role left out still counts its launches).
+    ``bq`` (MBW, 11-26; bit-exact): the receivers write the MXFP4 token rows (the router's quant_rows) and x as
+    MXFP8 for the shared gate_up (``T_X8``; quantize_fp8's bytes) right after their x words, from the same words with
+    the same instructions, so the router and the gate_up workgroups skip that work; with the down outside the launch
+    (``roles`` without bit 2) the gate_up skips the sentinel copy of h only the in-launch down reads.
     ``tl`` (diagnostic): thread 0 of each workgroup stamps the 100 MHz steady counter into ``arg_tl`` (int32
     [GRID, TLW]): GEMV [entry, packs pushed]; receivers [entry, poll end, x stored]; router [entry, x ready, chains
     done, logits published, logits ready, end]; gate_up [entry, x ready, chains done, h stored]; down [entry,
@@ -227,7 +237,7 @@ def launch_mf(
     ctr_recv = max_rows * RWAVES
     ctr_err = 2 * max_rows * RWAVES
     i32_m = ROWS
-    kernel_name = f"mf_moe_front_gfx1250_k{K}{'' if roles == 7 else f'_r{roles}'}{'_tl' if tl else ''}{'' if psleep == POLL_SLEEP else f'_s{psleep}'}{'_rm1' if rmode else ''}{f'_sh{shell}' if shell else ''}"
+    kernel_name = f"mf_moe_front_gfx1250_k{K}{'' if roles == 7 else f'_r{roles}'}{'_tl' if tl else ''}{'' if psleep == POLL_SLEEP else f'_s{psleep}'}{'_rm1' if rmode else ''}{f'_sh{shell}' if shell else ''}{'_bq' if bq else ''}"
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_mf(
@@ -550,6 +560,16 @@ def launch_mf(
                     u = tid + 512 * m_  # 16-B chunk of the 2 rows (1536 of them)
                     buffer_store(ones, xr, ((bid - N_GEMV) * 2 * HIDDEN + u * 8) * 2, offset_is_bytes=True,
                                  cache_modifier=SCOPE_DEV)
+            if const_expr(bq):
+                # bq: re-arm copy (E + 1) % 3 of the two rows' MXFP8 bytes (768 chunks) and E8M0 dwords (96 chunks)
+                x8r = copy_rs(T_X8, e, X8COPY, 1)
+                for m_ in range_constexpr(2):
+                    u = tid + 512 * m_
+                    o8 = (u < 2 * HIDDEN // 16).select(
+                        (bid - N_GEMV) * 2 * HIDDEN + u * 16,
+                        X8Q + (bid - N_GEMV) * 2 * (HIDDEN // 32) * 4 + (u - 2 * HIDDEN // 16) * 16)
+                    if u < 2 * HIDDEN // 16 + 2 * (HIDDEN // 32) * 4 // 16:
+                        buffer_store(ones, x8r, o8, offset_is_bytes=True, cache_modifier=SCOPE_DEV)
             half = wave // RWAVES
             w = wave % RWAVES
             r = (bid - N_GEMV) * 2 + half
@@ -649,6 +669,10 @@ def launch_mf(
             total = ((pr[0] + pr[1]) + (pr[2] + pr[3])) + ((pr[4] + pr[5]) + (pr[6] + pr[7]))
             mean = total * _rcp(fx.Float32(float(HIDDEN)))
             rstd = _rsq(fx.Float32(fx.Float64(mean) + f64_eps))
+            if const_expr(bq):
+                x8_rs = copy_rs(T_X8, e, X8COPY)
+                xq_rs = _rsrc(_word(tab, T_XQ), ROWS * (HIDDEN // 2))
+                xs_rs = _rsrc(_word(tab, T_XS), ROWS * (HIDDEN // 32))
             for j in range_constexpr(3):
                 o = []
                 for c in range_constexpr(4):
@@ -656,11 +680,46 @@ def launch_mf(
                     y0 = (s[j][2 * c] * rstd) * (_bf_lo(wv) + fx.Float32(1.0))
                     y1 = (s[j][2 * c + 1] * rstd) * (_bf_hi(wv) + fx.Float32(1.0))
                     o.append(_f2bf2(y0, y1))
-                buffer_store(Vec.from_elements(o, fx.Int32).ir_value(), out_rs, (p0 + 32 * j) * 16, offset_is_bytes=True)
+                if const_expr(not bq):
+                    buffer_store(Vec.from_elements(o, fx.Int32).ir_value(), out_rs, (p0 + 32 * j) * 16,
+                                 offset_is_bytes=True)
                 # x for the in-launch consumers: the same words, k5's sentinel rule, device scope
                 if const_expr(not (shell & 2)):
                     xo = Vec.from_elements([x_flag_word(o[c]) for c in range_constexpr(4)], fx.Int32)
                     buffer_store(xo.ir_value(), x_rs, (p0 + 32 * j) * 16, offset_is_bytes=True, cache_modifier=SCOPE_DEV)
+                if const_expr(bq):
+                    if const_expr(shell & 2):
+                        xo = Vec.from_elements([x_flag_word(o[c]) for c in range_constexpr(4)], fx.Int32)
+                    # bq: this lane's 8 columns are a quarter of a 32-value MX block (lanes 4 q .. 4 q + 3 hold the
+                    # block): the block's |x| max on the bit patterns (as _amax_bf16), then the gate_up's MXFP8 bytes
+                    # (quantize_fp8, the amax floor) and the router's MXFP4 row bytes, from the x words they read
+                    col = (w * SLAB + lane + 32 * j) * 8
+                    mb = fx.Int32(0)
+                    for c in range_constexpr(4):
+                        wd_ = fx.Int32(xo[c])
+                        mb = fx.max(mb, wd_ & fx.Int32(0x7FFF))
+                        mb = fx.max(mb, (wd_ >> fx.Int32(16)) & fx.Int32(0x7FFF))
+                    for off_ in (1, 2):
+                        mb = fx.max(mb, mb.shuffle_xor(fx.Int32(off_), fx.Int32(WAVE)))
+                    amax = (mb << fx.Int32(16)).bitcast(fx.Float32)
+                    bfs_ = xo.bitcast(fx.BFloat16)
+                    xe8 = fx.Int32(emit_mx_e8m0_scale(fx.max(amax, fx.Float32(_MXFP8_COPY_AMAX_FLOOR)), mode=_ROUND_MODE,
+                                                      dtype=MxDtypeInt.FP8_E4M3))
+                    q8 = Vec(_cvt_scalef32_pk8_fp8_bf16(bfs_, (xe8 << fx.Int32(23)).bitcast(fx.Float32),
+                                                        v2i32_ty=T.vec(2, T.i32)))
+                    q8w = Vec.from_elements([x_flag_word(fx.Int32(q8[0])), x_flag_word(fx.Int32(q8[1]))], fx.Int32)
+                    buffer_store(q8w, x8_rs, rr * HIDDEN + col, offset_is_bytes=True, cache_modifier=SCOPE_DEV)
+                    if lane % 4 == 0:
+                        buffer_store(xe8, x8_rs, X8Q + (rr * (HIDDEN // 32) + col // 32) * 4, offset_is_bytes=True,
+                                     cache_modifier=SCOPE_DEV)
+                    e8m0 = fx.Int32(emit_mx_e8m0_scale(amax, mode=_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1))
+                    pq = fx.Int32(_cvt_scalef32_pk8_fp4_bf16(bfs_, (e8m0 << fx.Int32(23)).bitcast(fx.Float32),
+                                                             i32_ty=T.i32))
+                    buffer_store(pq, xq_rs, rr * (HIDDEN // 2) + col // 2, offset_is_bytes=True)
+                    if lane % 4 == 0:
+                        buffer_store(fx.Uint8(e8m0), xs_rs, rr * (HIDDEN // 32) + col // 32, offset_is_bytes=True)
+                    buffer_store(Vec.from_elements(o, fx.Int32).ir_value(), out_rs, (p0 + 32 * j) * 16,
+                                 offset_is_bytes=True)
             for j in range_constexpr(3):
                 my_store(offs(i32_rank, j), sent)
             if lane == 0:
@@ -847,18 +906,22 @@ def launch_mf(
                     buffer_store(x_flag_word(wd), copy_rs(T_LG, e, LGBUF), (tok * EXPERTS + k * 16 + 2 * ep) * 2,
                                  offset_is_bytes=True, cache_modifier=SCOPE_DEV)
                 stamp(3)
-                # row k's MXFP4 rows (the router's quant_rows): MX block b of 32 values, thread b < 192
-                if tid < HIDDEN // 32:
-                    xq_rs = _rsrc(_word(tab, T_XQ), ROWS * (HIDDEN // 2))
-                    xs_rs = _rsrc(_word(tab, T_XS), ROWS * (HIDDEN // 32))
-                    ch = [Vec(_ld(x_rs, (k * HIDDEN + tid * 32) // 2 + cc * 4, 4, SCOPE_DEV)) for cc in range_constexpr(4)]
-                    bfs = [ch[cc].bitcast(fx.BFloat16) for cc in range_constexpr(4)]
-                    amax = _amax_bf16(ch)
-                    e8m0 = fx.Int32(emit_mx_e8m0_scale(amax, mode=_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1))
-                    sc = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-                    pq = [fx.Int32(_cvt_scalef32_pk8_fp4_bf16(bfs[cc], sc, i32_ty=T.i32)) for cc in range_constexpr(4)]
-                    buffer_store(Vec.from_elements(pq, fx.Int32), xq_rs, k * (HIDDEN // 2) + tid * 16, offset_is_bytes=True)
-                    buffer_store(fx.Uint8(e8m0), xs_rs, k * (HIDDEN // 32) + tid, offset_is_bytes=True)
+                # row k's MXFP4 rows (the router's quant_rows): MX block b of 32 values, thread b < 192 (bq: written by
+                # the receivers)
+                if const_expr(not bq):
+                    if tid < HIDDEN // 32:
+                        xq_rs = _rsrc(_word(tab, T_XQ), ROWS * (HIDDEN // 2))
+                        xs_rs = _rsrc(_word(tab, T_XS), ROWS * (HIDDEN // 32))
+                        ch = [Vec(_ld(x_rs, (k * HIDDEN + tid * 32) // 2 + cc * 4, 4, SCOPE_DEV))
+                              for cc in range_constexpr(4)]
+                        bfs = [ch[cc].bitcast(fx.BFloat16) for cc in range_constexpr(4)]
+                        amax = _amax_bf16(ch)
+                        e8m0 = fx.Int32(emit_mx_e8m0_scale(amax, mode=_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1))
+                        sc = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+                        pq = [fx.Int32(_cvt_scalef32_pk8_fp4_bf16(bfs[cc], sc, i32_ty=T.i32)) for cc in range_constexpr(4)]
+                        buffer_store(Vec.from_elements(pq, fx.Int32), xq_rs, k * (HIDDEN // 2) + tid * 16,
+                                     offset_is_bytes=True)
+                        buffer_store(fx.Uint8(e8m0), xs_rs, k * (HIDDEN // 32) + tid, offset_is_bytes=True)
                 # gate row k (wave 0): lane l holds experts l + 32 i, from the 8 slices' logits words
                 if wave == 0:
                     lg_rs = copy_rs(T_LG, e, LGBUF)
@@ -919,49 +982,89 @@ def launch_mf(
                     for ks_ in range_constexpr(S_STEPS)
                 ]
                 rocdl.sched_barrier(0)
-                # re-arm copy (E + 1) % 3 of this group's h bytes and h scales (the split-3 workgroup)
-                if (s == S_SPLIT - 1) & (tid < ROWS * 2):
-                    buffer_store(ones, copy_rs(T_HB, e, HCOPY, 1), (tid // 2) * S_INTER + g * GROUP + (tid % 2) * 16,
-                                 offset_is_bytes=True, cache_modifier=SCOPE_DEV)
-                if (s == S_SPLIT - 1) & (tid < ROWS):
-                    buffer_store(fx.Int32(-1), copy_rs(T_HB, e, HCOPY, 1), HBUF + (tid * N_GROUPS + g) * 4,
-                                 offset_is_bytes=True, cache_modifier=SCOPE_DEV)
-                if wave >= 4:
-                    # MX block b = tid - 128 (token b // 48, block b % 48 of the split): 4 chunks, polled, quantized
-                    b_ = tid - 128
-                    xtok = b_ // (S_CHUNK // 32)
-                    xkb = b_ % (S_CHUNK // 32)
-                    x_rs = copy_rs(T_XB, e, XBUF)
-                    xdw = (xtok * HIDDEN + s * S_CHUNK + xkb * 32) // 2
+                # re-arm copy (E + 1) % 3 of this group's h bytes and h scales (the split-3 workgroup); bq without the
+                # in-launch down: no sentinel copy of h at all (only that down reads it; the tail reads the plain h)
+                h_copy = not (bq and not (roles & 4))
+                if const_expr(h_copy):
+                    if (s == S_SPLIT - 1) & (tid < ROWS * 2):
+                        buffer_store(ones, copy_rs(T_HB, e, HCOPY, 1), (tid // 2) * S_INTER + g * GROUP + (tid % 2) * 16,
+                                     offset_is_bytes=True, cache_modifier=SCOPE_DEV)
+                    if (s == S_SPLIT - 1) & (tid < ROWS):
+                        buffer_store(fx.Int32(-1), copy_rs(T_HB, e, HCOPY, 1), HBUF + (tid * N_GROUPS + g) * 4,
+                                     offset_is_bytes=True, cache_modifier=SCOPE_DEV)
+                if const_expr(bq):
+                    if wave >= 4:
+                        # bq: MX block b = tid - 128 (token b // 48, block b % 48 of the split): its 32 E4M3 bytes and
+                        # its E8M0 dword as the receivers published them, polled, copied to the B fragments
+                        b_ = tid - 128
+                        xtok = b_ // (S_CHUNK // 32)
+                        xkb = b_ % (S_CHUNK // 32)
+                        x8_rs = copy_rs(T_X8, e, X8COPY)
+                        q_dw = (xtok * HIDDEN + s * S_CHUNK + xkb * 32) // 4
+                        sc_dw = (X8Q // 4) + xtok * (HIDDEN // 32) + s * (S_CHUNK // 32) + xkb
 
-                    def load_x():
-                        _mem_clobber()
-                        return tuple(Vec(_ld(x_rs, xdw + u * 4, 4, SCOPE_DEV)) for u in range_constexpr(4))
+                        def load_x8():
+                            _mem_clobber()
+                            return (Vec(_ld(x8_rs, q_dw, 4, SCOPE_DEV)), Vec(_ld(x8_rs, q_dw + 4, 4, SCOPE_DEV)),
+                                    fx.Int32(_ld(x8_rs, sc_dw, 1, SCOPE_DEV)))
 
-                    (c0, c1, c2, c3) = load_x()
-                    pend = pending((c0, c1, c2, c3))
-                    it = fx.Int32(0)
-                    while pend & (it < i32_maxit):
-                        rocdl.s_sleep(psleep)
+                        def pending8(a_, b_, sc_):
+                            m = sc_ == fx.Int32(-1)
+                            m = fx.Int32(rocdl.ballot(T.i32, m)) != 0
+                            return pending((a_, b_)) | m
+
+                        (u0, u1, us_) = load_x8()
+                        pend8 = pending8(u0, u1, us_)
+                        it8 = fx.Int32(0)
+                        while pend8 & (it8 < i32_maxit):
+                            rocdl.s_sleep(psleep)
+                            (u0, u1, us_) = load_x8()
+                            pend8 = pending8(u0, u1, us_)
+                            it8 = it8 + 1
+                        timeout(pend8)
+                        xks = xkb // 4
+                        xq_ = xkb % 4
+                        for kg, unit in ((0, u0), (1, u1)):
+                            lds_store_b128(lds_idx, LG_X + ((xks * 4 + xq_) * 16 + kg * 8 + xtok) * 16, unit)
+                        fx.ptr_store(fx.Uint8(us_),
+                                     fx.add_offset(lds_ptr, LG_SC + (xtok * S_STEPS + xks) * 4 + xq_))
+                else:
+                    if wave >= 4:
+                        # MX block b = tid - 128 (token b // 48, block b % 48 of the split): 4 chunks, polled, quantized
+                        b_ = tid - 128
+                        xtok = b_ // (S_CHUNK // 32)
+                        xkb = b_ % (S_CHUNK // 32)
+                        x_rs = copy_rs(T_XB, e, XBUF)
+                        xdw = (xtok * HIDDEN + s * S_CHUNK + xkb * 32) // 2
+
+                        def load_x():
+                            _mem_clobber()
+                            return tuple(Vec(_ld(x_rs, xdw + u * 4, 4, SCOPE_DEV)) for u in range_constexpr(4))
+
                         (c0, c1, c2, c3) = load_x()
                         pend = pending((c0, c1, c2, c3))
-                        it = it + 1
-                    timeout(pend)
-                    xch = [c0, c1, c2, c3]
-                    bfs = [xch[cc].bitcast(fx.BFloat16) for cc in range_constexpr(4)]
-                    xamax = _amax_bf16(xch)
-                    xe8 = fx.Int32(
-                        emit_mx_e8m0_scale(fx.max(xamax, fx.Float32(_MXFP8_COPY_AMAX_FLOOR)), mode=_ROUND_MODE,
-                                           dtype=MxDtypeInt.FP8_E4M3))
-                    xsc8 = (xe8 << fx.Int32(23)).bitcast(fx.Float32)
-                    qv = [Vec(_cvt_scalef32_pk8_fp8_bf16(bfs[cc], xsc8, v2i32_ty=T.vec(2, T.i32))) for cc in range_constexpr(4)]
-                    xks = xkb // 4
-                    xq_ = xkb % 4
-                    for kg in range_constexpr(2):
-                        unit = Vec.from_elements([qv[2 * kg][0], qv[2 * kg][1], qv[2 * kg + 1][0], qv[2 * kg + 1][1]],
-                                                 fx.Int32)
-                        lds_store_b128(lds_idx, LG_X + ((xks * 4 + xq_) * 16 + kg * 8 + xtok) * 16, unit)
-                    fx.ptr_store(fx.Uint8(xe8), fx.add_offset(lds_ptr, LG_SC + (xtok * S_STEPS + xks) * 4 + xq_))
+                        it = fx.Int32(0)
+                        while pend & (it < i32_maxit):
+                            rocdl.s_sleep(psleep)
+                            (c0, c1, c2, c3) = load_x()
+                            pend = pending((c0, c1, c2, c3))
+                            it = it + 1
+                        timeout(pend)
+                        xch = [c0, c1, c2, c3]
+                        bfs = [xch[cc].bitcast(fx.BFloat16) for cc in range_constexpr(4)]
+                        xamax = _amax_bf16(xch)
+                        xe8 = fx.Int32(
+                            emit_mx_e8m0_scale(fx.max(xamax, fx.Float32(_MXFP8_COPY_AMAX_FLOOR)), mode=_ROUND_MODE,
+                                               dtype=MxDtypeInt.FP8_E4M3))
+                        xsc8 = (xe8 << fx.Int32(23)).bitcast(fx.Float32)
+                        qv = [Vec(_cvt_scalef32_pk8_fp8_bf16(bfs[cc], xsc8, v2i32_ty=T.vec(2, T.i32))) for cc in range_constexpr(4)]
+                        xks = xkb // 4
+                        xq_ = xkb % 4
+                        for kg in range_constexpr(2):
+                            unit = Vec.from_elements([qv[2 * kg][0], qv[2 * kg][1], qv[2 * kg + 1][0], qv[2 * kg + 1][1]],
+                                                     fx.Int32)
+                            lds_store_b128(lds_idx, LG_X + ((xks * 4 + xq_) * 16 + kg * 8 + xtok) * 16, unit)
+                        fx.ptr_store(fx.Uint8(xe8), fx.add_offset(lds_ptr, LG_SC + (xtok * S_STEPS + xks) * 4 + xq_))
                 _lds_barrier()
                 stamp(1)
                 gp_rs = _rsrc(_word(tab, T_GP), GPBUF)
@@ -1080,14 +1183,16 @@ def launch_mf(
                         pairs.append(pick)
                     v8 = Vec.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16)
                     q8 = Vec(_cvt_scalef32_pk8_fp8_bf16(v8, sc8, v2i32_ty=T.vec(2, T.i32)))
-                    if q == 0:
-                        buffer_store(
-                            Vec.from_elements([x_flag_word(fx.Int32(q8[0])), x_flag_word(fx.Int32(q8[1]))], fx.Int32),
-                            copy_rs(T_HB, e, HCOPY), tok * S_INTER + g * GROUP + tile * 8, offset_is_bytes=True,
-                            cache_modifier=SCOPE_DEV)
-                    if (q == 0) & (tile == 0):
-                        buffer_store(e8, copy_rs(T_HB, e, HCOPY), HBUF + (tok * N_GROUPS + g) * 4, offset_is_bytes=True,
-                                     cache_modifier=SCOPE_DEV)
+                    if const_expr(h_copy):
+                        if q == 0:
+                            buffer_store(
+                                Vec.from_elements([x_flag_word(fx.Int32(q8[0])), x_flag_word(fx.Int32(q8[1]))],
+                                                  fx.Int32),
+                                copy_rs(T_HB, e, HCOPY), tok * S_INTER + g * GROUP + tile * 8, offset_is_bytes=True,
+                                cache_modifier=SCOPE_DEV)
+                        if (q == 0) & (tile == 0):
+                            buffer_store(e8, copy_rs(T_HB, e, HCOPY), HBUF + (tok * N_GROUPS + g) * 4,
+                                         offset_is_bytes=True, cache_modifier=SCOPE_DEV)
                     # the plain h / hs (production's bytes) for a shared down in a later launch (interface h)
                     if q == 0:
                         buffer_store(Vec.from_elements([fx.Int32(q8[0]), fx.Int32(q8[1])], fx.Int32),
