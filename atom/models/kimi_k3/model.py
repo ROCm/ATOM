@@ -82,6 +82,9 @@ from atom.utils.region_graph import (
     token_graph,
 )
 
+# Keep the conservative floor: the sharded tail changes BF16 addition order.
+_MOE_ROW_SHARD_MIN_TOKENS = 8192
+
 
 def _text_config(config):
     return getattr(config, "text_config", config)
@@ -453,18 +456,26 @@ class KimiSparseMoeBlock(nn.Module):
         # the routed-expert path (on the main stream). Only meaningful when a
         # shared branch exists and an alt_stream was threaded in. TBO already
         # provides its own overlap, so the two are mutually exclusive.
-        self._use_dual_stream = False
         self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
-        if self.shared_experts is not None and self.alt_stream is not None:
-            tbo_active = get_current_atom_config().enable_tbo
-            if (
-                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
-                and not tbo_active
-                and self.experts.allows_concurrent_shared_stream
-            ):
-                self._use_dual_stream = True
-        if self._use_dual_stream:
+        tbo_active = get_current_atom_config().enable_tbo
+        self._use_dual_stream = (
+            self.shared_experts is not None
+            and self.alt_stream is not None
+            and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not tbo_active
+            and self.experts.allows_concurrent_shared_stream
+        )
+        # The split op's single-stream target row-shards a large step's latent
+        # tail, so a latent block with TP takes the op with dual-stream off too.
+        self.row_shardable = (
+            self.use_latent_moe
+            and self.shared_experts is not None
+            and self.tp_size > 1
+            and not tbo_active
+        )
+        self._use_dispatch_op = self._use_dual_stream or self.row_shardable
+        if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
             cc = get_current_atom_config().compilation_config
@@ -519,10 +530,9 @@ class KimiSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Returns ``(first, shared)``, where ``shared`` may be None.
 
-        When ``shared`` is a tensor the two branches are left unsummed and
-        ``first`` is the routed branch alone: the caller's next apply_attn_res
-        folds both into its prefix on-load, so deferring the add removes a whole
-        [T, H] elementwise kernel and its HBM round-trip per MoE layer.
+        Replicated steps return routed/shared tensors; the row tail returns
+        sum/zero. The next apply_attn_res folds both into its prefix. Deferring
+        the replicated add removes a [T, H] kernel and its HBM round-trip.
 
         When ``shared`` is None, ``first`` is the module's *complete* output --
         either because there are no shared experts, or because the two branches
@@ -531,7 +541,7 @@ class KimiSparseMoeBlock(nn.Module):
         therefore treat ``first`` as the whole result and not as a routed
         partial that is still owed a shared add.
         """
-        if self._use_dual_stream:
+        if self._use_dispatch_op:
             if self._defer_shared_add:
                 # maybe_dual_stream_split_forward hands both branches back unsummed,
                 # so the deferral survives the custom-op boundary and the next
@@ -592,8 +602,57 @@ class KimiSparseMoeBlock(nn.Module):
         it has to defer exactly like the dual-stream target -- otherwise the
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
+
+        On a step `takes_row_tail` admits, the latent tail runs on this rank's
+        rows instead (`_row_sharded_split_moe_forward`).
         """
+        if self.takes_row_tail(hidden_states.shape[0]):
+            return self._row_sharded_split_moe_forward(hidden_states)
         return self._assert_split(self.split_moe_forward(hidden_states))
+
+    def takes_row_tail(self, num_tokens: int) -> bool:
+        """Row-shard with TP outside capture/TBO, above the stream threshold
+        and at least the row floor. Attention residual uses the same gate."""
+        from atom.utils.tbo.ubatching import tbo_active
+
+        return (
+            self.tp_size > 1
+            and num_tokens > self._dual_stream_token_threshold
+            and num_tokens >= _MOE_ROW_SHARD_MIN_TOKENS
+            and not torch.cuda.is_current_stream_capturing()
+            and not tbo_active()
+        )
+
+    def _row_sharded_split_moe_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`row_sharded_moe` over this step's rows. The second return is zeros:
+        the op's schema has no optional tensor."""
+        from atom.distributed.sequence_parallel import SequenceParallel
+
+        rows = SequenceParallel(
+            hidden_states.shape[0], self.tp_size, get_tensor_model_parallel_rank()
+        )
+        output = self.row_sharded_moe(hidden_states, rows)
+        return output, torch.zeros_like(output)
+
+    def row_sharded_moe(
+        self,
+        hidden_states: torch.Tensor,
+        rows,
+        prefix_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Scatter routed/shared partials, normalize and project local rows,
+        add the optional prefix, then gather the sum. Its BF16 rounding differs
+        from the next attn_res's FP32 fold and can move MoE routing."""
+        router_logits = self.gate(hidden_states)
+        routed_input = self.routed_expert_down_proj(hidden_states)
+        routed_output = self.experts(routed_input, router_logits)
+        routed_output = self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
+        output = routed_output + rows.scatter(self.shared_experts(hidden_states))
+        if prefix_rows is not None:
+            output += prefix_rows
+        return rows.gather(output)
 
     @staticmethod
     def _assert_split(
@@ -1978,6 +2037,17 @@ class KimiDecoderLayer(nn.Module):
             self.mlp = KimiMLP(
                 config, quant_config=quant_config, prefix=f"{prefix}.mlp"
             )
+        # An MoE layer whose tail can row-shard hands o_proj's partial sum to
+        # `kimi_k3_post_attention_forward`, which reduces it: an all-reduce, or
+        # on a row-sharded step a reduce-scatter.
+        self.layer_name = prefix
+        self.post_attention_op = (
+            hasattr(self, "block_sparse_moe") and self.block_sparse_moe.row_shardable
+        )
+        if self.post_attention_op:
+            self.self_attn.o_proj.reduce_results = False
+            cc = get_current_atom_config().compilation_config
+            cc.static_forward_context[prefix] = self
         # Fuse the activation quant into input_layernorm when the attention input
         # projection(s) run with a fusable quant scheme (self_attn decides and
         # exposes the flag + representative prefix). The normed output then flows
@@ -2065,15 +2135,72 @@ class KimiDecoderLayer(nn.Module):
     def _ffn(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the FFN, leaving the MoE's routed/shared add to the caller.
+        """Run the FFN, returning split MoE branches or its row-tail sum and zero.
 
-        The second tensor (when not None) is folded into the next
-        apply_attn_res's prefix as ``add_hidden2``, skipping a [T, H]
-        elementwise kernel. A dense mlp has nothing to defer.
+        The next apply_attn_res folds a returned second tensor into its prefix
+        as ``add_hidden2``. A dense MLP has nothing to defer.
         """
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(hidden_states)
         return self.mlp(hidden_states), None
+
+    def _mlp(
+        self,
+        attn_out: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """mlp_attn_res and the FFN on the reduced attention output; returns
+        ``(prefix_sum, ffn_out, shared)``."""
+        hidden_states, prefix_sum = self.mlp_attn_res(
+            prefix_sum, block_residual, attn_out
+        )
+        hidden_states, shared = self._ffn(hidden_states)
+        return prefix_sum, hidden_states, shared
+
+    def _post_attention(
+        self,
+        attn_out: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`_mlp` on the attention's output, which is o_proj's partial sum
+        on a `post_attention_op` layer."""
+        if self.post_attention_op:
+            return torch.ops.aiter.kimi_k3_post_attention_forward(
+                attn_out, prefix_sum, block_residual, self.layer_name
+            )
+        return self._mlp(attn_out, prefix_sum, block_residual)
+
+    def post_attention_forward(
+        self,
+        attn_partial: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce o_proj's partial and run residual/MoE, locally on sharded steps.
+
+        Sharded steps gather the normalized MoE input, then its tail gathers
+        the whole residual. Both addends are real zeros so auxiliary readers
+        and compiler-created clones can load them without pointer markers.
+        """
+        moe = self.block_sparse_moe
+        if not moe.takes_row_tail(attn_partial.shape[0]):
+            attn_out = tensor_model_parallel_all_reduce(attn_partial)
+            return self._mlp(attn_out, prefix_sum, block_residual)
+        from atom.distributed.sequence_parallel import SequenceParallel
+
+        rows = SequenceParallel(
+            attn_partial.shape[0], moe.tp_size, get_tensor_model_parallel_rank()
+        )
+        window = self.mlp_attn_res.window(block_residual)
+        hidden_rows, prefix_rows = self.mlp_attn_res(
+            None if prefix_sum is None else rows.shard(prefix_sum),
+            None if window is None else rows.shard(window),
+            rows.scatter(attn_partial),
+        )
+        residual = moe.row_sharded_moe(rows.gather(hidden_rows), rows, prefix_rows)
+        return residual, torch.zeros_like(residual), torch.zeros_like(residual)
 
     def forward(
         self,
@@ -2097,13 +2224,11 @@ class KimiDecoderLayer(nn.Module):
         else:
             hidden_states = self.self_attn(positions, hidden_states)
 
-        hidden_states, prefix_sum = self.mlp_attn_res(
-            prefix_sum, block_residual, hidden_states
+        # Replicated steps leave routed/shared adds to the next attn_res.
+        # A row-sharded step returns the whole residual with real zero addends.
+        prefix_sum, hidden_states, shared = self._post_attention(
+            hidden_states, prefix_sum, block_residual
         )
-        # Routed and shared expert outputs come back unsummed: the next layer's
-        # attn_res kernel folds both into its prefix on-load, so the [T, H]
-        # elementwise add that would combine them here never runs.
-        hidden_states, shared = self._ffn(hidden_states)
         return prefix_sum, hidden_states, shared, block_residual
 
     @staticmethod

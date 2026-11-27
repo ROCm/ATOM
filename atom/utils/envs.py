@@ -1248,7 +1248,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GRAPH_SIDE_STREAMS": lambda: _flag_env(
         "ATOM_GRAPH_SIDE_STREAMS", _graph_side_streams_default()
     ),
-    # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # Dual-stream MoE only when num_tokens <= threshold; 0 disables the fork.
+    # Eligible Kimi latent TP blocks keep their dispatch op: outside capture/TBO
+    # the row tail also requires the model's fixed minimum row count.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),

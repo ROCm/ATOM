@@ -20,7 +20,8 @@ the methods listed in each op's docstring.
 
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
-  - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
+  - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared or sum/zeros)
+  - torch.ops.aiter.kimi_k3_post_attention_forward — K3 layer after its attention
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
@@ -115,7 +116,7 @@ direct_register_custom_op(
 
 
 # ---------------------------------------------------------------------------
-# Dual-stream MoE dispatch, routed/shared returned UNSUMMED (K3)
+# Dual-stream MoE dispatch, routed/shared or row-sharded sum/zeros (K3)
 # ---------------------------------------------------------------------------
 #
 # Caller contract (the MoE module looked up by `layer_name`):
@@ -132,7 +133,8 @@ direct_register_custom_op(
 # next attn_res folds both addends into its on-load) cannot use it without
 # paying the [T, H] elementwise kernel it is trying to skip.
 #
-# This op returns both branches instead. Both returns are always real tensors,
+# This op returns both branches, or the row-sharded sum and a real zero.
+# Both returns are always real tensors,
 # which the schema does allow; the caller decides whether deferring is legal
 # from its own static config, NOT from anything about these tensors. A model
 # whose branches must be summed before a collective keeps using the op above.
@@ -167,6 +169,45 @@ direct_register_custom_op(
     op_func=maybe_dual_stream_split_forward,
     mutates_args=(),
     fake_impl=_maybe_dual_stream_split_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# K3 post-attention: reduce the attention partial, then run residual and MoE.
+# The registered layer returns (prefix, routed, shared), all [T, H] tensors.
+# Row-shape decisions stay inside this op; sharded steps return sum/real zeros.
+
+
+def kimi_k3_post_attention_forward(
+    attn_partial: torch.Tensor,
+    prefix_sum: torch.Tensor | None,
+    block_residual: torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.post_attention_forward(attn_partial, prefix_sum, block_residual)
+
+
+def _kimi_k3_post_attention_forward_fake(
+    attn_partial: torch.Tensor,
+    prefix_sum: torch.Tensor | None,
+    block_residual: torch.Tensor | None,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(attn_partial),
+        torch.empty_like(attn_partial),
+        torch.empty_like(attn_partial),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_post_attention_forward",
+    op_func=kimi_k3_post_attention_forward,
+    mutates_args=(),
+    fake_impl=_kimi_k3_post_attention_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
