@@ -160,9 +160,13 @@ def test_cost_limit_restored_even_if_partial_resume_raises(
     monkeypatch.setattr(sched, "_resume_partial_prefills", resume)
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
-            sched._resume_long_partials([long], {}, [], 0, 0, sched.max_num_batched_tokens)
+            sched._resume_long_partials(
+                [long], {}, [], 0, 0, sched.max_num_batched_tokens
+            )
     else:
-        assert sched._resume_long_partials([long], {}, [], 0, 0, sched.max_num_batched_tokens) == (0, 0)
+        assert sched._resume_long_partials(
+            [long], {}, [], 0, 0, sched.max_num_batched_tokens
+        ) == (0, 0)
     assert sched._tick_cost_limit == 1.0
 
 
@@ -219,7 +223,10 @@ def test_dp_cost_ceil_rounds_per_rank_and_preserves_target_room(monkeypatch, cei
 @pytest.mark.parametrize(
     "busy,decode,interval", [(0, (1, 49), 2), (5, (1, 49), 5), (5, (1, 2), 2)]
 )
-def test_busy_interval_same_across_uneven_ranks(monkeypatch, busy, decode, interval):
+@pytest.mark.parametrize("prefill_only", [False, True])
+def test_busy_interval_same_across_uneven_ranks(
+    monkeypatch, busy, decode, interval, prefill_only
+):
     ds = [
         PrefillDelayer(
             dp_size=2,
@@ -240,7 +247,7 @@ def test_busy_interval_same_across_uneven_ranks(monkeypatch, busy, decode, inter
         tensor[2] = sum(decode)
         tensor[7] = execution[0]  # only rank 0 really prefills; both see its report
         tensor[10] = 0
-        tensor[11] = execution[0]  # and that step was prefill-only (no decode beside it)
+        tensor[11] = execution[0] if prefill_only else 0
 
     monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
 
@@ -258,6 +265,11 @@ def test_busy_interval_same_across_uneven_ranks(monkeypatch, busy, decode, inter
 
     assert tick() == [True, True]
     execution[0] = 1
+    if not prefill_only:
+        tick()
+        assert [d._decode_interval_remaining for d in ds] == [0, 0]
+        assert [d.group_running_decode for d in ds] == [sum(decode)] * 2
+        return
     assert tick() == [False, False]
     assert [d._decode_interval_remaining for d in ds] == [interval - 1] * 2
     assert [d.group_running_decode for d in ds] == [sum(decode)] * 2
@@ -439,3 +451,21 @@ def test_default_off_delayer_matches_pinned_trace(monkeypatch):
             "rank_prefill_costs",
         ):
             assert getattr(old, attr) == getattr(new, attr)
+
+
+@pytest.mark.parametrize(
+    "helper", ["_resume_partial_prefills", "_resume_long_partials"]
+)
+@pytest.mark.parametrize("budget", [0, 4])
+def test_partial_resume_honors_reduced_mixed_budget(
+    monkeypatch, seq_factory, helper, budget
+):
+    sched = _sched(monkeypatch, rows=4)
+    seq = _prompt(seq_factory, 1000, 64)
+    sched.add(seq)
+    assert _step(sched) == [(seq, 8)]
+    scheduled, tokens = {}, []
+    counts = getattr(sched, helper)([seq], scheduled, tokens, 0, 0, budget)
+    assert counts == (int(budget > 0), budget)
+    assert tokens == ([budget] if budget else [])
+    assert len(scheduled) == int(budget > 0)

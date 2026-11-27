@@ -60,14 +60,14 @@ class SessionPolicy(LoadPolicy):
         prompts: dict,
         rank_count: int,
         parent_ignored: Callable[[], None],
+        rank_reqs: Callable[[], list[int]] | None = None,
+        margin: float = 0.1,
         *,
         prefix_index: Any = None,
         owner_tokens: int = 0,
         owner_extra_reqs: int = 0,
         load_reqs: Callable[[], list[int]] | None = None,
         prefix_owner_seen: Callable[[str, int], None] | None = None,
-        rank_reqs: Callable[[], list[int]] | None = None,
-        margin: float = 0.1,
     ) -> None:
         super().__init__(lightest)
         self.select_session = select_session

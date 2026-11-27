@@ -371,3 +371,38 @@ def test_confirmed_hits_require_every_ancestor():
     assert router.confirmed_hits(seq, 2) == {0: 256}
     router.pending[(root, 0)] = 123
     assert router.confirmed_hits(seq, 2) == {}
+
+
+@pytest.mark.parametrize("migrate", [False, True])
+def test_prefix_owner_load_reader_does_not_enable_session_spill(migrate):
+    mgr = _mgr()
+    if migrate:
+        mgr._session_migrate_margin = 0.25
+    _, owner = _first_session(mgr)
+    policy = mgr._get_dp_policy()
+    assert policy.load_reqs() is mgr._rank_reqs
+    assert (policy.rank_reqs is not None) == migrate
+    mgr._rank_reqs[:] = [40 if rank == owner else 0 for rank in range(2)]
+    turn = _Seq(2, 70_000, session="parent")
+    assert _route(mgr, turn) == (1 - owner if migrate else owner)
+    assert _count(mgr, "affinity_spill_total") == int(migrate)
+
+
+def test_session_spill_positional_arguments_still_match_main():
+    from atom.model_engine.dp_routing.policies import SessionPolicy
+
+    requests = [10, 0]
+    policy = SessionPolicy(
+        lambda: 1,
+        lambda session: 1,
+        {"s": 0},
+        {},
+        2,
+        lambda: None,
+        lambda: requests,
+        0.25,
+    )
+    route = policy.select(_Seq(1, 1024, session="s"), None)
+    assert route.rank == 1
+    assert route.decision == "affinity_spill_total"
+    assert policy.load_reqs is None

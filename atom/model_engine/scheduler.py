@@ -3050,8 +3050,10 @@ class Scheduler:
         late_before = None
         held = 0
         short_first = (
-            delayer_allows and prefill_budget > 0
-            and self._short_first_rows > 0 and self.kv_connector is None
+            delayer_allows
+            and prefill_budget > 0
+            and self._short_first_rows > 0
+            and self.kv_connector is None
         )
         if short_first:
             partials, late_partials, late_before = self._short_first_order()
