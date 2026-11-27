@@ -117,9 +117,10 @@ PAIR_MAX_TOKENS = 10
 
 
 def pair_mode() -> int:
-    """``ATOM_MONO_PAIR`` (0: no pairs; 1: pairs, no prefetch; 2, the default:
-    pairs, prefetch)."""
-    return int(os.environ.get("ATOM_MONO_PAIR", "2"))
+    """``ATOM_MONO_PAIR`` (0, the default: no pairs -- the run kernel,
+    ``layer_run``, takes every run of ordinary layers; 1: pairs, no prefetch;
+    2: pairs, prefetch; pairs only where ``ATOM_MONO_RUN`` is 0)."""
+    return int(os.environ.get("ATOM_MONO_PAIR", "0"))
 
 
 @dataclass(frozen=True)

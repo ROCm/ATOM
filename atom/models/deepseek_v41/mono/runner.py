@@ -19,7 +19,9 @@ the layer or the step); before an Engram layer the original Engram runs.
 
 import logging
 import math
+import os
 import struct
+import threading
 from dataclasses import dataclass, field, replace
 from functools import partial
 
@@ -66,6 +68,7 @@ from atom.models.deepseek_v41.mono.kernels import draft_ctx as dc
 from atom.models.deepseek_v41.mono.kernels import engram as eg
 from atom.models.deepseek_v41.mono.kernels import layer as kl
 from atom.models.deepseek_v41.mono.kernels import layer_pair as lp
+from atom.models.deepseek_v41.mono.kernels import layer_run as lr
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import UG_PART, Dims, kvrow_bytes
@@ -156,6 +159,9 @@ class RowsBuild:
     # (pair) K1 key -> the pair kernel of two such layers
     # (``layer_pair``), where ``ATOM_MONO_PAIR`` asks for one (``layer_pair.pair_mode``)
     pairs: dict = field(default_factory=dict)
+    # (run kernel) K1 key -> the run kernel of a run of such layers
+    # (``layer_run``), where ``ATOM_MONO_RUN`` asks for one
+    runs: dict = field(default_factory=dict)
     # a sharded step's column gathers (``_gather_cols``): ``col_gather.State``
     # -> its launcher
     gathers: dict = field(default_factory=dict)
@@ -186,6 +192,33 @@ def _draft_of(drafter):
 def f32_bits(x: float) -> int:
     """``x`` rounded to fp32, as the int32 of its bits (a kernel's Int32 arg)."""
     return struct.unpack("<i", struct.pack("<f", x))[0]
+
+
+def _filled_apart(vals, device: int):
+    """(run kernel) ``vals`` (int64) in a new device tensor, copied and waited
+    for on a thread and stream of its own: callable inside a thread_local
+    capture without adding to it. -> (host, device) tensors."""
+    out = {}
+
+    def work():
+        try:
+            torch.cuda.set_device(device)
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                host = torch.tensor(vals, dtype=torch.int64).pin_memory()
+                dev = torch.empty(len(vals), dtype=torch.int64, device=torch.device("cuda", device))
+                dev.copy_(host, non_blocking=True)
+            stream.synchronize()
+            out["got"] = (host, dev)
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the caller's thread
+            out["err"] = e
+
+    th = threading.Thread(target=work, name="v41-run-table")
+    th.start()
+    th.join()
+    if "err" in out:
+        raise out["err"]
+    return out["got"]
 
 
 class V41MonoDecodeRunner:
@@ -563,10 +596,15 @@ class V41MonoDecodeRunner:
         # (pair) a spilled pair kernel dropped: its layers run apart
         pairs = {k: f for k, f in built.pairs.items() if f not in rest}
         rest = [f for f in rest if f not in built.pairs.values()]
+        # (run kernel) a spilled run kernel dropped: its layers run apart
+        runs = {k: f for k, f in built.runs.items() if f not in rest}
+        rest = [f for f in rest if f not in built.runs.values()]
         layers = {k: f for k, f in built.layers.items() if f not in rest}
         if len(built.layers) - len(layers) != len(rest):
             return None
-        return replace(built, layers=layers, pairs=pairs, layer_post=post, post_key=key)
+        return replace(
+            built, layers=layers, pairs=pairs, runs=runs, layer_post=post, post_key=key
+        )
 
     def _layer_blocks(self) -> list:
         """(spec, block) of every layer this runner runs, in order (the
@@ -636,9 +674,28 @@ class V41MonoDecodeRunner:
     def _pair_mode(self) -> int:
         """``ATOM_MONO_PAIR`` for the target's runner (0: off;
         the draft's runner never pairs)."""
-        if type(self) is not V41MonoDecodeRunner:
+        if type(self) is not V41MonoDecodeRunner or self._run_mode():
             return 0
         return lp.pair_mode()
+
+    def _run_mode(self) -> int:
+        """(run kernel) ``ATOM_MONO_RUN`` for the target's runner (0: off; the
+        draft's runner never runs one)."""
+        if type(self) is not V41MonoDecodeRunner:
+            return 0
+        return lr.run_mode()
+
+    def _run_builds(self, s: int, numa: bool = True) -> dict:
+        """(run kernel) K1 key -> the run build of each ordinary layer build
+        of an s-row step (``layer_run.runnable``)."""
+        mode = self._run_mode()
+        if not mode or s > lr.RUN_MAX_TOKENS:
+            return {}
+        return {
+            key: lr.RunBuild(build, mode == 2, mode == 3)
+            for (key, ratio), build in self._fused_builds(s, numa).items()
+            if not ratio and lr.runnable(build)
+        }
 
     def _pair_builds(self, s: int, numa: bool = True) -> dict:
         """(pair) K1 key -> the pair build of each pairable
@@ -774,6 +831,9 @@ class V41MonoDecodeRunner:
             key: lp.build_layer_pair(build)
             for key, build in self._pair_builds(s).items()
         }
+        runs = {
+            key: lr.build_layer_run(build) for key, build in self._run_builds(s).items()
+        }
         compress = (
             {}
             if self.compressor is None
@@ -789,6 +849,7 @@ class V41MonoDecodeRunner:
             post_key=post_key,
             layers=layers,
             pairs=pairs,
+            runs=runs,
             gathers=gathers,
             compress=compress,
             head=None if self.lm_head is None else self.lm_head.build(s),
@@ -870,6 +931,7 @@ class V41MonoDecodeRunner:
         kernels = [(launcher, k1.ABI) for launcher in build.launchers.values()]
         kernels += [(launcher, kl.ABI) for launcher in build.layers.values()]
         kernels += [(launcher, lp.ABI) for launcher in build.pairs.values()]
+        kernels += [(launcher, lr.ABI) for launcher in build.runs.values()]
         kernels += [(launcher, cg.ABI) for launcher in build.gathers.values()]
         kernels += [(launcher, cp.ABI) for launcher in build.compress.values()]
         if build.head is not None:
@@ -925,7 +987,7 @@ class V41MonoDecodeRunner:
         # seam residual and gates to body b's attention seam (read on other
         # XCDs in the launch): uncached, the pair's alone -- every single
         # layer keeps the cached ``res_ffn`` / ``gates_ffn``
-        pairs = self._pair_mode() > 0
+        pairs = self._pair_mode() > 0 or self._run_mode() > 0
         self.res_pair = hand(1, s, hc, h, dtype=bf) if pairs else None
         # layer 0's residual, its streams written from the embedding by its
         # seam (``AttnPreBuild.embed_in``)
@@ -1045,6 +1107,8 @@ class V41MonoDecodeRunner:
             *(kl.scratch_bytes(b) for b in self._fused_builds(s, numa=False).values()),
             # (pair) a pair build's PND past them
             *(lp.pair_scratch_bytes(b) for b in self._pair_builds(s, numa=False).values()),
+            # (run kernel) a run build's PND past them
+            *(lr.run_scratch_bytes(b) for b in self._run_builds(s, numa=False).values()),
         )
 
     def _zero_extents(self, s: int):
@@ -1145,11 +1209,17 @@ class V41MonoDecodeRunner:
         sharded = False
         items = list(zip(model.topology, model.layers, self.layers, self.build.keys))
         paired = self._paired(rows, items)
+        # (run kernel) first layer -> its run's length
+        runs = self._runs(rows, items)
         skip = False
+        skip_to = 0
         for i, (spec, block, weights, key) in enumerate(items):
             if skip:
                 # (pair) run as the previous layer's pair's body b
                 skip = False
+                continue
+            if i < skip_to:
+                # (run kernel) run as an iteration of an earlier layer's run
                 continue
             rope = model.global_rope if spec.ratio else model.window_rope
             fuses = self._fuses(rows, spec, key, block)
@@ -1159,6 +1229,13 @@ class V41MonoDecodeRunner:
                 )
             # this layer leaves its columns only, as every one past it
             sharded = shards
+            if fuses and i in runs and self._layer_run(
+                items[i : i + runs[i]], state, cache, step
+            ):
+                pre, post, comb = self.gates_ffn
+                state = SinglePassHCState(self.res_ffn, pre, self.ffn_out, post, comb)
+                skip_to = i + runs[i]
+                continue
             if fuses and i in paired and self._layer_pair(
                 items[i], items[i + 1], state, cache, step
             ):
@@ -1397,6 +1474,124 @@ class V41MonoDecodeRunner:
             self.build.pairs[key], *lp.ABI.pack(args), torch.cuda.current_stream()
         )
         return True
+
+    def _runs(self, rows: int, items) -> dict:
+        """(run kernel) First layer -> length of each run of consecutive
+        layers of one runnable build (``layer_run``), none compressing nor
+        producing candidates; an Engram layer only as a run's first (its Engram
+        launch runs before the run's). A run of one too: every ordinary layer
+        runs the run kernel, one code object."""
+        runs = self.build.runs
+        if not runs:
+            return {}
+
+        def ok(item):
+            spec, block, _, key = item
+            return (
+                key in runs and self._fuses(rows, spec, key, block)
+                and self._compress_ratio(spec, block) == 0
+                and not spec.produces_candidates
+            )  # fmt: skip
+
+        out, i = {}, 0
+        while i < len(items):
+            if not ok(items[i]):
+                i += 1
+                continue
+            j = i + 1
+            while (
+                j < len(items) and items[j][3] == items[i][3] and ok(items[j])
+                and items[j][1].engram is None
+            ):  # fmt: skip
+                j += 1
+            # (diagnostic) ``ATOM_MONO_RUN_MAXLEN``: runs cut to at most this many layers
+            cap = int(os.environ.get("ATOM_MONO_RUN_MAXLEN", "0")) or j - i
+            for k in range(i, j, cap):
+                out[k] = min(cap, j - k)
+            i = j
+        return out
+
+    def _layer_run(self, items, state, cache, step) -> bool:
+        """(run kernel) A run of layers (consecutive, one build) in one launch
+        (``layer_run``): each layer's arguments a row of the run's table, its
+        state the previous one's outputs -- inside the run the uncached
+        ``res_pair`` / ``gates_pair``, the last layer's ``res_ffn`` /
+        ``gates_ffn`` (``_layer_args``' own). False (nothing run) where a layer
+        has no layer kernel."""
+        model = self.model
+        key = items[0][3]
+        n = len(items)
+        p = torch.Tensor.data_ptr
+        pre, post, comb = self.gates_pair
+        rows_args = []
+        st = state
+        for k, (spec, block, weights, _) in enumerate(items):
+            rope = model.global_rope if spec.ratio else model.window_rope
+            got = self._layer_args(spec, block, weights, key, st, cache, step, rope)
+            if got is None:
+                return False
+            args = got[1]
+            if k < n - 1:
+                args.update({
+                    "res_out": p(self.res_pair), "pre_out": p(pre), "post_out": p(post),
+                    "comb_out": p(comb),
+                })  # fmt: skip
+                st = SinglePassHCState(self.res_pair, pre, self.ffn_out, post, comb)
+            rows_args.append(args)
+        tab = self._run_table(rows_args)
+        seen = self.__dict__.setdefault("_runs_logged", set())
+        span = (items[0][0].layer_id, n, key.tokens)
+        if span not in seen:
+            seen.add(span)
+            logger.info(
+                "V4.1 mono run kernel (ATOM_MONO_RUN=%d): layers %d..%d in one launch, %d rows",
+                self._run_mode(), span[0], span[0] + n - 1, span[2],
+            )  # fmt: skip
+        tail = self._tail_args()
+        _run_compiled(
+            self.build.runs[key],
+            *lr.ABI.pack({"ltab": p(tab), "nlay": n, **{t: tail[t] for t in lr.ABI.names[2:]}}),
+            torch.cuda.current_stream(),
+        )
+        return True
+
+    def _run_table(self, rows_args) -> torch.Tensor:
+        """(run kernel) The run's argument table on the device (``layer_run``:
+        ``RUN_ARGS`` int64 a layer, ``layer.ABI`` order), one per distinct
+        content, never rewritten. Outside a capture: an async copy in the
+        stream from its own pinned host copy. Inside one (a key the warmup
+        forward did not have: the capture's step buffers): filled at once by a
+        helper thread on a stream of its own -- the capture is thread_local
+        (``region_graph``), so the graph holds no copy node and the table holds
+        the capture's values before any replay."""
+        vals = tuple(int(a[name]) for a in rows_args for name in lr.RUN_ARG_NAMES)
+        tabs = self.__dict__.setdefault("_run_tabs", {})
+        capturing = torch.cuda.is_current_stream_capturing()
+        got = tabs.get(vals)
+        last = self.__dict__.setdefault("_run_last", {})
+        span = (len(rows_args), rows_args[0]["layer"])
+        if got is None and capturing and span in last and len(last[span]) == len(vals):
+            # which arguments a capture's step changes (logged once a run)
+            names = sorted({
+                f"{lr.RUN_ARG_NAMES[k % lr.RUN_ARGS]}" for k, (a, b) in enumerate(zip(vals, last[span])) if a != b
+            })  # fmt: skip
+            logger.info("V4.1 mono run kernel: capture table of layers %d.. (+%d) differs from the warmup's in %s",
+                        span[1], span[0] - 1, names)  # fmt: skip
+        last[span] = vals
+        if got is None:
+            if capturing:
+                got = tabs[vals] = [*_filled_apart(vals, torch.cuda.current_device()), True]
+            else:
+                host = torch.tensor(vals, dtype=torch.int64).pin_memory()
+                dev = torch.empty_like(host, device=torch.device("cuda", torch.cuda.current_device()))
+                dev.copy_(host, non_blocking=True)
+                got = tabs[vals] = [host, dev, False]
+        got[2] = got[2] or capturing
+        if len(tabs) > 4096 and not capturing:
+            # eager steps with new buffers each: drop the tables no graph holds
+            for k in [k for k, v in tabs.items() if not v[2] and v is not got]:
+                del tabs[k]
+        return got[1]
 
     def _layer(self, spec, block, weights, key, state, cache, step, rope) -> bool:
         """``_layer_args`` launched."""

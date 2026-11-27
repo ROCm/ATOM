@@ -2329,6 +2329,9 @@ def run_attn_pre(
     pend_late = c.get("pend_late")
     # (pair) the destination's X8G base loaded by the caller
     x8_dst_base = c.get("x8_dst_base")
+    # (run kernel) pend from the run's previous iteration (PND) or, the run's
+    # first, the prefetched memory values (``layer_run``)
+    pend_sel = c.get("pend_sel")
     enter_stage("k1.slice")
     # a sharded seam (the layer kernel): this rank's quarter of the slices,
     # the same tasks its seam F runs (their SDONE local)
@@ -2359,6 +2362,16 @@ def run_attn_pre(
             (pre_fns, pre_rows), pre_wns = entry_pre
             pend_got = pend_late(unit < units, fx.min(unit, units - 1) % own)
             entry_pre = ((pre_fns, (*pre_rows, pend_got)), pre_wns)
+        if const_expr(pend_sel is not None):
+            # (run kernel) the entry prefetch loaded pend from memory (the
+            # run's first iteration's): polled now, past the slice's other
+            # loads, and selected (``layer_run``)
+            assert entry_pre is not None and pend_late is None
+            (pre_fns, pre_rows), pre_wns = entry_pre
+            pend_got = pend_sel(
+                unit < units, fx.min(unit, units - 1) % own, pre_rows[4]
+            )
+            entry_pre = ((pre_fns, (*pre_rows[:4], pend_got)), pre_wns)
         if unit < units:
             if const_expr(entry_pre is not None):
                 # its first loads issued at the kernel's entry, before
