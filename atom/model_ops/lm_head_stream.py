@@ -35,6 +35,9 @@ _SRC = os.path.join(os.path.dirname(__file__), "kernels", "dspark_tail_gfx1250.h
 MT = 8
 KMAX = 6144
 KB = 128
+# The (N, K) weight shapes it was measured on: bit-identical to tgemm.mm and faster at every M = 1..8 (MI455X,
+# graphs of 20 calls, interleaved rounds: -6.0 us at M 1 .. -1.7 us at M 8). Every other shape keeps tgemm.mm.
+MEASURED_SHAPES = frozenset({(50016, 6144)})
 # A/B switch (read at call time; a module attribute, not an env flag): False keeps tgemm.mm.
 _STREAM = True
 # Calls served, counted per call (a graph recording counts its captures).
@@ -105,6 +108,7 @@ def _usable(x: torch.Tensor, w: torch.Tensor, bias) -> bool:
         and x.shape[1] <= KMAX
         and x.shape[1] % KB == 0
         and w.shape[0] % 16 == 0
+        and tuple(w.shape) in MEASURED_SHAPES
         and x.device.type == "cuda"
         and x.device == w.device
     )
