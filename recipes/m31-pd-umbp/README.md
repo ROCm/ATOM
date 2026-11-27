@@ -141,3 +141,34 @@ What to read:
   - `umbp_pool` (UMBP-owned HBM pools shared across DP ranks; ROCm/ATOM#3886 refuses PP);
   - the D tray's DRAM over UALink (mori#1024);
   - an SSD tier.
+
+## 8. Running the checks and the A/B from a control host (`ctl/`)
+
+`ctl/` drives both trays over ssh (or runs locally on the tray it sits on). It is what ran V1 and V2's attempts.
+
+```bash
+export P_HOST=<P tray ssh name> D_HOST=<D tray ssh name> KIT_REMOTE=<kit path on both trays> PD_CONTAINER=<as site.env>
+cd ctl
+ARM=lmc  LMC_GB=160  ./run_umbp.sh verify gsm8k                              # control: LMCache lazy, no UMBP code
+ARM=umbp UMBP_GB=256 VERIFY_MEM=0.30 VERIFY_S=600 ./run_umbp.sh verify       # UMBP, small tier first
+ARM=umbp UMBP_GB=640 VERIFY_MEM=0.30 VERIFY_S=600 ./run_umbp.sh verify gsm8k # UMBP, full tier (1 TB trays)
+ARM=none ./run_umbp.sh c192; ARM=lmc LMC_GB=160 ./run_umbp.sh c192; ARM=umbp UMBP_GB=640 ./run_umbp.sh c192
+ARM=umbp UMBP_GB=640 CONC=300 DUR=3600 ./run_umbp.sh agentx                  # A2
+```
+
+| Step | What | Stops on |
+|---|---|---|
+| `verify` | AgentX C16 for `VERIFY_S` s at AL=0 with `ATOM_MORIIO_VERIFY=1` on P and D; P at `VERIFY_MEM` | no GATE PASS, aiperf failure, or any bad moriio-verify line |
+| `gsm8k` | GSM8K 5-shot (1319) through the router at AL=0 | flexible-extract under `GSM8K_MIN` (0.945) |
+| `c192` / `agentx` | AgentX at C192 for 900 s, or `CONC` for `DUR` s, at forced AL=4.04; then `kit/summarize.py` | — |
+
+**Arms:**
+- `ARM=none`: no DRAM tier, HBM only. It runs the HBM prefix policy the tier arms run: SLRU, half protected.
+- `ARM=lmc`: LMCache lazy, `LMC_GB` per PP stage.
+- `ARM=umbp`: `umbp_store` lazy over one UMBP server of `UMBP_GB`.
+
+Give `lmc` and `umbp` the same total: 4 × 160 = 640 GiB on 1 TB trays, 4 × 430 = 1,720 on 2 TB trays.
+
+Every run stops both servers first (`fab_down.sh`). Logs stay on the trays in `$WORK/logs/<tag>`, and `run_umbp.log`
+in `ctl/` records each step's result.
+
