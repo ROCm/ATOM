@@ -27,6 +27,10 @@ ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 if ATOM_ROOT not in sys.path:
     sys.path.insert(0, ATOM_ROOT)
 
+# Admission refuses sampled requests under ATOM_DP_LM_HEAD_MODE=argmax: run from
+# the default whatever the shell sets; a test of a mode sets it itself.
+os.environ.pop("ATOM_DP_LM_HEAD_MODE", None)
+
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
 from atom.config import Config
