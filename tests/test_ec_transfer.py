@@ -210,6 +210,25 @@ def test_reader_refuses_rows_past_its_limit(engines):
     assert reader._buf.numel() - 32 == 64
 
 
+def test_reader_syncs_the_grown_buffer_before_the_nic_writes_it(engines, monkeypatch):
+    pool = ec.MooncakeEcWriter(4096, "cpu", clock=Clock())
+    reader = ec.MooncakeEcReader(64, "cpu", max_bytes=4096)
+    handle = pool.put(11, rows(1))
+    old = reader._buf
+    synced = []
+    monkeypatch.setattr(ec, "_sync", synced.append)
+    engine = reader._engine
+    read = engine.transfer_sync_read
+
+    def checked_read(*a):
+        # The zero fill of the buffer the NIC writes has been synced.
+        assert synced and synced[-1] is reader._buf is not old
+        return read(*a)
+
+    monkeypatch.setattr(engine, "transfer_sync_read", checked_read)
+    assert torch.equal(reader.get(handle, 11, torch.bfloat16), rows(1))
+
+
 def test_reader_failing_to_grow_keeps_its_buffer(engines, monkeypatch):
     pool = ec.MooncakeEcWriter(4096, "cpu", clock=Clock())
     reader = ec.MooncakeEcReader(64, "cpu", max_bytes=4096)
