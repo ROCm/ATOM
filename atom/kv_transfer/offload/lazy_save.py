@@ -254,6 +254,15 @@ class LazySaveSchedulerMixin:
     def bind_block_manager(self, block_manager) -> None:
         if not block_manager.enable_prefix_caching:
             raise ValueError("save_policy 'lazy' keys blocks by prefix-cache hash")
+        if not hasattr(block_manager.kv, "set_write_back"):
+            # Demotion takes the blocks ATOM's pool is about to evict
+            # (`next_evicted`, `claim_unreused`). A pool a connector provides
+            # chooses its own evictions, out of ATOM's sight.
+            raise ValueError(
+                "save_policy 'lazy' saves the blocks ATOM's block pool is about "
+                f"to evict, and {type(block_manager.kv).__name__} chooses its "
+                "own evictions (umbp_pool): use save_policy 'eager' beside it"
+            )
         super().bind_block_manager(block_manager)
         block_manager.kv.set_write_back(self._is_dirty)
 

@@ -250,6 +250,12 @@ class KVPoolMemory(ABC):
     #: Whether other engine ranks can read and fill blocks of this pool.
     shares_blocks: bool = False
 
+    #: Whether this provider can take over a pool another connector allocated
+    #: in exportable memory (`KVConnectorBase.allocate_kv_pool`: MoRIIO fabric)
+    #: rather than allocate the pool itself. `bind_layout` then gets that
+    #: buffer.
+    adopts_exportable: bool = False
+
     #: Whether the pool has to be one allocation, addressed by offset (a
     #: backend that adopts it whole). A builder that allocates its arena in
     #: parts takes them all from one `allocate` then.

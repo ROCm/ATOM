@@ -674,6 +674,7 @@ class UmbpPoolMemory(KVPoolMemory):
         part: int = 0,
         num_parts: int = 1,
         batch_stamps: bool = False,
+        adopts_exportable: bool = False,
     ):
         self._client = client
         self.pool_id = pool_id
@@ -688,6 +689,9 @@ class UmbpPoolMemory(KVPoolMemory):
         # `writes_issued`), and the last such stamp seen.
         self.batch_stamps = batch_stamps
         self._batch_stamp: int | None = None
+        # `KVPoolMemory.adopts_exportable`: `bind_layout` may get a buffer a
+        # P/D connector allocated (MoRIIO fabric), adopted as any other.
+        self.adopts_exportable = adopts_exportable
         self._device = None
         # Where UMBP's part was adopted from; None until `bind_layout`.
         self._mapped_base: int | None = None
@@ -826,8 +830,26 @@ class UmbpPoolMemory(KVPoolMemory):
                 f"pool ({len(overlaps)} overlapping pairs, pool {buf.numel()} B, "
                 f"last region ends at {end})"
             )
-        allocation = hip_ipc.get_allocation_base(base)
-        handle = hip_ipc.get_ipc_handle(allocation)
+        try:
+            allocation = hip_ipc.get_allocation_base(base)
+            handle = hip_ipc.get_ipc_handle(allocation)
+        except (RuntimeError, ValueError) as exc:  # hip_ipc's failures
+            # The one step that depends on who allocated the pool: UMBP opens
+            # it in its own process through this handle. A pool a P/D connector
+            # allocated in exportable memory (`adopts_exportable`) gives one
+            # only where the device exports that memory over HIP IPC.
+            raise RuntimeError(
+                f"UMBP pool {self.pool_id} part {self.part}: no HIP IPC handle "
+                f"for the paged pool at {base:#x} ({buf.numel()} B), so UMBP "
+                "cannot adopt it"
+                + (
+                    " (it was allocated in exportable memory by a P/D "
+                    "connector, adopt_exportable_pool)"
+                    if self.adopts_exportable
+                    else ""
+                )
+                + f": {exc}"
+            ) from exc
         device = buf.device.index if buf.device.index is not None else 0
         whole = self.num_parts == 1
         part = {} if whole else {"part": self.part, "num_parts": self.num_parts}
@@ -896,6 +918,7 @@ def make_umbp_pool_memory(
         part=part,
         num_parts=pool_parts(config),
         batch_stamps=_pp_size(config) > 1,
+        adopts_exportable=settings.adopt_exportable_pool,
     )
 
 

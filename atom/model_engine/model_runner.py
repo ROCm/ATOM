@@ -2314,13 +2314,18 @@ class ModelRunner:
                 if total and self.config.kv_transfer_config
                 else None
             )
-            if shared is not None and memory.shares_blocks:
-                # Two owners of one allocation: the pool provider would hand
-                # another process memory it did not allocate.
+            if (
+                shared is not None
+                and memory.shares_blocks
+                and not memory.adopts_exportable
+            ):
+                # Two owners of one allocation: the provider shares blocks with
+                # other processes, out of memory it would not have allocated.
                 raise NotImplementedError(
                     "a KV pool provider (umbp_pool) beside a connector that "
-                    "allocates the pool in exportable memory (MoRIIO fabric) is "
-                    "not supported yet"
+                    "allocates the pool in exportable memory (MoRIIO fabric) "
+                    "needs the provider to adopt that memory "
+                    "(umbp_pool adopt_exportable_pool)"
                 )
             self._kv_pool_outside_torch_bytes = 0 if shared is None else total
             buf = (

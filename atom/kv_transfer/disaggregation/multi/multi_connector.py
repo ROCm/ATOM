@@ -301,16 +301,23 @@ class MultiConnector(KVConnectorBase):
         # resolve, not raise `AttributeError`.
         self._state_tier = None
 
+    # The sub whose `kv_pool_memory` answered (`close` takes it last). A class
+    # default, so a composite built without `__init__` has it.
+    _pool_provider = None
+
     def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory | None:
         """The pool memory of whichever sub provides the pool (at most one)."""
         provided = [
-            memory
+            (connector, memory)
             for connector in self._connectors
             if (memory := connector.kv_pool_memory(config, rank)) is not None
         ]
         if len(provided) > 1:
             raise ValueError("at most one sub-connector may provide the KV pool")
-        return provided[0] if provided else None
+        if not provided:
+            return None
+        self._pool_provider, memory = provided[0]
+        return memory
 
     def register_kv_caches(
         self,
@@ -422,8 +429,15 @@ class MultiConnector(KVConnectorBase):
         `lmc-state-load` / `offload-save` threads keep copying out of the KV pool
         that `destroy_dist_env()` is about to release. Guard per sub (`getattr`):
         a producer sub such as moriio need not implement `close`.
+
+        The sub that provides the pool closes last: until the others are
+        joined, a P/D push may still read the pool it would give back.
         """
-        for c in self._connectors:
+        provider = self._pool_provider
+        ordered = [c for c in self._connectors if c is not provider]
+        if provider is not None:
+            ordered.append(provider)
+        for c in ordered:
             fn = getattr(c, "close", None)
             if callable(fn):
                 fn()

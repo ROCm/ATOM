@@ -53,6 +53,11 @@ class UmbpPoolSettings:
     share_ratio: float = 1.0
     placement: str = "private"
     session_migrate_margin: float | None = None
+    # Take over the pool a P/D connector allocated in exportable memory
+    # (MoRIIO fabric) instead of refusing to run beside it (`KVPoolMemory
+    # .adopts_exportable`). UMBP adopts it through a HIP IPC handle, which a
+    # device has to give for that memory; off until a device has shown it.
+    adopt_exportable_pool: bool = False
 
     @classmethod
     def from_transfer_config(
@@ -79,9 +84,8 @@ class UmbpPoolSettings:
             margin = float(margin)
             if margin < 0:
                 raise ValueError(f"umbp_pool session_migrate_margin={margin} < 0")
-        fetch = extra.get("fetch", True)
-        if isinstance(fetch, str):
-            fetch = fetch.strip().lower() not in ("0", "false", "no", "off")
+        fetch = _flag(extra.get("fetch", True))
+        adopt = _flag(extra.get("adopt_exportable_pool", False))
         return cls(
             address=address,
             namespace=str(extra.get("namespace", "atom") or "atom"),
@@ -90,4 +94,11 @@ class UmbpPoolSettings:
             share_ratio=ratio,
             placement=placement,
             session_migrate_margin=margin,
+            adopt_exportable_pool=adopt,
         )
+
+
+def _flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
