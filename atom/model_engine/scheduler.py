@@ -2083,6 +2083,10 @@ class Scheduler:
             and not self.deferred_free_blocks
         )
 
+    def has_running_decode(self) -> bool:
+        """Whether `running` holds anything besides partial prefills."""
+        return len(self.running) > self._partial_prefill_count
+
     def has_forward_work(self) -> bool:
         """Whether a scheduling pass on this rank may produce a batch now.
 

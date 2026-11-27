@@ -24,10 +24,13 @@ this; nothing of it lives on the engine or the scheduler. Before each
    (`LoadWaitState.budget_s` over `load_wait_tradeoff`), woken by the
    doorbell, ending as soon as every started load landed. The hold delays
    every DP peer at the forward collective; the bound charges that through
-   `cost * dp_size`, never exceeds one tick and is ~0 while decodes run.
+   `cost * dp_size`, never exceeds one tick, and is 0 while any rank of the
+   DP group has a running decode (`DPEngineCoreProc.dp_group_decoding`,
+   carried on the existing per-step `_sync_dp_state` reduction).
 
-Rank-local throughout: no collective runs here and the step count is
-unchanged, so DP lockstep holds.
+Installed only for a KV connector whose offload tier loads early
+(`supports_early_load`: Mooncake Store); other connectors get no hook. No
+collective runs here and the step count is unchanged, so DP lockstep holds.
 """
 
 from __future__ import annotations
@@ -46,9 +49,11 @@ logger = logging.getLogger("atom")
 class LoadWaitState:
     """The load wait's inputs and counters.
 
-    `tick_s` is the wall time of the last forward this engine ran
-    (`OffloadLoadWait.on_forward_done`): the step cadence the waits are
-    measured against. 0 until a forward ran, so a cold engine never waits.
+    `tick_s` is the wall time of the last forward this engine ran, a DP
+    dummy forward included (`OffloadLoadWait.on_forward_done`): the group's
+    step cadence the waits are measured against, not this rank's last real
+    (often long prefill) forward. 0 until a forward ran, so a cold engine
+    never waits.
     """
 
     LOG_INTERVAL_S = 60.0
@@ -59,7 +64,7 @@ class LoadWaitState:
         self._last_log = time.monotonic()
         self._reset()
 
-    def budget_s(self, gain: int, cost: int) -> float:
+    def budget_s(self, gain: int, cost: int, *, group_decoding: bool = False) -> float:
         """How long holding this step for `gain` loading requests is worth.
 
         Each request that lands in time prefills one forward (`tick_s`) earlier;
@@ -68,10 +73,16 @@ class LoadWaitState:
         the router keeps the ranks alike, so the group carries about `dp_size`
         times this rank's count). The hold pays while it stays under
         `tick_s * gain / (cost * dp_size)`, and it is never longer than one
-        tick: past that the request is no later than without the hold. With a
-        running decode, `cost` is the whole decode batch and the bound is ~0.
+        tick: past that the request is no later than without the hold.
+
+        `group_decoding`: some rank of the DP group has a running decode
+        (`DPEngineCoreProc.dp_group_decoding`, reduced on the per-step state
+        sync). The hold would add to that decode's ITL at the next forward
+        collective, and this rank cannot count it, so nothing is worth
+        holding: 0. Without DP the engine's own decode stops the pre-phase
+        (`prestart_tier_loads`) before any hold.
         """
-        if gain <= 0 or self.tick_s <= 0.0:
+        if gain <= 0 or self.tick_s <= 0.0 or group_decoding:
             return 0.0
         return min(self.tick_s, self.tick_s * gain / (max(1, cost) * self.dp_size))
 
@@ -129,11 +140,6 @@ class LoadWaitState:
 # -- scheduler-side passes (read the scheduler; no state of their own on it) ----
 
 
-def has_running_decode(scheduler) -> bool:
-    """Whether `running` holds anything besides partial prefills."""
-    return len(scheduler.running) > scheduler._partial_prefill_count
-
-
 def prestart_tier_loads(scheduler) -> list:
     """Run this tick's early tier load ahead of `schedule()` and return the
     requests it parked.
@@ -152,7 +158,7 @@ def prestart_tier_loads(scheduler) -> list:
     `_schedule()`. That is an ordering requirement, not a tuning choice; the
     pass inside `_schedule()`, behind the reservation, runs instead.
     """
-    if not scheduler.waiting or has_running_decode(scheduler):
+    if not scheduler.waiting or scheduler.has_running_decode():
         return []
     scheduler._prefetch_waiting_lookups()
     early_load = scheduler._early_load
@@ -225,11 +231,12 @@ def load_wait_tradeoff(scheduler, loading: list) -> tuple[int, int]:
 
 class OffloadLoadWait:
     """Engine step hook (`EngineCore.step_hooks`): `before_schedule` ahead of
-    every `schedule()`, `on_forward_done` after every real forward.
+    every `schedule()`, `on_forward_done` after every forward (real or DP
+    dummy).
 
     Reads the engine it serves (`scheduler`, `runner_mgr`, `label`, the KV
-    progress event and `_collect_kv_transfer_progress`) and keeps everything
-    else here.
+    progress event, `_collect_kv_transfer_progress` and, under DP,
+    `dp_group_decoding`) and keeps everything else here.
     """
 
     def __init__(self, engine, dp_size: int, *, hold: bool) -> None:
@@ -264,7 +271,10 @@ class OffloadLoadWait:
             state.steps += 1
             state.loads += len(started)
             if self.hold:
-                budget = state.budget_s(*load_wait_tradeoff(scheduler, started))
+                budget = state.budget_s(
+                    *load_wait_tradeoff(scheduler, started),
+                    group_decoding=getattr(engine, "dp_group_decoding", False),
+                )
                 if budget > 0.0:
                     t0 = time.monotonic()
                     pending = self._wait_for_loads(started, t0 + budget)
@@ -369,8 +379,15 @@ class OffloadLoadWait:
 
 def load_wait_hook(engine, config) -> OffloadLoadWait | None:
     """The offload load wait for `engine`, or None when it is off
-    (`ATOM_OFFLOAD_LOAD_EVENT_WAIT=0`)."""
+    (`ATOM_OFFLOAD_LOAD_EVENT_WAIT=0`) or the engine's KV connector has no
+    offload tier that loads early (`supports_early_load` False: no connector,
+    a P/D-only connector, dense or DSV4 offload). `LoadExecutor` rings the
+    doorbell on every offload tier, so without this gate a non-early tier
+    would wait for a fresh answer after each of its loads for nothing."""
     if not envs.ATOM_OFFLOAD_LOAD_EVENT_WAIT:
+        return None
+    connector = getattr(engine.scheduler, "kv_connector", None)
+    if connector is None or not connector.supports_early_load:
         return None
     return OffloadLoadWait(
         engine,
