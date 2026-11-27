@@ -687,9 +687,7 @@ def load_route_wave(c, tab):
     # word, re-read and not stored (``load_route_bitmaps``' poll's)
     pk = fx.min(lane, n - 1)
     word = pk // topk * (2 * topk) + pk % topk
-    word = (tid < 64).select(
-        word, (tid < 128).select(word + topk, fx.Int32(2 * n - 1))
-    )
+    word = (tid < 64).select(word, (tid < 128).select(word + topk, fx.Int32(2 * n - 1)))
     copy_at = c["bid"] % ROUTE_COPIES * (2 * n)
     got = c["poll"]([(c["route_src"], copy_at + word, 1)])
     if (tid < 128) & (lane < n):

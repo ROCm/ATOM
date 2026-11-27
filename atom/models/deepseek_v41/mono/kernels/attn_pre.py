@@ -606,13 +606,13 @@ def slice_direct_loads_live(c, c0, q, live):
     col = c0 + 2 * (p % (COLS // 2))
     own = range(HC // split)
     o = [g * (HC // split) + j for j in own]
-    i32 = lambda name, i, n: fx.Int32(  # noqa: E731
+    i32 = lambda name, i, n: fx.Int32(
         _ld_live(a[name], n, i, live, T.i32, PTB_OOB_WORD)
     )
-    f32 = lambda name, i, n: fx.Float32(  # noqa: E731
+    f32 = lambda name, i, n: fx.Float32(
         _ld_live(a[name], n, i, live, T.f32, PTB_OOB_WORD)
     )
-    bf = lambda name, i, n: fx.Float32(  # noqa: E731
+    bf = lambda name, i, n: fx.Float32(
         fx.BFloat16(_ld_live(a[name], n, i, live, T.bf16, PTB_OOB_HALF))
     )
     res = [

@@ -388,7 +388,7 @@ def build_layer(key: LayerBuild):
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
         lds = {n: getattr(smem, n).peek() for n in members}
-        k1_args = lambda: attn_pre_args(  # noqa: E731
+        k1_args = lambda: attn_pre_args(
             k1_res_in, k1_pend, k1_post_in, k1_comb_in, k1_pre_in, k1_hc_fn,
             k1_hc_scale, k1_hc_base, k1_attn_w, k1_wqkv, k1_wqkv_s, k1_qn_w, k1_kvn_w,
             k1_wqb, k1_wqb_s, k1_cos, k1_sin, k1_pos, k1_ring, k1_ring_scale,
