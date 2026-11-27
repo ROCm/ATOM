@@ -3,18 +3,26 @@
 
 """Pydantic request/response models for the OpenAI-compatible API."""
 
+import array
+import base64
+import binascii
 import json
+import logging
+import sys
 import time
 from typing import Annotated, Any
 
+import numpy as np
 from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
     Field,
     NonNegativeInt,
+    PrivateAttr,
     TypeAdapter,
     ValidationError,
+    model_validator,
 )
 
 # ============================================================================
@@ -74,14 +82,16 @@ def check_media_handoff(
 
 
 def resolve_prompt_token_ids(
-    prompt_token_ids: PromptTokenIds | None,
+    prompt_token_ids: PromptTokenIds | array.array | None,
     kv_transfer_params: dict[str, Any] | None,
-) -> PromptTokenIds | None:
+) -> PromptTokenIds | array.array | None:
     """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
 
     On a chat decode leg whose prefill kept the image, these are the
     prefill's ids, image placeholders expanded. Reject empty lists and
-    conflicting IDs between the two locations.
+    conflicting IDs between the two locations. The top-level IDs may be the
+    ``array("i")`` decoded from ``prompt_token_ids_b64``; they are returned
+    as they are.
     """
     from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
     if prompt_token_ids is None and from_kv is None:
@@ -95,7 +105,12 @@ def resolve_prompt_token_ids(
                 "kv_transfer_params['prompt_token_ids'] must be a list of "
                 f"non-negative integers: {e.errors()[0]['msg']}"
             ) from e
-        if prompt_token_ids is not None and from_kv != prompt_token_ids:
+        top = (
+            prompt_token_ids.tolist()
+            if isinstance(prompt_token_ids, array.array)
+            else prompt_token_ids
+        )
+        if top is not None and from_kv != top:
             raise ValueError(
                 "prompt_token_ids and kv_transfer_params['prompt_token_ids'] "
                 "disagree; a request cannot carry two different prompts"
@@ -104,6 +119,48 @@ def resolve_prompt_token_ids(
     ids = prompt_token_ids if prompt_token_ids is not None else from_kv
     if not ids:
         raise ValueError("prompt_token_ids was given but is empty")
+    return ids
+
+
+#: P/D wire form of a pre-tokenized prompt: one JSON string instead of a JSON
+#: list of 100K+ ints, the base64 of ``array("I", ids).tobytes()`` (uint32,
+#: little-endian). Read with ATOM_PROMPT_IDS_B64=1, the default; with "0" it
+#: is ignored, like any unknown field.
+PROMPT_TOKEN_IDS_B64 = "prompt_token_ids_b64"
+_INT32_MAX = 2**31 - 1
+assert array.array("i").itemsize == 4
+_logger = logging.getLogger(__name__)
+_b64_ignored_warned = False
+
+
+def decode_prompt_token_ids_b64(text: str) -> array.array:
+    """``prompt_token_ids_b64`` -> ``array("i")``: the type a ``Sequence``
+    stores, so admission copies it with one memcpy, never through a list.
+
+    Raises ValueError for malformed base64, an empty or ragged buffer, and ids
+    a Sequence's int32 storage cannot hold.
+    """
+    if not isinstance(text, str):
+        # ValueError, not TypeError: pydantic turns it into a 422.
+        raise ValueError(  # noqa: TRY004
+            f"{PROMPT_TOKEN_IDS_B64} must be a base64 string"
+        )
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"{PROMPT_TOKEN_IDS_B64} is not valid base64: {e}") from e
+    if not raw or len(raw) % 4:
+        raise ValueError(
+            f"{PROMPT_TOKEN_IDS_B64} must encode a non-empty whole number of "
+            "uint32 ids"
+        )
+    wide = np.frombuffer(raw, dtype="<u4")
+    if int(wide.max()) > _INT32_MAX:
+        raise ValueError(f"{PROMPT_TOKEN_IDS_B64} holds an id above int32")
+    ids = array.array("i")
+    ids.frombytes(raw)
+    if sys.byteorder != "little":
+        ids.byteswap()
     return ids
 
 
@@ -209,7 +266,8 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
     ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
     SGLang deserialize arguments before applying the chat template. Skipped for
-    templates that take the string (Kimi-K3, DeepSeek-R1/V3); see
+    templates that take the string (Kimi-K3, DeepSeek-R1/V3, DeepSeek-V3.2 /
+    V4's encoders); see
     ``preserve_tool_call_arguments`` in ``api_server``.
     """
     if not isinstance(tool_calls, list):
@@ -330,12 +388,65 @@ class ChatCompletionRequest(BaseModel):
     # Pre-tokenized prompt (an image decode leg's has its prefill's image
     # placeholders expanded); messages are still required and validated.
     prompt_token_ids: PromptTokenIds | None = None
+    # The same prompt as base64(uint32 LE); see `decode_prompt_token_ids_b64`.
+    # Never dumped: decoded into `_b64_prompt_ids` and dropped. `Any`, so with
+    # ATOM_PROMPT_IDS_B64=0 no value is refused that was ignored before.
+    prompt_token_ids_b64: Any = Field(default=None, exclude=True, repr=False)
     # Echo prompt IDs in non-streaming responses, including n > 1.
     return_token_ids: bool | None = None
+    _b64_prompt_ids: array.array | None = PrivateAttr(default=None)
 
-    def get_prompt_token_ids(self) -> PromptTokenIds | None:
-        """This request's pre-tokenized prompt, or None to render+tokenize."""
-        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
+    @model_validator(mode="after")
+    def _decode_prompt_token_ids_b64(self):
+        encoded = self.prompt_token_ids_b64
+        if encoded is None:
+            return self
+        from atom.utils import envs
+
+        if not envs.ATOM_PROMPT_IDS_B64:
+            # Off: the field is ignored, as before it was declared.
+            global _b64_ignored_warned
+            if not _b64_ignored_warned:
+                _b64_ignored_warned = True
+                _logger.warning(
+                    "%s ignored: set ATOM_PROMPT_IDS_B64=1 to read it; "
+                    "requests fall back to their other prompt fields",
+                    PROMPT_TOKEN_IDS_B64,
+                )
+            self.prompt_token_ids_b64 = None
+            return self
+        ids = decode_prompt_token_ids_b64(encoded)
+        if self.prompt_token_ids is not None and self.prompt_token_ids != ids.tolist():
+            raise ValueError(
+                f"prompt_token_ids and {PROMPT_TOKEN_IDS_B64} disagree; "
+                "a request cannot carry two different prompts"
+            )
+        self._b64_prompt_ids = ids
+        self.prompt_token_ids_b64 = None
+        return self
+
+    def prompt_ids_from_b64(self) -> bool:
+        """True when this request's prompt came as ``prompt_token_ids_b64``."""
+        return self._b64_prompt_ids is not None
+
+    def get_prompt_token_ids(
+        self, media_decode_leg: bool = False
+    ) -> PromptTokenIds | array.array | None:
+        """This request's pre-tokenized prompt, or None to render+tokenize.
+
+        An ``array("i")`` when it came as ``prompt_token_ids_b64``.
+
+        ``media_decode_leg``: a remote-prefill leg whose messages carry media.
+        Its ``prompt_token_ids_b64`` is the client body's, forwarded unchanged,
+        with the image placeholders not expanded; the prompt is the prefill's
+        expanded ids in ``kv_transfer_params``. The b64 ids are not used then,
+        nor compared with those, which would always disagree.
+        """
+        if self._b64_prompt_ids is not None and not media_decode_leg:
+            top = self._b64_prompt_ids
+        else:
+            top = self.prompt_token_ids
+        return resolve_prompt_token_ids(top, self.kv_transfer_params)
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""

@@ -1,4 +1,9 @@
-"""Guard against prompt / SKILL.md drift.
+"""Guard the prompts and the wiring the review runs on.
+
+Drift is two of the checks below; the rest assert the fail classes, the run budget, the
+OWNERS wiring, the gate's identity exclusions, the runner label, _publish.py's permission
+closure and the citation gating. A refusal is not necessarily drift -- the callers quote
+the ❌ line, so say which check refused.
 
 prompts/worker.md and prompts/refuter.md quote SKILL.md verbatim (the Step 8 Output rules and
 the Step 7.7 text). If SKILL.md changes and the copies do not, they drift silently and the
@@ -515,7 +520,7 @@ def main():
     bad += check_publish_review_is_advisory()
     bad += check_range_anchor_shape()
     bad += check_unanchorable_citations_are_linked()
-    print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
+    print(f"{'OK' if bad == 0 else 'REFUSED'}: {bad} check(s) failed")
     return bad
 
 

@@ -242,9 +242,8 @@ class ForwardMode:
         """
         is_prefill = batch.has_prefill
         scheduled_tokens = batch.total_tokens_num
-        # The whole batch, never a per-kind count: `schedule` returns its
-        # prefill batch before it can add a decode row, so the two are equal
-        # today, and this is the one that survives a mixed batch.
+        # The whole batch, including both regions when prefill and decode
+        # share a step. A per-kind count would under-size mixed metadata.
         scheduled_bs = batch.total_seqs_num
         meets_min, can_split, ub0, ub1 = local_tbo
         # Every rank's row of the step, a group of one's included (its own
@@ -656,6 +655,8 @@ class Context:
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
 
+    is_mixed = False
+
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
@@ -701,6 +702,9 @@ class AttentionMetaData:
     sparse_kv_indices: torch.Tensor | None = None
     dcp_sparse_kv_indptr: torch.Tensor | None = None
     dcp_owned_counts: torch.Tensor | None = None
+    # Recorded when a "q" prefill's indexer writes the three above on a side
+    # stream; the layer's sparse MLA waits on it and clears it.
+    index_exchange_done: torch.cuda.Event | None = None
     # A DCP sparse prefill taking the "kv" transport: the step's gathered-KV
     # layout; None takes "q".
     dcp_sparse_prefill_kv: "DcpSparsePrefillKV | None" = None

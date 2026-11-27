@@ -227,6 +227,7 @@ def _metrics(exporter):
         "/v1/messages",
         "/beta/chat/completions",
         "/beta/completions",
+        api_server.PD_LATE_KV_PATH,
     ],
 )
 def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(

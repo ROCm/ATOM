@@ -1126,7 +1126,51 @@ def test_engine_routes_are_the_management_endpoints():
         "/server_info",
         "/start_profile",
         "/stop_profile",
+        "/offload/lookups",
     }
+
+
+_APPLIED = {"applied": True, "enabled": False}
+
+
+@pytest.mark.parametrize(
+    "ranks,body,expected",
+    [
+        (None, {"enabled": False}, 503),
+        ([_APPLIED] * 2, b"not json", 400),
+        ([_APPLIED] * 2, {"enabled": "no"}, 400),
+        (RuntimeError("rank 3 did not answer"), {"enabled": False}, 500),
+        ([_APPLIED] * 2, {"enabled": False}, 200),
+        ([_APPLIED, {"applied": False, "enabled": False}], {"enabled": False}, 409),
+        ([_APPLIED, {"applied": True, "enabled": True}], {"enabled": False}, 409),
+    ],
+)
+def test_offload_lookups_succeeds_only_when_every_rank_applied_it(
+    monkeypatch, ranks, body, expected
+):
+    from fastapi.testclient import TestClient
+
+    calls = []
+
+    def switch(enabled):
+        calls.append(enabled)
+        if isinstance(ranks, Exception):
+            raise ranks
+        return ranks
+
+    engine = None if ranks is None else SimpleNamespace(set_offload_lookups=switch)
+    monkeypatch.setattr(api_server, "engine", engine)
+    client = TestClient(api_server.app)
+    if isinstance(body, bytes):
+        reply = client.post("/offload/lookups", content=body)
+    else:
+        reply = client.post("/offload/lookups", json=body)
+    assert reply.status_code == expected
+    assert calls == ([False] if expected in (200, 409, 500) else [])
+    if expected == 200:
+        assert reply.json() == {"status": "success", "enabled": False, "ranks": ranks}
+    if expected == 409:
+        assert reply.json()["detail"] == {"enabled": False, "ranks": ranks}
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
@@ -1367,6 +1411,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "tool_call_parser_cls",
         "preserve_tool_call_arguments",
         "required_tool_channel",
+        "mid_system_supported",
     )
     for name in names:
         monkeypatch.setattr(api_server, name, "unset", raising=False)
@@ -1381,6 +1426,7 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
         "template_keeps_tool_call_arguments": lambda *_a: keeps,
         "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
+        "template_takes_mid_system": lambda *_a: False,
     }
     for name, stub in stubs.items():
         monkeypatch.setattr(api_server, name, stub)
@@ -1397,3 +1443,4 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"
+    assert api_server.mid_system_supported is False

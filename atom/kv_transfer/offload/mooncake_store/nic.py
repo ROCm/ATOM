@@ -7,9 +7,11 @@
   stage reads every owner, a requester listing several NICs, or owners on the
   requesters' NICs, stalled concurrent reads for 30-60 s and then failed them;
   one NIC per stage, disjoint from the owners', ran 4 x 33 GB/s with no error.
-  The NIC is the RDMA device closest to the GPU in the PCI tree. HIP numbers
-  the GPUs in KFD order, not PCI order, so neither ``rdma<gpu>`` nor a
-  BDF-sorted list names it reliably.
+  The NIC is the ACTIVE RDMA device behind the GPU's own PCIe switch: the one
+  closest to the GPU in the PCI tree, sharing its root port and the switch's
+  upstream port, and no closer to another GPU. A GPU whose own NIC is down or
+  missing gets none, not a neighbour's. HIP numbers the GPUs in KFD order, not
+  PCI order, so neither ``rdma<gpu>`` nor a BDF-sorted list names it reliably.
 * **Per-NIC pools.** Where the owners must share the stages' NICs (two nodes
   whose only NICs are their GPUs'), one master per NIC keeps each NIC to one
   stage and its own pool's owners: 4 x 37 GB/s with no retransmission across
@@ -62,7 +64,10 @@ def requester_rdma_device(device_index: int, cfg: Any) -> str:
         origin = "mooncake_store.rdma_devices"
     else:
         bdf = gpu_pci_bdf(device_index)
-        device = rail_rdma_device(bdf)
+        try:
+            device = rail_rdma_device(bdf)
+        except ValueError as exc:
+            raise ValueError(f"{exc}; set mooncake_store.rdma_devices") from None
         origin = f"the PCI topology of GPU {device_index} ({bdf})"
     if not (_IB_SYSFS_ROOT / device).exists():
         raise ValueError(f"RDMA device {device!r} from {origin} does not exist")
@@ -101,15 +106,19 @@ def rail_rdma_device(
     ib_root: Path = _IB_SYSFS_ROOT,
     pci_root: Path = _PCI_SYSFS_ROOT,
 ) -> str:
-    """Return the ACTIVE RDMA device that shares the deepest PCI path with a GPU.
+    """Return the ACTIVE RDMA device behind the GPU's own PCIe switch.
 
     On a rail-optimized node each GPU sits behind a PCIe switch with exactly
     one NIC, which shares more of the sysfs device path with that GPU than
-    any other NIC does.
+    any other NIC does. The device must share the GPU's root port and the
+    switch's upstream port, and be no closer to another GPU (a PCI function of
+    this GPU's vendor and class): with the GPU's own NIC down or missing, the
+    closest ACTIVE one is a neighbour's.
 
     Raises:
-        ValueError: The GPU is not in sysfs, no ACTIVE device shares its PCI
-            host bridge, or several are equally close.
+        ValueError: The GPU is not in sysfs, no ACTIVE device shares its PCIe
+            switch, several are equally close, or the closest is closer to
+            another GPU.
     """
     gpu_node = pci_root / gpu_bdf
     if not gpu_node.exists():
@@ -126,27 +135,64 @@ def rail_rdma_device(
     except OSError as exc:
         raise ValueError(f"cannot list RDMA devices in {ib_root}") from exc
     closeness: dict[str, int] = {}
+    nic_paths: dict[str, tuple[str, ...]] = {}
     for device in devices:
         if not _has_active_port(device):
             continue
-        nic_path = (device / "device").resolve().parts
-        shared = 0
-        for gpu_part, nic_part in zip(gpu_path, nic_path):
-            if gpu_part != nic_part:
-                break
-            shared += 1
-        closeness[device.name] = shared
+        nic_paths[device.name] = (device / "device").resolve().parts
+        closeness[device.name] = _shared_depth(gpu_path, nic_paths[device.name])
     best = max(closeness.values(), default=0)
     closest = [name for name, shared in closeness.items() if shared == best]
-    # A NIC that does not share the host bridge component shares no hardware.
-    if best <= host_bridge or len(closest) != 1:
+    # Below the host bridge come the root port and the switch's upstream port;
+    # a NIC on another root port is another GPU's, even under one host bridge.
+    switch = host_bridge + 2
+    if best <= switch or len(closest) != 1:
         found = ", ".join(f"{n}:{s}" for n, s in sorted(closeness.items()))
         raise ValueError(
             f"cannot tell GPU {gpu_bdf}'s NIC from the PCI topology (ACTIVE "
-            f"devices and shared path depth: {found or 'none'}); set "
-            "mooncake_store.rdma_devices"
+            f"devices and shared path depth: {found or 'none'})"
         )
+    # A NIC closer to another GPU is that GPU's, as when this GPU's own is gone.
+    for peer in _peer_gpu_paths(gpu_node, pci_root):
+        if _shared_depth(peer, nic_paths[closest[0]]) > best:
+            raise ValueError(
+                f"cannot tell GPU {gpu_bdf}'s NIC from the PCI topology: the "
+                f"closest ACTIVE device, {closest[0]}, is closer to GPU {peer[-1]}"
+            )
     return closest[0]
+
+
+def _shared_depth(a: tuple[str, ...], b: tuple[str, ...]) -> int:
+    shared = 0
+    for a_part, b_part in zip(a, b):
+        if a_part != b_part:
+            break
+        shared += 1
+    return shared
+
+
+def _peer_gpu_paths(gpu_node: Path, pci_root: Path) -> list[tuple[str, ...]]:
+    """sysfs paths of the node's other GPUs: PCI functions of this GPU's vendor
+    and class, so it assumes one GPU model per node."""
+    kind = _pci_kind(gpu_node)
+    if kind is None:
+        raise ValueError(f"cannot read GPU {gpu_node.name}'s PCI vendor and class")
+    try:
+        nodes = list(pci_root.iterdir())
+    except OSError as exc:
+        raise ValueError(f"cannot list PCI devices in {pci_root}") from exc
+    return [
+        node.resolve().parts
+        for node in nodes
+        if node.name != gpu_node.name and _pci_kind(node) == kind
+    ]
+
+
+def _pci_kind(node: Path) -> tuple[str, ...] | None:
+    try:
+        return tuple((node / f).read_text().strip() for f in ("vendor", "class"))
+    except OSError:
+        return None
 
 
 def _has_active_port(device: Path) -> bool:
