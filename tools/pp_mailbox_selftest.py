@@ -8,10 +8,19 @@ checks every element that arrives, and times the chain against the same chain
 over NCCL (today's path: gloo-free here, but the same rendezvous and the whole
 AttnRes bank).
 
-One node, one rank per GPU (hops between nodes stay on NCCL in both modes)::
+One node, one rank per GPU::
 
     torchrun --nproc_per_node 4 tools/pp_mailbox_selftest.py --transport mailbox
     torchrun --nproc_per_node 4 tools/pp_mailbox_selftest.py --transport nccl
+
+Two nodes of one scale-up fabric, four ranks each: the hop between the nodes
+stays on NCCL unless ``--fabric push|pull`` puts it on a mailbox over the fabric
+(atom/distributed/pp_fabric.py; run ``tools/pp_fabric_probe.py`` on the pair
+first). ``--first-layers 0,12,25,38,51,63,74,85`` gives the node hop #813's
+payload (5 bank blocks + 3 DSpark taps)::
+
+    torchrun --nnodes 2 --nproc_per_node 4 --node_rank <0|1> --master_addr <node 0> \
+        --master_port 29552 tools/pp_mailbox_selftest.py --transport mailbox --fabric push
 
 ``--check-every 0`` skips the element checks (each is a host sync) for a timing run.
 ``--compute-ms`` makes each stage busy for about that long per microbatch (bf16
@@ -30,6 +39,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+from atom.distributed.pp_fabric import FabricOptions
 from atom.distributed.pp_mailbox import PPMailbox, closed_bank_blocks
 
 HIDDEN, BLOCK, LAYERS = 7168, 12, 93
@@ -102,10 +112,15 @@ def main():
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--max-rows", type=int, default=16384)
     ap.add_argument("--compute-ms", type=float, default=150.0)
-    ap.add_argument("--compute-kind", choices=("elementwise", "gemm"), default="elementwise")
+    ap.add_argument(
+        "--compute-kind", choices=("elementwise", "gemm"), default="elementwise"
+    )
     ap.add_argument("--slots", type=int, default=2)
     ap.add_argument("--check-every", type=int, default=1)
     ap.add_argument("--first-layers", type=str, default="")
+    ap.add_argument("--fabric", choices=("off", "push", "pull"), default="off")
+    ap.add_argument("--fabric-wait", choices=("kernel", "stream"), default="kernel")
+    ap.add_argument("--fabric-ctas", type=int, default=32)
     args = ap.parse_args()
 
     local = int(os.environ["LOCAL_RANK"])
@@ -136,6 +151,7 @@ def main():
             total_blocks=TOTAL_BLOCKS, block_size=BLOCK, first_layer=first, end_layer=end,
             aux_cols_in=taps_in * HIDDEN, aux_cols_out=0 if rank == world - 1 else taps_out * HIDDEN,
             max_rows=args.max_rows, slots=args.slots,
+            fabric=None if args.fabric == "off" else FabricOptions(args.fabric, args.fabric_wait, args.fabric_ctas),
         )  # fmt: skip
     # The compute stand-in, sized to ~compute_ms. "elementwise" (default): in-place FMAs over a 1 GiB tensor. "gemm":
     # bf16 8192^3 matmuls; on gfx1250 / the K3 images these Tensile kernels memory-fault when another stream runs a
@@ -152,7 +168,9 @@ def main():
         def unit():
             a.mul_(0.5).add_(0.5)
 
-    for _ in range(3):  # warm up (first launches, allocator, library init) before timing
+    for _ in range(
+        3
+    ):  # warm up (first launches, allocator, library init) before timing
         unit()
     torch.cuda.synchronize()
     t = time.perf_counter()
@@ -215,7 +233,7 @@ def main():
         f"  rank {rank} layers [{first}, {end}) in {closed_in} blocks + {taps_in} taps, out {closed_out} + {taps_out}"
         f" | host ms per step median {statistics.median(step_ms):.1f} p90 {sorted(step_ms)[int(0.9 * len(step_ms))]:.1f}"
         + (
-            f" | recv {'mailbox' if box.recv_enabled else 'nccl'}, send {'mailbox' if box.send_enabled else 'nccl'}"
+            f" | recv {box.recv_kind or '-'}, send {box.send_kind or '-'}"
             if box
             else ""
         ),

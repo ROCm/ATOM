@@ -150,6 +150,21 @@ def closed_bank_blocks(
     return min(total_blocks, -(-first_layer // block_size))
 
 
+def fabric_options_from_env():
+    """``ATOM_PP_MAILBOX_FABRIC*`` as ``pp_fabric.FabricOptions``, or None when
+    fabric hops are off (or the mailbox is)."""
+    from atom.distributed.pp_fabric import FabricOptions
+    from atom.utils import envs
+
+    if not (envs.ATOM_PP_MAILBOX and envs.ATOM_PP_MAILBOX_FABRIC):
+        return None
+    return FabricOptions(
+        mode=envs.ATOM_PP_MAILBOX_FABRIC_MODE,
+        wait=envs.ATOM_PP_MAILBOX_FABRIC_WAIT,
+        ctas=envs.ATOM_PP_MAILBOX_FABRIC_CTAS,
+    )
+
+
 @dataclass(frozen=True)
 class HopLayout:
     """One hop's slot layout. Each end derives it from the split and its relay
@@ -264,6 +279,7 @@ class PPMailbox:
         max_rows: int,
         slots: int = 2,
         use_mailbox: bool = True,
+        fabric=None,
         trim_nccl_bank: bool = False,
         check: bool = False,
     ):
@@ -287,26 +303,40 @@ class PPMailbox:
             closed_bank_blocks(end_layer, block_size, total_blocks), aux_cols_out, elem, slots,
         )  # fmt: skip
 
-        # Which hops the mailbox serves (both ends on, same host), before any
-        # allocation: a hop between hosts stays on NCCL and gets no ring (a ring
-        # is up to 2 x max_rows x 13 H-wide rows, ~5.7 GiB on Kimi-K3's last
-        # stage, all of it KV cache otherwise).
+        # Which hops the mailbox serves, before any allocation: one host and the
+        # mailbox on at both ends -> "ipc" (HIP IPC ring); different hosts with
+        # fabric hops on and usable at both ends -> "fabric" (pp_fabric.py: a
+        # torch.symm_mem ring over the scale-up fabric); else "nccl", with no
+        # ring (a ring is up to 2 x max_rows x 13 H-wide rows, ~5.7 GiB on
+        # Kimi-K3's last stage, all of it KV cache otherwise).
+        from atom.distributed import pp_fabric
+
         r = group.rank_in_group
-        hosts: list = [None] * group.world_size
+        why_not_fabric = "off"
+        if use_mailbox and fabric is not None:
+            why_not_fabric = pp_fabric.probe_fabric(device)  # local; None: usable
+        gathered: list = [None] * group.world_size
         torch.distributed.all_gather_object(
-            hosts, (socket.gethostname(), use_mailbox), group=group.cpu_group
+            gathered,
+            (socket.gethostname(), use_mailbox, why_not_fabric is None, why_not_fabric),
+            group=group.cpu_group,
         )
+        stages = [pp_fabric.StageEnd(h, m, f) for h, m, f, _ in gathered]
+        # A fabric hop builds a two-rank group, which every rank of the default
+        # group must create: only when the PP group is the whole world.
+        fabric_allowed = (
+            fabric is not None
+            and torch.distributed.get_world_size() == group.world_size
+        )
+        kinds = pp_fabric.plan_hop_transports(stages, fabric_allowed)
+        self.recv_kind = None if first else kinds[r - 1]
+        self.send_kind = None if last else kinds[r]
+        self.fabric = fabric
 
-        def same_host_mailbox(peer: int) -> bool:
-            return use_mailbox and hosts[peer][1] and hosts[peer][0] == hosts[r][0]
-
-        self.recv_enabled = not first and same_host_mailbox(r - 1)
-        self.send_enabled = not last and same_host_mailbox(r + 1)
-
-        # Local memory: the receive ring and its counter page (a mailbox recv);
-        # the credit page of the ring this stage writes (a mailbox send).
-        # Counter pages are fine-grained, polled by the command processor and
-        # written by a peer; like every uncached / fine-grained peer page here,
+        # Local memory of an "ipc" hop: the receive ring and its counter page (a
+        # mailbox recv); the credit page of the ring this stage writes (a mailbox
+        # send). Counter pages are fine-grained, polled by the command processor
+        # and written by a peer; like every uncached / fine-grained peer page here,
         # never freed (atom/mono/runtime/uncached.py).
         from atom.mono.runtime.hip_ipc import (
             allocate_fine_grained,
@@ -315,10 +345,10 @@ class PPMailbox:
         )
 
         self._ring = self._ring_page = self._credit_page = None
-        if self.recv_enabled:
+        if self.recv_kind == "ipc":
             self._ring = _alloc_ring(self.in_layout.ring_bytes)
             self._ring_page = allocate_fine_grained(_COUNTER_PAGE)
-        if self.send_enabled:
+        if self.send_kind == "ipc":
             self._credit_page = allocate_fine_grained(_COUNTER_PAGE)
         torch.cuda.synchronize(device)
 
@@ -342,11 +372,37 @@ class PPMailbox:
                 f"PP mailbox: stage {r} writes {mine['out_layout']}, stage {r + 1} reads {nxt['in_layout']}"
             )
         self._peer_ring = self._peer_ring_page = self._peer_credit_page = None
-        if self.send_enabled:
+        if self.send_kind == "ipc":
             self._peer_ring = open_ipc_handle(nxt["ring"])
             self._peer_ring_page = open_ipc_handle(nxt["ring_page"])
-        if self.recv_enabled:
+        if self.recv_kind == "ipc":
             self._peer_credit_page = open_ipc_handle(prev["credit_page"])
+
+        # "fabric" hops: every rank creates every such hop's two-rank group, in
+        # hop order (new_group is collective over the world); the hop's two ends
+        # then map each other's buffer. If either end cannot, both keep NCCL.
+        self._fabric_in = self._fabric_out = None
+        for h, kind in enumerate(kinds):
+            if kind != "fabric":
+                continue
+            pair = torch.distributed.new_group(
+                [group.ranks[h], group.ranks[h + 1]], backend="gloo"
+            )
+            if r in (h, h + 1):
+                hop = pp_fabric.FabricHop(
+                    role="send" if r == h else "recv",
+                    layout=self.out_layout if r == h else self.in_layout,
+                    group=pair, device=device, options=fabric,
+                )  # fmt: skip
+                if r == h:
+                    self._fabric_out = hop if hop.ok else None
+                    self.send_kind = "fabric" if hop.ok else "nccl"
+                else:
+                    self._fabric_in = hop if hop.ok else None
+                    self.recv_kind = "fabric" if hop.ok else "nccl"
+
+        self.send_enabled = self.send_kind in ("ipc", "fabric")
+        self.recv_enabled = self.recv_kind in ("ipc", "fabric")
         self.send_seq = self.recv_seq = 0
         self._send_done: deque[torch.cuda.Event] = deque()
         self.send_stream = (
@@ -356,24 +412,42 @@ class PPMailbox:
             torch.cuda.Stream(device=device) if self.recv_enabled else None
         )
 
-        def describe(lay, enabled, peer) -> str:
+        def describe(lay, kind, peer) -> str:
             if peer is None:
                 return "-"
-            how = (
-                "mailbox"
-                if enabled
-                else ("nccl, closed blocks only" if trim_nccl_bank else "nccl")
-            )
+            how = {
+                "ipc": "mailbox",
+                "fabric": f"mailbox over the fabric ({fabric.mode if fabric else ''}, wait {fabric.wait if fabric else ''})",
+                "nccl": "nccl, closed blocks only" if trim_nccl_bank else "nccl",
+            }[kind]
             return f"{how} ({lay.closed_blocks}/{total_blocks} bank blocks, {lay.aux_cols // hidden} aux taps)"
 
+        rings = []
+        if self._ring is not None:
+            rings.append(f"ring {self.in_layout.ring_bytes / (1 << 30):.2f} GiB")
+        for hop in (self._fabric_in, self._fabric_out):
+            if hop is not None:
+                rings.append(f"fabric buffer {hop.buffer.numel() / (1 << 30):.2f} GiB")
         logger.info(
             "PP mailbox: stage %d layers [%d, %d): recv %s, send %s; %d slots%s",
             r, first_layer, end_layer,
-            describe(self.in_layout, self.recv_enabled, prev),
-            describe(self.out_layout, self.send_enabled, nxt),
+            describe(self.in_layout, self.recv_kind, prev),
+            describe(self.out_layout, self.send_kind, nxt),
             slots,
-            f", ring {self.in_layout.ring_bytes / (1 << 30):.2f} GiB" if self._ring is not None else "",
+            "".join(", " + x for x in rings),
         )  # fmt: skip
+        if r == 0 and fabric is not None:
+            for s, (_, _, ok, why) in enumerate(gathered):
+                if not ok:
+                    logger.warning(
+                        "PP mailbox: fabric hops unavailable on stage %d: %s", s, why
+                    )
+            if not fabric_allowed:
+                logger.warning(
+                    "PP mailbox: fabric hops need the PP group to be the whole world "
+                    "(%d of %d ranks); hops between hosts stay on NCCL",
+                    group.world_size, torch.distributed.get_world_size(),
+                )  # fmt: skip
 
     @classmethod
     def build(cls, config, model, relay, device) -> PPMailbox | None:
@@ -432,6 +506,7 @@ class PPMailbox:
             max_rows=int(config.max_num_batched_tokens),
             slots=envs.ATOM_PP_MAILBOX_SLOTS,
             use_mailbox=envs.ATOM_PP_MAILBOX,
+            fabric=fabric_options_from_env(),
             trim_nccl_bank=envs.ATOM_PP_TRIM_BANK,
             check=envs.ATOM_PP_MAILBOX_CHECK,
         )
@@ -440,7 +515,7 @@ class PPMailbox:
     def send(self, tensors: dict[str, torch.Tensor], rows: int) -> None:
         """Queue this microbatch's payload for the next stage and return; the copy
         stream does any waiting."""
-        lay, h, e = self.out_layout, self.hidden, self.out_layout.elem_size
+        lay, h = self.out_layout, self.hidden
         if rows > lay.max_rows:
             raise RuntimeError(
                 f"PP mailbox: {rows} rows exceed a slot's {lay.max_rows}"
@@ -467,62 +542,17 @@ class PPMailbox:
             raise RuntimeError(
                 f"PP mailbox: pp_aux {None if aux is None else tuple(aux.shape)}, expected ({rows}, {lay.aux_cols})"
             )
-        hip = _hip()
         compute = torch.cuda.current_stream(self.device)
         ready = torch.cuda.Event()
         ready.record(compute)
         s = self.send_stream
-        sh = _stream(s)
         seq, slot = self.send_seq, self.send_seq % lay.slots
-        base = self._peer_ring + slot * lay.slot_bytes
-        off = lay.offsets()
         with torch.cuda.stream(s):
             s.wait_event(ready)
-            if seq >= lay.slots:  # the slot's previous payload must have been read
-                credit = ctypes.c_void_p(self._credit_page + 8 * _COUNTER_WORD)
-                _check(
-                    hip.hipStreamWaitValue64(
-                        sh, credit, seq - lay.slots + 1, _WAIT_GTE, _MASK64
-                    ),
-                    "wait credit",
-                )
-            dst = ctypes.c_void_p(base + off["hidden"])
-            _check(
-                hip.hipMemcpyAsync(
-                    dst, ctypes.c_void_p(hidden.data_ptr()), rows * h * e, _D2D, sh
-                ),
-                "copy hidden",
-            )
-            if lay.closed_blocks:
-                width, pitch = lay.closed_blocks * h * e, bank.shape[1] * h * e
-                dst = ctypes.c_void_p(base + off["bank"])
-                src = ctypes.c_void_p(bank.data_ptr())
-                _check(
-                    hip.hipMemcpy2DAsync(dst, width, src, pitch, width, rows, _D2D, sh),
-                    "copy bank",
-                )
-            if lay.aux_cols:
-                dst = ctypes.c_void_p(base + off["aux"])
-                _check(
-                    hip.hipMemcpyAsync(
-                        dst,
-                        ctypes.c_void_p(aux.data_ptr()),
-                        rows * lay.aux_cols * e,
-                        _D2D,
-                        sh,
-                    ),
-                    "copy aux",
-                )
-            rows_word = ctypes.c_void_p(self._peer_ring_page + 8 * (_ROWS_WORD + slot))
-            flag = ctypes.c_void_p(self._peer_ring_page + 8 * _COUNTER_WORD)
-            _check(
-                hip.hipStreamWriteValue64(sh, rows_word, rows, _WRITE_DEFAULT),
-                "write rows",
-            )
-            _check(
-                hip.hipStreamWriteValue64(sh, flag, seq + 1, _WRITE_DEFAULT),
-                "write flag",
-            )
+            if self.send_kind == "fabric":
+                self._send_fabric(s, hidden, bank, aux, rows, seq, slot)
+            else:
+                self._send_ipc(s, hidden, bank, aux, rows, seq, slot)
             done = torch.cuda.Event()
             done.record(s)
         for t in (
@@ -537,11 +567,98 @@ class PPMailbox:
             compute.wait_event(self._send_done.popleft())
         self.send_seq += 1
 
+    def _send_ipc(self, s, hidden, bank, aux, rows: int, seq: int, slot: int) -> None:
+        """Same host: the copy engine writes the next stage's ring through IPC."""
+        hip, sh, lay = _hip(), _stream(s), self.out_layout
+        if seq >= lay.slots:  # the slot's previous payload must have been read
+            credit = ctypes.c_void_p(self._credit_page + 8 * _COUNTER_WORD)
+            _check(
+                hip.hipStreamWaitValue64(
+                    sh, credit, seq - lay.slots + 1, _WAIT_GTE, _MASK64
+                ),
+                "wait credit",
+            )
+        self._sdma_payload(
+            sh, self._peer_ring + slot * lay.slot_bytes, hidden, bank, aux, rows
+        )
+        rows_word = ctypes.c_void_p(self._peer_ring_page + 8 * (_ROWS_WORD + slot))
+        flag = ctypes.c_void_p(self._peer_ring_page + 8 * _COUNTER_WORD)
+        _check(
+            hip.hipStreamWriteValue64(sh, rows_word, rows, _WRITE_DEFAULT),
+            "write rows",
+        )
+        _check(
+            hip.hipStreamWriteValue64(sh, flag, seq + 1, _WRITE_DEFAULT), "write flag"
+        )
+
+    def _send_fabric(
+        self, s, hidden, bank, aux, rows: int, seq: int, slot: int
+    ) -> None:
+        """Another host on the fabric (pp_fabric.py). Push: one kernel stores the
+        payload into the next stage's ring and raises its flag. Pull: the copy
+        engine fills this stage's own ring slot, then a kernel raises the flag."""
+        from atom.distributed import pp_fabric as pf
+
+        hop, lay = self._fabric_out, self.out_layout
+        if seq >= lay.slots:
+            hop.wait_ge(s, hop.word(pf.CREDIT_WORD), seq - lay.slots + 1)
+        base = hop.slot_base(slot)
+        rows_word = hop.word(pf.ROWS_WORD + slot, peer=True)
+        flag = hop.word(pf.FLAG_WORD, peer=True)
+        if self.fabric.mode == "pull":
+            self._sdma_payload(_stream(s), base, hidden, bank, aux, rows)
+            hop.kernels.signal(s, rows_word, rows, flag, seq + 1)
+            return
+        off, h = lay.offsets(), self.hidden
+        v = 16 // lay.elem_size  # elements per 16 B word
+        hop.kernels.push(
+            s,
+            hidden=hidden.data_ptr(), hidden_v4=h // v,
+            bank=0 if bank is None else bank.data_ptr(),
+            bank_row_v4=0 if bank is None else bank.shape[1] * h // v,
+            closed_v4=lay.closed_blocks * h // v,
+            aux=0 if aux is None else aux.data_ptr(), aux_v4=lay.aux_cols // v,
+            rows=rows,
+            dst_hidden=base + off["hidden"], dst_bank=base + off["bank"], dst_aux=base + off["aux"],
+            rows_word=rows_word, flag_word=flag, flag_value=seq + 1,
+            arrive=hop.word(pf.ARRIVE_WORD), ctas=self.fabric.ctas,
+        )  # fmt: skip
+
+    def _sdma_payload(self, sh, base: int, hidden, bank, aux, rows: int) -> None:
+        """Hidden, the closed bank blocks (one 2D copy) and the aux rows into the
+        slot at ``base``, on the copy engine."""
+        hip, lay, h = _hip(), self.out_layout, self.hidden
+        e, off = lay.elem_size, lay.offsets()
+        dst = ctypes.c_void_p(base + off["hidden"])
+        _check(
+            hip.hipMemcpyAsync(
+                dst, ctypes.c_void_p(hidden.data_ptr()), rows * h * e, _D2D, sh
+            ),
+            "copy hidden",
+        )
+        if lay.closed_blocks:
+            width, pitch = lay.closed_blocks * h * e, bank.shape[1] * h * e
+            dst = ctypes.c_void_p(base + off["bank"])
+            src = ctypes.c_void_p(bank.data_ptr())
+            _check(
+                hip.hipMemcpy2DAsync(dst, width, src, pitch, width, rows, _D2D, sh),
+                "copy bank",
+            )
+        if lay.aux_cols:
+            dst = ctypes.c_void_p(base + off["aux"])
+            src = ctypes.c_void_p(aux.data_ptr())
+            _check(
+                hip.hipMemcpyAsync(dst, src, rows * lay.aux_cols * e, _D2D, sh),
+                "copy aux",
+            )
+
     def recv(self, rows: int) -> dict[str, torch.Tensor]:
         """This microbatch's payload from the previous stage, as fresh tensors the
         current (compute) stream may use at once: it waits on the copy-in. The
         bank is full size, the closed blocks filled, the rest this stage's to write."""
-        lay, h, e = self.in_layout, self.hidden, self.in_layout.elem_size
+        from atom.distributed import pp_fabric as pf
+
+        lay, h = self.in_layout, self.hidden
         if rows > lay.max_rows:
             raise RuntimeError(
                 f"PP mailbox: {rows} rows exceed a slot's {lay.max_rows}"
@@ -551,9 +668,7 @@ class PPMailbox:
         r = self.recv_stream
         rh = _stream(r)
         seq, slot = self.recv_seq, self.recv_seq % lay.slots
-        base = self._ring + slot * lay.slot_bytes
-        off = lay.offsets()
-        w = 8 // e  # elements per int64 word
+        hop = self._fabric_in if self.recv_kind == "fabric" else None
         with torch.cuda.stream(r):
             hidden = torch.empty(rows, h, dtype=self.dtype, device=self.device)
             bank = (
@@ -568,42 +683,30 @@ class PPMailbox:
                 if lay.aux_cols
                 else None
             )
-            flag = ctypes.c_void_p(self._ring_page + 8 * _COUNTER_WORD)
-            _check(
-                hip.hipStreamWaitValue64(rh, flag, seq + 1, _WAIT_GTE, _MASK64),
-                "wait flag",
-            )
+            if hop is not None:
+                hop.wait_ge(r, hop.word(pf.FLAG_WORD), seq + 1)
+                rows_word, base = hop.word(pf.ROWS_WORD + slot), hop.slot_base(slot)
+            else:
+                flag = ctypes.c_void_p(self._ring_page + 8 * _COUNTER_WORD)
+                _check(
+                    hip.hipStreamWaitValue64(rh, flag, seq + 1, _WAIT_GTE, _MASK64),
+                    "wait flag",
+                )
+                rows_word = self._ring_page + 8 * (_ROWS_WORD + slot)
+                base = self._ring + slot * lay.slot_bytes
             if self.check:
-                self._check_rows(r, slot, seq, rows)
-            copy_in(
-                base + off["hidden"],
-                hidden.view(torch.int64),
-                rows,
-                h // w,
-                h // w,
-                h // w,
-            )
-            if lay.closed_blocks:
-                cols = lay.closed_blocks * h // w
-                dst = bank.view(rows, -1).view(torch.int64)
-                copy_in(
-                    base + off["bank"],
-                    dst,
-                    rows,
-                    cols,
-                    cols,
-                    self.total_blocks * h // w,
+                self._check_rows(r, rows_word, seq, rows)
+            self._copy_in_payload(base, hidden, bank, aux, rows)
+            if hop is not None:
+                hop.kernels.signal(
+                    r, None, 0, hop.word(pf.CREDIT_WORD, peer=True), seq + 1
                 )
-            if lay.aux_cols:
-                cols = lay.aux_cols // w
-                copy_in(
-                    base + off["aux"], aux.view(torch.int64), rows, cols, cols, cols
+            else:
+                credit = ctypes.c_void_p(self._peer_credit_page + 8 * _COUNTER_WORD)
+                _check(
+                    hip.hipStreamWriteValue64(rh, credit, seq + 1, _WRITE_DEFAULT),
+                    "write credit",
                 )
-            credit = ctypes.c_void_p(self._peer_credit_page + 8 * _COUNTER_WORD)
-            _check(
-                hip.hipStreamWriteValue64(rh, credit, seq + 1, _WRITE_DEFAULT),
-                "write credit",
-            )
             done = torch.cuda.Event()
             done.record(r)
         compute.wait_event(done)
@@ -617,13 +720,31 @@ class PPMailbox:
         self.recv_seq += 1
         return out
 
+    def _copy_in_payload(self, base: int, hidden, bank, aux, rows: int) -> None:
+        """The slot at ``base`` (local, or a peer's across the fabric) into this
+        stage's tensors with ".cv" loads."""
+        lay, h = self.in_layout, self.hidden
+        off, w = lay.offsets(), 8 // lay.elem_size  # elements per int64 word
+        copy_in(
+            base + off["hidden"], hidden.view(torch.int64), rows, h // w, h // w, h // w
+        )
+        if lay.closed_blocks:
+            cols = lay.closed_blocks * h // w
+            dst = bank.view(rows, -1).view(torch.int64)
+            copy_in(
+                base + off["bank"], dst, rows, cols, cols, self.total_blocks * h // w
+            )
+        if lay.aux_cols:
+            cols = lay.aux_cols // w
+            copy_in(base + off["aux"], aux.view(torch.int64), rows, cols, cols, cols)
+
     def _check_rows(
-        self, stream: torch.cuda.Stream, slot: int, seq: int, rows: int
+        self, stream: torch.cuda.Stream, rows_word: int, seq: int, rows: int
     ) -> None:
         """``ATOM_PP_MAILBOX_CHECK``: the slot carries the rows this stage runs (a sync per microbatch)."""
         stream.synchronize()
         got = ctypes.c_uint64()
-        src = ctypes.c_void_p(self._ring_page + 8 * (_ROWS_WORD + slot))
+        src = ctypes.c_void_p(rows_word)
         _check(_hip().hipMemcpy(ctypes.byref(got), src, 8, _D2H), "read rows")
         if got.value != rows:
             raise RuntimeError(
