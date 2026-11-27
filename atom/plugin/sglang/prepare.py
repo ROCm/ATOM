@@ -47,7 +47,11 @@ def prepare_model(config: Any):
         getattr(config, "model_type", ""),
         getattr(text_cfg, "model_type", "") if text_cfg is not None else "",
     )
-    if model_arch == "DeepseekV41ForCausalLM":
+    if model_arch in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"):
+        from atom.plugin.sglang.qwen4_exp_pd import install_qwen4_exp_pd_patch
+
+        install_qwen4_exp_pd_patch()
+    elif model_arch == "DeepseekV41ForCausalLM":
         from atom.plugin.sglang.deepseek_v41_bridge import (
             install_deepseek_v41_proxy_pool_patch,
         )

@@ -52,6 +52,7 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
+    "prefill_token_graph_capture",
     "token_graph",
 ]
 
@@ -183,10 +184,18 @@ class _Recorder:
         self.begin()
         delivered = self._deliver(result, args, kwargs)
         bound = inspect.signature(fn).bind(*args, **kwargs)
+        # A replay reads what ``live`` returns afresh, so the recording keeps
+        # none of it: a step it held would keep that bucket's step-sized
+        # tables alive, one set per bucket beside the shared pool.
+        taken_live = () if live is None else live().keys()
         self._steps.append(
             _EagerStep(
                 fn,
-                {k: _weak(v) for k, v in bound.arguments.items()},
+                {
+                    k: _weak(v)
+                    for k, v in bound.arguments.items()
+                    if k not in taken_live
+                },
                 live,
                 stream,
                 None if delivered is None else weak_ref_tensor(delivered),
@@ -287,12 +296,30 @@ def eager_region(
     return decorate
 
 
+def prefill_token_graph_capture() -> bool:
+    """Whether this forward records a prefill token-graph bucket, or is the
+    warmup forward before it: the capture's dummy prefill, run under
+    `in_hipgraph` but not recorded. A layer that records its prefill split
+    around a region (the MLA head, the KDA projections) takes the split on
+    both, so the warmup runs what the recording captures."""
+    fwd_ctx = forward_context.get_forward_context()
+    context = fwd_ctx.context
+    if context is None or not context.is_prefill:
+        return False
+    return fwd_ctx.tr_graph == "record" or (
+        fwd_ctx.in_hipgraph and context.is_dummy_run
+    )
+
+
 def forks(stream: torch.cuda.Stream | None) -> bool:
     """Whether a region declared on ``stream`` runs beside the main stream
-    in this forward -- recorded, or inside a whole-forward capture."""
+    in this forward -- recorded, or inside a whole-forward capture that may
+    branch (`side_stream`'s gate). A recorded region's fork stays under
+    `graph_records_single_stream`: the region runs eagerly between segments,
+    so its fork is no branch of a graph."""
     if stream is None:
         return False
-    return _recorder() is not None or forward_context.get_forward_context().in_hipgraph
+    return _recorder() is not None or forward_context.graph_may_fork()
 
 
 def join_stream(*streams: torch.cuda.Stream | None) -> None:
@@ -381,7 +408,8 @@ class TokenGraph:
     `ReqGraph`'s included. Recordings never overlap -- one module's run in
     stream order, a module's output consumed before the next one replays --
     the same as two replays of one bucket, so the pool is the largest
-    recording's, not their sum.
+    recording's, not their sum. Outside it, a module holds its input buffers
+    and no bucket's step: what a region takes live is never kept.
     """
 
     _pool = None

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from aiter_stub import stubbed_aiter
 
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -177,3 +178,23 @@ def test_pd_logprobs_rejected_before_tokenization(configured):
         proc.preprocess_fanout("hello", SamplingParams(logprobs=True), **kwargs)
     proc.tokenizer.encode.assert_not_called()
     assert not proc.requests
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["", [], PrefixEncoding([], None)],
+    ids=["text", "token_ids", "prefix_encoding"],
+)
+@pytest.mark.parametrize("n", [1, 2])
+def test_a_prompt_of_no_tokens_is_refused(prompt, n):
+    proc = _make_processor()
+    with pytest.raises(ValueError, match="The decoder prompt cannot be empty"):
+        proc.preprocess_fanout(prompt, SamplingParams(n=n, temperature=0.8))
+    assert not proc.requests
+
+
+def test_an_empty_text_that_encodes_to_bos_runs():
+    proc = _make_processor()
+    proc.tokenizer.encode = MagicMock(return_value=[1])
+    seq = proc.preprocess("", SamplingParams())
+    assert list(seq.prompt_token_ids) == [1]

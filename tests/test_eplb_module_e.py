@@ -163,3 +163,21 @@ def test_dsr1_eplb_collects_gapped_layer_ids():
 def test_eplb_rejects_duplicate_layer_id():
     with pytest.raises(RuntimeError, match="layer_id=3"):
         eplb.collect_ep_moe_layers(_FakeTarget(second_moe_id=3))
+
+
+def test_eplb_collects_only_layers_before_declared_end():
+    # V4.1 under bounded replay: the decoder layers see a prefill's tails only.
+    model = _FakeTarget()
+    model.eplb_layer_end = 4
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3]
+    model.eplb_layer_end = None
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3, 4]
+
+
+def test_child_cannot_override_the_models_eplb_boundary():
+    model = _FakeTarget()
+    model.moe3.eplb_layer_end = 4
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3, 4]
+    model.eplb_layer_end = 4
+    model.moe3.eplb_layer_end = 3
+    assert sorted(eplb.collect_ep_moe_layers(model)) == [3]

@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from atom.utils import mooncake_hca
+
 # Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
 # The top-level name is taken back down below.
 _ps = sys.modules.get("aiter.dist.parallel_state")
@@ -509,9 +511,12 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
     monkeypatch.setenv("ATOM_HOST_IP", host_ip)
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
-    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", {0: "0000:65:00.0"}.__getitem__)
+    monkeypatch.setattr(
+        mooncake_hca, "rail_rdma_device", {"0000:65:00.0": "rdma2"}.__getitem__
+    )
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda name: True)
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
     )
@@ -632,9 +637,13 @@ def _one_row_staging_consumer(monkeypatch, send):
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "gpu_pci_bdf", {0: "0000:05:00.0"}.__getitem__)
+    monkeypatch.setattr(
+        mooncake_hca, "rail_rdma_device", {"0000:05:00.0": "rdma0"}.__getitem__
+    )
     monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
     monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda name: True)
     monkeypatch.setattr(
         mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
     )
@@ -873,58 +882,47 @@ def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    assert mc._select_ib_device("tcp", "rdma0", None) == ""
-    assert mc._select_ib_device(" TCP ", "ionic_0", None) == ""
+    assert mooncake_hca.ib_device_filter("tcp", "rdma0", None) == ""
+    assert mooncake_hca.ib_device_filter(" TCP ", "ionic_0", None) == ""
 
 
 def test_mooncake_tcp_forces_transfer_engine_transport(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
     monkeypatch.delenv("MC_FORCE_TCP", raising=False)
-    mc._configure_mooncake_transport(" TCP ")
+    mooncake_hca.configure_transport(" TCP ")
     assert os.environ["MC_FORCE_TCP"] == "true"
 
 
 def test_mooncake_rdma_preserves_explicit_device():
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
+    assert mooncake_hca.ib_device_filter("rdma", "ionic_3", None) == "ionic_3"
 
 
 def test_mooncake_rdma_normalizes_explicit_device_list():
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
     assert (
-        mc._select_ib_device("rdma", " ionic_4, ionic_0,ionic_4 ", None)
+        mooncake_hca.ib_device_filter("rdma", " ionic_4, ionic_0,ionic_4 ", None)
         == "ionic_4,ionic_0"
     )
 
 
-def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+def test_mooncake_rdma_auto_selects_from_gpu_pci_address(monkeypatch):
+    monkeypatch.setattr(
+        mooncake_hca, "auto_select_ib_device", lambda bdf: f"auto-{bdf}"
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
-    assert mc._select_ib_device("rdma", "", 5) == "auto5"
+    assert (
+        mooncake_hca.ib_device_filter("rdma", "", "0000:85:00.0") == "auto-0000:85:00.0"
+    )
 
 
 def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    monkeypatch.setattr(
+        mooncake_hca, "auto_select_ib_device", {"0000:85:00.0": "ionic_4"}.__getitem__
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+    monkeypatch.setattr(mooncake_hca, "numbered_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda _device: True)
 
-    assert mc._select_ib_devices(
+    assert mooncake_hca.select_ib_devices(
         "rdma",
         "",
-        4,
+        "0000:85:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == [
@@ -935,16 +933,16 @@ def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypat
 
 
 def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    monkeypatch.setattr(
+        mooncake_hca, "auto_select_ib_device", {"0000:75:00.0": "ionic_3"}.__getitem__
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+    monkeypatch.setattr(mooncake_hca, "numbered_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda _device: True)
 
-    assert mc._select_ib_devices(
+    assert mooncake_hca.select_ib_devices(
         "rdma",
         "",
-        3,
+        "0000:75:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == [
@@ -957,47 +955,44 @@ def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypat
 
 
 def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
     monkeypatch.setattr(
-        mc,
-        "_ib_device_exists",
+        mooncake_hca, "auto_select_ib_device", {"0000:75:00.0": "ionic_3"}.__getitem__
+    )
+    monkeypatch.setattr(mooncake_hca, "numbered_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mooncake_hca,
+        "ib_device_exists",
         lambda device: device in {"ionic_3", "ionic_0", "ionic_7"},
     )
 
-    assert mc._select_ib_devices(
+    assert mooncake_hca.select_ib_devices(
         "rdma",
         "",
-        3,
+        "0000:75:00.0",
         enable_alternate_hca=True,
         hca_count=8,
     ) == ["ionic_3", "ionic_0", "ionic_7"]
 
 
 def test_mooncake_rdma_rejects_nonpositive_hca_count(monkeypatch):
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    monkeypatch.setattr(
+        mooncake_hca, "auto_select_ib_device", {"0000:85:00.0": "ionic_4"}.__getitem__
     )
-    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mooncake_hca, "numbered_ib_device", lambda idx: f"ionic_{idx}")
 
     with pytest.raises(ValueError, match="ib_hca_count"):
-        mc._select_ib_devices(
+        mooncake_hca.select_ib_devices(
             "rdma",
             "",
-            4,
+            "0000:85:00.0",
             enable_alternate_hca=True,
             hca_count=0,
         )
 
 
-def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
-    with pytest.raises(ValueError, match="physical GPU index"):
-        mc._select_ib_device("rdma", "", None)
+def test_mooncake_rdma_requires_gpu_address_without_explicit_device():
+    with pytest.raises(ValueError, match="GPU's PCI address"):
+        mooncake_hca.ib_device_filter("rdma", "", None)
 
 
 # ---------------------------------------------------------------------------
@@ -1671,6 +1666,7 @@ def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
         _defer_prefix_hash=False,
         pp_size=pp_size,
         pp_max_inflight=pp_max_inflight,
+        _stages_push_load_terminals=False,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1916,6 +1912,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _defer_prefix_hash=False,
         pp_size=2,
         pp_max_inflight=2,
+        _stages_push_load_terminals=False,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -2474,7 +2471,9 @@ def test_matched_rails_reject_invalid_transport_configuration(
 ):
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: name.startswith("ionic_"))
+    monkeypatch.setattr(
+        mooncake_hca, "ib_device_exists", lambda name: name.startswith("ionic_")
+    )
     with pytest.raises(ValueError, match=message):
         mc._validate_matched_rails(protocol, devices, rails)
 
@@ -2484,7 +2483,7 @@ def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
 
     mc._validate_matched_rails("tcp", [], [])
     mc._validate_matched_rails("rdma", ["ionic_0", "ionic_1"], [])
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda _: True)
+    monkeypatch.setattr(mooncake_hca, "ib_device_exists", lambda _: True)
     mc._validate_matched_rails("rdma", ["ionic_2"], ["ionic_2", "ionic_6"])
 
 
@@ -2492,7 +2491,7 @@ def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
 def matched_rail_sysfs(tmp_path, monkeypatch):
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
-    monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", tmp_path)
+    monkeypatch.setattr(mooncake_hca, "IB_SYSFS_ROOT", tmp_path)
 
     def add(name, *states):
         device = tmp_path / name
@@ -2556,7 +2555,7 @@ def test_matched_rails_auto_rejects_missing_primary(matched_rail_sysfs):
 
 def test_matched_rails_auto_reports_hidden_sysfs(matched_rail_sysfs, tmp_path):
     mc, _ = matched_rail_sysfs
-    mc._IB_SYSFS_ROOT = tmp_path / "not-mounted"
+    mooncake_hca.IB_SYSFS_ROOT = tmp_path / "not-mounted"
     with pytest.raises(ValueError, match="Cannot discover RDMA HCAs"):
         mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
 
@@ -2599,7 +2598,7 @@ def test_matched_rails_explicit_list_and_unset_do_not_discover(matched_rail_sysf
     assert mc._resolve_matched_rails(
         "rdma", ["ionic_2"], " ionic_6, ionic_2,ionic_6, "
     ) == ["ionic_6", "ionic_2"]
-    mc._IB_SYSFS_ROOT = mc._IB_SYSFS_ROOT / "not-mounted"
+    mooncake_hca.IB_SYSFS_ROOT = mooncake_hca.IB_SYSFS_ROOT / "not-mounted"
     assert mc._resolve_matched_rails("tcp", [], " ") == []
     assert mc._resolve_matched_rails("rdma", ["ionic_2", "ionic_6"], "") == []
 

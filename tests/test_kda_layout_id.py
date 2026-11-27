@@ -19,13 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-K3 = pytest.importorskip(
-    "atom.model_ops.attentions.kimi_mla_gdn_attn",
-    reason="the K3 builder's module imports aiter at load",
-    exc_type=ImportError,
-)
-Builder = K3._KimiMLAGDNCommon
+from aiter_stub import atom_without_aiter
 
 SHAPE_K = (3, 4608)
 SHAPE_V = (12, 128, 128)
@@ -35,6 +29,7 @@ TP = 8
 
 
 def builder(
+    builder_cls,
     shape_k=SHAPE_K,
     shape_v=SHAPE_V,
     dt_k=DT_K,
@@ -43,21 +38,35 @@ def builder(
     num_spec=0,
     pp=1,
     rapidserve=False,
+    model_type="kimi_linear",
     replayssm=False,
     kpool=1,
     kpool_tail=None,
+    prefix_caching=True,
+    interval=-1,
+    block_size=4,
+    dcp=1,
+    kv_transfer_config=None,
 ):
     """`kpool` is the model's (GLM-5.3 pools indexer keys); `kpool_tail` says
     whether this PP stage holds indexer layers, and with them the tail plane."""
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
         enable_rapidserve=rapidserve,
+        hf_config=SimpleNamespace(linear_conv_kernel_dim=4),
+        enable_prefix_caching=prefix_caching,
+        state_checkpoint_interval_tokens=interval,
+        kv_cache_block_size=block_size,
+        decode_context_parallel_size=dcp,
+        kv_transfer_config=kv_transfer_config,
     )
     if kpool_tail is None:
         kpool_tail = kpool > 1
     tail = (256, 3) if kpool_tail else None
     stub = SimpleNamespace(
-        model_runner=SimpleNamespace(config=config),
+        model_runner=SimpleNamespace(
+            config=config, hf_text_config=SimpleNamespace(model_type=model_type)
+        ),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
         replayssm=replayssm,
@@ -69,10 +78,12 @@ def builder(
     )
     for name in (
         "_uses_paged_checkpoints",
+        "_reads_midstep",
+        "_conv_state_len",
         "_decode_keep",
         "_decode_image_is_conv_and_ssm",
     ):
-        setattr(stub, name, getattr(Builder, name).__get__(stub, type(stub)))
+        setattr(stub, name, getattr(builder_cls, name).__get__(stub, type(stub)))
     return stub
 
 
@@ -84,17 +95,19 @@ def tp_world(size: int):
     other test files stub `aiter` into `sys.modules`, so the import path is not
     reliably the one this module bound at load, but the name it bound is.
     """
-    original = K3.get_tp_group
-    K3.get_tp_group = lambda: SimpleNamespace(world_size=size)
-    try:
-        yield
-    finally:
-        K3.get_tp_group = original
+    with atom_without_aiter() as load:
+        K3 = load("atom.model_ops.attentions.kimi_mla_gdn_attn")
+        original = K3.get_tp_group
+        K3.get_tp_group = lambda: SimpleNamespace(world_size=size)
+        try:
+            yield K3._KimiMLAGDNCommon
+        finally:
+            K3.get_tp_group = original
 
 
 def layout_of(**kwargs) -> str:
-    with tp_world(kwargs.pop("tp", TP)):
-        return Builder.state_transfer(builder(**kwargs)).paged_layout_id
+    with tp_world(kwargs.pop("tp", TP)) as Builder:
+        return Builder.state_transfer(builder(Builder, **kwargs)).paged_layout_id
 
 
 class TestTheIdNamesItsVersionAndItsRule:
@@ -155,26 +168,45 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
     def test_pipeline_parallelism_copies(self):
         """The stages agree on one unit geometry, so a checkpoint is a PAGE
         image under PP too rather than a slot competing with admissions."""
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder(pp=2))
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder, pp=2))
         assert transfer.copies and not transfer.forks
         assert Builder.paged_checkpoints_span_pipeline
 
     def test_rapidserve_falls_back_to_fork(self):
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder(rapidserve=True))
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder, rapidserve=True))
         assert transfer.forks and not transfer.copies
 
     def test_the_ordinary_case_copies(self):
-        with tp_world(TP):
-            transfer = Builder.state_transfer(builder())
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder))
         assert transfer.copies and not transfer.forks
 
-    def test_a_copy_is_never_midstep_readable(self):
-        """KDA's chunk kernel returns only the final state, so there is no
-        interior state to slice a checkpoint out of."""
-        with tp_world(TP):
-            assert not Builder.state_transfer(builder()).readable_midstep
+    def test_k3_writes_a_checkpoint_inside_a_prefill(self):
+        """KDA's chunk kernel returns only the final state, so K3's forward
+        re-runs an interior checkpoint's head, which ends on any token; the
+        conv window still needs `conv_kernel - 1` of the forward's tokens."""
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(builder(Builder))
+        assert transfer.readable_midstep
+        assert (transfer.midstep_grid, transfer.midstep_min_offset) == (1, 3)
+
+    def test_nothing_else_writes_one(self):
+        """Not under PP, where the scratch slot's hand-back is unchecked;
+        GLM-5.3 shares the builder but not the forward that writes it."""
+        with tp_world(TP) as Builder:
+            assert not Builder.state_transfer(builder(Builder, pp=2)).readable_midstep
+            glm = builder(Builder, model_type="glm5_next_text")
+            assert not Builder.state_transfer(glm).readable_midstep
+
+    @pytest.mark.parametrize("kpool_tail", [False, True])
+    def test_midstep_refuses_a_model_with_an_unwritten_kpool_plane(self, kpool_tail):
+        with tp_world(TP) as Builder:
+            transfer = Builder.state_transfer(
+                builder(Builder, kpool=4, kpool_tail=kpool_tail)
+            )
+        assert transfer.copies and not transfer.readable_midstep
 
     @pytest.mark.parametrize(
         "replayssm, num_spec, kpool, keep",
@@ -192,9 +224,9 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
     ):
         """Under MTP or ReplaySSM the slot is ahead of a decode boundary, and
         the image is rebuilt only where it is conv and SSM alone."""
-        with tp_world(TP):
+        with tp_world(TP) as Builder:
             transfer = Builder.state_transfer(
-                builder(replayssm=replayssm, num_spec=num_spec, kpool=kpool)
+                builder(Builder, replayssm=replayssm, num_spec=num_spec, kpool=kpool)
             )
         assert transfer.decode_keep == keep
 
@@ -202,8 +234,8 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
     def test_every_pp_stage_of_a_kpool_model_keeps_none(self, kpool_tail):
         """A stage with no indexer layer holds no tail plane, but the head
         files and sizes scratch for every stage, so it answers as they do."""
-        with tp_world(TP):
+        with tp_world(TP) as Builder:
             transfer = Builder.state_transfer(
-                builder(replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
+                builder(Builder, replayssm=True, pp=2, kpool=4, kpool_tail=kpool_tail)
             )
         assert transfer.decode_keep == "none"

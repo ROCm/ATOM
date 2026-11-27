@@ -109,8 +109,25 @@ class VisionEmbeddingCache:
         self.leases.clear()
 
 
-def embed_multimodal_batch(model, cache, input_ids, batch, device, dtype):
-    """Consume request leases and scatter only the current chunk's intersections."""
+def embed_multimodal_batch(model, cache, input_ids, batch, device, dtype, read=None):
+    """Consume request leases and scatter only the current chunk's intersections.
+
+    A request whose payload carries ``ec_transfer_params`` takes the rows an
+    encoder server stored for it through ``read(params, cache_seed, dtype)``;
+    when that returns None, the model's tower encodes the images instead.
+    """
+
+    def encode(payload):
+        params = payload.get("ec_transfer_params")
+        if params is not None and read is not None:
+            rows = read(params, payload["cache_seed"], dtype)
+            if rows is not None:
+                return rows
+        return model.get_vision_embeddings(
+            payload["pixel_values"].to(device=device, dtype=dtype),
+            payload["image_grid_thw"],
+        )
+
     hidden = model.embed_input_ids(input_ids)
     offset = 0
     for request_id, length, end in zip(
@@ -120,14 +137,7 @@ def embed_multimodal_batch(model, cache, input_ids, batch, device, dtype):
         if data is not None:
             # Acquiring before the first image intersection lets later chunks
             # send descriptors only, even if the first chunk contains just text.
-            values = cache.acquire(
-                request_id,
-                data,
-                lambda payload: model.get_vision_embeddings(
-                    payload["pixel_values"].to(device=device, dtype=dtype),
-                    payload["image_grid_thw"],
-                ),
-            )
+            values = cache.acquire(request_id, data, encode)
             query, source = embedding_indices(
                 data["embedding_spans"], int(end) - int(length), int(length)
             )

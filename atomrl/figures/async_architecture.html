@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AtomRL Fully Async Training Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e1a;
+  --surface: #111827;
+  --surface-2: #1a2236;
+  --border: #2a3a5c;
+  --text: #e2e8f0;
+  --text-dim: #8892a8;
+  --accent-cyan: #22d3ee;
+  --accent-emerald: #34d399;
+  --accent-amber: #fbbf24;
+  --accent-rose: #fb7185;
+  --accent-violet: #a78bfa;
+  --glow-cyan: rgba(34, 211, 238, 0.15);
+  --glow-emerald: rgba(52, 211, 153, 0.15);
+  --glow-amber: rgba(251, 191, 36, 0.15);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+.canvas-root {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 48px 32px;
+}
+
+h1 {
+  font-family: 'Space Mono', monospace;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  margin-bottom: 6px;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-emerald));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.subtitle {
+  font-size: 14px;
+  color: var(--text-dim);
+  margin-bottom: 40px;
+  font-family: 'Space Mono', monospace;
+}
+
+/* ---- Main Architecture Diagram ---- */
+.arch-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2.1 / 1;
+  margin-bottom: 48px;
+}
+
+.node {
+  position: absolute;
+  border-radius: 16px;
+  padding: 24px;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+  cursor: default;
+}
+.node:hover { transform: translateY(-4px); }
+
+.node-rollouter {
+  top: 6%; left: 0;
+  width: 24%; height: 38%;
+  background: linear-gradient(145deg, var(--surface), var(--surface-2));
+  border: 1.5px solid var(--accent-cyan);
+  box-shadow: 0 0 40px var(--glow-cyan), inset 0 1px 0 rgba(34,211,238,0.1);
+}
+.node-rollouter:hover {
+  box-shadow: 0 0 60px var(--glow-cyan), 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.node-queue {
+  top: 6%; left: 35%;
+  width: 26%; height: 38%;
+  background: linear-gradient(145deg, var(--surface), var(--surface-2));
+  border: 1.5px solid var(--accent-amber);
+  box-shadow: 0 0 40px var(--glow-amber), inset 0 1px 0 rgba(251,191,36,0.1);
+}
+.node-queue:hover {
+  box-shadow: 0 0 60px var(--glow-amber), 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.node-trainer {
+  top: 6%; right: 0;
+  width: 24%; height: 38%;
+  background: linear-gradient(145deg, var(--surface), var(--surface-2));
+  border: 1.5px solid var(--accent-emerald);
+  box-shadow: 0 0 40px var(--glow-emerald), inset 0 1px 0 rgba(52,211,153,0.1);
+}
+.node-trainer:hover {
+  box-shadow: 0 0 60px var(--glow-emerald), 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.node-sync {
+  bottom: 6%; left: 50%;
+  transform: translateX(-50%);
+  width: 30%; height: 28%;
+  background: linear-gradient(145deg, var(--surface), var(--surface-2));
+  border: 1.5px solid var(--accent-violet);
+  box-shadow: 0 0 40px rgba(167,139,250,0.12), inset 0 1px 0 rgba(167,139,250,0.1);
+}
+.node-sync:hover {
+  transform: translateX(-50%) translateY(-4px);
+  box-shadow: 0 0 60px rgba(167,139,250,0.2), 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.node-icon { font-size: 28px; margin-bottom: 10px; display: block; }
+.node-title {
+  font-family: 'Space Mono', monospace;
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.node-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.node-rollouter .node-title { color: var(--accent-cyan); }
+.node-queue .node-title { color: var(--accent-amber); }
+.node-trainer .node-title { color: var(--accent-emerald); }
+.node-sync .node-title { color: var(--accent-violet); }
+
+/* ---- SVG Arrows ---- */
+.arrows-svg {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+
+.arrow-path {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+
+.arrow-forward { stroke: var(--accent-amber); }
+.arrow-consume { stroke: var(--accent-emerald); }
+.arrow-sync-down { stroke: var(--accent-violet); }
+.arrow-sync-up { stroke: var(--accent-violet); }
+
+@keyframes flow-right { to { stroke-dashoffset: -24; } }
+@keyframes flow-left  { to { stroke-dashoffset: 24; } }
+
+.flow-right { stroke-dasharray: 8 8; animation: flow-right 0.8s linear infinite; }
+.flow-left  { stroke-dasharray: 8 8; animation: flow-left 0.8s linear infinite; }
+
+/* Particles */
+@keyframes p-r1 {
+  0%   { offset-distance: 0%;   opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { offset-distance: 100%; opacity: 0; }
+}
+
+.particle {
+  position: absolute;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.p-forward {
+  background: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+  offset-path: path("M262 140 L378 140");
+  animation: p-r1 1.6s ease-in-out infinite;
+}
+.p-forward.d1 { animation-delay: 0s; }
+.p-forward.d2 { animation-delay: 0.53s; }
+.p-forward.d3 { animation-delay: 1.06s; }
+
+.p-consume {
+  background: var(--accent-emerald);
+  box-shadow: 0 0 8px var(--accent-emerald);
+  offset-path: path("M662 140 L838 140");
+  animation: p-r1 1.6s ease-in-out infinite;
+}
+.p-consume.d1 { animation-delay: 0s; }
+.p-consume.d2 { animation-delay: 0.53s; }
+.p-consume.d3 { animation-delay: 1.06s; }
+
+/* Queue bars */
+.queue-bars {
+  display: flex;
+  gap: 4px;
+  margin-top: 12px;
+  align-items: flex-end;
+  height: 36px;
+}
+
+@keyframes bar-pulse {
+  0%, 100% { opacity: 0.35; height: 10px; }
+  50% { opacity: 1; height: 32px; }
+}
+
+.q-bar {
+  width: 14px;
+  border-radius: 3px;
+  background: var(--accent-amber);
+  animation: bar-pulse 2s ease-in-out infinite;
+}
+.q-bar:nth-child(1) { animation-delay: 0s; }
+.q-bar:nth-child(2) { animation-delay: 0.15s; }
+.q-bar:nth-child(3) { animation-delay: 0.3s; }
+.q-bar:nth-child(4) { animation-delay: 0.45s; }
+.q-bar:nth-child(5) { animation-delay: 0.6s; }
+.q-bar:nth-child(6) { animation-delay: 0.75s; }
+.q-bar:nth-child(7) { animation-delay: 0.9s; }
+.q-bar:nth-child(8) { animation-delay: 1.05s; }
+
+/* ---- Mode Cards ---- */
+.modes-section { margin-bottom: 48px; }
+.modes-section h2 {
+  font-family: 'Space Mono', monospace;
+  font-size: 18px;
+  margin-bottom: 20px;
+}
+
+.modes-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.mode-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  transition: all 0.3s ease;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+.mode-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+}
+.mode-card:nth-child(1)::before { background: var(--accent-cyan); }
+.mode-card:nth-child(2)::before { background: var(--accent-amber); }
+.mode-card:nth-child(3)::before { background: var(--accent-emerald); }
+.mode-card:nth-child(4)::before { background: var(--accent-rose); }
+
+.mode-card:hover {
+  border-color: var(--text-dim);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+
+.mode-label {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 8px;
+}
+.mode-card:nth-child(1) .mode-label { color: var(--accent-cyan); }
+.mode-card:nth-child(2) .mode-label { color: var(--accent-amber); }
+.mode-card:nth-child(3) .mode-label { color: var(--accent-emerald); }
+.mode-card:nth-child(4) .mode-label { color: var(--accent-rose); }
+
+.mode-name { font-weight: 700; font-size: 15px; margin-bottom: 6px; }
+.mode-config {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.mode-desc { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+.mode-speed {
+  display: inline-block;
+  margin-top: 10px;
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border);
+}
+
+/* ---- Timeline comparison ---- */
+.timeline-section { margin-bottom: 32px; }
+.timeline-section h2 {
+  font-family: 'Space Mono', monospace;
+  font-size: 18px;
+  margin-bottom: 20px;
+}
+
+.timeline-pair { margin-bottom: 20px; }
+.timeline-label {
+  font-family: 'Space Mono', monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+
+.timeline-bar {
+  display: flex;
+  height: 40px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.tl-segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Space Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--bg);
+  position: relative;
+  overflow: hidden;
+}
+
+.tl-rollout { background: var(--accent-cyan); }
+.tl-idle {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--surface-2), var(--surface-2) 6px,
+    var(--border) 6px, var(--border) 12px
+  );
+  color: var(--text-dim);
+}
+.tl-train { background: var(--accent-emerald); }
+.tl-sync { background: var(--accent-violet); width: 3%; }
+
+.stats-row {
+  display: flex;
+  gap: 16px;
+  margin-top: 32px;
+  flex-wrap: wrap;
+}
+
+.stat-chip {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+}
+.stat-chip strong { color: var(--text); }
+
+@media (max-width: 900px) {
+  .modes-grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+<div class="canvas-root">
+
+<h1>Fully Async Training</h1>
+<p class="subtitle">AtomRL &mdash; Decoupled Rollout + Training Pipeline</p>
+
+<!-- Architecture Diagram -->
+<div class="arch-container">
+  <svg class="arrows-svg" viewBox="0 0 1100 520" preserveAspectRatio="xMidYMid meet">
+    <defs>
+      <marker id="ah-amber" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+        <polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24"/>
+      </marker>
+      <marker id="ah-emerald" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+        <polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/>
+      </marker>
+      <marker id="ah-violet" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+        <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/>
+      </marker>
+      <marker id="ah-violet-l" markerWidth="10" markerHeight="7" refX="0" refY="3.5" orient="auto">
+        <polygon points="10 0, 0 3.5, 10 7" fill="#a78bfa"/>
+      </marker>
+      <filter id="glow-a">
+        <feGaussianBlur stdDeviation="3" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <filter id="glow-e">
+        <feGaussianBlur stdDeviation="3" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+
+    <!-- Rollouter → Queue -->
+    <path d="M264 135 L383 135" class="arrow-path arrow-forward flow-right" marker-end="url(#ah-amber)" filter="url(#glow-a)"/>
+    <!-- Queue → Trainer -->
+    <path d="M670 135 L835 135" class="arrow-path arrow-consume flow-right" marker-end="url(#ah-emerald)" filter="url(#glow-e)"/>
+
+    <!-- Trainer → WeightSync (curve down) -->
+    <path d="M935 240 C935 340 750 390 710 395" class="arrow-path arrow-sync-down flow-left" marker-end="url(#ah-violet)"/>
+    <!-- WeightSync → Rollouter (curve up) -->
+    <path d="M390 395 C350 390 130 340 130 240" class="arrow-path arrow-sync-up flow-left" marker-end="url(#ah-violet-l)"/>
+
+    <!-- Arrow labels -->
+    <text x="324" y="120" fill="#fbbf24" font-family="Space Mono, monospace" font-size="11" font-weight="700" text-anchor="middle" opacity="0.9">samples</text>
+    <text x="752" y="120" fill="#34d399" font-family="Space Mono, monospace" font-size="11" font-weight="700" text-anchor="middle" opacity="0.9">batches</text>
+    <text x="548" y="440" fill="#a78bfa" font-family="Space Mono, monospace" font-size="11" font-weight="700" text-anchor="middle" opacity="0.9">safetensors v{n}</text>
+
+    <!-- Animated particles: Rollouter → Queue -->
+    <circle r="4" fill="#fbbf24" opacity="0" filter="url(#glow-a)">
+      <animateMotion dur="1.5s" repeatCount="indefinite" path="M264 135 L383 135"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="4" fill="#fbbf24" opacity="0" filter="url(#glow-a)">
+      <animateMotion dur="1.5s" begin="0.5s" repeatCount="indefinite" path="M264 135 L383 135"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.5s" begin="0.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="4" fill="#fbbf24" opacity="0" filter="url(#glow-a)">
+      <animateMotion dur="1.5s" begin="1s" repeatCount="indefinite" path="M264 135 L383 135"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.5s" begin="1s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Animated particles: Queue → Trainer -->
+    <circle r="4" fill="#34d399" opacity="0" filter="url(#glow-e)">
+      <animateMotion dur="1.5s" repeatCount="indefinite" path="M670 135 L835 135"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle r="4" fill="#34d399" opacity="0" filter="url(#glow-e)">
+      <animateMotion dur="1.5s" begin="0.5s" repeatCount="indefinite" path="M670 135 L835 135"/>
+      <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.5s" begin="0.5s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Weight sync particle: Trainer → Sync → Rollouter -->
+    <circle r="4" fill="#a78bfa" opacity="0">
+      <animateMotion dur="4s" repeatCount="indefinite" path="M935 240 C935 340 750 390 710 395 L390 395 C350 390 130 340 130 240"/>
+      <animate attributeName="opacity" values="0;0.8;0.8;0" keyTimes="0;0.05;0.95;1" dur="4s" repeatCount="indefinite"/>
+    </circle>
+  </svg>
+
+  <!-- Rollouter -->
+  <div class="node node-rollouter">
+    <span class="node-icon">⚡</span>
+    <div class="node-title">Rollouter</div>
+    <div class="node-desc">
+      Generates sequences via<br>
+      ATOM / vLLM engine,<br>
+      streaming one sample at a time
+    </div>
+  </div>
+
+  <!-- MessageQueue -->
+  <div class="node node-queue">
+    <span class="node-icon">📦</span>
+    <div class="node-title">MessageQueue</div>
+    <div class="node-desc">
+      Thread-safe buffer with<br>
+      freshness &amp; staleness control
+    </div>
+    <div class="queue-bars">
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+      <div class="q-bar"></div>
+    </div>
+  </div>
+
+  <!-- Trainer -->
+  <div class="node node-trainer">
+    <span class="node-icon">🧠</span>
+    <div class="node-title">Trainer</div>
+    <div class="node-desc">
+      FSDP2 gradient updates<br>
+      with configurable<br>
+      accumulation &amp; batching
+    </div>
+  </div>
+
+  <!-- WeightSync -->
+  <div class="node node-sync">
+    <span class="node-icon">🔄</span>
+    <div class="node-title">WeightSync</div>
+    <div class="node-desc">
+      Filesystem parameter transfer<br>
+      via versioned safetensors snapshots
+    </div>
+  </div>
+</div>
+
+<!-- Mode Cards -->
+<div class="modes-section">
+  <h2>Supported Modes</h2>
+  <div class="modes-grid">
+    <div class="mode-card">
+      <div class="mode-label">Mode A</div>
+      <div class="mode-name">On-Policy</div>
+      <div class="mode-config">staleness=0 sync=1</div>
+      <div class="mode-desc">Produce one batch, train, sync immediately. Maximum freshness.</div>
+      <div class="mode-speed">1.0&times; baseline</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-label">Mode B</div>
+      <div class="mode-name">Stream Off-Policy</div>
+      <div class="mode-config">staleness=0 sync&gt;1</div>
+      <div class="mode-desc">Multiple local updates between syncs. Streaming reduces bubbles.</div>
+      <div class="mode-speed">~1.6&times; speedup</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-label">Mode C</div>
+      <div class="mode-name">Async + Stale</div>
+      <div class="mode-config">staleness&gt;0 partial=off</div>
+      <div class="mode-desc">Allow stale samples up to threshold. Wait for active tasks on sync.</div>
+      <div class="mode-speed">~2.0&times; speedup</div>
+    </div>
+    <div class="mode-card">
+      <div class="mode-label">Mode D</div>
+      <div class="mode-name">Async + Partial</div>
+      <div class="mode-config">staleness&gt;0 partial=on</div>
+      <div class="mode-desc">Interrupt in-progress generation on sync. Maximum overlap.</div>
+      <div class="mode-speed">~2.7&times; speedup</div>
+    </div>
+  </div>
+</div>
+
+<!-- Timeline -->
+<div class="timeline-section">
+  <h2>Pipeline Comparison</h2>
+
+  <div class="timeline-pair">
+    <div class="timeline-label">&#9654; Colocate Sync &mdash; sequential, GPU idle between phases</div>
+    <div class="timeline-bar">
+      <div class="tl-segment tl-rollout" style="width:38%">ROLLOUT</div>
+      <div class="tl-segment tl-idle" style="width:7%"></div>
+      <div class="tl-segment tl-train" style="width:28%">TRAIN</div>
+      <div class="tl-segment tl-idle" style="width:7%"></div>
+      <div class="tl-segment tl-rollout" style="width:15%">ROLL..</div>
+      <div class="tl-segment tl-idle" style="width:5%"></div>
+    </div>
+  </div>
+
+  <div class="timeline-pair">
+    <div class="timeline-label">&#9654; Fully Async (Mode D) &mdash; overlapped, minimal idle</div>
+    <div class="timeline-bar">
+      <div class="tl-segment tl-rollout" style="width:12%">GEN</div>
+      <div class="tl-segment tl-train" style="width:25%">TRAIN</div>
+      <div class="tl-segment tl-sync"></div>
+      <div class="tl-segment tl-rollout" style="width:10%">GEN</div>
+      <div class="tl-segment tl-train" style="width:25%">TRAIN</div>
+      <div class="tl-segment tl-sync"></div>
+      <div class="tl-segment tl-rollout" style="width:10%">GEN</div>
+      <div class="tl-segment tl-train" style="width:12%">TRAIN</div>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-chip">Pipeline bubble: <strong>~60%</strong> &rarr; <strong>&lt;5%</strong></div>
+    <div class="stat-chip">Throughput: <strong>2.35&ndash;2.67&times;</strong> on 128 GPUs</div>
+    <div class="stat-chip">Accuracy: <strong>within 1%</strong> of sync baseline</div>
+    <div class="stat-chip">Models: <strong>7B dense &amp; 30B MoE</strong></div>
+  </div>
+</div>
+
+</div>
+</body>
+</html>
