@@ -2,6 +2,7 @@
 aiter's ``flydsl_aq1`` takes ``k_chain``, and the step qualifies for AQ (``_aq1_decode``). Every other case returns
 None, so the caller runs the QKV linear on the same MXFP8 input: production's quantize + GEMM."""
 
+import inspect
 import sys
 import types
 
@@ -42,9 +43,13 @@ def chain_ok(monkeypatch):
 
 
 def _call(impl):
+    """The chain with MXFP8 rows and scales; every later argument (q, positions, caches, slot mappings; their
+    number follows the signature) is None: the gate decides before any of them is read."""
     x = torch.zeros(8, H, dtype=torch.float8_e4m3fn)
     xs = torch.zeros(8, H // 32, dtype=torch.uint8)
-    return am.SparseMHAPagedAttentionImpl._fused_qkv_chain(impl, x, xs, None, None, None, None, None, None, None)
+    fn = am.SparseMHAPagedAttentionImpl._fused_qkv_chain
+    rest = len(inspect.signature(fn).parameters) - 3  # self, x, x_scale
+    return fn(impl, x, xs, *([None] * rest))
 
 
 def test_switch_off_returns_to_the_qkv_linear(chain_ok, monkeypatch):
