@@ -1481,10 +1481,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Batches the PP head keeps in flight, middle prefill chunks included,
     # before it waits for the oldest to come back. At the default (the stage
     # count), one slow batch stalls the head while the stages ahead of it
-    # drain. Unset or 0 means pipeline_parallel_size; negative is an error.
+    # drain. Unset or 0 means pipeline_parallel_size (twice it over the IPC
+    # boundary below); negative is an error.
     "ATOM_PP_MAX_INFLIGHT": lambda: (
         _optional_int_env("ATOM_PP_MAX_INFLIGHT", min_value=0) or 0
     ),
+    # PP stage boundary over HIP IPC (`pp_ipc.py`) on a MiniMax-M3 P/D prefill
+    # producer with one rank a stage on gfx950; 0 keeps NCCL everywhere.
+    "ATOM_PP_IPC": lambda: os.getenv("ATOM_PP_IPC", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (`engram.host_memory.pin_rows`), not copied to HBM; the

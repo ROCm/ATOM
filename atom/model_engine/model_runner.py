@@ -48,6 +48,7 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
+from atom.distributed.pp_ipc import pp_ipc_enabled
 from atom.distributed.ulysses_sp import (
     get_sp_world_size,
     local_num_kv_heads,
@@ -202,6 +203,10 @@ class GreedyIdsOrSample:
 # a drafted model's head picks by the shared mono LM head launch, in front of
 # ATOM's Triton picks (`_bind_verify_head`)
 MONO_VERIFY_HEAD = "atom.mono.lm_head.head.bind_verify_head"
+
+# The last PP stage's forward() result while its sampled ids are still being
+# copied to the host (`_defer_pp_last_output`).
+PP_OUTPUT_PENDING = "PP_OUTPUT_PENDING"
 
 
 def max_schedulable_decode_bs(
@@ -874,6 +879,9 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # Last PP stage under the IPC boundary: return before the sampled ids
+    # reach the host, once the stage loop asks (`set_pp_async_out`).
+    _pp_last_async_out = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -973,6 +981,11 @@ class ModelRunner:
         )
 
         self._pp_pending_send: list = []
+        # PP boundary over HIP IPC (`pp_ipc`), its ends built on first use.
+        self._pp_ipc = pp_ipc_enabled(config)
+        self._pp_ipc_rx = None
+        self._pp_ipc_tx = None
+        self._pp_pending_out: list = []
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -1262,6 +1275,12 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
+        for end in (
+            getattr(self, "_pp_ipc_rx", None),
+            getattr(self, "_pp_ipc_tx", None),
+        ):
+            if end is not None:
+                end.close()
         # MegaMoE's arenas live on the EP all2all manager's cco communicator,
         # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
         # both. A close error propagates once the rest of the teardown has run.
@@ -3429,18 +3448,22 @@ class ModelRunner:
 
                 intermediate_tensors = recv_aux = None
                 if pp_enabled and not pp_group.is_first_rank:
-                    intermediate_tensors = recv_intermediate_tensors()
-                    # GLM-5.2 IndexShare: load prior rank's top-k for leading
-                    # shared layers. Pop so compiled model sees only hidden_states.
-                    recv_sparse = intermediate_tensors.tensors.pop(
-                        "sparse_kv_indices", None
-                    )
-                    if recv_sparse is not None and self._pp_recv_needs_sparse:
-                        tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
-                        tgt[: recv_sparse.numel()].copy_(recv_sparse)
-                    # DSpark aux hidden states from target layers on earlier
-                    # stages. Popped for the same reason as the top-k above.
-                    recv_aux = intermediate_tensors.tensors.pop(PP_AUX_KEY, None)
+                    if self._pp_ipc:
+                        # Its aux block (if any) is filled by `_finish_pp_aux`.
+                        intermediate_tensors, recv_aux = self._pp_ipc_receiver().recv()
+                    else:
+                        intermediate_tensors = recv_intermediate_tensors()
+                        # GLM-5.2 IndexShare: load prior rank's top-k for leading
+                        # shared layers. Pop so compiled model sees only hidden_states.
+                        recv_sparse = intermediate_tensors.tensors.pop(
+                            "sparse_kv_indices", None
+                        )
+                        if recv_sparse is not None and self._pp_recv_needs_sparse:
+                            tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
+                            tgt[: recv_sparse.numel()].copy_(recv_sparse)
+                        # DSpark aux hidden states from target layers on earlier
+                        # stages. Popped for the same reason as the top-k above.
+                        recv_aux = intermediate_tensors.tensors.pop(PP_AUX_KEY, None)
                     if self.pp_aux_relay is not None and pp_group.is_last_rank:
                         self.pp_aux_relay.absorb(recv_aux, self.drafter)
 
@@ -3460,7 +3483,19 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 self._dynamic_chunking.finish_sample(chunk_sample)
-                if pp_enabled and not pp_group.is_last_rank:
+                if pp_enabled and not pp_group.is_last_rank and self._pp_ipc:
+                    aux = None
+                    if self.pp_aux_relay is not None:
+                        self._finish_pp_aux()
+                        aux = self.pp_aux_relay.pack(
+                            recv_aux,
+                            model_output.tensors["hidden_states"].shape[0],
+                        )
+                    # The forward's own outputs go straight into the next
+                    # stage's ring: nothing is cloned.
+                    self._pp_ipc_sender().send(model_output, aux)
+                    hidden_states = None
+                elif pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
                         # Use hidden_states rows (correct under PCP shard).
@@ -3573,6 +3608,35 @@ class ModelRunner:
         if self._pp_pending_send:
             commit_pp_send_work(self._pp_pending_send)
         return True
+
+    def _pp_ipc_receiver(self):
+        if self._pp_ipc_rx is None:
+            from atom.distributed.pp_ipc import PPIpcReceiver
+
+            relay = self.pp_aux_relay
+            aux_cols = 0
+            if relay is not None and relay.incoming_ids:
+                aux_cols = len(relay.incoming_ids) * relay.spec.hidden_size
+            self._pp_ipc_rx = PPIpcReceiver(
+                self.config.max_num_batched_tokens,
+                self.hf_text_config.hidden_size,
+                self.config.torch_dtype,
+                aux_cols,
+            )
+        return self._pp_ipc_rx
+
+    def _pp_ipc_sender(self):
+        if self._pp_ipc_tx is None:
+            from atom.distributed.pp_ipc import PPIpcSender
+
+            self._pp_ipc_tx = PPIpcSender()
+        return self._pp_ipc_tx
+
+    def _finish_pp_aux(self) -> None:
+        """Fill this step's relayed aux block from the IPC ring (a stream wait:
+        its copy ran under the forward); call before the aux is first read."""
+        if self._pp_ipc_rx is not None:
+            self._pp_ipc_rx.finish_aux()
 
     def release_constraints(self, request_ids):
         release_token_constraints(self, request_ids)
@@ -3837,6 +3901,13 @@ class ModelRunner:
         self.forward_done_event.record(
             None if self._served is None else self._served.output_stream
         )
+        if (
+            self._pp_last_async_out
+            and not need_logprobs
+            and constraints is None
+            and not hasattr(self, "drafter")
+        ):
+            return self._defer_pp_last_output(batch, sampled_tokens)
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
@@ -3916,6 +3987,35 @@ class ModelRunner:
             constraint_errors=constraint_errors(self),
         )
 
+    def _defer_pp_last_output(self, batch: ScheduledBatch, sampled_tokens):
+        """Last PP stage: queue the sampled ids' D2H copy and return at once;
+        `pp_collect_output` takes them after the next forward is launched."""
+        cpu = sampled_tokens.to("cpu", non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        errors = constraint_errors(self)
+        self._pp_pending_out.append((list(batch.req_ids), cpu, done, errors))
+        return PP_OUTPUT_PENDING
+
+    def set_pp_async_out(self) -> bool:
+        """The last stage's engine loop runs: defer sampled ids from now on."""
+        self._pp_last_async_out = True
+        return True
+
+    def pp_collect_output(self) -> ScheduledBatchOutput:
+        """The oldest deferred last-stage output, once its copy has landed."""
+        req_ids, cpu, done, errors = self._pp_pending_out.pop(0)
+        done.synchronize()
+        bs = len(req_ids)
+        return ScheduledBatchOutput(
+            req_ids=req_ids,
+            token_ids=[(tid,) for tid in cpu.tolist()],
+            draft_token_ids=None,
+            num_rejected=np.zeros(bs, dtype=np.int32),
+            num_bonus=np.zeros(bs, dtype=np.int32),
+            constraint_errors=errors,
+        )
+
     def _kv_after_forward(self) -> None:
         """Let the KV connector act behind this step's enqueued KV writes.
 
@@ -3989,6 +4089,8 @@ class ModelRunner:
         if self.spec_status_deferred:
             self.tokenID_processor.take_deferred_spec_status()
         self._settle_target_pcp_split()
+        # The drafter reads the relayed aux from here on (draft K/V, propose).
+        self._finish_pp_aux()
         drafter = getattr(self, "drafter", None)
 
         pp_group = get_pp_group()

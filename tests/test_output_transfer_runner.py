@@ -104,6 +104,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         forward_done_event=mock.Mock(),
         _served=None,
         structured_output=None,
+        _pp_last_async_out=False,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
@@ -499,3 +500,67 @@ def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(
     runner.rejection_sampler.arm_ratio.assert_called_once_with(
         8, 3, 160, torch.bfloat16, "cpu", block=block
     )
+
+
+def test_last_pp_stage_defers_ids_and_collects_them_in_order(monkeypatch):
+    """Over the IPC boundary the last stage returns PP_OUTPUT_PENDING first."""
+    done = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(runner_module.torch.cuda, "Event", lambda: done)
+    runner = SimpleNamespace(_pp_pending_out=[], structured_output=None)
+    defer = runner_module.ModelRunner._defer_pp_last_output
+    for ids, tokens in (([7, 9], [11, 12]), ([8], [13])):
+        pending = defer(runner, SimpleNamespace(req_ids=ids), torch.tensor(tokens))
+        assert pending == runner_module.PP_OUTPUT_PENDING
+    first = runner_module.ModelRunner.pp_collect_output(runner)
+    second = runner_module.ModelRunner.pp_collect_output(runner)
+    assert (first.req_ids, first.token_ids) == ([7, 9], [(11,), (12,)])
+    assert (second.req_ids, second.token_ids) == ([8], [(13,)])
+    assert first.num_rejected.tolist() == [0, 0] and first.draft_token_ids is None
+
+
+@pytest.mark.parametrize("relay", [False, True])
+def test_a_middle_stage_waits_for_the_relayed_aux_where_it_packs_it(monkeypatch, relay):
+    """IPC boundary, middle stage: receive, forward, the aux block's wait and pack,
+    then the send of the forward's own outputs."""
+    seen = []
+    mode = SimpleNamespace(
+        assert_shape_contract=lambda *args: None,
+        sync=SimpleNamespace(prefill_across_dp=[True]),
+        use_cudagraph=False,
+        running_tokens=4,
+        scheduled_tokens=4,
+        pcp_groups=None,
+    )
+    context = SimpleNamespace(
+        scheduled_bs=1, running_bs=1, is_prefill=True, positions=None, forward_mode=mode
+    )
+    forward = SimpleNamespace(context=context, attn_metadata=None, ubatch_slices=None)
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: forward)
+    monkeypatch.setattr(runner_module, "build_run_label", lambda **kwargs: "prefill")
+    stage = SimpleNamespace(world_size=4, is_first_rank=False, is_last_rank=False)
+    monkeypatch.setattr(runner_module, "get_pp_group", lambda: stage)
+    out = SimpleNamespace(tensors={"hidden_states": torch.zeros(4, 8)})
+    rx = SimpleNamespace(
+        recv=lambda: ("received", "aux in"), finish_aux=lambda: seen.append("wait aux")
+    )
+    runner = SimpleNamespace(
+        config=SimpleNamespace(prefill_context_parallel_size=1),
+        sp_mega_moe=None,
+        _detailed_label_suffix=lambda batch: "",
+        _setup_pp_shared_indexer=lambda: None,
+        _dynamic_chunking=mock.Mock(),
+        model=lambda *args, **kw: seen.append(kw["intermediate_tensors"]) or out,
+        _pp_ipc=True,
+        _pp_ipc_rx=rx,
+        _pp_ipc_receiver=lambda: rx,
+        _pp_ipc_sender=lambda: SimpleNamespace(send=lambda *sent: seen.append(sent)),
+        pp_aux_relay=None,
+    )
+    if relay:
+        runner.pp_aux_relay = SimpleNamespace(
+            pack=lambda aux, rows: seen.append(("pack", aux, rows)) or "aux out"
+        )
+    runner._finish_pp_aux = lambda: runner_module.ModelRunner._finish_pp_aux(runner)
+    assert runner_module.ModelRunner.run_model(runner, torch.zeros(4)) is None
+    aux = ["wait aux", ("pack", "aux in", 4)] if relay else []
+    assert seen == ["received", *aux, (out, "aux out" if relay else None)]
