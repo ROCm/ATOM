@@ -1,0 +1,3638 @@
+# ROCm/mori#1102 (draft, TianDi101) at c93838be, squashed: git diff a518d1a3 c93838be.
+# Multi-part L1 pools (one part per GPU of an engine) and the optional server-side DRAM store.
+# Applies on mori c5bdc391 + the recipe picks + #1045, #1082, #1089. Only src/umbp and tests/cpp/umbp.
+
+diff --git a/src/umbp/CMakeLists.txt b/src/umbp/CMakeLists.txt
+index b0ccb23b..a8dee4b0 100644
+--- a/src/umbp/CMakeLists.txt
++++ b/src/umbp/CMakeLists.txt
+@@ -450,6 +450,7 @@ add_library(
+   distributed/distributed_client.cpp
+   standalone/external_kv_identity_client.cpp
+   standalone/ipc.cpp
++  standalone/l1_backing_store.cpp
+   standalone/standalone_process_client.cpp
+   standalone/standalone_server.cpp)
+ add_dependencies(umbp_common umbp_workload_proto)
+diff --git a/src/umbp/distributed/proto/umbp_l1.proto b/src/umbp/distributed/proto/umbp_l1.proto
+index ad6d6172..b4cd868d 100644
+--- a/src/umbp/distributed/proto/umbp_l1.proto
++++ b/src/umbp/distributed/proto/umbp_l1.proto
+@@ -60,6 +60,11 @@ message AttachRequest {
+   // neither zeroed nor freed by the server; detaching only unmaps it.
+   bytes external_handle = 5;
+   uint64 external_offset = 6;
++  // A pool over several allocations (an engine rank whose KV is sharded over
++  // its devices): this call brings part `part` of `num_parts`. The parts share
++  // one slot table; each has its own memory, layout and commit. 0 parts = 1.
++  uint32 part = 7;
++  uint32 num_parts = 8;
+ }
+ 
+ message AttachResponse {
+@@ -83,6 +88,8 @@ message BindLayoutRequest {
+   string pool_id = 1;
+   uint32 num_slots = 2;
+   repeated Region regions = 3;
++  // The part this layout is of. Every part declares the same `num_slots`.
++  uint32 part = 4;
+ }
+ 
+ message OpenRequest {
+@@ -142,6 +149,8 @@ message CommitRequest {
+   string pool_id = 1;
+   // Every device write issued before this instant has landed.
+   uint64 committed = 2;
++  // The part whose device that is. A slot has settled once every part's has.
++  uint32 part = 3;
+ }
+ 
+ message FetchRequest {
+@@ -187,6 +196,18 @@ message PoolStats {
+   uint64 fetched_in_bytes = 11;
+   uint64 served_out_slots = 12;
+   uint64 copy_micros = 13;
++  uint32 parts = 14;
++  // The store under the pools (write-back): slots written to it at eviction
++  // and ahead of it, slots filled from it, last copies evicted that it did not
++  // get, and the time this pool's calls spent in it. What the store holds and
++  // has room for is in the store's own metrics.
++  uint64 written_back_slots = 15;
++  uint64 written_ahead_slots = 16;
++  uint64 loaded_slots = 17;
++  uint64 lost_slots = 18;
++  uint64 tier_micros = 19;
++  // Were tier_records and tier_capacity.
++  reserved 20, 21;
+ }
+ 
+ message StatsResponse {
+diff --git a/src/umbp/doc/runtime-env-vars.md b/src/umbp/doc/runtime-env-vars.md
+index 0274add7..b962380c 100644
+--- a/src/umbp/doc/runtime-env-vars.md
++++ b/src/umbp/doc/runtime-env-vars.md
+@@ -189,6 +189,27 @@ operators can find them in one place.
+ 
+ ---
+ 
++## L1 pools over the store
++
++Read by `umbp_standalone_server`. The L1 pool manager manages HBM only; with
++the switch below, the last L1 copy of a key is written to **this server's
++store** when its slot is evicted, and read back from it when no pool holds
++the key. The pools have no DRAM of their own: how much is kept, and on which
++node, is the store's configuration (`UMBP_DRAM_CAPACITY`, the master's
++routing), and what the store evicts is gone for the pools too.
++
++| Env var | Default | Description |
++|---|---|---|
++| `UMBP_L1_DRAM_STORE` | `0` | `1`: put the store under the L1 pools. Needs the server's store on the DRAM medium. With a master, also needs the ranged scratch arenas (`UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES`, a shard at least one slot large): a slot the master routes to another node is assembled there before it is sent, and one read from another node is staged there or in this node's DRAM. |
++| `UMBP_L1_DRAM_AHEAD` | `0` | Fraction of each pool's slots (`0`..`1`) whose content -- the cached last copies an eviction takes next -- a background thread keeps already written, so the eviction does not wait for the write. |
++| `UMBP_L1_DRAM_WRITE_AT_EVICTION` | `1` | `0`: an eviction never waits for the store; a last copy not written ahead is lost and counted (`lost_slots`). |
++| `UMBP_L1_DRAM_THREADS` | `4` | Store calls one burst of evictions, or one load, is split over. |
++
++`UMBP_L1_DRAM_BYTES` and `UMBP_L1_DRAM_PINNED` are no longer read (the server
++warns about the first).
++
++---
++
+ ## Pre-existing / unrelated knobs
+ 
+ | Env var | Default | Description |
+diff --git a/src/umbp/include/umbp/l1/l1_pool.h b/src/umbp/include/umbp/l1/l1_pool.h
+index 865af23e..93bc75b9 100644
+--- a/src/umbp/include/umbp/l1/l1_pool.h
++++ b/src/umbp/include/umbp/l1/l1_pool.h
+@@ -28,6 +28,7 @@
+ #include <mutex>
+ #include <set>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -43,6 +44,25 @@ namespace mori::umbp::l1 {
+ // the content index. Pools in the same group share that index, so content one
+ // engine published can be copied into another engine's pool on request.
+ //
++// A pool may also be several such allocations, its parts: an engine rank that
++// runs tensor-parallel attention keeps slot i of its KV on every one of its
++// devices, a different shard on each. The parts share one slot table -- one
++// free list, one index, one eviction order -- so slot i is the same slot on
++// every device; each part has its own memory and layout and reports its own
++// device's progress. A copy between two pools copies part p to part p.
++//
++// Below the pools (write-back): this class manages HBM and nothing else. With
++// a backing store set (`SetBackingStore`; in the standalone server, the UMBP
++// store the same process hosts, so DRAM on this node or wherever its master
++// routes the put), a cached slot's content is written there when the slot is
++// taken for new content and no other pool of the group holds that key -- the
++// last L1 copy, and only then: content an engine has just computed stays in L1
++// alone, and a spare copy another pool also holds is simply dropped. A fetch
++// finds a key no pool holds in the store and has it read into the requester's
++// slots. What the store keeps, for how long and on which node is the store's
++// business; this class only remembers which of the keys it still holds it has
++// already written, so that one is not written twice.
++//
+ // Nothing here knows what a slot holds. A slot is `sum(region.unit_bytes)`
+ // bytes, spread over the pool's regions; a key is opaque bytes.
+ //
+@@ -106,6 +126,45 @@ class MemoryApi {
+                          std::string* error);
+ };
+ 
++// Where the last L1 copy of a key goes when its slot is taken, and where a
++// fetch looks for a key no pool holds. The pools hand it addresses inside
++// their own memory; it moves the bytes, by whatever path it has, and decides
++// on its own what it keeps. Injectable: the standalone server supplies the
++// UMBP store it hosts, a test a fake.
++//
++// Every call may come from several threads at once, and none is made with the
++// pool manager's lock held.
++class BackingStore {
++ public:
++  struct Fragment {
++    void* address = nullptr;
++    uint64_t bytes = 0;
++  };
++  // One slot's content. The fragments stand part by part and, within a part,
++  // region by region: the same order and sizes for every pool that shares a
++  // `space`, so what one pool wrote another reads.
++  struct Block {
++    std::string key;
++    std::vector<Fragment> fragments;
++  };
++
++  virtual ~BackingStore() = default;
++  // An allocation of a pool, on `device`, that later blocks point into. Called
++  // once when a pool attaches the memory, never on the copy path.
++  virtual bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) = 0;
++  virtual void RemoveMemory(void* base) = 0;
++  // Store every block under (`space`, key) and return once its bytes are out
++  // of the pool. result[i]: block i is stored; a key already there counts.
++  virtual std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) = 0;
++  // Fill every block's fragments with what is stored under (`space`, key);
++  // the bytes have landed when this returns. result[i]: block i was filled.
++  virtual std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) = 0;
++  // result[i]: keys[i] is stored under `space`. A hint: the store may drop a
++  // key before it is read.
++  virtual std::vector<bool> Contains(const std::string& space,
++                                     const std::vector<std::string>& keys) = 0;
++};
++
+ std::shared_ptr<MemoryApi> MakeHipMemoryApi();
+ // Host memory; the exported handle is not openable by another process.
+ std::shared_ptr<MemoryApi> MakeHostMemoryApi();
+@@ -130,6 +189,31 @@ struct ExternalMemory {
+   uint64_t offset = 0;
+ };
+ 
++// Which part of a pool an Attach brings, and how many the pool has. Every
++// part of a pool names the same count.
++struct PartSpec {
++  uint32_t index = 0;
++  uint32_t count = 1;
++};
++
++// How the pools use their backing store (`PoolManager::SetBackingStore`).
++struct BackingStoreOptions {
++  // Keep the content of this fraction of every pool's slots -- the cached last
++  // copies an eviction takes next -- already written to the store, by a
++  // background thread, so the eviction does not wait for the write. 0 writes
++  // only at eviction, inside the Allocate that evicts.
++  double ahead = 0.0;
++  // Whether an eviction writes a last copy that was not written ahead before
++  // it hands the slot out. Off, the engine never waits for the store: such
++  // content is lost (and counted), which is the trade when the write is slow.
++  bool write_at_eviction = true;
++  // Store calls one write-back or load is split over, side by side: the store
++  // copies one call's blocks on the calling thread.
++  uint32_t threads = 4;
++};
++// From UMBP_L1_DRAM_AHEAD, UMBP_L1_DRAM_WRITE_AT_EVICTION, UMBP_L1_DRAM_THREADS.
++BackingStoreOptions BackingStoreOptionsFromEnv();
++
+ struct AttachResult {
+   Status status;
+   ExportedMemory memory;
+@@ -174,8 +258,9 @@ struct FetchResult {
+ struct PoolStats {
+   std::string pool_id;
+   std::string group;
+-  int device = -1;
+-  uint64_t bytes = 0;
++  int device = -1;     // of part 0
++  uint64_t bytes = 0;  // over every part
++  uint32_t parts = 1;
+   uint32_t num_slots = 0;
+   uint32_t held = 0;
+   uint32_t cached = 0;
+@@ -185,6 +270,15 @@ struct PoolStats {
+   uint64_t fetched_in_bytes = 0;
+   uint64_t served_out_slots = 0;
+   uint64_t copy_micros = 0;
++  // Backing store: slots of this pool written to it at eviction and ahead of
++  // it, slots filled from it, and evictions of a last copy it did not get.
++  uint64_t written_back_slots = 0;
++  uint64_t written_ahead_slots = 0;
++  uint64_t loaded_slots = 0;
++  uint64_t lost_slots = 0;
++  // Time this pool's calls spent in the store: lookups, writes and loads.
++  // What the store holds and has room for is in the store's own metrics.
++  uint64_t tier_micros = 0;
+ };
+ 
+ class PoolManager {
+@@ -199,10 +293,15 @@ class PoolManager {
+   // match. A pool with the same id and a different shape is replaced.
+   // With `external.handle` the pool adopts that memory instead: the owner keeps
+   // allocating and freeing it, the server only maps it and manages its slots.
++  // With `part.count` > 1 this is one part of the pool: the others arrive in
++  // their own calls, in any order, and the pool serves once all are bound. A
++  // part attached again with another shape replaces the whole pool.
+   AttachResult Attach(const std::string& pool_id, const std::string& group, int device,
+-                      uint64_t bytes, const ExternalMemory& external = {});
+-  // Every pool of a group must declare the same per-region slot sizes.
+-  Status BindLayout(const std::string& pool_id, const Layout& layout);
++                      uint64_t bytes, const ExternalMemory& external = {},
++                      const PartSpec& part = {});
++  // Every pool of a group must declare the same per-region slot sizes, part by
++  // part, and every part of a pool the same number of slots.
++  Status BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part = 0);
+   // Reset every slot to vacant and drop the pool's keys.
+   OpenResult Open(const std::string& pool_id);
+   // Up to `count` slots: vacant ones first (lowest id), then — only until
+@@ -214,11 +313,14 @@ class PoolManager {
+   AllocateResult Allocate(const std::string& pool_id, uint32_t count,
+                           uint32_t min_count = kAllRequired);
+   static constexpr uint32_t kAllRequired = UINT32_MAX;
++  // More parts than a pool has devices to put them on is a caller's mistake.
++  static constexpr uint32_t kMaxParts = 64;
+   // `stamp` marks the slots these ops publish or release as unsettled until a
+   // Commit at or past it; 0 means they are settled already.
+   Status Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp = 0);
+   // Every write the owner's device was issued before `committed` has landed.
+-  Status Commit(const std::string& pool_id, uint64_t committed);
++  // A pool of several parts has got as far as its slowest part.
++  Status Commit(const std::string& pool_id, uint64_t committed, uint32_t part = 0);
+   // For each key in order: already in this pool -> its slot; held, settled,
+   // by another pool of the group -> copied into a settled free slot here,
+   // which becomes cached under that key. Stops at the first key no settled
+@@ -247,6 +349,15 @@ class PoolManager {
+   // served now. Read from UMBP_L1_KEEP_COPIES at construction (default 1;
+   // 0 is plain least-recently-released).
+   void SetEvictionPolicy(uint32_t keep_copies);
++  // Put a store under the pools. Before any pool is attached: a pool's
++  // memory is made known to the store as it attaches, and a pool attached
++  // earlier does not use the store.
++  void SetBackingStore(std::shared_ptr<BackingStore> store,
++                       const BackingStoreOptions& options = {});
++  // Stop writing to and reading from the store, and wait for the writer
++  // ahead. For the store's owner, before it closes the store; the pools'
++  // memory is still taken out of it as they go.
++  void StopBackingStore();
+   // Whether a grant passes over vacant slots their owner's device may still
+   // be writing, evicting cold content instead, until nothing else is free.
+   // Read from UMBP_L1_GRANT_SETTLED_FIRST at construction (default 1). Set
+@@ -283,6 +394,10 @@ class PoolManager {
+     // The element for `pool`, or size().
+     size_t find(const Pool* pool) const;
+ 
++    // The backing store was given this key's content (written ahead, or it
++    // was loaded from there): its last copy needs no write when evicted.
++    bool stored = false;
++
+    private:
+     static constexpr size_t kInline = 3;
+     Holder inline_[kInline];
+@@ -323,19 +438,11 @@ class PoolManager {
+     uint32_t size = 0;
+   };
+ 
+-  struct Group {
+-    bool has_layout = false;
+-    std::vector<uint64_t> unit_bytes;
+-    Content content;
+-    uint64_t slots = 0;  // of every pool bound so far: what `content` is sized for
+-  };
++  struct Group;
+ 
+-  struct Pool {
+-    std::string id;
+-    // Tells this pool from a later one attached under the same id.
+-    uint64_t serial = 0;
+-    std::string group;
+-    Group* content_group = nullptr;  // set once bound
++  // One allocation of a pool, on one device.
++  struct Part {
++    bool attached = false;
+     int device = -1;
+     void* base = nullptr;
+     uint64_t bytes = 0;
+@@ -344,8 +451,26 @@ class PoolManager {
+     void* mapped = nullptr;  // what Import returned, for Unimport
+     std::string external_handle;
+     uint64_t external_offset = 0;
++    bool registered = false;  // known to the backing store (`AddMemory`)
+     Layout layout;
+     bool bound = false;
++    uint64_t committed = 0;  // how far this part's device has got
++  };
++
++  struct Pool {
++    std::string id;
++    // Tells this pool from a later one attached under the same id.
++    uint64_t serial = 0;
++    std::string group;
++    Group* content_group = nullptr;  // set once every part is bound
++    std::vector<Part> parts;
++    // Every part attached and bound: the pool has slots and can be opened.
++    bool bound = false;
++    // Every part is known to the backing store: evicted last copies go there.
++    bool backed = false;
++    // Names the group and how its slots are cut, for the store's key space.
++    std::string space_prefix;
++    uint32_t num_slots = 0;
+     std::vector<Slot> slots;
+     std::set<uint32_t> vacant;
+     // Vacant slots their owner's device may still be writing, by the stamp
+@@ -358,17 +483,47 @@ class PoolManager {
+     SlotList kept;
+     uint32_t held = 0;
+     uint32_t busy = 0;       // in-flight copies into or out of this pool
+-    uint64_t committed = 0;  // how far the owner's device has got
++    uint64_t committed = 0;  // how far the owner's devices have got: the slowest part
+     uint64_t evicted = 0;
+     uint64_t evicted_spare = 0;  // of those, evictions that left another pool holding the key
+     uint64_t fetched_in_slots = 0;
+     uint64_t fetched_in_bytes = 0;
+     uint64_t served_out_slots = 0;
+     uint64_t copy_micros = 0;
++    uint64_t written_back_slots = 0;
++    uint64_t written_ahead_slots = 0;
++    uint64_t loaded_slots = 0;
++    uint64_t lost_slots = 0;
++    uint64_t tier_micros = 0;
++  };
++
++  // A slot whose content goes to the backing store.
++  struct StoreSlot {
++    uint32_t slot = 0;
++    std::string key;
++  };
++
++  // What a store call made without the lock needs: taken under it.
++  struct StoreCall {
++    std::shared_ptr<BackingStore> store;  // null: the pool has no store
++    std::string space;
++    uint64_t generation = 0;
++    uint32_t threads = 1;
++  };
++
++  struct Group {
++    // Per part index, the slot size of each region; empty until a pool of the
++    // group binds that part.
++    std::vector<std::vector<uint64_t>> unit_bytes;
++    Content content;
++    uint64_t slots = 0;  // of every pool bound so far: what `content` is sized for
++    // Part of the store's key space. A Clear moves the group to a new one:
++    // what it wrote before can no longer be found.
++    uint64_t generation = 0;
+   };
+ 
+   struct CopyStep {
+-    Pool* src = nullptr;
++    Pool* src = nullptr;  // null: from the backing store
+     uint32_t src_slot = 0;
+     uint32_t dst_slot = 0;
+     size_t key_index = 0;
+@@ -397,8 +552,35 @@ class PoolManager {
+   // A free slot for new content, or false. Appends the key it destroyed; with
+   // `evicted` null only a vacant slot is taken. `settled_only` is for a taker
+   // other than the owner, which must not write where the owner still may.
++  // With `victims`, an evicted slot whose content is the group's last L1 copy
++  // and not yet in the backing store is appended: the caller writes it back
++  // before anything writes the slot.
+   bool TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
+-                      bool settled_only = false);
++                      bool settled_only = false, std::vector<StoreSlot>* victims = nullptr);
++  // The pool's store call; `.store` is null when the pool has none.
++  StoreCall StoreCallLocked(const Pool* pool) const;
++  bool BackedLocked(const Pool* pool) const { return store_on_ && pool->backed; }
++  // Whether no other pool of the group holds `slot`'s key.
++  static bool LastCopy(const Slot& slot);
++  // Whether `slot`'s content is the group's last L1 copy and the backing
++  // store has not been given it.
++  bool NeedsWriteBackLocked(const Pool* pool, const Slot& slot) const;
++  // Write `slots` of `pool` to the backing store. The caller keeps the slots
++  // from changing (it holds them, or has pinned them) and holds `busy` on the
++  // pool; called without the lock. result[i]: slots[i] is stored.
++  std::vector<bool> WriteBack(Pool* pool, const std::vector<StoreSlot>& slots,
++                              const StoreCall& call, bool ahead);
++  // The fragments of `slot`, in the order every pool of its shape names them.
++  static void AppendFragments(const Pool& pool, uint32_t slot,
++                              std::vector<BackingStore::Fragment>* out);
++  // One Write (or Read) of `blocks`, split over `call.threads` store calls.
++  static std::vector<bool> StoreBlocks(const StoreCall& call,
++                                       std::vector<BackingStore::Block> blocks, bool write);
++  void StoreWorker();
++  // One round of writing ahead of eviction: slots written, or -1 when no pool
++  // had any to write.
++  int WriteAhead();
++  void StopStoreWorker();
+   static bool Readable(const Pool& pool, const Slot& slot) {
+     return slot.written <= pool.committed;
+   }
+@@ -409,11 +591,24 @@ class PoolManager {
+   // Waits, without the lock, for the pool's copies to finish. Destroys nothing
+   // if the pool was detached or replaced under its id in the meantime.
+   void DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool);
+-  // Unmap an adopted pool's memory, free an allocated one's.
+-  void ReleaseMemoryLocked(Pool* pool);
++  // Take a part's memory out of the backing store, then unmap it if adopted
++  // or free it if allocated. Without the lock: the store may make this wait
++  // for its calls in flight.
++  void ReleasePart(const Part& part);
++  // Whether a slot of `src` can be copied into `dst`: the same parts, each
++  // with the same regions.
++  static bool SameShape(const Pool& src, const Pool& dst);
+ 
+   std::shared_ptr<MemoryApi> api_;
+   uint32_t keep_copies_ = 0;
++  std::shared_ptr<BackingStore> store_;
++  // Off once the store's owner is closing it: `store_` then only takes the
++  // pools' memory back.
++  bool store_on_ = false;
++  BackingStoreOptions store_options_;
++  std::thread store_worker_;  // the writer ahead
++  std::condition_variable store_wake_;
++  bool stopping_ = false;
+   // A grant prefers evicting cold content to handing out a slot whose owner's
+   // writes have not landed (UMBP_L1_GRANT_SETTLED_FIRST, default on).
+   bool settled_first_ = true;
+@@ -421,7 +616,8 @@ class PoolManager {
+   std::condition_variable idle_;
+   std::unordered_map<std::string, std::unique_ptr<Pool>> pools_;
+   std::unordered_map<std::string, Group> groups_;
+-  std::unordered_set<std::string> attaching_;  // pool ids being allocated outside the lock
++  // "pool id#part" of each part being allocated or mapped outside the lock
++  std::unordered_set<std::string> attaching_;
+   uint64_t next_serial_ = 1;
+ };
+ 
+diff --git a/src/umbp/include/umbp/l1/l1_service.h b/src/umbp/include/umbp/l1/l1_service.h
+index 2ed2a8a4..262ad4a2 100644
+--- a/src/umbp/include/umbp/l1/l1_service.h
++++ b/src/umbp/include/umbp/l1/l1_service.h
+@@ -66,12 +66,13 @@ class L1Client {
+   L1Client& operator=(const L1Client&) = delete;
+ 
+   AttachResult Attach(const std::string& pool_id, const std::string& group, int device,
+-                      uint64_t bytes, const ExternalMemory& external = {});
+-  Status BindLayout(const std::string& pool_id, const Layout& layout);
++                      uint64_t bytes, const ExternalMemory& external = {},
++                      const PartSpec& part = {});
++  Status BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part = 0);
+   OpenResult Open(const std::string& pool_id);
+   AllocateResult Allocate(const std::string& pool_id, uint32_t count, uint32_t min_count);
+   Status Apply(const std::string& pool_id, const std::vector<Op>& ops, uint64_t stamp = 0);
+-  Status Commit(const std::string& pool_id, uint64_t committed);
++  Status Commit(const std::string& pool_id, uint64_t committed, uint32_t part = 0);
+   FetchResult Fetch(const std::string& pool_id, const std::vector<std::string>& keys,
+                     const FetchOptions& options = {});
+   Status Clear(const std::string& pool_id);
+diff --git a/src/umbp/include/umbp/standalone/l1_backing_store.h b/src/umbp/include/umbp/standalone/l1_backing_store.h
+new file mode 100644
+index 00000000..0b0b6846
+--- /dev/null
++++ b/src/umbp/include/umbp/standalone/l1_backing_store.h
+@@ -0,0 +1,73 @@
++// Copyright © Advanced Micro Devices, Inc. All rights reserved.
++//
++// MIT License
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++#pragma once
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "mori/io/enum.hpp"
++#include "umbp/l1/l1_pool.h"
++#include "umbp/umbp_client.h"
++
++namespace mori::umbp::standalone {
++
++// The L1 pools' backing store, over the UMBP store behind `client`.
++//
++// The L1 pool manager manages HBM; this hands what it evicts to the store
++// that manages everything below, and adds nothing of its own: no memory, no
++// index, no copy. A slot is one stored object, its fragments -- every region
++// of every part, on as many GPUs as the pool has parts -- the object's
++// ranges, so a write is `BatchPutRanges`, a load `BatchGetRanges` and a
++// lookup `BatchExists`. Where the object is placed (this node's medium, or a
++// peer the master routes it to), by which transfer engine its bytes move and
++// when it is evicted are the store's decisions, made as for any other put.
++//
++// One object a slot, not one a part: a slot is only useful whole, so it is
++// routed, placed, found and evicted as one key (a part of it left behind on
++// another node, or evicted alone, would be dead weight), and the master
++// indexes one key rather than one per GPU. The store's planner groups the
++// ranges by source allocation in either shape, so the copies are the same.
++//
++// The pools' memory is registered with the store when a pool attaches it,
++// `kLocalCopyOnly`: recorded, so that a range is planned against its
++// allocation and the store knows which GPU it is on, but neither pinned nor
++// exported to the NIC. That is the rule the standalone server follows for
++// every allocation it imports over HIP IPC -- the dmabuf fallback is unsafe
++// for such a mapping -- and it costs nothing however large the pool is. A put
++// the master routes to another node is therefore staged: gathered into the
++// store's registered scratch arena, then sent from there.
++//
++// `location` is where the pools' memory is: GPU in the server, CPU for a test
++// that runs the pools over host memory.
++//
++// `client` must outlive the returned object; calls after the client is closed
++// fail and store nothing. No locking is added: the caller serializes against
++// the client's lifecycle the way it does for its other data-path calls.
++std::shared_ptr<l1::BackingStore> MakeL1BackingStore(
++    IUMBPClient* client, mori::io::MemoryLocationType location = mori::io::MemoryLocationType::GPU);
++
++// The key a slot's content is stored under. Store keys are text; the pools'
++// are opaque bytes, so one that is not printable is written in hex.
++std::string L1StoreKey(const std::string& space, const std::string& key);
++
++}  // namespace mori::umbp::standalone
+diff --git a/src/umbp/l1/l1_pool.cpp b/src/umbp/l1/l1_pool.cpp
+index 870d09ae..291f3453 100644
+--- a/src/umbp/l1/l1_pool.cpp
++++ b/src/umbp/l1/l1_pool.cpp
+@@ -25,11 +25,15 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <shared_mutex>
++#include <string>
++#include <thread>
+ #include <utility>
++#include <vector>
+ 
+ #include "mori/utils/mori_log.hpp"
+ 
+@@ -315,9 +319,37 @@ uint32_t EnvCount(const char* name, uint32_t fallback) {
+   return (end == raw || *end != '\0') ? fallback : static_cast<uint32_t>(value);
+ }
+ 
++double EnvFraction(const char* name, double fallback) {
++  const char* raw = std::getenv(name);
++  if (raw == nullptr || *raw == '\0') return fallback;
++  char* end = nullptr;
++  const double value = std::strtod(raw, &end);
++  return end == raw ? fallback : std::min(1.0, std::max(0.0, value));
++}
++
+ // One line per this many evictions of a pool: how much it evicts and how much
+ // of that another pool still holds.
+ constexpr uint64_t kEvictionLogEvery = 16384;
++// One line per this many slots of a pool written to the backing store.
++constexpr uint64_t kStoreLogEvery = 8192;
++// Slots one round of writing ahead copies.
++constexpr size_t kAheadBatch = 128;
++// A store call carries at least this many slots before a write-back or a
++// load is split over several.
++constexpr size_t kStoreCallSlots = 16;
++// How long the writer ahead waits when it found nothing to write, and when
++// the store took nothing of what it offered.
++constexpr std::chrono::milliseconds kAheadIdle{20};
++constexpr std::chrono::milliseconds kAheadRefused{500};
++
++// What tells one cut of a slot from another in the store's key space.
++uint64_t HashUnits(uint64_t hash, uint64_t value) {
++  for (int i = 0; i < 8; ++i) {
++    hash ^= (value >> (8 * i)) & 0xFF;
++    hash *= 1099511628211ULL;  // FNV-1a
++  }
++  return hash;
++}
+ 
+ }  // namespace
+ 
+@@ -329,6 +361,50 @@ PoolManager::PoolManager(std::shared_ptr<MemoryApi> api) : api_(std::move(api))
+   MORI_UMBP_INFO("[L1Pool] grants take settled slots first: {}", settled_first_ ? "on" : "off");
+ }
+ 
++BackingStoreOptions BackingStoreOptionsFromEnv() {
++  BackingStoreOptions options;
++  options.ahead = EnvFraction("UMBP_L1_DRAM_AHEAD", 0.0);
++  options.write_at_eviction = EnvCount("UMBP_L1_DRAM_WRITE_AT_EVICTION", 1) != 0;
++  options.threads = std::max<uint32_t>(1, EnvCount("UMBP_L1_DRAM_THREADS", options.threads));
++  return options;
++}
++
++void PoolManager::SetBackingStore(std::shared_ptr<BackingStore> store,
++                                  const BackingStoreOptions& options) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  store_ = std::move(store);
++  store_on_ = store_ != nullptr;
++  store_options_ = options;
++  store_options_.threads = std::max<uint32_t>(1, options.threads);
++  if (!store_on_) return;
++  MORI_UMBP_INFO(
++      "[L1Pool] backing store: a key's last L1 copy is written {}{}, over {} store calls at once",
++      store_options_.write_at_eviction ? "at its eviction" : "only ahead of its eviction",
++      store_options_.write_at_eviction && store_options_.ahead > 0 ? " and ahead of it" : "",
++      store_options_.threads);
++  if (store_options_.ahead > 0 && !store_worker_.joinable()) {
++    stopping_ = false;
++    store_worker_ = std::thread(&PoolManager::StoreWorker, this);
++  }
++}
++
++void PoolManager::StopStoreWorker() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    stopping_ = true;
++  }
++  store_wake_.notify_all();
++  if (store_worker_.joinable()) store_worker_.join();
++}
++
++void PoolManager::StopBackingStore() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    store_on_ = false;
++  }
++  StopStoreWorker();
++}
++
+ void PoolManager::SetEvictionPolicy(uint32_t keep_copies) {
+   std::lock_guard<std::mutex> lock(mutex_);
+   keep_copies_ = keep_copies;
+@@ -457,19 +533,214 @@ void PoolManager::HolderUsedLocked(Pool* pool, uint32_t slot) {
+ }
+ 
+ PoolManager::~PoolManager() {
++  StopStoreWorker();
++  std::vector<Part> parts;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (auto& entry : pools_) {
++      for (Part& part : entry.second->parts) parts.push_back(std::move(part));
++    }
++    pools_.clear();
++  }
++  for (const Part& part : parts) ReleasePart(part);
++}
++
++// ----------------------------- backing store ------------------------------ //
++
++PoolManager::StoreCall PoolManager::StoreCallLocked(const Pool* pool) const {
++  StoreCall call;
++  if (!BackedLocked(pool) || pool->content_group == nullptr) return call;
++  call.store = store_;
++  call.generation = pool->content_group->generation;
++  call.space = pool->space_prefix + "/" + std::to_string(call.generation);
++  call.threads = store_options_.threads;
++  return call;
++}
++
++bool PoolManager::LastCopy(const Slot& slot) {
++  return slot.content != nullptr && slot.content->second.size() <= 1;
++}
++
++bool PoolManager::NeedsWriteBackLocked(const Pool* pool, const Slot& slot) const {
++  return BackedLocked(pool) && LastCopy(slot) && !slot.content->second.stored;
++}
++
++void PoolManager::AppendFragments(const Pool& pool, uint32_t slot,
++                                  std::vector<BackingStore::Fragment>* out) {
++  for (const Part& part : pool.parts) {
++    for (const Region& region : part.layout.regions) {
++      out->push_back(BackingStore::Fragment{
++          static_cast<char*>(part.base) + region.offset + uint64_t{slot} * region.unit_bytes,
++          region.unit_bytes});
++    }
++  }
++}
++
++// The store copies a call's blocks on the thread that makes the call, so a
++// burst of slots goes out as a few calls side by side.
++std::vector<bool> PoolManager::StoreBlocks(const StoreCall& call,
++                                           std::vector<BackingStore::Block> blocks, bool write) {
++  const size_t count = blocks.size();
++  const auto one_call = [&](const std::vector<BackingStore::Block>& part) {
++    std::vector<bool> done =
++        write ? call.store->Write(call.space, part) : call.store->Read(call.space, part);
++    done.resize(part.size(), false);
++    return done;
++  };
++  const size_t calls = std::min<size_t>(call.threads, std::max<size_t>(1, count / kStoreCallSlots));
++  if (calls <= 1) return one_call(blocks);
++  std::vector<std::vector<BackingStore::Block>> parts(calls);
++  std::vector<size_t> first(calls + 1, 0);
++  for (size_t c = 0; c < calls; ++c) {
++    first[c + 1] = first[c] + count / calls + (c < count % calls ? 1 : 0);
++    parts[c].assign(std::make_move_iterator(blocks.begin() + first[c]),
++                    std::make_move_iterator(blocks.begin() + first[c + 1]));
++  }
++  std::vector<std::vector<bool>> done(calls);
++  std::vector<std::thread> workers;
++  for (size_t c = 1; c < calls; ++c) {
++    workers.emplace_back([&, c] { done[c] = one_call(parts[c]); });
++  }
++  done[0] = one_call(parts[0]);
++  for (std::thread& worker : workers) worker.join();
++  std::vector<bool> all;
++  all.reserve(count);
++  for (const std::vector<bool>& part : done) all.insert(all.end(), part.begin(), part.end());
++  return all;
++}
++
++std::vector<bool> PoolManager::WriteBack(Pool* pool, const std::vector<StoreSlot>& slots,
++                                         const StoreCall& call, bool ahead) {
++  std::vector<bool> stored(slots.size(), false);
++  if (slots.empty()) return stored;
++  const auto started = std::chrono::steady_clock::now();
++  if (call.store != nullptr) {
++    std::vector<BackingStore::Block> blocks(slots.size());
++    for (size_t i = 0; i < slots.size(); ++i) {
++      blocks[i].key = slots[i].key;
++      AppendFragments(*pool, slots[i].slot, &blocks[i].fragments);
++    }
++    stored = StoreBlocks(call, std::move(blocks), /*write=*/true);
++  }
++  const size_t written = static_cast<size_t>(std::count(stored.begin(), stored.end(), true));
++  std::lock_guard<std::mutex> lock(mutex_);
++  const uint64_t before = pool->written_back_slots + pool->written_ahead_slots;
++  (ahead ? pool->written_ahead_slots : pool->written_back_slots) += written;
++  if (!ahead) pool->lost_slots += slots.size() - written;
++  pool->tier_micros += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                                 std::chrono::steady_clock::now() - started)
++                                                 .count());
++  if (written != slots.size() && !ahead) {
++    MORI_UMBP_WARN("[L1Pool] the backing store took {} of {} evicted slots of pool={}: {} lost",
++                   written, slots.size(), pool->id, pool->lost_slots);
++  }
++  if ((before + written) / kStoreLogEvery != before / kStoreLogEvery) {
++    MORI_UMBP_INFO(
++        "[L1Pool] backing store pool={} written_at_eviction={} written_ahead={} loaded={} "
++        "lost={} micros={}",
++        pool->id, pool->written_back_slots, pool->written_ahead_slots, pool->loaded_slots,
++        pool->lost_slots, pool->tier_micros);
++  }
++  return stored;
++}
++
++// The slots an eviction takes next are a pool's coldest last copies: write the
++// content of up to `ahead` of its slots to the store before they are asked
++// for, so the Allocate that evicts them has nothing to write.
++int PoolManager::WriteAhead() {
++  Pool* chosen = nullptr;
++  std::vector<StoreSlot> slots;
++  StoreCall call;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (auto& entry : pools_) {
++      Pool* pool = entry.second.get();
++      if (!pool->bound || !BackedLocked(pool)) continue;
++      size_t budget = static_cast<size_t>(store_options_.ahead * pool->num_slots);
++      // Spare copies stand among the last ones and are passed over: look at
++      // no more than a few times the budget, this runs under the pools' lock.
++      size_t looked = 4 * budget + kAheadBatch;
++      // In the order an eviction takes last copies: those it has passed over
++      // first, then the coldest of the rest.
++      for (const SlotList* list : {&pool->kept, &pool->lru}) {
++        for (uint32_t slot = list->head; slot != kNoSlot; slot = pool->slots[slot].next) {
++          if (budget == 0 || looked == 0 || slots.size() >= kAheadBatch) break;
++          --looked;
++          const Slot& s = pool->slots[slot];
++          // A copy another pool also holds is dropped at eviction, not written.
++          if (!LastCopy(s)) continue;
++          --budget;
++          if (s.pins != 0 || !Readable(*pool, s) || s.content->second.stored) continue;
++          slots.push_back(StoreSlot{slot, s.content->first});
++        }
++      }
++      if (slots.empty()) continue;
++      // Pinned: an eviction leaves them alone until the copy is out.
++      for (const StoreSlot& slot : slots) ++pool->slots[slot.slot].pins;
++      ++pool->busy;
++      chosen = pool;
++      call = StoreCallLocked(pool);
++      break;
++    }
++  }
++  if (chosen == nullptr) return -1;
++  const std::vector<bool> stored = WriteBack(chosen, slots, call, /*ahead=*/true);
++  int written = 0;
+   std::lock_guard<std::mutex> lock(mutex_);
+-  for (auto& entry : pools_) ReleaseMemoryLocked(entry.second.get());
+-  pools_.clear();
++  // A Clear since then moved the group to another key space: what was just
++  // written is not where a fetch would look, and counts for nothing.
++  const bool current = chosen->content_group->generation == call.generation;
++  for (size_t i = 0; i < slots.size(); ++i) {
++    Slot& s = chosen->slots[slots[i].slot];
++    --s.pins;
++    if (!stored[i]) continue;
++    ++written;
++    // Remembered with the key, for whichever pool evicts its last copy.
++    if (current && s.content != nullptr && s.content->first == slots[i].key) {
++      s.content->second.stored = true;
++    }
++  }
++  --chosen->busy;
++  idle_.notify_all();
++  return written;
++}
++
++void PoolManager::StoreWorker() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  while (!stopping_) {
++    lock.unlock();
++    const int written = WriteAhead();
++    lock.lock();
++    if (written > 0 || stopping_) continue;
++    // Nothing to write, or a store that took none of it: full of content it
++    // may not drop, or closing. Offered again, but not at once.
++    store_wake_.wait_for(lock, written < 0 ? kAheadIdle : kAheadRefused);
++  }
+ }
+ 
+-void PoolManager::ReleaseMemoryLocked(Pool* pool) {
+-  if (pool->external) {
+-    api_->Unimport(pool->device, pool->mapped);
++void PoolManager::ReleasePart(const Part& part) {
++  if (!part.attached) return;
++  if (part.registered) {
++    std::shared_ptr<BackingStore> store;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      store = store_;
++    }
++    if (store != nullptr) store->RemoveMemory(part.base);
++  }
++  if (part.external) {
++    api_->Unimport(part.device, part.mapped);
+   } else {
+-    api_->Free(pool->device, pool->base, pool->bytes);
++    api_->Free(part.device, part.base, part.bytes);
+   }
+ }
+ 
++// Pools of one group declare the same slot sizes part by part (`BindLayout`),
++// so two of them differ in shape only by how many parts they have.
++bool PoolManager::SameShape(const Pool& src, const Pool& dst) {
++  return src.parts.size() == dst.parts.size();
++}
++
+ PoolManager::Pool* PoolManager::FindLocked(const std::string& pool_id) {
+   auto it = pools_.find(pool_id);
+   return it == pools_.end() ? nullptr : it->second.get();
+@@ -505,6 +776,7 @@ void PoolManager::ResetSlotsLocked(Pool* pool) {
+   }
+   pool->held = 0;
+   pool->committed = 0;
++  for (Part& part : pool->parts) part.committed = 0;
+ }
+ 
+ void PoolManager::VacateLocked(Pool* pool, uint32_t slot) {
+@@ -526,7 +798,7 @@ void PoolManager::UnvacateLocked(Pool* pool, uint32_t slot) {
+ }
+ 
+ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::string>* evicted,
+-                                 bool settled_only) {
++                                 bool settled_only, std::vector<StoreSlot>* victims) {
+   // Vacant slots whose owner's writes have landed since they were released.
+   while (!pool->unsettled.empty() && pool->unsettled.begin()->first <= pool->committed) {
+     pool->vacant.insert(pool->unsettled.begin()->second);
+@@ -604,6 +876,15 @@ bool PoolManager::TakeFreeLocked(Pool* pool, uint32_t* slot, std::vector<std::st
+   UncacheLocked(pool, victim);
+   if (s.content != nullptr) {
+     if (copies(s) > 1) ++pool->evicted_spare;
++    if (victims != nullptr && NeedsWriteBackLocked(pool, s)) {
++      // Content its owner is still writing cannot be read out: it is lost. So
++      // is content not written ahead when evictions do not wait for the store.
++      if (store_options_.write_at_eviction && Readable(*pool, s)) {
++        victims->push_back(StoreSlot{victim, s.content->first});
++      } else {
++        ++pool->lost_slots;
++      }
++    }
+     evicted->push_back(s.content->first);
+     UnindexLocked(pool, *slot);
+     if (++pool->evicted % kEvictionLogEvery == 0) {
+@@ -644,106 +925,173 @@ void PoolManager::DestroyLocked(std::unique_lock<std::mutex>& lock, Pool* pool)
+   // pool under the id: that one is not this caller's to destroy.
+   if (pool == nullptr || pool->serial != serial) return;
+   for (uint32_t slot = 0; slot < pool->slots.size(); ++slot) UnindexLocked(pool, slot);
+-  ReleaseMemoryLocked(pool);
+-  MORI_UMBP_INFO("[L1Pool] destroyed pool={} device={} bytes={}{} evicted={} spare_copy={}",
+-                 pool_id, pool->device, pool->bytes, pool->external ? " (adopted, unmapped)" : "",
+-                 pool->evicted, pool->evicted_spare);
++  const std::vector<Part> parts = std::move(pool->parts);
++  uint64_t bytes = 0;
++  for (const Part& part : parts) bytes += part.attached ? part.bytes : 0;
++  MORI_UMBP_INFO("[L1Pool] destroyed pool={} parts={} bytes={} evicted={} spare_copy={}", pool_id,
++                 parts.size(), bytes, pool->evicted, pool->evicted_spare);
+   pools_.erase(pool_id);
++  // The pool is gone from the table and nothing copies into or out of it: its
++  // memory is given up without the lock, which the store may make wait.
++  lock.unlock();
++  for (const Part& part : parts) ReleasePart(part);
++  lock.lock();
+ }
+ 
+ AttachResult PoolManager::Attach(const std::string& pool_id, const std::string& group, int device,
+-                                 uint64_t bytes, const ExternalMemory& external) {
++                                 uint64_t bytes, const ExternalMemory& external,
++                                 const PartSpec& spec) {
+   const bool adopt = !external.handle.empty();
+   AttachResult result;
+   if (pool_id.empty() || bytes == 0 || device < 0) {
+     result.status = Status::Error("attach needs a pool id, a device and a non-zero size");
+     return result;
+   }
++  if (spec.count == 0 || spec.count > kMaxParts || spec.index >= spec.count) {
++    result.status = Status::Error("attach of pool " + pool_id + " names part " +
++                                  std::to_string(spec.index) + " of " + std::to_string(spec.count));
++    return result;
++  }
+   const uint64_t offset = adopt ? external.offset : 0;
++  const std::string attach_key = pool_id + "#" + std::to_string(spec.index);
+   std::unique_lock<std::mutex> lock(mutex_);
+   // DestroyLocked gives up the lock while the pool's copies finish, so another
+   // Attach of this id may have replaced the pool, or be allocating it, by the
+   // time it returns: look again each time round.
+   for (;;) {
+-    if (attaching_.count(pool_id) != 0) {
++    if (attaching_.count(attach_key) != 0) {
+       result.status = Status::Error("pool " + pool_id + " is already being attached");
+       return result;
+     }
+     Pool* existing = FindLocked(pool_id);
+     if (existing == nullptr) break;
+-    if (existing->group == group && existing->device == device && existing->bytes == bytes &&
+-        existing->external == adopt && existing->external_handle == external.handle &&
+-        existing->external_offset == offset) {
+-      result.memory = existing->exported;
+-      result.bytes = existing->bytes;
+-      result.created = false;
+-      return result;
++    if (existing->group == group && existing->parts.size() == spec.count) {
++      const Part& have = existing->parts[spec.index];
++      // The pool's other parts came first and it is waiting for this one.
++      if (!have.attached) break;
++      if (have.device == device && have.bytes == bytes && have.external == adopt &&
++          have.external_handle == external.handle && have.external_offset == offset) {
++        result.memory = have.exported;
++        result.bytes = have.bytes;
++        result.created = false;
++        return result;
++      }
+     }
++    // Another shape under this id: the pool goes, every part of it. Its owner
++    // restarted, and the other parts' memory went with the old process too.
+     DestroyLocked(lock, existing);
+   }
+   // The allocation zero-fills hundreds of GB; do it without the lock so pools
+   // already serving are not stalled behind it.
+-  attaching_.insert(pool_id);
++  attaching_.insert(attach_key);
++  const std::shared_ptr<BackingStore> store = store_on_ ? store_ : nullptr;
+   lock.unlock();
+-  void* base = nullptr;
+-  void* mapped = nullptr;
+-  ExportedMemory exported;
++  Part part;
+   std::string error;
+-  const bool ok =
+-      adopt ? api_->Import(device, external.handle, external.offset, &base, &mapped, &error)
+-            : api_->Allocate(device, bytes, &base, &exported, &error);
++  const bool ok = adopt ? api_->Import(device, external.handle, external.offset, &part.base,
++                                       &part.mapped, &error)
++                        : api_->Allocate(device, bytes, &part.base, &part.exported, &error);
++  // Here, once, and not when a slot is copied: the store learns where this
++  // memory is and on which device, so that its copies are planned against the
++  // allocation rather than fragment by fragment.
++  if (ok && store != nullptr) {
++    std::string why;
++    part.registered = store->AddMemory(part.base, bytes, device, &why);
++    if (!part.registered) {
++      MORI_UMBP_WARN(
++          "[L1Pool] the backing store did not take pool={} part={}: {}; the pool's evicted "
++          "content is not kept",
++          pool_id, spec.index, why);
++    }
++  }
+   lock.lock();
+-  attaching_.erase(pool_id);
++  attaching_.erase(attach_key);
+   if (!ok) {
+-    MORI_UMBP_ERROR("[L1Pool] attach pool={} device={} bytes={} failed: {}", pool_id, device, bytes,
+-                    error);
++    MORI_UMBP_ERROR("[L1Pool] attach pool={} part={} device={} bytes={} failed: {}", pool_id,
++                    spec.index, device, bytes, error);
+     result.status = Status::Error(error);
+     return result;
+   }
+-  auto pool = std::make_unique<Pool>();
+-  pool->id = pool_id;
+-  pool->serial = next_serial_++;
+-  pool->group = group;
+-  pool->device = device;
+-  pool->base = base;
+-  pool->bytes = bytes;
+-  pool->exported = exported;
+-  pool->external = adopt;
+-  pool->mapped = mapped;
+-  pool->external_handle = external.handle;
+-  pool->external_offset = offset;
+-  pools_[pool_id] = std::move(pool);
+-  MORI_UMBP_INFO("[L1Pool] attached pool={} group={} device={} bytes={}{}", pool_id, group, device,
+-                 bytes, adopt ? " (adopted from its owner)" : "");
+-  result.memory = std::move(exported);
++  part.attached = true;
++  part.device = device;
++  part.bytes = bytes;
++  part.external = adopt;
++  part.external_handle = external.handle;
++  part.external_offset = offset;
++  // The pool's other parts attach on their own threads: by now one of them may
++  // have created the pool this part belongs to.
++  Pool* pool = FindLocked(pool_id);
++  if (pool != nullptr && (pool->group != group || pool->parts.size() != spec.count ||
++                          pool->parts[spec.index].attached)) {
++    lock.unlock();
++    ReleasePart(part);
++    result.status = Status::Error("pool " + pool_id + " was replaced while part " +
++                                  std::to_string(spec.index) + " was attaching");
++    return result;
++  }
++  if (pool == nullptr) {
++    auto created = std::make_unique<Pool>();
++    created->id = pool_id;
++    created->serial = next_serial_++;
++    created->group = group;
++    created->parts.resize(spec.count);
++    pool = created.get();
++    pools_[pool_id] = std::move(created);
++  }
++  result.memory = part.exported;
++  pool->parts[spec.index] = std::move(part);
++  MORI_UMBP_INFO("[L1Pool] attached pool={} part={}/{} group={} device={} bytes={}{}", pool_id,
++                 spec.index, spec.count, group, device, bytes,
++                 adopt ? " (adopted from its owner)" : "");
+   result.bytes = bytes;
+   result.created = true;
+   return result;
+ }
+ 
+-Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout) {
++Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout,
++                               uint32_t part_index) {
+   if (layout.num_slots == 0 || layout.regions.empty()) {
+     return Status::Error("a layout needs slots and at least one region");
+   }
+   std::unique_lock<std::mutex> lock(mutex_);
+   Pool* pool = FindLocked(pool_id);
+   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
++  const auto part_of = [&](Pool* p) -> Part* {
++    return part_index < p->parts.size() && p->parts[part_index].attached ? &p->parts[part_index]
++                                                                         : nullptr;
++  };
++  Part* part = part_of(pool);
++  if (part == nullptr) {
++    return Status::Error("pool " + pool_id + " has no part " + std::to_string(part_index) +
++                         " attached");
++  }
+   std::vector<uint64_t> units;
+   for (const Region& region : layout.regions) {
+     // Divided rather than multiplied out: offset + slots * unit can wrap.
+-    if (region.unit_bytes == 0 || region.offset > pool->bytes ||
+-        region.unit_bytes > (pool->bytes - region.offset) / layout.num_slots) {
++    if (region.unit_bytes == 0 || region.offset > part->bytes ||
++        region.unit_bytes > (part->bytes - region.offset) / layout.num_slots) {
+       return Status::Error("a region does not fit in pool " + pool_id);
+     }
+     units.push_back(region.unit_bytes);
+   }
+-  if (pool->bound && SameLayout(pool->layout, layout)) return Status{};
++  if (part->bound && SameLayout(part->layout, layout)) return Status{};
++  // One slot table for every part: slot i is the same slot on each of them.
++  for (size_t i = 0; i < pool->parts.size(); ++i) {
++    const Part& other = pool->parts[i];
++    if (i != part_index && other.bound && other.layout.num_slots != layout.num_slots) {
++      return Status::Error("part " + std::to_string(part_index) + " of pool " + pool_id +
++                           " declares " + std::to_string(layout.num_slots) + " slots, part " +
++                           std::to_string(i) + " " + std::to_string(other.layout.num_slots));
++    }
++  }
+ 
+   Group& group = groups_[pool->group];
+-  if (group.has_layout && group.unit_bytes != units) {
++  if (part_index < group.unit_bytes.size() && !group.unit_bytes[part_index].empty() &&
++      group.unit_bytes[part_index] != units) {
+     for (const auto& entry : pools_) {
+       const Pool* other = entry.second.get();
+-      if (other != pool && other->bound && other->group == pool->group) {
++      if (other != pool && other->group == pool->group && part_index < other->parts.size() &&
++          other->parts[part_index].bound) {
+         return Status::Error("pool " + pool_id + " declares slot sizes that differ from group " +
+                              pool->group);
+       }
+@@ -755,24 +1103,43 @@ Status PoolManager::BindLayout(const std::string& pool_id, const Layout& layout)
+       return p == nullptr || p->busy == 0;
+     });
+     pool = FindLocked(pool_id);
+-    if (pool == nullptr) return Status::Error("pool " + pool_id + " was detached");
++    part = pool == nullptr ? nullptr : part_of(pool);
++    if (part == nullptr) return Status::Error("pool " + pool_id + " was detached");
+     ResetSlotsLocked(pool);
+   }
+   Group& current = groups_[pool->group];
+-  current.has_layout = true;
+-  current.unit_bytes = std::move(units);
++  if (current.unit_bytes.size() <= part_index) current.unit_bytes.resize(part_index + 1);
++  current.unit_bytes[part_index] = std::move(units);
++  const bool was_bound = pool->bound;
++  part->layout = layout;
++  part->bound = true;
++  pool->bound = std::all_of(pool->parts.begin(), pool->parts.end(),
++                            [](const Part& p) { return p.attached && p.bound; });
++  MORI_UMBP_INFO("[L1Pool] bound pool={} part={}/{} slots={} regions={}{}", pool_id, part_index,
++                 pool->parts.size(), layout.num_slots, layout.regions.size(),
++                 pool->bound ? "" : " (waiting for the other parts)");
++  if (!pool->bound) return Status{};
+   // Room for every slot's key now, so the index never rehashes -- a pause of
+   // tens of milliseconds at this size -- while engines are being served.
+-  if (pool->bound) current.slots -= pool->layout.num_slots;
++  if (was_bound) current.slots -= pool->num_slots;
+   current.slots += layout.num_slots;
+   current.content.reserve(current.slots);
+   pool->content_group = &current;
+-  pool->layout = layout;
++  pool->num_slots = layout.num_slots;
++  // Pools write and find each other's evicted content in the store only when
++  // their slots are cut the same way, part by part and region by region.
++  uint64_t shape = 14695981039346656037ULL;
++  for (const Part& p : pool->parts) {
++    shape = HashUnits(shape, p.layout.regions.size());
++    for (const Region& region : p.layout.regions) shape = HashUnits(shape, region.unit_bytes);
++  }
++  char shape_text[17];
++  std::snprintf(shape_text, sizeof(shape_text), "%016llx", static_cast<unsigned long long>(shape));
++  pool->space_prefix = pool->group + "/" + std::to_string(pool->parts.size()) + "x" + shape_text;
++  pool->backed = std::all_of(pool->parts.begin(), pool->parts.end(),
++                             [](const Part& p) { return p.registered; });
+   pool->slots.assign(layout.num_slots, Slot{});
+-  pool->bound = true;
+   ResetSlotsLocked(pool);
+-  MORI_UMBP_INFO("[L1Pool] bound pool={} slots={} regions={}", pool_id, layout.num_slots,
+-                 layout.regions.size());
+   return Status{};
+ }
+ 
+@@ -789,7 +1156,7 @@ OpenResult PoolManager::Open(const std::string& pool_id) {
+     return result;
+   }
+   ResetSlotsLocked(pool);
+-  result.num_slots = pool->layout.num_slots;
++  result.num_slots = pool->num_slots;
+   MORI_UMBP_INFO("[L1Pool] opened pool={} slots={}", pool_id, result.num_slots);
+   return result;
+ }
+@@ -804,10 +1171,15 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
+     return result;
+   }
+   const auto deadline = std::chrono::steady_clock::now() + kPinnedWait;
++  // Evicted slots whose content has to reach the backing store before the
++  // owner is given them: until this call returns they are held, and nobody
++  // writes them.
++  std::vector<StoreSlot> victims;
+   while (result.slots.size() < count) {
+     uint32_t slot = 0;
+     const bool required = result.slots.size() < min_count;
+-    if (TakeFreeLocked(pool, &slot, required ? &result.evicted_keys : nullptr)) {
++    if (TakeFreeLocked(pool, &slot, required ? &result.evicted_keys : nullptr,
++                       /*settled_only=*/false, &victims)) {
+       pool->slots[slot].state = SlotState::kHeld;
+       ++pool->held;
+       result.slots.push_back(slot);
+@@ -823,14 +1195,30 @@ AllocateResult PoolManager::Allocate(const std::string& pool_id, uint32_t count,
+       return result;
+     }
+   }
++  if (!victims.empty()) {
++    const StoreCall call = StoreCallLocked(pool);
++    ++pool->busy;  // Open, a re-bind and Detach wait for the copy
++    lock.unlock();
++    WriteBack(pool, victims, call, /*ahead=*/false);
++    lock.lock();
++    --pool->busy;
++    idle_.notify_all();
++  }
+   return result;
+ }
+ 
+-Status PoolManager::Commit(const std::string& pool_id, uint64_t committed) {
++Status PoolManager::Commit(const std::string& pool_id, uint64_t committed, uint32_t part) {
+   std::lock_guard<std::mutex> lock(mutex_);
+   Pool* pool = FindLocked(pool_id);
+   if (pool == nullptr) return Status::Error("unknown pool " + pool_id);
+-  pool->committed = std::max(pool->committed, committed);
++  if (part >= pool->parts.size()) {
++    return Status::Error("pool " + pool_id + " has no part " + std::to_string(part));
++  }
++  pool->parts[part].committed = std::max(pool->parts[part].committed, committed);
++  // A slot is one slot on every part: it has landed when the slowest has.
++  uint64_t slowest = pool->parts[0].committed;
++  for (const Part& p : pool->parts) slowest = std::min(slowest, p.committed);
++  pool->committed = slowest;
+   // A fetch into this pool's held slots may be waiting for them to settle.
+   idle_.notify_all();
+   return Status{};
+@@ -936,20 +1324,76 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+     if (holders == nullptr) return nullptr;
+     for (const Holder& h : *holders) {
+       // Not this pool, and not a slot its owner may still be writing.
+-      if (h.pool != pool && Readable(*h.pool, h.pool->slots[h.slot])) return &h;
++      if (h.pool != pool && SameShape(*h.pool, *pool) && Readable(*h.pool, h.pool->slots[h.slot])) {
++        return &h;
++      }
+     }
+     return nullptr;
+   };
+ 
++  const bool into = !options.dst_slots.empty();
++  // Whether a pool of the group can supply `key` to this call: a fetch into
++  // the caller's slots does not look in this pool.
++  auto in_pools = [&](const std::string& key, bool local_counts) {
++    const Holders* holders = holders_of(key);
++    return (local_counts && local_of(holders) != kNoSlot) || source_of(holders) != nullptr;
++  };
++
++  // The keys no pool can supply are looked up in the backing store, in one
++  // call and without the lock, before anything is taken: `in_store[i]` then
++  // says the store held keys[i] a moment ago. A call whose every key a pool
++  // holds asks the store nothing.
++  StoreCall store_call = StoreCallLocked(pool);
++  std::vector<char> in_store;
++  uint64_t lookup_micros = 0;
++  const auto look_in_store = [&](bool local_counts) {
++    std::vector<std::string> ask;
++    std::vector<size_t> ask_index;
++    for (size_t i = 0; i < keys.size(); ++i) {
++      if (in_pools(keys[i], local_counts)) continue;
++      ask.push_back(keys[i]);
++      ask_index.push_back(i);
++    }
++    if (ask.empty()) return;
++    const auto started = std::chrono::steady_clock::now();
++    lock.unlock();
++    std::vector<bool> found = store_call.store->Contains(store_call.space, ask);
++    lock.lock();
++    lookup_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                              std::chrono::steady_clock::now() - started)
++                                              .count());
++    found.resize(ask.size(), false);
++    in_store.assign(keys.size(), 0);
++    for (size_t j = 0; j < ask.size(); ++j) in_store[ask_index[j]] = found[j] ? 1 : 0;
++  };
++  // The lock was given up for the lookup: the pool may be gone, or its group
++  // cleared, and then the answer is for a key space nobody reads any more.
++  const auto after_lookup = [&]() {
++    pool = FindLocked(pool_id);
++    if (pool == nullptr || !pool->bound) return false;
++    content = &pool->content_group->content;
++    const StoreCall now = StoreCallLocked(pool);
++    if (now.store == nullptr || now.space != store_call.space) in_store.clear();
++    store_call = now;
++    pool->tier_micros += lookup_micros;
++    return true;
++  };
++  auto held_by_store = [&](size_t i) { return i < in_store.size() && in_store[i] != 0; };
++
+   if (options.probe_only) {
+-    for (const std::string& key : keys) {
+-      const Holders* holders = holders_of(key);
+-      if (local_of(holders) == kNoSlot && source_of(holders) == nullptr) break;
++    if (store_call.store != nullptr) {
++      look_in_store(/*local_counts=*/true);
++      if (!after_lookup()) {
++        result.status = Status::Error("pool " + pool_id + " was detached");
++        return result;
++      }
++    }
++    for (size_t i = 0; i < keys.size(); ++i) {
++      if (!in_pools(keys[i], /*local_counts=*/true) && !held_by_store(i)) break;
+       ++result.available;
+     }
+     return result;
+   }
+-  const bool into = !options.dst_slots.empty();
+   uint64_t settle_micros = 0;  // waiting for the destinations' owner to commit
+   if (into && options.dst_slots.size() < keys.size()) {
+     result.status = Status::Error("fetch into pool " + pool_id + ": fewer slots than keys");
+@@ -976,15 +1420,25 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+       return result;
+     }
+     content = &pool->content_group->content;
++    store_call = StoreCallLocked(pool);
+     settle_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - settle_started)
+                                               .count());
+   }
+ 
++  if (store_call.store != nullptr) {
++    look_in_store(/*local_counts=*/!into);
++    if (!after_lookup()) {
++      result.status = Status::Error("pool " + pool_id + " was detached");
++      return result;
++    }
++  }
++
+   // Plan under the lock: pick a source and a destination for every key, pin
+   // the sources, and take the destinations off the free lists -- or, copying
+   // into the caller's slots, check that it holds them.
+   std::vector<CopyStep> steps;
++  std::vector<StoreSlot> victims;  // slots evicted for this call, bound for the store
+   std::vector<uint32_t> local_pins;
+   if (!into) {
+     // Every key of the call this pool already holds is pinned before any
+@@ -1007,17 +1461,23 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+         break;
+       }
+       const Holder* source = source_of(holders_of(key));
+-      if (source == nullptr) break;
++      if (source == nullptr && !held_by_store(i)) break;
+       if (!Fillable(*pool, pool->slots[dst])) {
+         // Allocate may regrant a slot before its owner's writes complete:
+         // owner-local reuse is ordered on that stream, but this copy is not.
+         // Stop at the landed prefix; the caller still holds every destination.
+         break;
+       }
+-      ++source->pool->slots[source->slot].pins;
+-      ++source->pool->busy;
++      if (source != nullptr) {
++        ++source->pool->slots[source->slot].pins;
++        ++source->pool->busy;
++        steps.push_back(CopyStep{source->pool, source->slot, dst, i});
++      } else {
++        // From the store, which may have dropped the key by the time it is
++        // read: the call then ends before this key.
++        steps.push_back(CopyStep{nullptr, 0, dst, i});
++      }
+       ++pool->busy;
+-      steps.push_back(CopyStep{source->pool, source->slot, dst, i});
+       result.slots.push_back(dst);
+       continue;
+     }
+@@ -1028,16 +1488,21 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+       continue;
+     }
+     const Holder* found = source_of(holders);
+-    if (found == nullptr) break;
+-    // By value: making room below edits the index.
+-    const Holder source = *found;
++    if (found == nullptr && !held_by_store(i)) break;
++    // By value: making room below edits the index. Without one, from the store.
++    const bool from_pool = found != nullptr;
++    const Holder source = from_pool ? *found : Holder{};
+     uint32_t dst = 0;
+-    if (!TakeFreeLocked(pool, &dst, &result.evicted_keys, /*settled_only=*/true)) break;
++    if (!TakeFreeLocked(pool, &dst, &result.evicted_keys, /*settled_only=*/true, &victims)) break;
+     pool->slots[dst].state = SlotState::kFilling;
+-    ++source.pool->slots[source.slot].pins;
+-    ++source.pool->busy;
++    if (from_pool) {
++      ++source.pool->slots[source.slot].pins;
++      ++source.pool->busy;
++      steps.push_back(CopyStep{source.pool, source.slot, dst, i});
++    } else {
++      steps.push_back(CopyStep{nullptr, 0, dst, i});
++    }
+     ++pool->busy;
+-    steps.push_back(CopyStep{source.pool, source.slot, dst, i});
+     result.slots.push_back(dst);
+   }
+ 
+@@ -1050,37 +1515,103 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+   const auto started = std::chrono::steady_clock::now();
+   std::vector<bool> copied(steps.size(), false);
+   std::string copy_error;
+-  std::vector<MemoryApi::Fragment> fragments;
++  // Part p of the source slots to part p of the destination slots.
++  const size_t num_parts = pool->parts.size();
++  std::vector<std::vector<MemoryApi::Fragment>> fragments(num_parts);
++  // The slots this call evicted to make room go to the store before it fills
++  // them.
++  if (!victims.empty()) WriteBack(pool, victims, store_call, /*ahead=*/false);
++  uint64_t slot_bytes = 0;
++  for (const Part& part : pool->parts) {
++    for (const Region& region : part.layout.regions) slot_bytes += region.unit_bytes;
++  }
++  // The steps the store supplies: it reads each key into its destination slot.
++  std::vector<size_t> store_steps;
++  std::vector<BackingStore::Block> store_blocks;
++  uint64_t store_micros = 0;
++  size_t store_dropped = 0;  // keys the store held at the lookup and not at the read
+   size_t run_start = 0;
+   bool failed = false;
+   while (run_start < steps.size()) {
++    const CopyStep& first = steps[run_start];
++    if (first.src == nullptr) {
++      store_steps.push_back(run_start);
++      store_blocks.emplace_back();
++      store_blocks.back().key = keys[first.key_index];
++      AppendFragments(*pool, first.dst_slot, &store_blocks.back().fragments);
++      ++run_start;
++      continue;
++    }
+     size_t run_end = run_start + 1;
+-    while (run_end < steps.size() && steps[run_end].src == steps[run_start].src &&
++    while (run_end < steps.size() && steps[run_end].src == first.src &&
+            steps[run_end].src_slot == steps[run_end - 1].src_slot + 1 &&
+            steps[run_end].dst_slot == steps[run_end - 1].dst_slot + 1) {
+       ++run_end;
+     }
+-    const CopyStep& first = steps[run_start];
+     const uint64_t run_slots = run_end - run_start;
+-    for (size_t r = 0; r < pool->layout.regions.size(); ++r) {
+-      const Region& dst_region = pool->layout.regions[r];
+-      const Region& src_region = first.src->layout.regions[r];
+-      const uint64_t unit = dst_region.unit_bytes;
+-      void* dst =
+-          static_cast<char*>(pool->base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
+-      const void* src = static_cast<const char*>(first.src->base) + src_region.offset +
+-                        uint64_t{first.src_slot} * unit;
+-      fragments.push_back(MemoryApi::Fragment{dst, src, run_slots * unit, first.src->device});
+-      result.copied_bytes += run_slots * unit;
++    for (size_t p = 0; p < num_parts; ++p) {
++      const Part& dst_part = pool->parts[p];
++      const Part& src_part = first.src->parts[p];
++      for (size_t r = 0; r < dst_part.layout.regions.size(); ++r) {
++        const Region& dst_region = dst_part.layout.regions[r];
++        const Region& src_region = src_part.layout.regions[r];
++        const uint64_t unit = dst_region.unit_bytes;
++        void* dst =
++            static_cast<char*>(dst_part.base) + dst_region.offset + uint64_t{first.dst_slot} * unit;
++        const void* src = static_cast<const char*>(src_part.base) + src_region.offset +
++                          uint64_t{first.src_slot} * unit;
++        fragments[p].push_back(MemoryApi::Fragment{dst, src, run_slots * unit, src_part.device});
++      }
+     }
+     run_start = run_end;
+   }
+-  // One batch for the whole call, landed before it returns: nothing is
+-  // handed to the requester before then.
+-  if (!fragments.empty()) {
+-    failed = !api_->CopyBatch(pool->device, fragments, &copy_error);
+-    if (failed) result.copied_bytes = 0;
+-    std::fill(copied.begin(), copied.end(), !failed);
++  // One batch a part for the whole call, landed before it returns: nothing is
++  // handed to the requester before then. The parts are on different devices,
++  // so their batches run side by side, and the store's reads beside them; a
++  // slot copied from a pool counts only if every part of it landed, and one
++  // read from the store only if the store filled it.
++  if (!steps.empty()) {
++    std::vector<bool> read(store_steps.size(), false);
++    std::thread reader;
++    const bool from_pools = store_steps.size() != steps.size();
++    const auto read_store = [&] {
++      const auto read_started = std::chrono::steady_clock::now();
++      read = StoreBlocks(store_call, std::move(store_blocks), /*write=*/false);
++      store_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                               std::chrono::steady_clock::now() - read_started)
++                                               .count());
++    };
++    if (!store_steps.empty() && store_call.store != nullptr) {
++      if (from_pools) {
++        reader = std::thread(read_store);
++      } else {
++        read_store();
++      }
++    }
++    if (from_pools) {
++      std::vector<std::string> errors(num_parts);
++      std::vector<char> landed(num_parts, 0);
++      const auto copy_part = [&](size_t p) {
++        const int device = pool->parts[p].device;
++        landed[p] =
++            fragments[p].empty() || api_->CopyBatch(device, fragments[p], &errors[p]) ? 1 : 0;
++      };
++      std::vector<std::thread> workers;
++      for (size_t p = 1; p < num_parts; ++p) workers.emplace_back(copy_part, p);
++      copy_part(0);
++      for (std::thread& worker : workers) worker.join();
++      for (size_t p = 0; p < num_parts; ++p) {
++        if (landed[p] != 0) continue;
++        if (!failed) copy_error = "part " + std::to_string(p) + ": " + errors[p];
++        failed = true;
++      }
++    }
++    if (reader.joinable()) reader.join();
++    for (size_t i = 0; i < steps.size(); ++i) copied[i] = steps[i].src != nullptr && !failed;
++    for (size_t j = 0; j < store_steps.size(); ++j) {
++      copied[store_steps[j]] = read[j];
++      if (!read[j]) ++store_dropped;
++    }
+   }
+   result.copy_micros = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - started)
+@@ -1088,26 +1619,37 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+   if (copying) lock.lock();
+ 
+   // Commit: a copied slot becomes cached content of this pool.
++  const uint64_t store_generation_now = pool->content_group->generation;
+   size_t valid_keys = result.slots.size();
+   std::vector<std::pair<std::string, uint32_t>> sources;  // runs, for the log
+   for (size_t i = 0; i < steps.size(); ++i) {
+     const CopyStep& step = steps[i];
+-    --step.src->slots[step.src_slot].pins;
+-    --step.src->busy;
++    if (step.src != nullptr) {
++      --step.src->slots[step.src_slot].pins;
++      --step.src->busy;
++    }
+     --pool->busy;
++    // Who a landed slot came from: another pool, or the backing store.
++    const auto count_source = [&] {
++      const std::string from = step.src != nullptr ? step.src->id : std::string("store");
++      if (step.src != nullptr) {
++        ++step.src->served_out_slots;
++      } else {
++        ++pool->loaded_slots;
++      }
++      if (sources.empty() || sources.back().first != from) sources.emplace_back(from, 0u);
++      ++sources.back().second;
++      result.copied_bytes += slot_bytes;
++    };
+     Slot& d = pool->slots[step.dst_slot];
+     const std::string& key = keys[step.key_index];
+     const bool usable = copied[i] && step.key_index < valid_keys;
+     if (into) {
+       // The caller's slot, which it publishes itself: only the count moves.
+       if (usable) {
+-        ++step.src->served_out_slots;
++        count_source();
+         ++pool->fetched_in_slots;
+         ++result.copied_slots;
+-        if (sources.empty() || sources.back().first != step.src->id) {
+-          sources.emplace_back(step.src->id, 0u);
+-        }
+-        ++sources.back().second;
+       } else {
+         valid_keys = std::min(valid_keys, step.key_index);
+       }
+@@ -1128,13 +1670,14 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+       PushBack(pool, &pool->lru, step.dst_slot);
+       entry->second.push_back(Holder{pool, step.dst_slot});
+       HolderAddedLocked(&entry->second);
+-      ++step.src->served_out_slots;
++      // What was just read from the store is there: evicting this copy, the
++      // last one or not, writes nothing. Not so after a Clear during the read.
++      if (step.src == nullptr && store_generation_now == store_call.generation) {
++        entry->second.stored = true;
++      }
++      count_source();
+       ++pool->fetched_in_slots;
+       ++result.copied_slots;
+-      if (sources.empty() || sources.back().first != step.src->id) {
+-        sources.emplace_back(step.src->id, 0u);
+-      }
+-      ++sources.back().second;
+       continue;
+     }
+     VacateLocked(pool, step.dst_slot);
+@@ -1149,8 +1692,16 @@ FetchResult PoolManager::Fetch(const std::string& pool_id, const std::vector<std
+   result.slots.resize(valid_keys);
+   pool->fetched_in_bytes += result.copied_bytes;
+   pool->copy_micros += result.copy_micros;
++  pool->tier_micros += store_micros;
+   idle_.notify_all();
+ 
++  if (store_dropped != 0) {
++    MORI_UMBP_INFO(
++        "[L1Pool] fetch pool={}: the backing store no longer had {} of the {} keys it was "
++        "asked for",
++        pool_id, store_dropped, store_steps.size());
++  }
++
+   if (failed) {
+     MORI_UMBP_ERROR("[L1Pool] fetch into pool={} stopped after {} of {} keys: {}", pool_id,
+                     valid_keys, keys.size(), copy_error);
+@@ -1186,6 +1737,22 @@ Status PoolManager::Clear(const std::string& pool_id) {
+       VacateLocked(pool, slot);
+     }
+   }
++  // What the owner asked to forget must not come back from the backing store
++  // either (an engine clears its pool when the content no longer matches its
++  // weights). The store has no way to delete a key, so the group moves to a
++  // key space of its own from here on -- one no earlier Clear used, in this
++  // process or one before it: what the group wrote stays in the store,
++  // unreachable, until the store evicts it. That holds for every pool of the
++  // group, whose content means the same thing as this pool's.
++  if (store_ != nullptr) {
++    Group* group = pool->content_group;
++    const uint64_t now =
++        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::system_clock::now().time_since_epoch())
++                                  .count());
++    group->generation = std::max(group->generation + 1, now);
++    for (auto& entry : group->content) entry.second.stored = false;
++  }
+   return Status{};
+ }
+ 
+@@ -1206,8 +1773,9 @@ std::vector<PoolStats> PoolManager::Stats() const {
+     PoolStats stats;
+     stats.pool_id = pool.id;
+     stats.group = pool.group;
+-    stats.device = pool.device;
+-    stats.bytes = pool.bytes;
++    stats.device = pool.parts[0].device;
++    for (const Part& part : pool.parts) stats.bytes += part.attached ? part.bytes : 0;
++    stats.parts = static_cast<uint32_t>(pool.parts.size());
+     stats.num_slots = static_cast<uint32_t>(pool.slots.size());
+     stats.held = pool.held;
+     stats.cached = pool.lru.size + pool.kept.size;
+@@ -1217,6 +1785,11 @@ std::vector<PoolStats> PoolManager::Stats() const {
+     stats.fetched_in_bytes = pool.fetched_in_bytes;
+     stats.served_out_slots = pool.served_out_slots;
+     stats.copy_micros = pool.copy_micros;
++    stats.written_back_slots = pool.written_back_slots;
++    stats.written_ahead_slots = pool.written_ahead_slots;
++    stats.loaded_slots = pool.loaded_slots;
++    stats.lost_slots = pool.lost_slots;
++    stats.tier_micros = pool.tier_micros;
+     out.push_back(std::move(stats));
+   }
+   std::sort(out.begin(), out.end(),
+diff --git a/src/umbp/l1/l1_service.cpp b/src/umbp/l1/l1_service.cpp
+index 19c7928e..f513127e 100644
+--- a/src/umbp/l1/l1_service.cpp
++++ b/src/umbp/l1/l1_service.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include <grpcpp/grpcpp.h>
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <utility>
+ 
+@@ -50,8 +51,10 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
+   grpc::Status Attach(grpc::ServerContext*, const pb::AttachRequest* request,
+                       pb::AttachResponse* response) override {
+     ExternalMemory external{request->external_handle(), request->external_offset()};
++    // A caller that knows nothing of parts sends 0 of 0: the whole pool.
++    const PartSpec part{request->part(), std::max<uint32_t>(request->num_parts(), 1)};
+     AttachResult result = manager_->Attach(request->pool_id(), request->group(), request->device(),
+-                                           request->bytes(), external);
++                                           request->bytes(), external, part);
+     SetStatus(result.status, response);
+     response->set_handle_kind(result.memory.kind);
+     response->set_handle(result.memory.handle);
+@@ -68,7 +71,7 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
+     for (const pb::Region& region : request->regions()) {
+       layout.regions.push_back(Region{region.offset(), region.unit_bytes()});
+     }
+-    SetStatus(manager_->BindLayout(request->pool_id(), layout), response);
++    SetStatus(manager_->BindLayout(request->pool_id(), layout, request->part()), response);
+     return grpc::Status::OK;
+   }
+ 
+@@ -118,7 +121,8 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
+ 
+   grpc::Status Commit(grpc::ServerContext*, const pb::CommitRequest* request,
+                       pb::StatusResponse* response) override {
+-    SetStatus(manager_->Commit(request->pool_id(), request->committed()), response);
++    SetStatus(manager_->Commit(request->pool_id(), request->committed(), request->part()),
++              response);
+     return grpc::Status::OK;
+   }
+ 
+@@ -168,6 +172,12 @@ class L1PoolService final : public pb::UMBPL1Pool::Service {
+       out->set_fetched_in_bytes(stats.fetched_in_bytes);
+       out->set_served_out_slots(stats.served_out_slots);
+       out->set_copy_micros(stats.copy_micros);
++      out->set_parts(stats.parts);
++      out->set_written_back_slots(stats.written_back_slots);
++      out->set_written_ahead_slots(stats.written_ahead_slots);
++      out->set_loaded_slots(stats.loaded_slots);
++      out->set_lost_slots(stats.lost_slots);
++      out->set_tier_micros(stats.tier_micros);
+     }
+     return grpc::Status::OK;
+   }
+@@ -235,7 +245,8 @@ L1Client::L1Client(const std::string& address) : impl_(std::make_unique<Impl>(ad
+ L1Client::~L1Client() = default;
+ 
+ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& group, int device,
+-                              uint64_t bytes, const ExternalMemory& external) {
++                              uint64_t bytes, const ExternalMemory& external,
++                              const PartSpec& part) {
+   pb::AttachRequest request;
+   request.set_pool_id(pool_id);
+   request.set_group(group);
+@@ -243,6 +254,8 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
+   request.set_bytes(bytes);
+   request.set_external_handle(external.handle);
+   request.set_external_offset(external.offset);
++  request.set_part(part.index);
++  request.set_num_parts(part.count);
+   pb::AttachResponse response;
+   // A long deadline: the server allocates and zero-fills the whole pool.
+   grpc::ClientContext context;
+@@ -258,9 +271,10 @@ AttachResult L1Client::Attach(const std::string& pool_id, const std::string& gro
+   return result;
+ }
+ 
+-Status L1Client::BindLayout(const std::string& pool_id, const Layout& layout) {
++Status L1Client::BindLayout(const std::string& pool_id, const Layout& layout, uint32_t part) {
+   pb::BindLayoutRequest request;
+   request.set_pool_id(pool_id);
++  request.set_part(part);
+   request.set_num_slots(layout.num_slots);
+   for (const Region& region : layout.regions) {
+     pb::Region* out = request.add_regions();
+@@ -301,9 +315,10 @@ AllocateResult L1Client::Allocate(const std::string& pool_id, uint32_t count, ui
+   return result;
+ }
+ 
+-Status L1Client::Commit(const std::string& pool_id, uint64_t committed) {
++Status L1Client::Commit(const std::string& pool_id, uint64_t committed, uint32_t part) {
+   pb::CommitRequest request;
+   request.set_pool_id(pool_id);
++  request.set_part(part);
+   request.set_committed(committed);
+   pb::StatusResponse response;
+   grpc::ClientContext context;
+@@ -390,6 +405,12 @@ Status L1Client::Stats(std::vector<PoolStats>* out) {
+     stats.fetched_in_bytes = in.fetched_in_bytes();
+     stats.served_out_slots = in.served_out_slots();
+     stats.copy_micros = in.copy_micros();
++    stats.parts = std::max<uint32_t>(in.parts(), 1);
++    stats.written_back_slots = in.written_back_slots();
++    stats.written_ahead_slots = in.written_ahead_slots();
++    stats.loaded_slots = in.loaded_slots();
++    stats.lost_slots = in.lost_slots();
++    stats.tier_micros = in.tier_micros();
+     out->push_back(std::move(stats));
+   }
+   return Status{};
+diff --git a/src/umbp/l1/pybind_l1.cpp b/src/umbp/l1/pybind_l1.cpp
+index bce8966d..66c87a90 100644
+--- a/src/umbp/l1/pybind_l1.cpp
++++ b/src/umbp/l1/pybind_l1.cpp
+@@ -62,12 +62,14 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+       .def(
+           "attach",
+           [](L1Client& client, const std::string& pool_id, const std::string& group, int device,
+-             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset) {
++             uint64_t bytes, const py::bytes& external_handle, uint64_t external_offset,
++             uint32_t part, uint32_t num_parts) {
+             ExternalMemory external{std::string(external_handle), external_offset};
++            const PartSpec spec{part, num_parts};
+             AttachResult result;
+             {
+               py::gil_scoped_release release;
+-              result = client.Attach(pool_id, group, device, bytes, external);
++              result = client.Attach(pool_id, group, device, bytes, external, spec);
+             }
+             Check(result.status);
+             return py::make_tuple(result.memory.kind, py::bytes(result.memory.handle), result.bytes,
+@@ -75,14 +77,16 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+           },
+           py::arg("pool_id"), py::arg("group"), py::arg("device"), py::arg("bytes"),
+           py::arg("external_handle") = py::bytes(), py::arg("external_offset") = 0,
++          py::arg("part") = 0, py::arg("num_parts") = 1,
+           "Create or re-attach a pool. Returns (handle_kind, handle, bytes, created). With "
+           "`external_handle` (a hip_ipc handle of the caller's allocation; on the host test "
+           "server, its 8-byte address) the pool adopts that memory at `external_offset` "
+-          "instead of allocating: the server neither zeroes nor frees it.")
++          "instead of allocating: the server neither zeroes nor frees it. With `num_parts` > 1 "
++          "this is part `part` of a pool over several allocations that share one slot table.")
+       .def(
+           "bind_layout",
+           [](L1Client& client, const std::string& pool_id, uint32_t num_slots,
+-             const std::vector<std::pair<uint64_t, uint64_t>>& regions) {
++             const std::vector<std::pair<uint64_t, uint64_t>>& regions, uint32_t part) {
+             Layout layout;
+             layout.num_slots = num_slots;
+             for (const auto& region : regions) {
+@@ -91,12 +95,12 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+             Status status;
+             {
+               py::gil_scoped_release release;
+-              status = client.BindLayout(pool_id, layout);
++              status = client.BindLayout(pool_id, layout, part);
+             }
+             Check(status);
+           },
+-          py::arg("pool_id"), py::arg("num_slots"), py::arg("regions"),
+-          "Declare the slot layout as (offset, unit_bytes) regions.")
++          py::arg("pool_id"), py::arg("num_slots"), py::arg("regions"), py::arg("part") = 0,
++          "Declare the slot layout of a part as (offset, unit_bytes) regions.")
+       .def(
+           "open",
+           [](L1Client& client, const std::string& pool_id) {
+@@ -157,16 +161,16 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+           "Slots published or released stay unsettled until commit(stamp or later).")
+       .def(
+           "commit",
+-          [](L1Client& client, const std::string& pool_id, uint64_t committed) {
++          [](L1Client& client, const std::string& pool_id, uint64_t committed, uint32_t part) {
+             Status status;
+             {
+               py::gil_scoped_release release;
+-              status = client.Commit(pool_id, committed);
++              status = client.Commit(pool_id, committed, part);
+             }
+             Check(status);
+           },
+-          py::arg("pool_id"), py::arg("committed"),
+-          "The owner's device has finished every write issued before `committed`.")
++          py::arg("pool_id"), py::arg("committed"), py::arg("part") = 0,
++          "The device of part `part` has finished every write issued before `committed`.")
+       .def(
+           "fetch",
+           [](L1Client& client, const std::string& pool_id, const std::vector<std::string>& keys,
+@@ -226,6 +230,7 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+           d["group"] = stats.group;
+           d["device"] = stats.device;
+           d["bytes"] = stats.bytes;
++          d["parts"] = stats.parts;
+           d["num_slots"] = stats.num_slots;
+           d["held"] = stats.held;
+           d["cached"] = stats.cached;
+@@ -235,6 +240,11 @@ PYBIND11_MODULE(mori_umbp_l1, m) {
+           d["fetched_in_bytes"] = stats.fetched_in_bytes;
+           d["served_out_slots"] = stats.served_out_slots;
+           d["copy_micros"] = stats.copy_micros;
++          d["written_back_slots"] = stats.written_back_slots;
++          d["written_ahead_slots"] = stats.written_ahead_slots;
++          d["loaded_slots"] = stats.loaded_slots;
++          d["lost_slots"] = stats.lost_slots;
++          d["tier_micros"] = stats.tier_micros;
+           out.append(std::move(d));
+         }
+         return out;
+diff --git a/src/umbp/standalone/l1_backing_store.cpp b/src/umbp/standalone/l1_backing_store.cpp
+new file mode 100644
+index 00000000..47bd0c9a
+--- /dev/null
++++ b/src/umbp/standalone/l1_backing_store.cpp
+@@ -0,0 +1,169 @@
++// Copyright © Advanced Micro Devices, Inc. All rights reserved.
++//
++// MIT License
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++#include "umbp/standalone/l1_backing_store.h"
++
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace mori::umbp::standalone {
++namespace {
++
++class ClientL1BackingStore final : public l1::BackingStore {
++ public:
++  ClientL1BackingStore(IUMBPClient* client, mori::io::MemoryLocationType location)
++      : client_(client), location_(location) {}
++
++  bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    // Two pools over one allocation register it once and keep it until both
++    // have gone: the store holds one region per base address.
++    auto known = regions_.find(base);
++    if (known != regions_.end()) {
++      if (bytes > known->second.bytes) {
++        *error = "the allocation is already registered with the store, with fewer bytes";
++        return false;
++      }
++      ++known->second.users;
++      return true;
++    }
++    const bool gpu = location_ == mori::io::MemoryLocationType::GPU;
++    if (!client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), static_cast<size_t>(bytes),
++                                 location_, gpu ? device : -1,
++                                 MemoryRegistration::kLocalCopyOnly)) {
++      *error = "the store refused the registration";
++      return false;
++    }
++    regions_.emplace(base, Region{bytes, 1});
++    return true;
++  }
++
++  void RemoveMemory(void* base) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto known = regions_.find(base);
++    if (known == regions_.end() || --known->second.users != 0) return;
++    regions_.erase(known);
++    client_->DeregisterMemory(reinterpret_cast<uintptr_t>(base));
++  }
++
++  std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) override {
++    Ranges ranges(space, blocks);
++    return client_->BatchPutRanges(ranges.keys, ranges.object_sizes, ranges.addresses, ranges.sizes,
++                                   ranges.offsets);
++  }
++
++  std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) override {
++    Ranges ranges(space, blocks);
++    return client_->BatchGetRanges(ranges.keys, ranges.addresses, ranges.sizes, ranges.offsets);
++  }
++
++  std::vector<bool> Contains(const std::string& space,
++                             const std::vector<std::string>& keys) override {
++    std::vector<std::string> store_keys;
++    store_keys.reserve(keys.size());
++    for (const std::string& key : keys) store_keys.push_back(L1StoreKey(space, key));
++    return client_->BatchExists(store_keys);
++  }
++
++ private:
++  // The blocks as the store's ranged calls take them: each block one object,
++  // its fragments the object's ranges, end to end from offset 0.
++  struct Ranges {
++    Ranges(const std::string& space, const std::vector<Block>& blocks) {
++      keys.reserve(blocks.size());
++      object_sizes.reserve(blocks.size());
++      addresses.resize(blocks.size());
++      sizes.resize(blocks.size());
++      offsets.resize(blocks.size());
++      for (size_t i = 0; i < blocks.size(); ++i) {
++        const std::vector<Fragment>& fragments = blocks[i].fragments;
++        keys.push_back(L1StoreKey(space, blocks[i].key));
++        addresses[i].reserve(fragments.size());
++        sizes[i].reserve(fragments.size());
++        offsets[i].reserve(fragments.size());
++        size_t offset = 0;
++        for (const Fragment& fragment : fragments) {
++          addresses[i].push_back(reinterpret_cast<uintptr_t>(fragment.address));
++          sizes[i].push_back(static_cast<size_t>(fragment.bytes));
++          offsets[i].push_back(offset);
++          offset += static_cast<size_t>(fragment.bytes);
++        }
++        object_sizes.push_back(offset);
++      }
++    }
++
++    std::vector<std::string> keys;
++    std::vector<size_t> object_sizes;
++    std::vector<std::vector<uintptr_t>> addresses;
++    std::vector<std::vector<size_t>> sizes;
++    std::vector<std::vector<size_t>> offsets;
++  };
++
++  struct Region {
++    uint64_t bytes = 0;
++    uint32_t users = 0;
++  };
++
++  IUMBPClient* const client_;
++  const mori::io::MemoryLocationType location_;
++  std::mutex mutex_;
++  std::map<void*, Region> regions_;
++};
++
++}  // namespace
++
++std::string L1StoreKey(const std::string& space, const std::string& key) {
++  bool printable = true;
++  for (const char c : key) {
++    if (c < 0x21 || c > 0x7E) {
++      printable = false;
++      break;
++    }
++  }
++  std::string out;
++  out.reserve(space.size() + 2 * key.size() + 8);
++  out += "l1/";
++  out += space;
++  // The two spellings cannot name the same key: they differ in this letter.
++  out += printable ? "/s/" : "/x/";
++  if (printable) {
++    out += key;
++    return out;
++  }
++  static const char kHex[] = "0123456789abcdef";
++  for (const char c : key) {
++    const auto byte = static_cast<unsigned char>(c);
++    out += kHex[byte >> 4];
++    out += kHex[byte & 0xF];
++  }
++  return out;
++}
++
++std::shared_ptr<l1::BackingStore> MakeL1BackingStore(IUMBPClient* client,
++                                                     mori::io::MemoryLocationType location) {
++  return std::make_shared<ClientL1BackingStore>(client, location);
++}
++
++}  // namespace mori::umbp::standalone
+diff --git a/src/umbp/standalone/standalone_server.cpp b/src/umbp/standalone/standalone_server.cpp
+index 7d86a4ea..f8559cd1 100644
+--- a/src/umbp/standalone/standalone_server.cpp
++++ b/src/umbp/standalone/standalone_server.cpp
+@@ -68,6 +68,7 @@
+ #include "umbp/sim/sim.h"
+ #include "umbp/standalone/external_kv_identity_client.h"
+ #include "umbp/standalone/ipc.h"
++#include "umbp/standalone/l1_backing_store.h"
+ #include "umbp/umbp_client.h"
+ #include "umbp_standalone.grpc.pb.h"
+ 
+@@ -492,7 +493,6 @@ class EngineL1MemoryApi final : public l1::MemoryApi {
+   bool Synchronize(int device, std::string* error) override {
+     return inner_->Synchronize(device, error);
+   }
+-
+   bool CopyBatch(int dst_device, const std::vector<Fragment>& fragments,
+                  std::string* error) override {
+     if (fragments.size() < 2) return inner_->CopyBatch(dst_device, fragments, error);
+@@ -558,6 +558,11 @@ std::shared_ptr<l1::MemoryApi> MakeL1MemoryApi() {
+   return std::make_shared<EngineL1MemoryApi>(std::move(api));
+ }
+ 
++bool EnvSwitchOn(const char* name) {
++  const char* raw = std::getenv(name);
++  return raw != nullptr && raw[0] != '\0' && std::strcmp(raw, "0") != 0;
++}
++
+ }  // namespace
+ 
+ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+@@ -622,7 +627,15 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+       memory_importer_ = std::make_unique<RealMemoryImporter>();
+   }
+ 
+-  ~Impl() override { Shutdown(); }
++  ~Impl() override {
++    Shutdown();
++    // In this order, and here rather than as members go: the gRPC server
++    // first, since its handlers call the L1 pools; then the pools, which give
++    // their memory back to the store through client_mu_ while it still exists.
++    server_.reset();
++    l1_service_.reset();
++    l1_manager_.reset();
++  }
+ 
+   bool Start() {
+     std::string error;
+@@ -652,6 +665,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+     // L1 block pools ride the same socket. Registering costs nothing: no GPU
+     // context or memory exists until an engine attaches a pool.
+     l1_manager_ = std::make_shared<l1::PoolManager>(MakeL1MemoryApi());
++    PutStoreUnderL1Pools();
+     l1_service_ = l1::MakeL1PoolService(l1_manager_);
+     builder.RegisterService(l1_service_.get());
+     mode_t old_umask = umask(0077);
+@@ -696,6 +710,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+       server_->Shutdown(std::chrono::system_clock::now() + ShutdownDeadline());
+     }
+     UnregisterAllExternalIdentities();
++    // The pools stop writing evicted content to the store before it closes.
++    if (l1_manager_) l1_manager_->StopBackingStore();
+     {
+       std::unique_lock<std::shared_mutex> lock(client_mu_);
+       client_->Flush();
+@@ -1248,6 +1264,87 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+     size_t refcount = 0;
+   };
+ 
++  // The store this server hosts, as the L1 pools' backing store: every call
++  // is made as the server's own data-path handlers make theirs, under
++  // client_mu_ in the mode the deployment asks for, and refused once the
++  // server is shutting down. What it calls is `MakeL1BackingStore`.
++  class L1Store final : public l1::BackingStore {
++   public:
++    explicit L1Store(Impl* server)
++        : server_(server), inner_(MakeL1BackingStore(server->client_.get())) {}
++
++    bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) override {
++      std::unique_lock<std::shared_mutex> lock(server_->client_mu_);
++      if (server_->shutdown_.load()) {
++        *error = "the server is shutting down";
++        return false;
++      }
++      return inner_->AddMemory(base, bytes, device, error);
++    }
++    void RemoveMemory(void* base) override {
++      std::unique_lock<std::shared_mutex> lock(server_->client_mu_);
++      inner_->RemoveMemory(base);
++    }
++    std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) override {
++      DataPathLock lock(server_->client_mu_, server_->WriteLocking());
++      if (server_->shutdown_.load()) return std::vector<bool>(blocks.size(), false);
++      return inner_->Write(space, blocks);
++    }
++    std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) override {
++      DataPathLock lock(server_->client_mu_, server_->ReadLocking());
++      if (server_->shutdown_.load()) return std::vector<bool>(blocks.size(), false);
++      return inner_->Read(space, blocks);
++    }
++    std::vector<bool> Contains(const std::string& space,
++                               const std::vector<std::string>& keys) override {
++      DataPathLock lock(server_->client_mu_, server_->LookupLocking());
++      if (server_->shutdown_.load()) return std::vector<bool>(keys.size(), false);
++      return inner_->Contains(space, keys);
++    }
++
++   private:
++    Impl* const server_;
++    const std::shared_ptr<l1::BackingStore> inner_;
++  };
++
++  // UMBP_L1_DRAM_STORE=1: what the L1 pools evict goes to this server's store,
++  // and comes back from it. Off by default; how much the store holds, and
++  // where, is the store's own configuration (UMBP_DRAM_CAPACITY and the rest).
++  void PutStoreUnderL1Pools() {
++    if (std::getenv("UMBP_L1_DRAM_BYTES") != nullptr) {
++      MORI_UMBP_WARN(
++          "[StandaloneServer] UMBP_L1_DRAM_BYTES is no longer read: the L1 pools have no DRAM "
++          "of their own. Set UMBP_L1_DRAM_STORE=1 to keep their evicted content in this "
++          "server's store, which is sized by the store's configuration");
++    }
++    if (!EnvSwitchOn("UMBP_L1_DRAM_STORE")) return;
++    if (!BackendIsDistributed() || backend_config_.sim.enabled) {
++      MORI_UMBP_ERROR(
++          "[StandaloneServer] UMBP_L1_DRAM_STORE needs a real store in this server; the L1 "
++          "pools keep no evicted content");
++      return;
++    }
++    if (BackendMedium(backend_config_) != UMBPMedium::DRAM) {
++      MORI_UMBP_ERROR(
++          "[StandaloneServer] UMBP_L1_DRAM_STORE needs this server's store on the DRAM medium "
++          "(it is on {}); the L1 pools keep no evicted content",
++          TierTypeName(ToTierType(BackendMedium(backend_config_))));
++      return;
++    }
++    const bool has_master = backend_config_.distributed.has_value() &&
++                            !backend_config_.distributed->master_config.master_address.empty();
++    if (has_master && !client_->SupportsRangedIO()) {
++      MORI_UMBP_WARN(
++          "[StandaloneServer] UMBP_L1_DRAM_STORE with a master and no ranged scratch arena: an "
++          "evicted L1 slot the master routes to another node cannot be sent and is lost");
++    }
++    l1_manager_->SetBackingStore(std::make_shared<L1Store>(this), l1::BackingStoreOptionsFromEnv());
++    MORI_UMBP_INFO(
++        "[StandaloneServer] L1 pools write their evicted last copies to this server's store "
++        "({})",
++        has_master ? "placed by the master" : "this node's DRAM");
++  }
++
+   bool BackendIsDistributed() const {
+     return client_ && client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed;
+   }
+diff --git a/tests/cpp/umbp/distributed/CMakeLists.txt b/tests/cpp/umbp/distributed/CMakeLists.txt
+index e88d20c2..09fd9a64 100644
+--- a/tests/cpp/umbp/distributed/CMakeLists.txt
++++ b/tests/cpp/umbp/distributed/CMakeLists.txt
+@@ -472,6 +472,18 @@ target_link_libraries(test_l1_pool PRIVATE umbp_l1 GTest::gtest_main)
+ target_compile_features(test_l1_pool PRIVATE cxx_std_17)
+ add_test(NAME umbp_l1_pool COMMAND test_l1_pool)
+ 
++# The L1 pools over the UMBP store: what they evict becomes objects of an
++# embedded client's DRAM medium and is read back out of it. Host memory
++# throughout, so it needs no GPU and no fabric.
++add_executable(test_l1_backing_store test_l1_backing_store.cpp)
++if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++  target_link_options(test_l1_backing_store PRIVATE -Wl,--no-as-needed)
++endif()
++target_link_libraries(
++  test_l1_backing_store PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
++                                ${_TEST_GRPCPP_LIB} gtest_main)
++add_test(NAME umbp_l1_backing_store COMMAND test_l1_backing_store)
++
+ # HipMemoryApi::CopyBatch when the runtime fails under it, on real devices
+ # (skipped with fewer than two GPUs). The two HIP calls are wrapped at link
+ # time so the test can make one of them fail.
+diff --git a/tests/cpp/umbp/distributed/test_l1_backing_store.cpp b/tests/cpp/umbp/distributed/test_l1_backing_store.cpp
+new file mode 100644
+index 00000000..9f5d9ada
+--- /dev/null
++++ b/tests/cpp/umbp/distributed/test_l1_backing_store.cpp
+@@ -0,0 +1,361 @@
++// Copyright © Advanced Micro Devices, Inc. All rights reserved.
++//
++// MIT License
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++// The L1 pools over the UMBP store, end to end and without a GPU: a pool
++// manager whose pools are host memory, and under it the store an embedded
++// client hosts -- the real one, with its DRAM medium, its page allocator and
++// its transfer layer. What the pools evict becomes objects of that store and
++// comes back out of them; nothing here is a fake.
++//
++// The pools' memory is registered as host memory, so the store's planner hands
++// the copies to LocalCopyEngine where a server's go to HbmCopyEngine. Every
++// step before the copy itself is the one a server takes.
++
++#include <gtest/gtest.h>
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "umbp/common/config.h"
++#include "umbp/l1/l1_pool.h"
++#include "umbp/standalone/l1_backing_store.h"
++#include "umbp/umbp_client.h"
++
++namespace mori::umbp {
++namespace {
++
++using l1::AllocateResult;
++using l1::FetchOptions;
++using l1::FetchResult;
++using l1::Layout;
++using l1::Op;
++using l1::OpKind;
++using l1::PartSpec;
++using l1::PoolManager;
++using l1::PoolStats;
++using l1::Region;
++
++constexpr uint32_t kSlots = 6;
++constexpr size_t kPage = 4096;
++// A slot is three pieces on two allocations, 9000 bytes: more than two of the
++// store's pages, with no piece ending on a page boundary.
++constexpr uint64_t kUnitA = 3000;
++constexpr uint64_t kUnitB = 1000;
++constexpr uint64_t kUnitC = 5000;
++constexpr uint64_t kSlotBytes = kUnitA + kUnitB + kUnitC;
++constexpr uint64_t kBytes0 = kSlots * (kUnitA + kUnitB);
++constexpr uint64_t kBytes1 = kSlots * kUnitC;
++
++Layout Layout0() {
++  Layout layout;
++  layout.num_slots = kSlots;
++  layout.regions = {Region{0, kUnitA}, Region{kSlots * kUnitA, kUnitB}};
++  return layout;
++}
++
++Layout Layout1() {
++  Layout layout;
++  layout.num_slots = kSlots;
++  layout.regions = {Region{0, kUnitC}};
++  return layout;
++}
++
++class L1BackingStoreTest : public ::testing::Test {
++ protected:
++  static void SetUpTestSuite() {
++    // The store would otherwise register its DRAM with the GPUs of the machine
++    // for its gather kernel. These pools are host memory: no GPU is needed
++    // here, and none is opened.
++    setenv("UMBP_DRAM_HOST_REGISTER", "0", 1);
++  }
++
++  // A store of `pages` pages in this process: no master, no peers.
++  void BringStore(size_t pages) {
++    UMBPConfig config;
++    config.dram.capacity_bytes = pages * kPage;
++    config.dram.prefault = false;
++    UMBPDistributedConfig distributed;
++    distributed.dram_page_size = kPage;
++    distributed.io_engine.host.clear();
++    distributed.peer_service_port = 0;
++    config.distributed = distributed;
++    client = CreateUMBPClient(config);
++    ASSERT_NE(client, nullptr);
++    store = standalone::MakeL1BackingStore(client.get(), mori::io::MemoryLocationType::CPU);
++  }
++
++  // Pool `rank`: two parts, each over memory this test owns and the pool adopts.
++  void BringPool(int rank) {
++    const std::string id = "r" + std::to_string(rank);
++    memory[rank][0].assign(kBytes0, 0);
++    memory[rank][1].assign(kBytes1, 0);
++    for (uint32_t part : {0u, 1u}) {
++      const uint64_t address = reinterpret_cast<uint64_t>(memory[rank][part].data());
++      l1::ExternalMemory external;
++      external.handle.assign(reinterpret_cast<const char*>(&address), sizeof(address));
++      ASSERT_TRUE(manager
++                      ->Attach(id, "g", 10 * rank + static_cast<int>(part),
++                               part == 0 ? kBytes0 : kBytes1, external, PartSpec{part, 2})
++                      .status.ok);
++      ASSERT_TRUE(manager->BindLayout(id, part == 0 ? Layout0() : Layout1(), part).ok);
++    }
++    ASSERT_EQ(manager->Open(id).num_slots, kSlots);
++  }
++
++  void Bring(size_t pages = 256) {
++    BringStore(pages);
++    manager = std::make_unique<PoolManager>(l1::MakeHostMemoryApi());
++    manager->SetBackingStore(store);
++    BringPool(0);
++    BringPool(1);
++  }
++
++  void TearDown() override {
++    manager.reset();  // the pools give their memory back to the store first
++    store.reset();
++    if (client) client->Close();
++  }
++
++  // Every byte of a slot differs from its neighbours and from other slots'.
++  static uint8_t ByteOf(uint8_t seed, uint64_t offset) {
++    return static_cast<uint8_t>(seed * 31 + offset * 7 + (offset >> 8));
++  }
++  void Fill(int rank, uint32_t slot, uint8_t seed) {
++    uint8_t* a = memory[rank][0].data() + slot * kUnitA;
++    uint8_t* b = memory[rank][0].data() + kSlots * kUnitA + slot * kUnitB;
++    uint8_t* c = memory[rank][1].data() + slot * kUnitC;
++    for (uint64_t i = 0; i < kUnitA; ++i) a[i] = ByteOf(seed, i);
++    for (uint64_t i = 0; i < kUnitB; ++i) b[i] = ByteOf(seed, kUnitA + i);
++    for (uint64_t i = 0; i < kUnitC; ++i) c[i] = ByteOf(seed, kUnitA + kUnitB + i);
++  }
++  bool Holds(int rank, uint32_t slot, uint8_t seed) {
++    const uint8_t* a = memory[rank][0].data() + slot * kUnitA;
++    const uint8_t* b = memory[rank][0].data() + kSlots * kUnitA + slot * kUnitB;
++    const uint8_t* c = memory[rank][1].data() + slot * kUnitC;
++    for (uint64_t i = 0; i < kUnitA; ++i) {
++      if (a[i] != ByteOf(seed, i)) return false;
++    }
++    for (uint64_t i = 0; i < kUnitB; ++i) {
++      if (b[i] != ByteOf(seed, kUnitA + i)) return false;
++    }
++    for (uint64_t i = 0; i < kUnitC; ++i) {
++      if (c[i] != ByteOf(seed, kUnitA + kUnitB + i)) return false;
++    }
++    return true;
++  }
++
++  // Allocate, fill, publish and release `keys` in pool r<rank>.
++  void Cache(int rank, const std::vector<std::string>& keys, uint8_t first) {
++    const std::string id = "r" + std::to_string(rank);
++    AllocateResult got = manager->Allocate(id, static_cast<uint32_t>(keys.size()));
++    ASSERT_EQ(got.slots.size(), keys.size());
++    std::vector<Op> ops;
++    for (size_t i = 0; i < keys.size(); ++i) {
++      Fill(rank, got.slots[i], static_cast<uint8_t>(first + i));
++      ops.push_back(Op{OpKind::kPublish, got.slots[i], keys[i]});
++    }
++    for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++    ASSERT_TRUE(manager->Apply(id, ops).ok);
++  }
++
++  // Take every slot of the pool, which evicts all it caches, scribble over the
++  // pool as an engine reusing it would, and give the slots back empty.
++  void EvictAll(int rank) {
++    const std::string id = "r" + std::to_string(rank);
++    AllocateResult got = manager->Allocate(id, kSlots);
++    ASSERT_EQ(got.slots.size(), kSlots);
++    std::memset(memory[rank][0].data(), 0xEE, kBytes0);
++    std::memset(memory[rank][1].data(), 0xEE, kBytes1);
++    std::vector<Op> ops;
++    for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++    ASSERT_TRUE(manager->Apply(id, ops).ok);
++  }
++
++  PoolStats StatsOf(const std::string& id) {
++    for (const PoolStats& stats : manager->Stats()) {
++      if (stats.pool_id == id) return stats;
++    }
++    return PoolStats{};
++  }
++
++  std::unique_ptr<IUMBPClient> client;
++  std::shared_ptr<l1::BackingStore> store;
++  std::unique_ptr<PoolManager> manager;
++  std::vector<uint8_t> memory[2][2];
++};
++
++TEST_F(L1BackingStoreTest, AnEvictedSlotIsStoredAsOneObjectAndReadBackIntoAnotherPool) {
++  Bring();
++  Cache(0, {"a", "b", "c"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("r0").written_back_slots, 3u);
++  EXPECT_EQ(StatsOf("r0").lost_slots, 0u);
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("r1", {"a", "b", "c", "never"}, probe).available, 3u);
++  FetchResult fetched = manager->Fetch("r1", {"a", "b", "c", "never"});
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  ASSERT_EQ(fetched.slots.size(), 3u);
++  for (size_t i = 0; i < 3; ++i) {
++    EXPECT_TRUE(Holds(1, fetched.slots[i], static_cast<uint8_t>(1 + i))) << "key " << i;
++  }
++  EXPECT_EQ(fetched.copied_bytes, 3 * kSlotBytes);
++  EXPECT_EQ(StatsOf("r1").loaded_slots, 3u);
++  // And into slots the caller already holds, in the pool that evicted them.
++  AllocateResult held = manager->Allocate("r0", 2);
++  FetchOptions into;
++  into.dst_slots = held.slots;
++  FetchResult filled = manager->Fetch("r0", {"c", "a"}, into);
++  ASSERT_EQ(filled.copied_slots, 2u);
++  EXPECT_TRUE(Holds(0, held.slots[0], 3));
++  EXPECT_TRUE(Holds(0, held.slots[1], 1));
++}
++
++TEST_F(L1BackingStoreTest, TheObjectsAreTheStoresOwn) {
++  Bring();
++  Cache(0, {"a"}, 9);
++  EvictAll(0);
++  FetchOptions probe;
++  probe.probe_only = true;
++  ASSERT_EQ(manager->Fetch("r1", {"a"}, probe).available, 1u);
++  // Emptying the store empties what the pools can find: they kept no copy and
++  // no index of their own.
++  ASSERT_TRUE(client->Clear());
++  EXPECT_EQ(manager->Fetch("r1", {"a"}, probe).available, 0u);
++  EXPECT_TRUE(manager->Fetch("r1", {"a"}).slots.empty());
++}
++
++TEST_F(L1BackingStoreTest, KeysOfOpaqueBytesAreStoredUnderTextKeys) {
++  Bring();
++  const std::string binary("\x00\xff\x80 k\n", 6);
++  const std::string plain = "00ff80206b0a";  // the hex of the one above
++  Cache(0, {binary, plain}, 20);
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("r0").written_back_slots, 2u);
++  FetchResult fetched = manager->Fetch("r1", {binary, plain});
++  ASSERT_EQ(fetched.slots.size(), 2u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 20));
++  EXPECT_TRUE(Holds(1, fetched.slots[1], 21));
++  EXPECT_EQ(standalone::L1StoreKey("g/1", "abc"), "l1/g/1/s/abc");
++  EXPECT_EQ(standalone::L1StoreKey("g/1", binary), "l1/g/1/x/" + plain);
++  EXPECT_NE(standalone::L1StoreKey("g/1", binary), standalone::L1StoreKey("g/1", plain));
++}
++
++// The pools' share of DRAM is whatever the store's own configuration and
++// eviction leave them. A put into a full store is refused -- the store evicts
++// in the background, at its watermarks, never inside a put -- so of a burst
++// larger than the room it has, the excess is lost and counted; the pools
++// neither fail nor serve a slot the store does not hold; and once the store
++// has evicted, later evictions are kept again.
++TEST_F(L1BackingStoreTest, TheStoresCapacityAndEvictionDecideWhatIsKept) {
++  Bring(/*pages=*/12);  // four slots' worth: a slot takes three pages
++  const std::vector<std::string> first = {"a0", "a1", "a2", "a3", "a4", "a5"};
++  const std::vector<std::string> second = {"b0", "b1", "b2", "b3", "b4", "b5"};
++  Cache(0, first, 1);
++  EvictAll(0);
++  Cache(0, second, 41);
++  EvictAll(0);
++  PoolStats stats = StatsOf("r0");
++  EXPECT_EQ(stats.written_back_slots + stats.lost_slots, 12u);
++  EXPECT_GE(stats.written_back_slots, 1u);
++  EXPECT_LE(stats.written_back_slots, 4u) << "more slots were taken than the store has pages for";
++  size_t found = 0;
++  for (size_t i = 0; i < 12; ++i) {
++    const std::string& key = i < 6 ? first[i] : second[i - 6];
++    FetchResult fetched = manager->Fetch("r1", {key});
++    if (fetched.slots.empty()) continue;
++    ++found;
++    EXPECT_TRUE(Holds(1, fetched.slots[0], static_cast<uint8_t>(i < 6 ? 1 + i : 41 + i - 6)))
++        << key;
++  }
++  EXPECT_GE(found, 1u);
++  EXPECT_LE(found, stats.written_back_slots);
++  // The store was left over its high watermark: its evictor makes room, and a
++  // slot evicted from L1 after that is stored.
++  const uint64_t before = stats.written_back_slots;
++  for (int round = 0; round < 200 && StatsOf("r0").written_back_slots == before; ++round) {
++    Cache(0, {"late" + std::to_string(round)}, static_cast<uint8_t>(90 + round));
++    EvictAll(0);
++    std::this_thread::sleep_for(std::chrono::milliseconds(25));
++  }
++  EXPECT_GT(StatsOf("r0").written_back_slots, before)
++      << "the store never made room for a later eviction";
++}
++
++TEST_F(L1BackingStoreTest, ClearingAPoolPutsItsGroupsObjectsOutOfReach) {
++  Bring();
++  Cache(0, {"a"}, 3);
++  EvictAll(0);
++  ASSERT_TRUE(manager->Clear("r0").ok);
++  EXPECT_TRUE(manager->Fetch("r1", {"a"}).slots.empty());
++  // The same key, written after the Clear, is a new object.
++  Cache(0, {"a"}, 4);
++  EvictAll(0);
++  FetchResult fetched = manager->Fetch("r1", {"a"});
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 4));
++}
++
++TEST_F(L1BackingStoreTest, AClosedStoreTakesNothingAndThePoolsCarryOn) {
++  Bring();
++  Cache(0, {"a"}, 3);
++  client->Close();
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("r0").written_back_slots, 0u);
++  EXPECT_EQ(StatsOf("r0").lost_slots, 1u);
++  EXPECT_TRUE(manager->Fetch("r1", {"a"}).slots.empty());
++}
++
++TEST_F(L1BackingStoreTest, AnAllocationTwoPoolsShareIsRegisteredOnce) {
++  BringStore(16);
++  std::vector<uint8_t> shared(1 << 16);
++  std::string error;
++  ASSERT_TRUE(store->AddMemory(shared.data(), shared.size(), 0, &error)) << error;
++  ASSERT_TRUE(store->AddMemory(shared.data(), shared.size() / 2, 0, &error)) << error;
++  EXPECT_FALSE(store->AddMemory(shared.data(), shared.size() * 2, 0, &error));
++  EXPECT_FALSE(error.empty());
++  // Still registered for its other user after the first has gone: the object
++  // is written from it and read back into it.
++  store->RemoveMemory(shared.data());
++  for (size_t i = 0; i < 8192; ++i) shared[i] = static_cast<uint8_t>(i * 13);
++  l1::BackingStore::Block block;
++  block.key = "k";
++  block.fragments = {{shared.data(), 5000}, {shared.data() + 5000, 3192}};
++  ASSERT_EQ(store->Write("space", {block}), std::vector<bool>({true}));
++  EXPECT_EQ(store->Contains("space", {"k", "other"}), std::vector<bool>({true, false}));
++  EXPECT_EQ(store->Contains("elsewhere", {"k"}), std::vector<bool>({false}));
++  block.fragments = {{shared.data() + 20000, 100}, {shared.data() + 30000, 8092}};
++  ASSERT_EQ(store->Read("space", {block}), std::vector<bool>({true}));
++  EXPECT_EQ(std::memcmp(shared.data() + 20000, shared.data(), 100), 0);
++  EXPECT_EQ(std::memcmp(shared.data() + 30000, shared.data() + 100, 8092), 0);
++  // A key already stored is not an error: the pools may offer one twice.
++  EXPECT_EQ(store->Write("space", {block}), std::vector<bool>({true}));
++  store->RemoveMemory(shared.data());
++}
++
++}  // namespace
++}  // namespace mori::umbp
+diff --git a/tests/cpp/umbp/distributed/test_l1_pool.cpp b/tests/cpp/umbp/distributed/test_l1_pool.cpp
+index 9ee49c83..99056ef4 100644
+--- a/tests/cpp/umbp/distributed/test_l1_pool.cpp
++++ b/tests/cpp/umbp/distributed/test_l1_pool.cpp
+@@ -22,17 +22,21 @@
+ #include <gtest/gtest.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstring>
++#include <deque>
+ #include <functional>
++#include <iterator>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <set>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #include "umbp/l1/l1_pool.h"
+@@ -69,6 +73,7 @@ class RecordingApi final : public MemoryApi {
+   bool Import(int device, const std::string& handle, uint64_t offset, void** base, void** mapped,
+               std::string* error) override {
+     if (!host_->Import(device, handle, offset, base, mapped, error)) return false;
++    std::lock_guard<std::mutex> lock(mutex_);
+     bases[device] = static_cast<uint8_t*>(*base);
+     return true;
+   }
+@@ -93,8 +98,9 @@ class RecordingApi final : public MemoryApi {
+   }
+ 
+   std::map<int, uint8_t*> bases;
+-  int copies = 0;
+-  int synchronizes = 0;
++  // Counted from several threads: a pool's parts copy side by side.
++  std::atomic<int> copies{0};
++  std::atomic<int> synchronizes{0};
+   int frees = 0;
+   int unimports = 0;
+   int allocations = 0;
+@@ -125,6 +131,11 @@ class L1PoolTest : public ::testing::Test {
+   void SetUp() override {
+     api = std::make_shared<RecordingApi>();
+     manager = std::make_unique<PoolManager>(api);
++    BringPools();
++  }
++
++  // Pools p0 and p1 of group "g", attached, bound and opened.
++  void BringPools() {
+     for (int device : {0, 1}) {
+       const std::string id = "p" + std::to_string(device);
+       ASSERT_TRUE(manager->Attach(id, "g", device, kBytes).status.ok);
+@@ -807,6 +818,930 @@ TEST_F(L1PoolTest, TwoAttachesReplacingABusyPoolAllocateItOnce) {
+   EXPECT_EQ(StatsOf("p1").bytes, 2 * kBytes);
+ }
+ 
++// A pool of two parts, as an engine rank with tensor-parallel attention has:
++// slot i is on both devices, a different shard on each, in a different layout.
++constexpr uint64_t kUnitC = 8;
++constexpr uint64_t kBytesC = kSlots * kUnitC;
++
++Layout ShardLayout() {
++  Layout layout;
++  layout.num_slots = kSlots;
++  layout.regions = {Region{0, kUnitC}};
++  return layout;
++}
++
++class L1PartsTest : public L1PoolTest {
++ protected:
++  // Pool r<rank>: part 0 on device 10 * rank + 10, part 1 on the next device.
++  static int Device(int rank, uint32_t part) { return 10 * rank + 10 + static_cast<int>(part); }
++  static std::string Id(int rank) { return "r" + std::to_string(rank); }
++
++  Status AttachPart(int rank, uint32_t part) {
++    return manager
++        ->Attach(Id(rank), "tp", Device(rank, part), part == 0 ? kBytes : kBytesC, {},
++                 PartSpec{part, 2})
++        .status;
++  }
++  void Bring(int rank) {
++    for (uint32_t part : {0u, 1u}) {
++      ASSERT_TRUE(AttachPart(rank, part).ok);
++      ASSERT_TRUE(manager->BindLayout(Id(rank), part == 0 ? TestLayout() : ShardLayout(), part).ok);
++    }
++    ASSERT_EQ(manager->Open(Id(rank)).num_slots, kSlots);
++  }
++  void FillShard(int rank, uint32_t slot, uint8_t value) {
++    std::memset(api->bases[Device(rank, 1)] + slot * kUnitC, value, kUnitC);
++  }
++  bool ShardHolds(int rank, uint32_t slot, uint8_t value) {
++    const uint8_t* c = api->bases[Device(rank, 1)] + slot * kUnitC;
++    for (uint64_t i = 0; i < kUnitC; ++i) {
++      if (c[i] != value) return false;
++    }
++    return true;
++  }
++  // Allocate one slot of r<rank>, write both parts of it, publish and release.
++  uint32_t CacheOne(int rank, const std::string& key, uint8_t value, uint64_t stamp = 0) {
++    AllocateResult got = manager->Allocate(Id(rank), 1);
++    EXPECT_EQ(got.slots.size(), 1u);
++    Fill(Device(rank, 0), got.slots[0], value);
++    FillShard(rank, got.slots[0], static_cast<uint8_t>(value + 50));
++    EXPECT_TRUE(manager
++                    ->Apply(Id(rank),
++                            {Op{OpKind::kPublish, got.slots[0], key},
++                             Op{OpKind::kRelease, got.slots[0], ""}},
++                            stamp)
++                    .ok);
++    return got.slots[0];
++  }
++};
++
++TEST_F(L1PartsTest, APoolServesOnlyOnceEveryPartIsBound) {
++  ASSERT_TRUE(AttachPart(0, 0).ok);
++  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
++  EXPECT_FALSE(manager->Open("r0").status.ok);
++  EXPECT_FALSE(manager->Allocate("r0", 1).status.ok);
++  // A layout for a part that has not arrived is refused, not remembered.
++  EXPECT_FALSE(manager->BindLayout("r0", ShardLayout(), 1).ok);
++  ASSERT_TRUE(AttachPart(0, 1).ok);
++  EXPECT_FALSE(manager->Open("r0").status.ok);
++  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
++  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
++  const PoolStats stats = StatsOf("r0");
++  EXPECT_EQ(stats.parts, 2u);
++  EXPECT_EQ(stats.bytes, kBytes + kBytesC);
++  EXPECT_EQ(stats.device, Device(0, 0));
++}
++
++TEST_F(L1PartsTest, PartsMayArriveInAnyOrder) {
++  ASSERT_TRUE(AttachPart(0, 1).ok);
++  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
++  ASSERT_TRUE(AttachPart(0, 0).ok);
++  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
++  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
++}
++
++TEST_F(L1PartsTest, AttachRejectsAPartOutsideItsCount) {
++  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{2, 2}).status.ok);
++  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, 0}).status.ok);
++  EXPECT_FALSE(manager->Attach("r0", "tp", 10, kBytes, {}, PartSpec{0, PoolManager::kMaxParts + 1})
++                   .status.ok);
++}
++
++TEST_F(L1PartsTest, EveryPartDeclaresTheSameSlotCount) {
++  ASSERT_TRUE(AttachPart(0, 0).ok);
++  ASSERT_TRUE(AttachPart(0, 1).ok);
++  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
++  Layout fewer = ShardLayout();
++  fewer.num_slots = kSlots - 1;
++  EXPECT_FALSE(manager->BindLayout("r0", fewer, 1).ok);
++  EXPECT_FALSE(manager->Open("r0").status.ok);
++}
++
++TEST_F(L1PartsTest, FetchCopiesEveryPartOfASlotToTheSamePart) {
++  Bring(0);
++  Bring(1);
++  CacheOne(1, "filler", 90);  // so the slot numbers of the two pools differ
++  const uint32_t src = CacheOne(0, "k", 7);
++  FetchResult fetched = manager->Fetch("r1", {"k"});
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  const uint32_t dst = fetched.slots[0];
++  EXPECT_NE(dst, src);
++  EXPECT_TRUE(Holds(Device(1, 0), dst, 7));
++  EXPECT_TRUE(ShardHolds(1, dst, 57));
++  EXPECT_EQ(fetched.copied_slots, 1u);
++  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
++  EXPECT_EQ(StatsOf("r1").fetched_in_bytes, kUnitA + kUnitB + kUnitC);
++}
++
++TEST_F(L1PartsTest, FetchIntoHeldSlotsFillsEveryPart) {
++  Bring(0);
++  Bring(1);
++  CacheOne(0, "a", 3);
++  CacheOne(0, "b", 4);
++  AllocateResult held = manager->Allocate("r1", 2);
++  ASSERT_EQ(held.slots.size(), 2u);
++  FetchOptions into;
++  into.dst_slots = held.slots;
++  FetchResult fetched = manager->Fetch("r1", {"a", "b"}, into);
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  EXPECT_EQ(fetched.copied_slots, 2u);
++  EXPECT_TRUE(Holds(Device(1, 0), held.slots[0], 3));
++  EXPECT_TRUE(ShardHolds(1, held.slots[0], 53));
++  EXPECT_TRUE(Holds(Device(1, 0), held.slots[1], 4));
++  EXPECT_TRUE(ShardHolds(1, held.slots[1], 54));
++}
++
++TEST_F(L1PartsTest, ASlotSettlesOnlyWhenEveryPartHasCommitted) {
++  Bring(0);
++  Bring(1);
++  CacheOne(0, "k", 7, /*stamp=*/500);
++  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
++  ASSERT_TRUE(manager->Commit("r0", 500, 0).ok);
++  // Part 1's device may still be writing its shard of the slot.
++  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
++  ASSERT_TRUE(manager->Commit("r0", 499, 1).ok);
++  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());
++  ASSERT_TRUE(manager->Commit("r0", 500, 1).ok);
++  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
++  EXPECT_FALSE(manager->Commit("r0", 600, 2).ok);
++}
++
++TEST_F(L1PartsTest, APartThatFailsToCopyLeavesNothingBehind) {
++  Bring(0);
++  Bring(1);
++  CacheOne(0, "k", 7);
++  api->fail_copies = true;
++  FetchResult failed = manager->Fetch("r1", {"k"});
++  EXPECT_TRUE(failed.slots.empty());
++  EXPECT_EQ(failed.copied_bytes, 0u);
++  EXPECT_EQ(StatsOf("r1").vacant, kSlots);
++  api->fail_copies = false;
++  EXPECT_EQ(manager->Fetch("r1", {"k"}).slots.size(), 1u);
++}
++
++TEST_F(L1PartsTest, PoolsWithADifferentNumberOfPartsDoNotExchangeSlots) {
++  Bring(0);
++  // One part, in the same group and with part 0's layout.
++  ASSERT_TRUE(manager->Attach("single", "tp", 30, kBytes).status.ok);
++  ASSERT_TRUE(manager->BindLayout("single", TestLayout()).ok);
++  ASSERT_EQ(manager->Open("single").num_slots, kSlots);
++  CacheOne(0, "k", 7);
++  EXPECT_TRUE(manager->Fetch("single", {"k"}).slots.empty());
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("single", {"k"}, probe).available, 0u);
++}
++
++TEST_F(L1PartsTest, GroupChecksSlotSizesPartByPart) {
++  Bring(0);
++  ASSERT_TRUE(AttachPart(1, 0).ok);
++  ASSERT_TRUE(AttachPart(1, 1).ok);
++  ASSERT_TRUE(manager->BindLayout("r1", TestLayout(), 0).ok);
++  // Part 0's layout is not part 1's.
++  ASSERT_TRUE(manager->Attach("r2", "tp", 41, kBytes, {}, PartSpec{1, 2}).status.ok);
++  EXPECT_FALSE(manager->BindLayout("r2", TestLayout(), 1).ok);
++  EXPECT_TRUE(manager->BindLayout("r1", ShardLayout(), 1).ok);
++}
++
++TEST_F(L1PartsTest, APartAttachedWithAnotherShapeReplacesTheWholePool) {
++  Bring(0);
++  Bring(1);
++  CacheOne(0, "k", 7);
++  const int frees = api->frees;
++  // The rank restarted: its first part comes back larger.
++  ASSERT_TRUE(manager->Attach("r0", "tp", Device(0, 1), 2 * kBytesC, {}, PartSpec{1, 2}).status.ok);
++  EXPECT_EQ(api->frees, frees + 2);  // both parts of the old pool
++  EXPECT_FALSE(manager->Open("r0").status.ok);
++  EXPECT_TRUE(manager->Fetch("r1", {"k"}).slots.empty());  // its content went with it
++  ASSERT_TRUE(manager->BindLayout("r0", ShardLayout(), 1).ok);
++  ASSERT_TRUE(AttachPart(0, 0).ok);
++  ASSERT_TRUE(manager->BindLayout("r0", TestLayout(), 0).ok);
++  EXPECT_EQ(manager->Open("r0").num_slots, kSlots);
++  // The same part again, unchanged: the pool stays.
++  AttachResult again = manager->Attach("r0", "tp", Device(0, 0), kBytes, {}, PartSpec{0, 2});
++  EXPECT_TRUE(again.status.ok);
++  EXPECT_FALSE(again.created);
++}
++
++TEST_F(L1PartsTest, DetachReleasesEveryPart) {
++  Bring(0);
++  const int frees = api->frees;
++  ASSERT_TRUE(manager->Detach("r0").ok);
++  EXPECT_EQ(api->frees, frees + 2);
++  EXPECT_TRUE(manager->Detach("r0").ok);  // the rank's other runner detaching the same pool
++  EXPECT_EQ(api->frees, frees + 2);
++}
++
++// A backing store over a map: what the pools ask of it is counted, and a test
++// decides what it refuses, drops and how much it holds.
++class FakeStore final : public BackingStore {
++ public:
++  bool AddMemory(void* base, uint64_t bytes, int device, std::string* error) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (refuse_memory) {
++      *error = "injected";
++      return false;
++    }
++    memory_[static_cast<uint8_t*>(base)] = {bytes, device};
++    ++adds;
++    return true;
++  }
++  void RemoveMemory(void* base) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    memory_.erase(static_cast<uint8_t*>(base));
++    ++removes;
++  }
++
++  std::vector<bool> Write(const std::string& space, const std::vector<Block>& blocks) override {
++    if (on_call) on_call();
++    std::lock_guard<std::mutex> lock(mutex_);
++    ++write_calls;
++    largest_write = std::max(largest_write, blocks.size());
++    std::vector<bool> stored(blocks.size(), false);
++    for (size_t i = 0; i < blocks.size(); ++i) {
++      const Block& block = blocks[i];
++      fragments_of_last_block = block.fragments.size();
++      if (refuse_writes || !InsideMemoryLocked(block)) continue;
++      const std::string name = space + '\n' + block.key;
++      stored[i] = true;
++      if (objects_.count(name) != 0) continue;  // already there: nothing is copied
++      std::vector<uint8_t> bytes;
++      for (const Fragment& f : block.fragments) {
++        const auto* at = static_cast<const uint8_t*>(f.address);
++        bytes.insert(bytes.end(), at, at + f.bytes);
++      }
++      objects_[name] = std::move(bytes);
++      order_.push_back(name);
++      ++written;
++      // Room for `capacity` objects: the oldest goes, as a store's eviction would.
++      while (capacity != 0 && order_.size() > capacity) {
++        objects_.erase(order_.front());
++        order_.pop_front();
++      }
++    }
++    return stored;
++  }
++
++  std::vector<bool> Read(const std::string& space, const std::vector<Block>& blocks) override {
++    if (on_call) on_call();
++    std::lock_guard<std::mutex> lock(mutex_);
++    ++read_calls;
++    std::vector<bool> filled(blocks.size(), false);
++    for (size_t i = 0; i < blocks.size(); ++i) {
++      const Block& block = blocks[i];
++      const auto found = objects_.find(space + '\n' + block.key);
++      if (found == objects_.end() || !InsideMemoryLocked(block)) continue;
++      uint64_t total = 0;
++      for (const Fragment& f : block.fragments) total += f.bytes;
++      if (total != found->second.size()) continue;
++      const uint8_t* from = found->second.data();
++      for (const Fragment& f : block.fragments) {
++        std::memcpy(f.address, from, f.bytes);
++        from += f.bytes;
++      }
++      filled[i] = true;
++      ++read;
++    }
++    return filled;
++  }
++
++  std::vector<bool> Contains(const std::string& space,
++                             const std::vector<std::string>& keys) override {
++    if (on_call) on_call();
++    std::vector<bool> found(keys.size(), false);
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      ++lookups;
++      for (size_t i = 0; i < keys.size(); ++i) {
++        found[i] = objects_.count(space + '\n' + keys[i]) != 0;
++      }
++    }
++    if (after_lookup) after_lookup();
++    return found;
++  }
++
++  // The store evicts `key`, in whichever space it is.
++  void Drop(const std::string& key) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (auto it = objects_.begin(); it != objects_.end();) {
++      const bool match = it->first.substr(it->first.find('\n') + 1) == key;
++      if (match) order_.erase(std::find(order_.begin(), order_.end(), it->first));
++      it = match ? objects_.erase(it) : std::next(it);
++    }
++  }
++  size_t Objects() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return objects_.size();
++  }
++  size_t Spaces() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::set<std::string> spaces;
++    for (const auto& object : objects_) {
++      spaces.insert(object.first.substr(0, object.first.find('\n')));
++    }
++    return spaces.size();
++  }
++  std::vector<uint8_t> Object(const std::string& key) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (const auto& object : objects_) {
++      if (object.first.substr(object.first.find('\n') + 1) == key) return object.second;
++    }
++    return {};
++  }
++  size_t Regions() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return memory_.size();
++  }
++
++  std::atomic<int> adds{0};
++  std::atomic<int> removes{0};
++  std::atomic<int> write_calls{0};
++  std::atomic<int> read_calls{0};
++  std::atomic<int> lookups{0};
++  std::atomic<int> written{0};  // objects copied in; a key already there is not
++  std::atomic<int> read{0};
++  size_t largest_write = 0;
++  size_t fragments_of_last_block = 0;
++  size_t capacity = 0;  // objects; 0: no bound
++  bool refuse_memory = false;
++  bool refuse_writes = false;
++  std::function<void()> on_call;       // on entry to Write, Read and Contains
++  std::function<void()> after_lookup;  // once Contains has its answer
++
++ private:
++  // Every fragment lies in memory a pool registered: the store is never
++  // handed an address it was not told about.
++  bool InsideMemoryLocked(const Block& block) const {
++    for (const Fragment& f : block.fragments) {
++      const auto* at = static_cast<const uint8_t*>(f.address);
++      auto region = memory_.upper_bound(const_cast<uint8_t*>(at));
++      if (region == memory_.begin()) return false;
++      --region;
++      if (at + f.bytes > region->first + region->second.first) return false;
++    }
++    return true;
++  }
++
++  std::mutex mutex_;
++  std::map<uint8_t*, std::pair<uint64_t, int>> memory_;
++  std::map<std::string, std::vector<uint8_t>> objects_;
++  std::deque<std::string> order_;
++};
++
++// A store under the pools: the last L1 copy of a key is written there when its
++// slot is taken, and a fetch finds it there when no pool holds it.
++class L1StoreTest : public L1PoolTest {
++ protected:
++  void SetUp() override {}  // each test brings its own store
++
++  static constexpr uint64_t kSlotBytes = kUnitA + kUnitB;
++
++  void Bring(double ahead = 0.0, bool write_at_eviction = true) {
++    api = std::make_shared<RecordingApi>();
++    store = std::make_shared<FakeStore>();
++    manager = std::make_unique<PoolManager>(api);
++    BackingStoreOptions options;
++    options.ahead = ahead;
++    options.write_at_eviction = write_at_eviction;
++    options.threads = 2;
++    manager->SetBackingStore(store, options);
++    L1PoolTest::BringPools();
++  }
++
++  template <typename Fn>
++  static bool Eventually(Fn&& done) {
++    for (int i = 0; i < 5000; ++i) {
++      if (done()) return true;
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    return false;
++  }
++
++  // Take every slot of the pool, which evicts all it caches, and give the
++  // slots back empty.
++  void EvictAll(int device) {
++    const std::string id = "p" + std::to_string(device);
++    AllocateResult got = manager->Allocate(id, kSlots);
++    ASSERT_EQ(got.slots.size(), kSlots);
++    std::vector<Op> ops;
++    for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++    ASSERT_TRUE(manager->Apply(id, ops).ok);
++  }
++
++  uint64_t Written() { return StatsOf("p0").written_back_slots + StatsOf("p1").written_back_slots; }
++
++  std::shared_ptr<FakeStore> store;
++};
++
++TEST_F(L1StoreTest, ContentAnEngineJustComputedIsNotWrittenToTheStore) {
++  Bring();
++  Cache(0, {"a", "b", "c"}, 1);
++  EXPECT_EQ(store->write_calls, 0);
++  EXPECT_EQ(Written(), 0u);
++}
++
++TEST_F(L1StoreTest, AnEvictedLastCopyGoesToTheStoreAndComesBackOnFetch) {
++  Bring();
++  Cache(0, {"a", "b"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("p0").written_back_slots, 2u);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
++  EXPECT_EQ(store->write_calls, 1) << "the slots one call evicts go out together";
++  // One object a slot: its regions end to end.
++  std::vector<uint8_t> expected(kUnitA, 1);
++  expected.insert(expected.end(), kUnitB, 101);
++  EXPECT_EQ(store->Object("a"), expected);
++  std::memset(api->bases[0], 0xEE, kBytes);  // the engine has since reused its pool
++  FetchResult fetched = manager->Fetch("p1", {"a", "b", "missing"});
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  ASSERT_EQ(fetched.slots.size(), 2u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
++  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
++  EXPECT_EQ(fetched.copied_slots, 2u);
++  EXPECT_EQ(fetched.copied_bytes, 2 * kSlotBytes);
++  EXPECT_EQ(StatsOf("p1").loaded_slots, 2u);
++  EXPECT_EQ(store->read_calls, 1);
++  // The pool that evicted it finds it there too.
++  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
++}
++
++TEST_F(L1StoreTest, ACopyAnotherPoolStillHoldsIsDroppedNotWritten) {
++  Bring();
++  Cache(0, {"a"}, 1);
++  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // two pools hold "a"
++  EvictAll(0);
++  EXPECT_EQ(Written(), 0u);
++  EXPECT_EQ(store->write_calls, 0);
++  // p1's is the last copy in L1 now: that one goes to the store.
++  EvictAll(1);
++  EXPECT_EQ(StatsOf("p1").written_back_slots, 1u);
++  EXPECT_EQ(manager->Fetch("p0", {"a"}).slots.size(), 1u);
++}
++
++TEST_F(L1StoreTest, WithTwoCopiesToKeepOnlyTheLastOneLeftIsWritten) {
++  Bring();
++  manager->SetEvictionPolicy(2);
++  Cache(0, {"a"}, 1);
++  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);
++  EvictAll(0);
++  EXPECT_EQ(Written(), 0u) << "p1 still holds it";
++  EvictAll(1);
++  EXPECT_EQ(Written(), 1u);
++  EXPECT_EQ(store->written, 1);
++}
++
++TEST_F(L1StoreTest, AKeyLoadedFromTheStoreIsNotWrittenAgain) {
++  Bring();
++  Cache(0, {"a"}, 1);
++  EvictAll(0);
++  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // back in L1, still in the store
++  EvictAll(1);
++  EXPECT_EQ(Written(), 1u);
++  EXPECT_EQ(store->write_calls, 1);
++  EXPECT_EQ(StatsOf("p1").lost_slots, 0u);
++}
++
++TEST_F(L1StoreTest, FetchIntoHeldSlotsFillsThemFromTheStore) {
++  Bring();
++  Cache(0, {"a", "b"}, 5);
++  EvictAll(0);
++  AllocateResult held = manager->Allocate("p1", 2);
++  FetchOptions into;
++  into.dst_slots = held.slots;
++  FetchResult fetched = manager->Fetch("p1", {"a", "b"}, into);
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  EXPECT_EQ(fetched.copied_slots, 2u);
++  EXPECT_TRUE(Holds(1, held.slots[0], 5));
++  EXPECT_TRUE(Holds(1, held.slots[1], 6));
++  EXPECT_EQ(StatsOf("p1").loaded_slots, 2u);
++}
++
++TEST_F(L1StoreTest, AProbeCountsWhatTheStoreHoldsAndCopiesNothing) {
++  Bring();
++  Cache(0, {"a", "b"}, 5);
++  EvictAll(0);         // "a" and "b" are in the store only
++  Cache(0, {"c"}, 7);  // "c" is in p0 only
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("p1", {"a", "b", "c", "missing", "a"}, probe).available, 3u);
++  EXPECT_EQ(store->lookups, 1) << "one lookup for the keys no pool holds";
++  EXPECT_EQ(store->read_calls, 0);
++  // Keys the pools hold are not asked about at all.
++  EXPECT_EQ(manager->Fetch("p1", {"c"}, probe).available, 1u);
++  EXPECT_EQ(store->lookups, 1);
++}
++
++TEST_F(L1StoreTest, AFetchTakesWhatPoolsHoldFromThemAndTheRestFromTheStore) {
++  Bring();
++  Cache(0, {"a"}, 1);
++  EvictAll(0);         // "a" is in the store only
++  Cache(0, {"b"}, 2);  // "b" is in p0 only
++  FetchResult fetched = manager->Fetch("p1", {"a", "b"});
++  ASSERT_EQ(fetched.slots.size(), 2u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
++  EXPECT_TRUE(Holds(1, fetched.slots[1], 2));
++  EXPECT_EQ(fetched.copied_bytes, 2 * kSlotBytes);
++  EXPECT_EQ(StatsOf("p1").loaded_slots, 1u);
++  EXPECT_EQ(StatsOf("p0").served_out_slots, 1u);
++}
++
++TEST_F(L1StoreTest, WhatTheStoreKeepsIsTheStoresDecision) {
++  Bring();
++  store->capacity = 4;
++  Cache(0, {"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("p0").written_back_slots, 8u);
++  EXPECT_EQ(store->Objects(), 4u);
++  // The pools kept no index of their own to disagree with the store's.
++  EXPECT_TRUE(manager->Fetch("p1", {"a0"}).slots.empty());
++  FetchResult kept = manager->Fetch("p1", {"a4", "a7"});
++  ASSERT_EQ(kept.slots.size(), 2u);
++  EXPECT_TRUE(Holds(1, kept.slots[0], 5));
++  EXPECT_TRUE(Holds(1, kept.slots[1], 8));
++}
++
++TEST_F(L1StoreTest, AKeyTheStoreDropsBeforeItIsReadEndsTheFetchThere) {
++  Bring();
++  Cache(0, {"a", "b", "c", "d"}, 1);
++  EvictAll(0);
++  store->after_lookup = [&] { store->Drop("b"); };  // evicted between lookup and read
++  FetchResult fetched = manager->Fetch("p1", {"a", "b", "c"});
++  store->after_lookup = nullptr;
++  ASSERT_TRUE(fetched.status.ok) << fetched.status.error;
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 1));
++  EXPECT_EQ(fetched.copied_slots, 1u);
++  EXPECT_EQ(fetched.copied_bytes, kSlotBytes);
++  // The slots taken for "b" and "c" are free again, and nothing is pinned.
++  EXPECT_EQ(StatsOf("p1").cached, 1u);
++  EXPECT_EQ(StatsOf("p1").vacant, kSlots - 1);
++  // Into held slots, the same: the leading keys that landed.
++  store->after_lookup = [&] { store->Drop("d"); };
++  AllocateResult held = manager->Allocate("p0", 2);
++  FetchOptions into;
++  into.dst_slots = held.slots;
++  FetchResult filled = manager->Fetch("p0", {"c", "d"}, into);
++  store->after_lookup = nullptr;
++  EXPECT_EQ(filled.slots.size(), 1u);
++  EXPECT_EQ(filled.copied_slots, 1u);
++  EXPECT_TRUE(Holds(0, held.slots[0], 3));
++  // What the store still has is still served.
++  EXPECT_EQ(manager->Fetch("p1", {"c"}).slots.size(), 1u);
++}
++
++TEST_F(L1StoreTest, WritingAheadLeavesTheEvictionNothingToWrite) {
++  Bring(/*ahead=*/1.0);
++  Cache(0, {"a", "b", "c"}, 1);
++  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 3; }));
++  const int calls = store->write_calls;
++  EvictAll(0);
++  EXPECT_EQ(store->write_calls, calls);
++  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
++  FetchResult fetched = manager->Fetch("p1", {"a", "b", "c"});
++  ASSERT_EQ(fetched.slots.size(), 3u);
++  EXPECT_TRUE(Holds(1, fetched.slots[2], 3));
++}
++
++TEST_F(L1StoreTest, AKeyWrittenAheadIsNotWrittenAgainByThePoolThatEvictsItsLastCopy) {
++  Bring(/*ahead=*/1.0);
++  Cache(0, {"a"}, 1);
++  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 1; }));
++  ASSERT_EQ(manager->Fetch("p1", {"a"}).slots.size(), 1u);  // p1 holds a copy as well
++  EvictAll(0);                                              // a spare copy: dropped
++  EvictAll(1);  // the last copy, of a key the store was already given
++  EXPECT_EQ(Written(), 0u);
++  EXPECT_EQ(store->written, 1);
++  EXPECT_EQ(StatsOf("p1").lost_slots, 0u);
++}
++
++TEST_F(L1StoreTest, WritingAheadSkipsWhatItsOwnerIsStillWriting) {
++  Bring(/*ahead=*/1.0);
++  AllocateResult got = manager->Allocate("p0", 1);
++  ASSERT_TRUE(manager
++                  ->Apply("p0",
++                          {Op{OpKind::kPublish, got.slots[0], "late"},
++                           Op{OpKind::kRelease, got.slots[0], ""}},
++                          /*stamp=*/900)
++                  .ok);
++  std::this_thread::sleep_for(std::chrono::milliseconds(50));
++  EXPECT_EQ(StatsOf("p0").written_ahead_slots, 0u);
++  Fill(0, got.slots[0], 9);  // the forward lands
++  ASSERT_TRUE(manager->Commit("p0", 900).ok);
++  ASSERT_TRUE(Eventually([&] { return StatsOf("p0").written_ahead_slots == 1; }));
++  EvictAll(0);
++  FetchResult fetched = manager->Fetch("p1", {"late"});
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  EXPECT_TRUE(Holds(1, fetched.slots[0], 9));
++}
++
++TEST_F(L1StoreTest, AnEvictedSlotItsOwnerIsStillWritingIsLostNotWritten) {
++  Bring();
++  AllocateResult got = manager->Allocate("p0", 1);
++  ASSERT_TRUE(manager
++                  ->Apply("p0",
++                          {Op{OpKind::kPublish, got.slots[0], "late"},
++                           Op{OpKind::kRelease, got.slots[0], ""}},
++                          /*stamp=*/900)
++                  .ok);
++  EvictAll(0);  // before the owner's Commit reaches the stamp
++  EXPECT_EQ(store->write_calls, 0);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 1u);
++}
++
++TEST_F(L1StoreTest, AnEvictionThatMayNotWaitForTheStoreLosesWhatWasNotWrittenAhead) {
++  Bring(/*ahead=*/0.0, /*write_at_eviction=*/false);
++  Cache(0, {"a", "b"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(store->write_calls, 0);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 2u);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++}
++
++TEST_F(L1StoreTest, AWriteTheStoreRefusesLosesTheContentAndSaysSo) {
++  Bring();
++  Cache(0, {"a"}, 1);
++  store->refuse_writes = true;
++  EvictAll(0);
++  store->refuse_writes = false;
++  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 1u);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++}
++
++TEST_F(L1StoreTest, ClearingAPoolPutsWhatItsGroupWroteOutOfReach) {
++  Bring(/*ahead=*/1.0);
++  Cache(0, {"a"}, 1);
++  EvictAll(0);
++  Cache(1, {"kept"}, 4);  // p1 has it written ahead, and still holds it
++  ASSERT_TRUE(Eventually([&] { return StatsOf("p1").written_ahead_slots == 1; }));
++  ASSERT_EQ(store->Objects(), 2u);
++  ASSERT_TRUE(manager->Clear("p0").ok);
++  // The store cannot delete: the objects are still there, and not found.
++  EXPECT_EQ(store->Objects(), 2u);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("p0", {"a"}, probe).available, 0u);
++  // What the group still holds in L1 is written again, where it now looks.
++  ASSERT_TRUE(Eventually([&] { return StatsOf("p1").written_ahead_slots == 2; }));
++  EXPECT_EQ(store->Spaces(), 2u);
++  EvictAll(1);
++  FetchResult fetched = manager->Fetch("p0", {"kept"});
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  EXPECT_TRUE(Holds(0, fetched.slots[0], 4));
++}
++
++TEST_F(L1StoreTest, WithoutAStoreAnEvictedSlotIsGone) {
++  api = std::make_shared<RecordingApi>();
++  manager = std::make_unique<PoolManager>(api);
++  L1PoolTest::BringPools();
++  Cache(0, {"a"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(StatsOf("p0").written_back_slots, 0u);
++  EXPECT_EQ(StatsOf("p0").lost_slots, 0u);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++}
++
++TEST_F(L1StoreTest, APoolsMemoryIsMadeKnownToTheStoreWhenItAttachesAndNeverOnACopy) {
++  Bring();
++  EXPECT_EQ(store->adds, 2);  // one allocation a pool
++  EXPECT_EQ(store->Regions(), 2u);
++  Cache(0, {"a", "b"}, 1);
++  EvictAll(0);
++  ASSERT_EQ(manager->Fetch("p1", {"a", "b"}).slots.size(), 2u);
++  EXPECT_EQ(store->adds, 2);
++  EXPECT_EQ(store->removes, 0);
++  ASSERT_TRUE(manager->Detach("p0").ok);
++  EXPECT_EQ(store->removes, 1);
++  manager.reset();
++  EXPECT_EQ(store->removes, 2);
++  EXPECT_EQ(store->Regions(), 0u);
++}
++
++TEST_F(L1StoreTest, APoolTheStoreDidNotTakeKeepsNoEvictedContent) {
++  api = std::make_shared<RecordingApi>();
++  store = std::make_shared<FakeStore>();
++  store->refuse_memory = true;
++  manager = std::make_unique<PoolManager>(api);
++  manager->SetBackingStore(store);
++  L1PoolTest::BringPools();
++  Cache(0, {"a"}, 1);
++  EvictAll(0);
++  EXPECT_EQ(store->write_calls, 0);
++  EXPECT_EQ(store->lookups, 0);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++}
++
++TEST_F(L1StoreTest, EveryStoreCallIsMadeWithoutThePoolsLock) {
++  Bring();
++  // Anything that takes the pool manager's lock: it would never return if a
++  // store call were made with the lock held.
++  int calls = 0;
++  store->on_call = [&] {
++    ++calls;
++    (void)manager->Stats();
++  };
++  Cache(0, {"a", "b"}, 1);
++  EvictAll(0);                                                   // Write
++  ASSERT_EQ(manager->Fetch("p1", {"a", "b"}).slots.size(), 2u);  // Contains, Read
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("p0", {"a", "nope"}, probe).available, 1u);  // Contains
++  EXPECT_EQ(calls, 4);
++  store->on_call = nullptr;
++}
++
++TEST_F(L1StoreTest, AStoppedStoreIsNotWrittenOrReadButStillGetsItsMemoryBack) {
++  Bring();
++  Cache(0, {"a"}, 1);
++  EvictAll(0);
++  manager->StopBackingStore();
++  Cache(0, {"b"}, 2);
++  EvictAll(0);
++  EXPECT_EQ(store->write_calls, 1);
++  EXPECT_TRUE(manager->Fetch("p1", {"a"}).slots.empty());
++  EXPECT_EQ(store->lookups, 0);
++  manager.reset();
++  EXPECT_EQ(store->removes, 2);
++}
++
++// A burst of evictions goes out as a few store calls side by side, and comes
++// back the same way.
++TEST_F(L1StoreTest, ABurstIsSplitOverSeveralStoreCalls) {
++  constexpr uint32_t kMany = 70;
++  constexpr uint64_t kUnit = 8;
++  api = std::make_shared<RecordingApi>();
++  store = std::make_shared<FakeStore>();
++  manager = std::make_unique<PoolManager>(api);
++  BackingStoreOptions options;
++  options.threads = 3;
++  manager->SetBackingStore(store, options);
++  Layout layout;
++  layout.num_slots = kMany;
++  layout.regions = {Region{0, kUnit}};
++  for (int device : {0, 1}) {
++    const std::string id = "big" + std::to_string(device);
++    ASSERT_TRUE(manager->Attach(id, "many", device, kMany * kUnit).status.ok);
++    ASSERT_TRUE(manager->BindLayout(id, layout).ok);
++    ASSERT_EQ(manager->Open(id).num_slots, kMany);
++  }
++  AllocateResult got = manager->Allocate("big0", kMany);
++  ASSERT_EQ(got.slots.size(), kMany);
++  std::vector<Op> ops;
++  std::vector<std::string> keys;
++  for (uint32_t i = 0; i < kMany; ++i) {
++    std::memset(api->bases[0] + got.slots[i] * kUnit, static_cast<int>(i + 1), kUnit);
++    keys.push_back("k" + std::to_string(i));
++    ops.push_back(Op{OpKind::kPublish, got.slots[i], keys.back()});
++  }
++  for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++  ASSERT_TRUE(manager->Apply("big0", ops).ok);
++  ASSERT_EQ(manager->Allocate("big0", kMany).slots.size(), kMany);  // evicts all 70
++  EXPECT_EQ(StatsOf("big0").written_back_slots, kMany);
++  EXPECT_EQ(store->write_calls, 3);
++  EXPECT_EQ(store->largest_write, 24u);  // 24 + 23 + 23
++  FetchResult fetched = manager->Fetch("big1", keys);
++  ASSERT_EQ(fetched.slots.size(), kMany);
++  EXPECT_EQ(store->read_calls, 3);
++  for (uint32_t i = 0; i < kMany; ++i) {
++    const uint8_t* at = api->bases[1] + fetched.slots[i] * kUnit;
++    EXPECT_EQ(at[0], static_cast<uint8_t>(i + 1)) << "key " << i;
++    EXPECT_EQ(at[kUnit - 1], static_cast<uint8_t>(i + 1)) << "key " << i;
++  }
++}
++
++// Two owners caching, evicting, fetching each other's keys and clearing, with
++// the writer ahead running beside them: whatever a fetch returns holds the
++// bytes of its key, wherever they came from, and nothing is left pinned, held
++// or registered that should not be.
++TEST_F(L1StoreTest, OwnersWorkingAtOnceGetTheRightBytesAndLeaveNothingBehind) {
++  Bring(/*ahead=*/0.5);
++  store->capacity = 24;
++  std::atomic<int> published[2] = {{0}, {0}};
++  std::atomic<int> checked{0};
++  std::atomic<int> wrong{0};
++  std::atomic<bool> stop{false};
++  const auto seed_of = [](int index) { return static_cast<uint8_t>(1 + index % 90); };
++  const auto owner = [&](int device) {
++    const std::string id = "p" + std::to_string(device);
++    const char mine = device == 0 ? 'a' : 'b';
++    const char theirs = device == 0 ? 'b' : 'a';
++    uint32_t round = 0;
++    while (!stop.load()) {
++      ++round;
++      // Two new keys of this owner's: evicts its coldest slots once it is full.
++      AllocateResult got = manager->Allocate(id, 2);
++      if (got.slots.size() == 2) {
++        std::vector<Op> ops;
++        for (uint32_t slot : got.slots) {
++          const int index = published[device].load();
++          Fill(device, slot, seed_of(index));
++          ops.push_back(Op{OpKind::kPublish, slot, mine + std::to_string(index)});
++          ops.push_back(Op{OpKind::kRelease, slot, ""});
++          if (!manager->Apply(id, {ops.end() - 2, ops.end()}).ok) ++wrong;
++          published[device].store(index + 1);
++        }
++      } else {
++        std::vector<Op> ops;
++        for (uint32_t slot : got.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++        (void)manager->Apply(id, ops);
++      }
++      // Two of the other owner's keys, from its pool or from the store.
++      const int known = published[1 - device].load();
++      if (known >= 2) {
++        const int first = static_cast<int>((round * 7919u) % static_cast<uint32_t>(known - 1));
++        const std::vector<std::string> keys = {theirs + std::to_string(first),
++                                               theirs + std::to_string(first + 1)};
++        FetchOptions probe;
++        probe.probe_only = true;
++        (void)manager->Fetch(id, keys, probe);
++        FetchResult fetched = manager->Fetch(id, keys);
++        for (size_t i = 0; i < fetched.slots.size(); ++i) {
++          ++checked;
++          if (!Holds(device, fetched.slots[i], seed_of(first + static_cast<int>(i)))) ++wrong;
++        }
++      }
++      if (device == 0 && round % 64 == 0 && !manager->Clear(id).ok) ++wrong;
++    }
++  };
++  std::thread first(owner, 0);
++  std::thread second(owner, 1);
++  std::this_thread::sleep_for(std::chrono::milliseconds(400));
++  stop = true;
++  first.join();
++  second.join();
++  EXPECT_EQ(wrong, 0);
++  EXPECT_GT(checked, 0);
++  EXPECT_GT(store->read, 0) << "nothing came back from the store";
++  for (int device : {0, 1}) {
++    const std::string id = "p" + std::to_string(device);
++    // Wait out a write ahead in flight, which pins the slots it copies.
++    ASSERT_TRUE(Eventually([&] {
++      AllocateResult all = manager->Allocate(id, kSlots);
++      std::vector<Op> ops;
++      for (uint32_t slot : all.slots) ops.push_back(Op{OpKind::kRelease, slot, ""});
++      EXPECT_TRUE(manager->Apply(id, ops).ok);
++      return all.slots.size() == kSlots;
++    })) << id
++        << " has a slot that is neither free nor evictable";
++    const PoolStats stats = StatsOf(id);
++    EXPECT_EQ(stats.held, 0u);
++    EXPECT_EQ(stats.cached + stats.vacant, kSlots);
++  }
++  manager.reset();
++  EXPECT_EQ(store->Regions(), 0u);
++}
++
++// The store under pools of two parts: a slot is one object, a piece per part.
++TEST_F(L1PartsTest, EveryPartOfAnEvictedSlotGoesToTheStoreAndBack) {
++  api = std::make_shared<RecordingApi>();
++  auto store = std::make_shared<FakeStore>();
++  manager = std::make_unique<PoolManager>(api);
++  manager->SetBackingStore(store);
++  Bring(0);
++  Bring(1);
++  EXPECT_EQ(store->adds, 4);  // each part is an allocation of its own
++  CacheOne(0, "k", 7);
++  AllocateResult all = manager->Allocate("r0", kSlots);  // evicts "k", the last copy
++  ASSERT_EQ(all.slots.size(), kSlots);
++  EXPECT_EQ(StatsOf("r0").written_back_slots, 1u);
++  EXPECT_EQ(store->fragments_of_last_block, 3u);  // two regions of part 0, one of part 1
++  std::vector<uint8_t> expected(kUnitA, 7);
++  expected.insert(expected.end(), kUnitB, 107);
++  expected.insert(expected.end(), kUnitC, 57);
++  EXPECT_EQ(store->Object("k"), expected);
++  std::memset(api->bases[Device(0, 0)], 0xEE, kBytes);
++  std::memset(api->bases[Device(0, 1)], 0xEE, kBytesC);
++  FetchResult fetched = manager->Fetch("r1", {"k"});
++  ASSERT_EQ(fetched.slots.size(), 1u);
++  EXPECT_TRUE(Holds(Device(1, 0), fetched.slots[0], 7));
++  EXPECT_TRUE(ShardHolds(1, fetched.slots[0], 57));
++  EXPECT_EQ(fetched.copied_bytes, kUnitA + kUnitB + kUnitC);
++  EXPECT_EQ(StatsOf("r1").loaded_slots, 1u);
++}
++
++// A pool of one part and a pool of two do not read each other's slots out of
++// the store either: the bytes of a slot mean something else.
++TEST_F(L1PartsTest, PoolsWithADifferentNumberOfPartsDoNotShareStoreContent) {
++  api = std::make_shared<RecordingApi>();
++  auto store = std::make_shared<FakeStore>();
++  manager = std::make_unique<PoolManager>(api);
++  manager->SetBackingStore(store);
++  Bring(0);
++  ASSERT_TRUE(manager->Attach("single", "tp", 5, kBytes).status.ok);
++  ASSERT_TRUE(manager->BindLayout("single", TestLayout()).ok);
++  ASSERT_EQ(manager->Open("single").num_slots, kSlots);
++  CacheOne(0, "k", 7);
++  ASSERT_EQ(manager->Allocate("r0", kSlots).slots.size(), kSlots);
++  ASSERT_EQ(store->Objects(), 1u);
++  EXPECT_TRUE(manager->Fetch("single", {"k"}).slots.empty());
++  FetchOptions probe;
++  probe.probe_only = true;
++  EXPECT_EQ(manager->Fetch("single", {"k"}, probe).available, 0u);
++}
++
+ TEST_F(L1PoolTest, AKeyHeldByManyPoolsIsTrackedThroughEveryHolderComingAndGoing) {
+   // Six pools: more holders of one key than an index entry keeps in place.
+   const int pools = 6;
+@@ -904,6 +1839,28 @@ TEST(L1ServiceTest, RoundTripsOverAUnixSocket) {
+     EXPECT_EQ(stats[1].fetched_in_slots, 3u);
+     EXPECT_TRUE(client.Detach("p0").ok);
+     EXPECT_FALSE(client.Open("p0").status.ok);
++    // A pool of two parts: each part attaches, binds and commits by its index.
++    for (const std::string id : {"r0", "r1"}) {
++      for (uint32_t part : {0u, 1u}) {
++        AttachResult attached =
++            client.Attach(id, "tp", 2 + static_cast<int>(part), kBytes, {}, PartSpec{part, 2});
++        ASSERT_TRUE(attached.status.ok) << attached.status.error;
++        EXPECT_EQ(client.Open(id).status.ok, false);
++        ASSERT_TRUE(client.BindLayout(id, TestLayout(), part).ok);
++      }
++      EXPECT_EQ(client.Open(id).num_slots, kSlots);
++    }
++    AllocateResult shard = client.Allocate("r0", 1, 1);
++    ASSERT_TRUE(client.Apply("r0", {Op{OpKind::kPublish, shard.slots[0], "s"}}, 700).ok);
++    ASSERT_TRUE(client.Commit("r0", 700, 0).ok);
++    EXPECT_TRUE(client.Fetch("r1", {"s"}).slots.empty());
++    ASSERT_TRUE(client.Commit("r0", 700, 1).ok);
++    FetchResult both = client.Fetch("r1", {"s"});
++    EXPECT_EQ(both.slots.size(), 1u);
++    EXPECT_EQ(both.copied_bytes, 2 * (kUnitA + kUnitB));
++    ASSERT_TRUE(client.Stats(&stats).ok);
++    ASSERT_EQ(stats.size(), 3u);
++    EXPECT_EQ(stats[1].parts, 2u);
+   }
+   unlink(path.c_str());
+ }
