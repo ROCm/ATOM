@@ -1669,10 +1669,7 @@ def _kda_gate(A_log_ptr, a_ptr, dt_bias_ptr, mask_k, LOWER_BOUND, USE_LOWER_BOUN
         dt_bias_ptr, mask=mask_k, other=0.0
     ).to(tl.float32)
     b_A = tl.load(A_log_ptr).to(tl.float32)
-    if USE_LOWER_BOUND:
-        return LOWER_BOUND * tl.sigmoid(tl.exp(b_A) * x)
-    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
-    return -tl.exp(b_A) * softplus_x
+    return _kda_log_decay(x, b_A, LOWER_BOUND, USE_LOWER_BOUND)
 
 
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])

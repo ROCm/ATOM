@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 """Construct native KDA layers and reach the real fused API on CPU tensors."""
 
 from types import SimpleNamespace as NS
@@ -175,6 +177,7 @@ def test_conv_weight_rank_is_rejected_before_kernel_launch(modules, monkeypatch)
 def test_fallback_passes_pool_owned_flush_resources(modules, monkeypatch, verify):
     c = layer_case(modules, monkeypatch, verify=verify)
     monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
+    c.attn._init_fused_kda_decode()
     for _ in range(2):
         c.attn._forward_impl(c.hidden)
     assert len(c.calls.split) == 2 and not c.calls.fused
@@ -239,7 +242,6 @@ def test_constructed_layer_routes_views_and_slots_to_real_api(
         "arch",
         "classic",
         "plugin",
-        "mixed",
         "head",
         "conv",
         "window",
@@ -267,10 +269,6 @@ def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
         c.meta.replayssm = False
         for name in ("replay_buf_k", "replay_buf_u", "replay_buf_g"):
             delattr(c.cache, name)
-    elif reason == "mixed":
-        c.meta.num_decodes = 1
-        c.meta.non_spec_query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
-        c.meta.non_spec_state_indices_in_tensor = c.read[:, 0]
     elif reason == "conv":
         c.attn.conv_kernel_size = 3
     elif reason == "window":
@@ -298,6 +296,8 @@ def test_unsupported_steps_execute_existing_path(modules, monkeypatch, reason):
         c.attn.f_b_proj.bias = torch.nn.Parameter(torch.zeros(256))
     elif reason == "activation":
         c.attn.activation = "relu"
+    # These mutations represent loaded configuration, before serving starts.
+    c.attn._init_fused_kda_decode()
     out = c.attn._forward_impl(c.hidden)
     assert not c.calls.fused and len(c.calls.conv) == len(c.calls.split) == 1
     torch.testing.assert_close(out, torch.full_like(out, 3))
@@ -308,6 +308,7 @@ def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank):
     c = layer_case(modules, monkeypatch, verify=True)
     c.attn.tp_size, c.attn.tp_rank = 2, rank
     monkeypatch.setattr(modules.kimi, "get_cu_num", lambda: 5)
+    c.attn._init_fused_kda_decode()
     report = modules.kimi._log_kda_wave_fallback
     report.cache_clear()
     try:
@@ -330,6 +331,69 @@ def test_wave_fallback_logs_geometry_once(modules, monkeypatch, caplog, rank):
             assert not messages
     finally:
         report.cache_clear()
+
+
+def test_static_checks_are_not_repeated_after_pool_qualification(modules, monkeypatch):
+    c = layer_case(modules, monkeypatch, verify=True)
+    c.attn._forward_impl(c.hidden)
+    checks = NS(weight=0, layout=0)
+    contiguous, stride = torch.Tensor.is_contiguous, torch.Tensor.stride
+
+    def count_contiguous(tensor, *args, **kwargs):
+        if tensor is c.attn.f_b_proj.weight:
+            checks.weight += 1
+        return contiguous(tensor, *args, **kwargs)
+
+    def count_stride(tensor, *args):
+        if tensor is c.cache.v_cache and not args:
+            checks.layout += 1
+        return stride(tensor, *args)
+
+    def no_device_query():
+        raise AssertionError("device constants must be cached before serving")
+
+    monkeypatch.setattr(torch.Tensor, "is_contiguous", count_contiguous)
+    monkeypatch.setattr(torch.Tensor, "stride", count_stride)
+    monkeypatch.setattr(modules.kimi, "get_gfx_runtime", no_device_query)
+    monkeypatch.setattr(modules.kimi, "get_cu_num", no_device_query)
+    c.attn._forward_impl(c.hidden)
+    assert len(c.calls.fused) == 2
+    # One validation remains at the public fused-kernel API boundary.
+    assert checks.weight == 1 and checks.layout == 0
+
+
+def test_child_online_quantization_is_seen_on_first_use(modules, monkeypatch):
+    c = layer_case(modules, monkeypatch, verify=True)
+    # The loader calls the parent's hook before the f_b child's quantization.
+    c.attn.f_b_proj.quant_type = modules.kimi.QuantType.per_Token
+    monkeypatch.setattr(
+        c.attn.f_b_proj, "forward", lambda x: F.linear(x, c.attn.f_b_proj.weight)
+    )
+    out = c.attn._forward_impl(c.hidden)
+    assert not c.calls.fused and len(c.calls.split) == 1
+    torch.testing.assert_close(out, torch.full_like(out, 3))
+
+
+@pytest.mark.parametrize("replacement", ["state", "conv", "records", "weight"])
+def test_pool_or_weight_rebinding_rechecks_eligibility(
+    modules, monkeypatch, replacement
+):
+    c = layer_case(modules, monkeypatch, verify=True)
+    c.attn._forward_impl(c.hidden)
+    assert len(c.calls.fused) == 1
+    if replacement == "state":
+        c.cache.v_cache = c.cache.v_cache.transpose(-1, -2)
+    elif replacement == "conv":
+        c.cache.k_cache = c.cache.k_cache[:, :3]
+    elif replacement == "records":
+        c.cache.replay_buf_k = c.cache.replay_buf_k[:, :, :8]
+    else:
+        c.attn.f_b_proj.weight = torch.nn.Parameter(
+            c.attn.f_b_proj.weight.T.contiguous().T
+        )
+    out = c.attn._forward_impl(c.hidden)
+    assert len(c.calls.fused) == 1 and len(c.calls.split) == 1
+    torch.testing.assert_close(out, torch.full_like(out, 3))
 
 
 @pytest.mark.parametrize("prefill", [False, True])

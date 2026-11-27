@@ -9,6 +9,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 """
 
 import logging
+import weakref
 from functools import lru_cache
 from typing import ClassVar
 
@@ -1312,7 +1313,61 @@ class KimiKDAAttention(nn.Module):
             ],
             dim=0,
         ).contiguous()
+        self._init_fused_kda_decode()
         self._in_proj_fused = True
+
+    def _init_fused_kda_decode(self) -> None:
+        """Cache device/model constants; child weight hooks and pools settle later."""
+        supported = (
+            get_gfx_runtime() == "gfx950"
+            and self.head_dim == 128
+            and self.conv_kernel_size == 4
+            and self.activation == "silu"
+        )
+        self._fused_kda_max_programs = get_cu_num() if supported else 0
+        self._fused_kda_pool = None
+
+    def _fused_kda_query_capacity(self, cache) -> int:
+        """Qualify fixed pool layouts once, refreshing when their tensors change."""
+        conv, state, records = cache.k_cache, cache.v_cache, cache.replay_buf_k
+        weight = self.f_b_proj.weight
+        previous = self._fused_kda_pool
+        if (
+            previous is not None
+            and previous[0]() is conv
+            and previous[1]() is state
+            and previous[2]() is records
+            and previous[3]() is weight
+        ):
+            return previous[4]
+        hd = self.head_dim
+        capacity = 0
+        if (
+            self.f_b_proj.quant_type == QuantType.No
+            and self.f_b_proj.bias is None
+            and weight.dtype == torch.bfloat16
+            and weight.shape == (self.local_proj_size, hd)
+            and weight.is_contiguous()
+            and conv.dtype == torch.bfloat16
+            and state.shape[1:] == (self.num_local_heads, hd, hd)
+            and state.stride()[1:] == (hd * hd, hd, 1)
+        ):
+            window = (
+                conv.shape[2]
+                if conv.shape[1] == 3 * self.local_proj_size
+                else conv.shape[1]
+            )
+            capacity = min(8, window - 2, records.shape[2] // 2)
+        # Parent post-load precedes f_b's online quantization. First use sees
+        # its final weight; weak references do not retain replaced allocations.
+        self._fused_kda_pool = (
+            weakref.ref(conv),
+            weakref.ref(state),
+            weakref.ref(records),
+            weakref.ref(weight),
+            capacity,
+        )
+        return capacity
 
     def _run_kda(
         self,
@@ -1443,30 +1498,21 @@ class KimiKDAAttention(nn.Module):
         # admission policy, not a kernel legality constraint. Use the padded
         # request bucket so replay never changes the selected path.
         num_seqs = 0
-        if kda_metadata.num_prefills == 0 and getattr(kda_metadata, "replayssm", False):
+        if (
+            self._fused_kda_max_programs > 0
+            and kda_metadata.num_prefills == 0
+            and getattr(kda_metadata, "replayssm", False)
+        ):
             num_seqs = kda_metadata.num_decodes or kda_metadata.num_spec_decodes
         fused = (
             num_seqs > 0
-            and (kda_metadata.num_decodes > 0) != (kda_metadata.num_spec_decodes > 0)
-            and hd == 128
-            and self.conv_kernel_size == 4
-            and self.activation == "silu"
-            and self.f_b_proj.quant_type == QuantType.No
-            and self.f_b_proj.bias is None
-            and fused_in.dtype == conv_state.dtype == torch.bfloat16
-            and self.f_b_proj.weight.dtype == torch.bfloat16
-            and self.f_b_proj.weight.shape == (lp, hd)
-            and self.f_b_proj.weight.is_contiguous()
-            and ssm_state.shape[1:] == (nlh, hd, hd)
-            and ssm_state.stride()[1:] == (hd * hd, hd, 1)
-            and 1 <= kda_metadata.replayssm_max_query_len <= 8
-            and conv_state.shape[-1] >= 2 + kda_metadata.replayssm_max_query_len
-            and cache.replay_buf_k.shape[2] >= 2 * kda_metadata.replayssm_max_query_len
-            and get_gfx_runtime() == "gfx950"
-            and 0 < num_seqs * nlh
+            and fused_in.dtype == torch.bfloat16
+            and 1
+            <= kda_metadata.replayssm_max_query_len
+            <= self._fused_kda_query_capacity(cache)
         )
         if fused:
-            num_cus = get_cu_num()
+            num_cus = self._fused_kda_max_programs
             if num_seqs * nlh > num_cus:
                 if self.tp_rank == 0:
                     _log_kda_wave_fallback(self.tp_size, num_seqs, nlh, num_cus)

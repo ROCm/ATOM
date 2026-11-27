@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
 
 """Kimi-K3's KDA decode / verify rows through one kernel, against the three it
 replaces -- `causal_conv1d_update`, f_b_proj and ReplaySSM's recurrence -- on
