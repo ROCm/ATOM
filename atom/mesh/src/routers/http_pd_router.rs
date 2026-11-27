@@ -3563,6 +3563,7 @@ mod tests {
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                     prefill_tokens: 5,
+                    decode_load: None,
                 },
                 None,
             )
