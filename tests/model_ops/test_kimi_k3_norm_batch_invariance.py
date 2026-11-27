@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+
 """BF16 normalization must not change when a prefix has different batch peers."""
 
 import pytest
@@ -83,7 +87,7 @@ def test_bf16_attn_res_batch_invariance(blocks, add_count):
     )
     score_weight, norm_weight = score_weight.cuda(), norm_weight.cuda()
     baseline = None
-    for rows in (97, 512, 513, 8192):
+    for rows in (97, 256, 257, 512, 513, 8192):
         x = _tile(prefix, rows).cuda()
         residuals = _tile(block, rows).cuda()
         add = [_tile(a, rows).cuda() for a in adds] if add_count else [None, None]

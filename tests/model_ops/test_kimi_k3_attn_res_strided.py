@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
 
 """apply_attn_res must read a strided slice of a block bank exactly as its copy."""
 
@@ -10,6 +11,7 @@ pytest.importorskip("aiter")
 pytest.importorskip("triton")
 
 from aiter import dtypes
+from aiter.ops.triton.fusions import attn_res as aiter_attn_res
 
 from atom.model_ops.kimi_k3 import attention_residual
 from atom.model_ops.kimi_k3.attention_residual import _apply_attn_res_impl
@@ -92,44 +94,36 @@ def test_offset_slices_match_their_copies(tokens):
         _assert_bitwise(_call(inputs, view, 2, True, True), want)
 
 
-@pytest.mark.parametrize("backend", ["triton", "tdm"])
+@pytest.mark.parametrize("backend", ["triton", "aiter"])
 @torch.inference_mode()
 def test_the_kernel_reads_the_bank_in_place(monkeypatch, backend):
-    # what the guard is for: the launch gets the slice itself, not a copy of it
-    monkeypatch.setitem(
-        attention_residual.envs.environment_variables,
-        "ATOM_KIMI_K3_ATTN_RES_GLUON_TDM",
-        lambda: backend == "tdm",
-    )
-    attention_residual._attn_res_tdm_module.cache_clear()
-    try:
-        tdm = attention_residual._attn_res_tdm_module()
-        if backend == "tdm" and tdm is None:
-            pytest.skip("Gluon TDM attn-res needs gfx1250 and the CDNA5 TDM API")
-        launched = []
+    if backend == "aiter" and attention_residual.arch_info.get_arch() != "gfx1250":
+        pytest.skip("AITER Gluon TDM attn-res needs gfx1250")
+    monkeypatch.setattr(attention_residual, "_USE_AITER_ATTN_RES", backend == "aiter")
+    launched = []
+    inline_kernel = attention_residual._attn_res_fused_kernel
+    tdm_launch = aiter_attn_res._launch_gate_tdm
 
-        def record(name, launcher):
+    class RecordingKernel:
+        def __getitem__(self, grid):
             def launch(br, *args, **kwargs):
-                launched.append((name, br.data_ptr(), br.stride()))
-                return launcher(br, *args, **kwargs)
+                launched.append(("triton", br.data_ptr(), br.stride()))
+                return inline_kernel[grid](br, *args, **kwargs)
 
             return launch
 
-        monkeypatch.setattr(
-            attention_residual,
-            "_launch_attn_res_triton",
-            record("triton", attention_residual._launch_attn_res_triton),
-        )
-        if tdm is not None:
-            monkeypatch.setattr(
-                tdm, "launch_attn_res_tdm", record("tdm", tdm.launch_attn_res_tdm)
-            )
-        x = _inputs(16, 20261032)
-        view = x["bank"][:, :3]
-        _call(x, view, 2, True, False)
-        assert launched == [(backend, view.data_ptr(), view.stride())]
-    finally:
-        attention_residual._attn_res_tdm_module.cache_clear()
+    def record_tdm(*args, **kwargs):
+        br = args[4]
+        launched.append(("aiter", br.data_ptr(), br.stride()))
+        return tdm_launch(*args, **kwargs)
+
+    monkeypatch.setattr(attention_residual, "_attn_res_fused_kernel", RecordingKernel())
+    monkeypatch.setattr(aiter_attn_res, "_launch_gate_tdm", record_tdm)
+    x = _inputs(16, 20261032)
+    view = x["bank"][:, :3]
+    _call(x, view, 2, True, False)
+    # Inspect the actual kernel launch, after AITER's input preparation too.
+    assert launched == [(backend, view.data_ptr(), view.stride())]
 
 
 @torch.inference_mode()

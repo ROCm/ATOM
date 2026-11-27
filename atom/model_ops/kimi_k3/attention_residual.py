@@ -18,10 +18,11 @@ Attention Residuals: https://arxiv.org/abs/2603.15031
 Four deliberate divergences from that reference:
 
 * ``residuals`` is a Sequence of separate ``[..., D]`` tensors there; here it is
-  one ``[T, B, H]`` block_residual (read by stride) plus ``prefix_sum`` read as
-  the final candidate. Not just cheaper -- their pointer-table gather cannot run
-  on ROCm at all (details at the ``Adapted from FLA`` note in the kernel body).
-* the caller's ``prefix_sum = prefix_sum + ...`` adds are folded into the last
+  one ``[T, B, H]`` block_residual (read by stride) plus ``prefix_sum``. The inline
+  Triton kernel reads the prefix last; AITER's Gluon kernel reads it first.
+  Their pointer-table gather cannot run on ROCm (details at the ``Adapted from
+  FLA`` note in the kernel body).
+* the caller's ``prefix_sum = prefix_sum + ...`` adds are folded into the prefix
   candidate's on-load (``DO_ADD``/``DO_ADD2``), which fla leaves to the caller.
   That fold is what lets the decoder layers defer their FFN and routed/shared
   expert adds across the layer boundary.
@@ -34,13 +35,14 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
-import functools
-
 import torch
+from aiter.ops.triton.fusions.attn_res import attn_res_gate
+from aiter.ops.triton.utils._triton import arch_info
 
-from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
+
+_USE_AITER_ATTN_RES = arch_info.get_arch() == "gfx1250"
 
 try:
     import triton
@@ -213,39 +215,6 @@ _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
 _ATTN_RES_BF16_CONFIG = (8, 2, 2)
 
 
-@functools.cache
-def _attn_res_tdm_module():
-    """The gfx1250 Gluon kernel module, which streams the candidate rows through
-    LDS with TDM, or None where it does not apply. Chosen per arch, never per
-    token count, so a row's result does not depend on its batch peers."""
-    if not envs.ATOM_KIMI_K3_ATTN_RES_GLUON_TDM:
-        return None
-    try:
-        from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-        if get_arch() != "gfx1250":
-            return None
-        from triton.experimental.gluon import language as gl
-
-        # Gluon can import on Triton versions without the CDNA5/TDM APIs.
-        # Probe before importing the kernel: names in its JIT body are only
-        # resolved at compilation, too late for this import-time fallback.
-        cdna5 = getattr(getattr(gl, "amd", None), "cdna5", None)
-        tdm = getattr(cdna5, "tdm", None)
-        if not all(
-            callable(getattr(cdna5, name, None))
-            for name in ("buffer_load", "buffer_store")
-        ) or not all(
-            callable(getattr(tdm, name, None))
-            for name in ("make_tensor_descriptor", "async_load", "async_wait")
-        ):
-            return None
-        from atom.model_ops.kimi_k3 import attention_residual_gluon
-    except ImportError:
-        return None
-    return attention_residual_gluon
-
-
 def _pick_attn_res_config(tokens: int):
     for max_tokens, nw, ns, bl in _ATTN_RES_CONFIGS:
         if tokens <= max_tokens:
@@ -298,8 +267,27 @@ def _apply_attn_res_impl(
     quant = quant_dtype is not None
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
+
+    if _USE_AITER_ATTN_RES:
+        y, prefix_out = attn_res_gate(
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+            output_rms_weight=out_norm_weight,
+            output_rms_eps=out_eps,
+            out_quant_dtype=quant_dtype,
+            backend="arch",
+        )
+        if quant:
+            y, y_scale = y
+            return y, y_scale, prefix_out
+        return y, prefix_out
+
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    # the kernel reads T and B by stride (i32 offsets) and H unit-stride, so a
+    # The kernel reads T and B by stride and H unit-stride, so a
     # slice of a wider block bank needs no copy
     br = (
         block_residual
@@ -325,37 +313,11 @@ def _apply_attn_res_impl(
     hs = add_hidden.contiguous() if do_add else ps
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
-    flags = {
-        "DO_ADD": do_add,
-        "DO_ADD2": do_add2,
-        "WRITE_PREF": do_add,
-        "OUT_NORM": out_norm,
-        "QUANT": quant,
-    }
-
-    tdm = _attn_res_tdm_module()
-    if tdm is not None and tdm.attn_res_tdm_supported(br):
-        tdm.launch_attn_res_tdm(
-            br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
-        )
-    else:
-        _launch_attn_res_triton(
-            br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
-        )
-    prefix_out = pref if do_add else prefix_sum
-    if quant:
-        return y, y_scale, prefix_out
-    return y, prefix_out
-
-
-def _launch_attn_res_triton(
-    br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
-):
-    T, B, H = br.shape
+    B = br.shape[1]
     Bp = B + 1
     nw, ns, bl = (
         _ATTN_RES_BF16_CONFIG
-        if ps.dtype == torch.bfloat16 and not flags["QUANT"]
+        if ps.dtype == torch.bfloat16 and not quant
         else _pick_attn_res_config(T)
     )
     _attn_res_fused_kernel[(T,)](
@@ -386,8 +348,16 @@ def _launch_attn_res_triton(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        **flags,
+        DO_ADD=do_add,
+        DO_ADD2=do_add2,
+        WRITE_PREF=do_add,
+        OUT_NORM=out_norm,
+        QUANT=quant,
     )
+    prefix_out = pref if do_add else prefix_sum
+    if quant:
+        return y, y_scale, prefix_out
+    return y, prefix_out
 
 
 def _apply_attn_res_op(
@@ -586,7 +556,7 @@ def apply_attn_res(
     add_hidden2: torch.Tensor | None = None,
     quant_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
+    """Dispatch an opaque custom op whose CUDA implementation selects by architecture.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
