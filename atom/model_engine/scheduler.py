@@ -6720,8 +6720,6 @@ class PrefillScheduler:
     can_recompute_prompts = False
     # P/D admission is decode-side Mooncake policy; this prefill side has none.
     pd_admission: PdAdmissionController | None = None
-    # The decode process owns the KV connector's scheduler side.
-    kv_connector = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs

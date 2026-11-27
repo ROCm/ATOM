@@ -525,15 +525,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # sequence, so a failed report (the worker retired the transfer: D was
         # told it failed) stops the prefill instead of computing for nobody.
         self._early_sources: dict[str, Sequence] = {}
-        # ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: P answers the router when it first
-        # schedules an early request (allocates it, or finds it must wait for
-        # D) rather than at DP dispatch. The engine drains these request ids
-        # after each schedule (`take_early_answers`).
-        self._answer_at_schedule = bool(
-            early_handoff and envs.ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE
-        )
-        self._early_answers: list[ReqId] = []
-        self._answered: set[ReqId] = set()
         # Max-heap of the registered, not yet allocated chunked requests
         # (`_chunked_waiting`), as (-prompt pages, id); stale entries are
         # dropped lazily when they reach the top.
@@ -758,8 +749,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             if seq.has_per_req_cache:
                 self._spec_state_pins.add(str(seq.id))
             self._early_sources[str(seq.id)] = seq
-        if self.is_producer and params.get("pd_early_handoff"):
-            self._answer_early(seq)
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
         ):
@@ -856,8 +845,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._chunked_waiting.pop(seq.id, None)
             self._chunked_ready.discard(seq.id)
             self._forget_early_source(seq.id)
-            if self._answer_at_schedule:
-                self._answered.discard(seq.id)
             if aborted:
                 # Its cancellation is queued below. A finished source keeps
                 # its pin until D reaches P or the worker reports it safe.
@@ -1000,36 +987,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             return True
         if not params.get("pd_early_handoff"):
             return False
-        if self._may_allocate_before_d(seq):
-            return True
-        # It waits for D (the gate), so D must learn of it now: answering only
-        # once it is scheduled would wait on itself.
-        self._answer_early(seq)
-        return False
-
-    # ------------------------------------------------- answering at schedule
-    #
-    # With ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE, P answers the router (NDJSON
-    # line 1) when it first schedules an early request instead of at DP
-    # dispatch, so D binds the request to a DP rank about one P queue wait
-    # later, close to when its KV starts to land. "Scheduled" is the first of:
-    # its source is allocated (`update_state_after_alloc`), or the admission
-    # rule sends it to the gate (`admission_ready`), where it waits for D's
-    # write request and so must be answered. A request that only queues behind
-    # P's own capacity holds nothing D waits on, so delaying its answer cannot
-    # form a cycle; the rule's premise (D reserves only requests already
-    # registered here) still holds, since registration happens in `add`.
-
-    def _answer_early(self, seq: Sequence) -> None:
-        if self._answer_at_schedule and seq.id not in self._answered:
-            self._answered.add(seq.id)
-            self._early_answers.append(seq.id)
-
-    def take_early_answers(self) -> list[ReqId]:
-        """Request ids to answer now; the engine sends each its frontend's
-        `pd_early_scheduled` event."""
-        answers, self._early_answers = self._early_answers, []
-        return answers
+        # Otherwise it waits for D's write request (the gate).
+        return self._may_allocate_before_d(seq)
 
     # ---------------------------------------------- allocation before D's report
     #

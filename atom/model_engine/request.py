@@ -4,11 +4,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-# `kv_transfer_params_output` key of the token-less, unfinished output that
-# tells a P/D early-handoff prefill's front end its request was scheduled
-# (ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE).
-PD_EARLY_SCHEDULED_KEY = "pd_early_scheduled"
-
 
 @dataclass
 class RequestOutput:

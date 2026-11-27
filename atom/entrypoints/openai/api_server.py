@@ -53,7 +53,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
-from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY, RequestOutput
+from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import leaves_media_on_prefill, new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
@@ -1099,31 +1099,6 @@ class _EarlyPrefill:
             self.task.cancel()
 
 
-async def _wait_until_scheduled(seq, token_queue: asyncio.Queue) -> None:
-    """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: hold the early answer until P's
-    scheduler reports it scheduled the request (allocated its source, or sent
-    it to wait for D). A request that ends first was never prefilled: fail it
-    like a prefill error. Leaving (the router hung up) aborts it."""
-    finished = False
-    try:
-        while True:
-            item = await token_queue.get()
-            if item.get(PD_EARLY_SCHEDULED_KEY):
-                return
-            if item.get("finished", False):
-                finished = True
-                raise RuntimeError(
-                    "P/D early handoff: prefill ended before it was scheduled "
-                    f"({item.get('finish_reason')})"
-                )
-    except BaseException:
-        if not finished:
-            with contextlib.suppress(Exception):
-                engine.core_mgr.abort_request(seq.id)
-        engine.io_processor.requests.pop(seq.id, None)
-        raise
-
-
 def _nonstream_response(body: dict[str, Any], final_output: dict[str, Any]):
     """The JSON answer, or for an early-handoff prefill the two-line NDJSON
     answer (line 1 now, line 2 when the prefill ends)."""
@@ -1196,9 +1171,6 @@ async def generate_async(
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
-                PD_EARLY_SCHEDULED_KEY: bool(
-                    (kv_transfer_output_meta_info or {}).get(PD_EARLY_SCHEDULED_KEY)
-                ),
             },
         )
 
@@ -1234,8 +1206,6 @@ async def generate_async(
                 engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
             raise RuntimeError("P/D early handoff: DP rank unknown at dispatch")
-        if envs.ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE:
-            await _wait_until_scheduled(seq, token_queue)
         response = {
             "text": "",
             "token_ids": new_token_ids(),

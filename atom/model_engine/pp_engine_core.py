@@ -19,7 +19,6 @@ from atom.model_engine.engine_core import (
     HELD_POLL_S,
     EngineCore,
     publish_idle_state_work,
-    send_early_handoff_answers,
     yield_gil,
 )
 from atom.model_engine.scheduler import ScheduledBatch
@@ -176,7 +175,6 @@ class PPEngineCoreProc(EngineCore):
         launched = 0
         while len(self._in_flight) < self.pp_max_inflight:
             result = self.scheduler.schedule()
-            send_early_handoff_answers(self)
 
             rejected = self.scheduler.take_rejected()
             if rejected:

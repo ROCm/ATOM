@@ -30,7 +30,6 @@ from atom.model_engine.engine_utility import (
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
-from atom.model_engine.request import PD_EARLY_SCHEDULED_KEY, RequestOutput
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -85,35 +84,6 @@ def dp_idle_when_blocked(config: Config) -> bool:
     if enabled is None:
         enabled = disaggregated_kv_role(config) == "kv_producer"
     return enabled
-
-
-def send_early_handoff_answers(core) -> None:
-    """ATOM_PD_EARLY_HANDOFF_AT_SCHEDULE: tell each early request's front end
-    that the step just scheduled scheduled it (or sent it to wait for D), so
-    it answers the router now. Queued ahead of the step's forward."""
-    kv_connector = core.scheduler.kv_connector
-    if kv_connector is None:
-        return
-    answers = kv_connector.take_early_answers()
-    if not answers:
-        return
-    core.output_queue.put_nowait(
-        (
-            "STREAM",
-            [
-                (
-                    req_id,
-                    RequestOutput(
-                        request_id=req_id,
-                        output_tokens=[],
-                        finished=False,
-                        kv_transfer_params_output={PD_EARLY_SCHEDULED_KEY: True},
-                    ),
-                )
-                for req_id in answers
-            ],
-        )
-    )
 
 
 def yield_gil() -> None:
@@ -698,7 +668,6 @@ class EngineCore:
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
         result = self.scheduler.schedule()
-        send_early_handoff_answers(self)
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -1337,10 +1306,6 @@ class DPEngineCoreProc(EngineCore):
                     # CPU tier) instead of staying COPYING with their pins
                     # (`BlockManager.complete_previous_checkpoint_batch`).
                     self.scheduler.block_manager.complete_previous_checkpoint_batch()
-                    # The vote's admission probe (`has_forward_work`) may have
-                    # sent an early request to wait for D: answer it now, or
-                    # with every rank idle P waits on D while D waits on P.
-                    send_early_handoff_answers(self)
                     blocked = idle_when_blocked and bool(self.scheduler.waiting)
                     if self.has_pending_kv_work() or blocked:
                         # Local RPCs only. Anything that reaches schedule()

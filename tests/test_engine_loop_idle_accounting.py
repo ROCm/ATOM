@@ -52,8 +52,6 @@ def _extract(class_name: str, method: str):
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
         "HELD_POLL_S": 0.0,
         "yield_gil": lambda: None,
-        # P/D early handoff is off here: nothing to answer.
-        "send_early_handoff_answers": lambda core: None,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope
@@ -101,7 +99,6 @@ class _Engine:
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
             close_kv_connector=lambda: None,
-            kv_connector=None,
         )
         self.utility_queue = None
         self.utility_handler = SimpleNamespace(

@@ -165,11 +165,6 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
 
     def cancel_pending_load(self, seq) -> None: ...
 
-    # The P/D early-handoff hook the engine reads off any connector
-    # (`KVConnectorSchedulerBase`); offload keeps none.
-    def take_early_answers(self) -> list:
-        return []
-
 
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)

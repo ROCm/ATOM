@@ -126,8 +126,6 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
                 info=lambda *a: None, warning=lambda *a: None, exception=lambda *a: None
             ),
             "tracing": SimpleNamespace(shutdown=lambda: None),
-            # P/D early handoff is off here: nothing to answer.
-            "send_early_handoff_answers": lambda core: None,
         }
         for name, method in _loop_methods(scope).items():
             setattr(engine, name, method.__get__(engine))
