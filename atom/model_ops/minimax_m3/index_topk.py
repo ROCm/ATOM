@@ -35,10 +35,15 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+
+# The only arch aiter's FlyDSL M3 index scorers build for (ROCm/aiter#5626,
+# SUPPORTED_ARCHS == ("gfx950",)). There is no Triton fallback behind either
+# scoring phase, so the arch is refused at startup where the index cache is sized
+# (`AiterAttentionMetadataBuilder._index_cache_spec`) rather than at the first score.
+SCORER_ARCH = "gfx950"
 
 
 @functools.cache
@@ -115,20 +120,15 @@ SCORE_NUM_STAGES = 3
 
 @functools.cache
 def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
-    """Return (warps, stages) without changing the tuned gfx950 path."""
-    if get_gfx() != "gfx1250":
-        return 4, SCORE_NUM_STAGES
+    """(warps, stages) for the Triton prefill reference kernel (`_index_block_score_kernel`).
 
-    # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
-    # enough that four warps outperform eight on long-context prefill. Keep
-    # the BF16 configuration separate: it does not have the same tradeoff.
-    fp8_dtypes = (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e4m3fnuz", None),
-        getattr(torch, "float8_e5m2", None),
-        getattr(torch, "float8_e5m2fnuz", None),
-    )
-    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
+    Constant now that the index scorer path is gfx950-only: the production prefill
+    runs the FlyDSL scorer, and this Triton kernel stays only as the oracle the
+    tests score against. The old gfx1250 (wave32) launch branch was dead -- M3's
+    FlyDSL scorers do not build for gfx1250/gfx942, so the arch is refused at
+    startup (`AiterAttentionMetadataBuilder._index_cache_spec`) and this kernel
+    never runs there. ``dtype`` is kept for the call sites that pass it."""
+    return 4, SCORE_NUM_STAGES
 
 
 # Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache.

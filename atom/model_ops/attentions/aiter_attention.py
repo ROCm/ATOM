@@ -523,6 +523,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         if not self._has_sparse_attention:
             return None
+        # MiniMax-M3's index scorers are aiter FlyDSL kernels that build only for
+        # gfx950 (ROCm/aiter#5626), and the Triton decode scorer that used to serve
+        # the other archs is gone. Refuse non-gfx950 here, when the pool is sized,
+        # naming the live arch -- not 57 layers into the first decode, where aiter's
+        # own _validate_arch fails with a message that names neither the arch bound
+        # nor ATOM. The live GPU, not get_gfx() (which follows the GPU_ARCHS build
+        # setting). fp4 caches also hit the same bound earlier in validate_runtime_config.
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if arch != "gfx950":
+            from atom.model_ops.minimax_m3.index_topk import SCORER_ARCH
+
+            raise ValueError(
+                f"MiniMax-M3's index scorer requires {SCORER_ARCH}, got {arch}: "
+                "its FlyDSL index scorers are gfx950-only (ROCm/aiter#5626) and the "
+                "Triton decode scorer has been removed, so there is no scorer for "
+                "this arch."
+            )
         from aiter import dtypes
 
         config = self.model_runner.config

@@ -49,25 +49,21 @@ TOPK = 16
 
 
 @pytest.mark.parametrize(
-    "arch,dtype,want",
+    "dtype",
     [
-        ("gfx942", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
-        ("gfx942", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.float8_e4m3fn, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
-        ("gfx1250", torch.bfloat16, (8, m.SCORE_NUM_STAGES)),
-        ("gfx1250", torch.float8_e4m3fn, (4, 1)),
-        ("gfx1250", torch.float8_e4m3fnuz, (4, 1)),
-        ("gfx1250", torch.float8_e5m2, (4, 1)),
-        ("gfx1250", torch.float8_e5m2fnuz, (4, 1)),
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
     ],
 )
-def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
-    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+def test_prefill_score_launch_config(dtype):
+    # Constant now that the index scorer path is gfx950-only: the Triton prefill
+    # kernel is just the tests' oracle, and the old gfx1250 (wave32) launch branch
+    # was dead (M3's FlyDSL scorers do not build for gfx1250/gfx942, so the arch is
+    # refused at startup). No dependence on arch or dtype any more.
     m._prefill_score_launch_config.cache_clear()
     try:
-        assert m._prefill_score_launch_config(dtype) == want
+        assert m._prefill_score_launch_config(dtype) == (4, m.SCORE_NUM_STAGES)
     finally:
         m._prefill_score_launch_config.cache_clear()
 
@@ -1128,19 +1124,22 @@ class TestPrefillScoreAgainstTheDefinition:
         assert not torch.allclose(moved[live], want[live], rtol=2e-2, atol=2e-2)
 
 
-def test_the_native_kv_pool_allocator_refuses_bf16_by_name():
-    """The native refusal that matters most: it happens before anything is allocated.
+def test_the_native_kv_pool_allocator_refuses_bf16_and_non_gfx950_by_name(monkeypatch):
+    """The native refusals that matter most: they happen before anything is allocated.
 
-    `_index_cache_spec` runs when the KV pool is sized. Without this the same
+    `_index_cache_spec` runs when the KV pool is sized. Without these the same
     configuration starts, serves a prefill and dies at the first decode inside
-    aiter, which names neither the flag nor ATOM as the refuser.
+    aiter, which names neither the flag/arch nor ATOM as the refuser.
 
-    Pinned because a refusal nothing watches is one refactor from disappearing,
-    and this one is the whole of the fp8 narrowing on the native path.
+    Pinned because a refusal nothing watches is one refactor from disappearing:
+    the fp8 narrowing and the gfx950-only narrowing are the whole of the native
+    guard (the FlyDSL scorers are gfx950-only and there is no Triton fallback).
     """
     from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
 
-    def spec(index_cache_dtype):
+    def spec(index_cache_dtype, arch="gfx950"):
+        # the live GPU the builder reads; patched where _index_cache_spec imports it
+        monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: arch)
         b = object.__new__(AiterAttentionMetadataBuilder)
         b._has_sparse_attention, b.block_size = True, 128
         b.row_counts = dict
@@ -1154,12 +1153,20 @@ def test_the_native_kv_pool_allocator_refuses_bf16_by_name():
         )
         return b._index_cache_spec(128)
 
+    # A non-gfx950 GPU is refused for every index dtype, before the dtype branch,
+    # naming the live arch: its FlyDSL scorers do not build there and the Triton
+    # decode scorer is gone, so nothing would score.
+    for index_dtype in ("fp8", "fp4", "bf16"):
+        with pytest.raises(ValueError, match="requires gfx950, got gfx942"):
+            spec(index_dtype, arch="gfx942")
+
+    # On gfx950 the dtype narrowing stands: bf16 refused by name...
     with pytest.raises(ValueError, match="--kv_cache_dtype fp8") as native:
         spec("bf16")
     assert "--index-cache-dtype fp8" in str(
         native.value
     )  # the native server's own flag
-    # fp8 still resolves, so the guard is not refusing everything
+    # ...and fp8 still resolves, so neither guard is refusing everything
     assert spec("fp8").view_dtype == aiter.dtypes.fp8
 
 
@@ -1369,107 +1376,3 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
         assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
         assert int(bt[:n].max()) < 10_000 * 8 * heads
     assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
-
-
-@gpu
-@pytest.mark.parametrize("heads", [1, 4])
-@pytest.mark.parametrize("strided_q", [False, True])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize(
-    "qlens,prefixes,q_zero",
-    [
-        ([1], [128], False),
-        ([129, 17, 0], [127, 4096, 0], False),
-        ([257], [4096], True),
-        ([2517], [102784], False),
-    ],
-)
-def test_prefill_launch_policy_preserves_scores_and_selection(
-    monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
-):
-    """The launch-only optimization must preserve the previous PR's exact output.
-
-    Compare every causally valid score and all top-k/page-table outputs against
-    the previous (8 warps, FP8 stages=1 / BF16 stages=3) launch, on identical
-    tensor values. This supplements rather than replaces the independent
-    selector/oracle tests above.
-    """
-    import triton
-
-    if m.get_gfx() != "gfx1250":
-        pytest.skip("gfx1250 launch-policy regression")
-    kw = _inputs(qlens, prefixes, heads, "cuda")
-    q = kw["idx_q"]
-    if strided_q:
-        storage = torch.empty(
-            (q.shape[0], heads * 2, HEAD_DIM), dtype=q.dtype, device=q.device
-        )
-        storage[:, 1 : heads + 1].copy_(q)
-        q = storage[:, 1 : heads + 1]
-        kw["idx_q"] = q
-    if q_zero:
-        q.zero_()
-    cache = kw["index_kv_cache"].to(cache_dtype)
-    kw["index_kv_cache"] = cache
-    # Check that logical and physical page ids are not accidentally conflated.
-    kw["block_table"] = torch.randperm(
-        cache.shape[0], dtype=torch.int32, device=q.device
-    ).reshape(kw["block_table"].shape)
-    total_q = sum(qlens)
-    max_block = triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
-    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    chunk = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, q.device)
-    valid_counts = torch.cat(
-        [
-            (torch.arange(length, device=q.device) + prefix + SPARSE_BLOCK_SIZE)
-            // SPARSE_BLOCK_SIZE
-            for length, prefix in zip(qlens, prefixes)
-        ]
-    )
-    valid = (
-        torch.arange(max_block, device=q.device)[None, None, :]
-        < valid_counts[None, :, None]
-    ).expand(heads, -1, -1)
-
-    def score(config):
-        result = torch.full((heads, total_q, max_block), float("nan"), device=q.device)
-        m._index_block_score_kernel[
-            (q_tiles, len(qlens) * heads, triton.cdiv(max_block, chunk))
-        ](
-            q,
-            cache,
-            result,
-            kw["block_table"],
-            kw["cu_seqlens_q"],
-            kw["seq_lens"],
-            kw["prefix_lens"],
-            heads,
-            HEAD_DIM,
-            kw["sm_scale"],
-            chunk,
-            *q.stride(),
-            *cache.stride(),
-            *result.stride(),
-            kw["block_table"].stride(0),
-            BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
-            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-            num_warps=config[0],
-            num_stages=config[1],
-        )
-        return result
-
-    old_config = (8, 1 if cache_dtype == torch.float8_e4m3fn else m.SCORE_NUM_STAGES)
-    new_config = m._prefill_score_launch_config(cache_dtype)
-    old_score, new_score = score(old_config), score(new_config)
-    torch.cuda.synchronize()
-    assert torch.isfinite(old_score[valid]).all()
-    assert torch.equal(old_score[valid], new_score[valid])
-
-    # Exercise the production wrapper too; do not validate only a raw launch.
-    new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
-    with monkeypatch.context() as patch:
-        patch.setattr(m, "_prefill_score_launch_config", lambda dtype: old_config)
-        old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
-    torch.cuda.synchronize()
-    for old_output, new_output in zip(old_outputs, new_outputs):
-        assert torch.equal(old_output, new_output)
