@@ -5,17 +5,17 @@ import functools
 from typing import Optional
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
-from atom.config import QuantizationConfig
-from atom.quant_spec import LayerQuantConfig
-from aiter.jit.utils.torch_guard import torch_compile_guard
-
 from aiter import (
     QuantType,
     dtypes,
+    silu_and_mul,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from torch import nn
+
+from atom.config import QuantizationConfig
+from atom.quant_spec import LayerQuantConfig
 
 
 def mxfp4_act_mul_quant_fuse_fake(
@@ -128,10 +128,10 @@ class SiluAndMul(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # fp8 quantization
         if x_scale is not None and self.fused_quant:
+            import aiter as rocm_aiter
             from aiter.ops.triton.fused_fp8_quant import (
                 fused_silu_mul_fp8_per_tensor_static_quant,
             )
-            import aiter as rocm_aiter
 
             rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
