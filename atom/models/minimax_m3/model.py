@@ -114,6 +114,12 @@ from atom.utils.region_graph import token_graph
 # next all-reduce (the k5 one-shot kernel's default row cap; larger calls would only
 # run the deferred launch in front of another AR path).
 _TAIL_IN_AR_MAX_ROWS = 256
+# DSpark taps through the next all-reduce's residual output up to this many rows: the Gluon
+# one-shot / k5 Gluon-order range, whose residual output rounds the rank sum to bf16 first, and far
+# below the sequence-parallel AR range (ATOM_M3_PREFILL_SP_AR, > 32 MiB), where the residual is whole
+# on every rank (aiter sp_allreduce_add_residual: "the residual_out the next replicated AR + norm
+# would write")
+_TAP_VIA_AR_MAX_ROWS = 128
 _logged_once: set[str] = set()
 # Diagnostic: join the shared-expert stream before the routed MoE (see dual_stream_moe_forward).
 _EARLY_JOIN = os.environ.get("ATOM_MINIMAX_M3_MOE_EARLY_JOIN", "0") == "1"
@@ -890,7 +896,13 @@ class MiniMaxM3MoE(nn.Module):
         if _nn_module._global_forward_hooks or _nn_module._global_forward_pre_hooks:
             return False
         owner = self._owner_layer() if self._owner_layer is not None else None
-        if owner is None or owner._forward_hooks:
+        if owner is None:
+            return False
+        if owner._forward_hooks and not (
+            len(owner._forward_hooks) == 1 and owner.tap_via_next_ar(hidden_states.shape[0])
+        ):
+            # a reader of this layer's output besides the next all-reduce; the layer's own DSpark
+            # tap is not one when the next all-reduce writes it (tap_via_next_ar)
             return False
         nxt = getattr(owner, "_next_layer", None)
         nxt = nxt() if nxt is not None else None
@@ -984,6 +996,17 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        out = self._single_stream_moe_forward(hidden_states, shared_in)
+        if getattr(self, "_use_dual_stream", False):
+            # reached through the dual-stream op only (eager): its DSpark tap as there
+            out = self._tap_to_next_ar(out)
+        return out
+
+    def _single_stream_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         if self.shared_input_from_moe_quant:
@@ -1060,7 +1083,42 @@ class MiniMaxM3MoE(nn.Module):
             route_and_experts=route_and_experts,
         )
 
+    def _tap_to_next_ar(self, output: torch.Tensor) -> torch.Tensor:
+        """DSpark tap on this layer (``MiniMaxM3DecoderLayer.tap_via_next_ar``): the tap is
+        the residual stream after the layer, which the all-reduce consuming ``output`` (the
+        next layer's input AR + norm, or the final norm's) computes as its residual output.
+        Hand it the tap buffer rows the drafter's hook would have written."""
+        owner = self._owner_layer() if self._owner_layer is not None else None
+        if owner is None or not owner.tap_via_next_ar(output.shape[0]):
+            return output
+        from aiter.ops.flydsl.moe_deferred_tail import register_residual_tap
+        from atom.utils.forward_context import get_forward_context
+
+        ctx = get_forward_context().context
+        tokens = ctx.ubatch_token_order
+        if tokens is None:
+            offset = ctx.ubatch_token_offset
+            tokens = slice(offset, offset + output.shape[0])
+        register_residual_tap(output, owner._tap_buf, tokens)
+        _log_once(
+            "tap_via_ar",
+            "MiniMax-M3: DSpark taps written by the next all-reduce's residual output "
+            f"(first at {output.shape[0]} rows)",
+        )
+        return output
+
     def dual_stream_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """``_dual_stream_moe_forward``, then this layer's DSpark tap handed to the next
+        all-reduce (``_tap_to_next_ar``) on every path."""
+        return self._tap_to_next_ar(
+            self._dual_stream_moe_forward(hidden_states, shared_in)
+        )
+
+    def _dual_stream_moe_forward(
         self,
         hidden_states: torch.Tensor,
         shared_in: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -1733,6 +1791,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
+        # DSpark tap buffer of this layer (MiniMaxM3Model.set_aux_hidden_state_rows), or None
+        self._tap_buf = None
+        self._tap_idx = -1
         attn_cls = (
             MiniMaxM3SparseAttention
             if layer_num in _sparse_attention_layer_ids(config)
@@ -1996,8 +2057,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         return ffn(hidden_states), residual
 
-    @staticmethod
-    def aux_hidden_state(output: tuple) -> torch.Tensor:
+    def tap_via_next_ar(self, rows: int) -> bool:
+        """Whether this layer's DSpark tap is written by the all-reduce that consumes its
+        output, not by the drafter's hook: a MoE layer on the one-stream MoE path whose
+        routed tail may go to that all-reduce (decode sizes). The tap is the residual
+        stream after the layer, i.e. that all-reduce's residual output: the same bits
+        (the all-reduce's bf16 rank-order sum, then the fp32 residual add, as the hook's
+        all-reduce + add), so the layer's tail can be deferred into it (P6)."""
+        moe = self.block_sparse_moe if self.is_moe_layer else None
+        return bool(
+            self._tap_buf is not None
+            and moe is not None
+            and getattr(moe, "_tail_in_ar", False)
+            and getattr(moe, "_use_dual_stream", False)
+            and rows <= _TAP_VIA_AR_MAX_ROWS
+        )
+
+    def aux_hidden_state(self, output: tuple) -> torch.Tensor:
         """This layer's output as a DSpark draft reads it: the residual stream
         after the layer, ``hidden + residual``.
 
@@ -2005,14 +2081,65 @@ class MiniMaxM3DecoderLayer(nn.Module):
         which the next layer's fused all-reduce RMSNorm performs -- so it is
         reduced here first. That costs one all-reduce per tapped layer per
         target forward, only when a DSpark drafter taps this layer.
+
+        A layer bound to a tap buffer (``set_aux_hidden_state_rows``) decides per call,
+        inside an op (``minimax_m3_dspark_tap_value``): the compiled forward traces the
+        drafter's hook once (at a prefill size) and then runs without guards, so a
+        size test here would be fixed at trace time. At decode sizes
+        (``tap_via_next_ar``) the all-reduce that consumes this layer's output writes
+        the tap rows after the hook, and the layer's tail stays deferred into it.
         """
         hidden_states, residual = output[0], output[1]
+        if self._tap_buf is not None:
+            return torch.ops.aiter.minimax_m3_dspark_tap_value(
+                hidden_states, residual, self._tap_idx
+            )
+        return self._aux_value(hidden_states, residual)
+
+    @staticmethod
+    def _aux_value(hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """``hidden + residual`` with ``hidden`` all-reduced (``aux_hidden_state``)."""
         if get_tensor_model_parallel_world_size() > 1:
             if MiniMaxM3Model.sp_ar_enabled:
                 # The residual may be sequence-parallel (prefill sizes): the op gathers it.
                 return sp_allreduce_add_residual(hidden_states, residual)
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states + residual
+
+
+# Decoder layers bound to a DSpark tap buffer, by layer index (MiniMaxM3Model.set_aux_hidden_state_rows)
+_TAP_LAYERS: dict = {}
+
+
+def minimax_m3_dspark_tap_value(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_idx: int
+) -> torch.Tensor:
+    """The value the drafter's hook writes for tapped layer ``layer_idx``, decided per call.
+
+    At decode sizes (``tap_via_next_ar``), the all-reduce that consumes ``hidden_states`` writes
+    the tap rows itself (``MiniMaxM3MoE._tap_to_next_ar``). That all-reduce runs after the hook,
+    in stream order, so the hook's copy of this placeholder is overwritten. ``hidden_states``
+    (possibly a deferred MoE tail, written by that all-reduce) is not read. Otherwise this is
+    ``MiniMaxM3DecoderLayer._aux_value``, as the hook computed it before."""
+    ref = _TAP_LAYERS.get(layer_idx)
+    layer = ref() if ref is not None else None
+    if layer is not None and layer.tap_via_next_ar(hidden_states.shape[0]):
+        return torch.empty_like(hidden_states)
+    return MiniMaxM3DecoderLayer._aux_value(hidden_states, residual)
+
+
+def _minimax_m3_dspark_tap_value_fake(
+    hidden_states: torch.Tensor, residual: torch.Tensor, layer_idx: int
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_dspark_tap_value",
+    op_func=minimax_m3_dspark_tap_value,
+    mutates_args=(),
+    fake_impl=_minimax_m3_dspark_tap_value_fake,
+)
 
 
 @token_graph(per_phase=True)
@@ -2101,6 +2228,18 @@ class MiniMaxM3Model(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def set_aux_hidden_state_rows(self, layer_ids, buffers) -> None:
+        """The drafter's tap buffers (spec decode ``arm_aux_capture``): a MoE layer's tap
+        then goes through the next all-reduce at decode sizes
+        (``MiniMaxM3DecoderLayer.tap_via_next_ar``)."""
+        for lid, buf in zip(layer_ids, buffers):
+            if 0 <= lid < len(self.layers):
+                layer = self.layers[lid]
+                if isinstance(layer, MiniMaxM3DecoderLayer) and layer.is_moe_layer and buf.numel():
+                    layer._tap_buf = buf
+                    layer._tap_idx = lid
+                    _TAP_LAYERS[lid] = weakref.ref(layer)
 
     def forward(
         self,
