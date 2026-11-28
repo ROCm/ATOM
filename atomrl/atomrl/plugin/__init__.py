@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Copyright (c) 2026 ZhangDanyang-AMD
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
-"""AtomRL plugin adapters for external RL frameworks (verl and vime)."""
+"""AtomRL plugin adapters for verl, vime, miles, and slime."""

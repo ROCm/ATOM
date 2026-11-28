@@ -1,6 +1,11 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2022 The HuggingFace Team. All rights reserved.
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/trainer/ppo/core_algos.py
 
 """Shared PyTorch loss helpers for policy optimization algorithms."""
 

@@ -1,4 +1,13 @@
-# Copyright 2025 The AtomRL Authors.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/trainer/ppo/rollout_corr_helper.py
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/trainer/ppo/core_algos.py
+# Source: https://github.com/verl-project/verl/blob/ca439aa5afcfe913c075570a9cb3f0f83730904d/verl/trainer/ppo/ray_trainer.py
+
 # Derived from verl (verl-project/verl):
 #   verl/trainer/ppo/rollout_corr_helper.py (IS weights, rejection sampling, metrics)
 #   verl/trainer/ppo/core_algos.py (bypass_mode loss integration)

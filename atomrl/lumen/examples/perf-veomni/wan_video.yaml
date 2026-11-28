@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/ByteDance-Seed/VeOmni/blob/573848a00fcd7329c2411346c6f4a983e9f67e3f/configs/dit/wan2.1_I2V_1.3B_lora.yaml
+# Source: https://github.com/ByteDance-Seed/VeOmni/blob/573848a00fcd7329c2411346c6f4a983e9f67e3f/docs/examples/wan2.1_I2V_1.3B.md
+
 # Wan2.1-T2V-1.3B DiT SFT, online training -- the video (T>1) side of the example.
 #
 # Derived from VeOmni's configs/dit/wan2.1_I2V_1.3B_lora.yaml and

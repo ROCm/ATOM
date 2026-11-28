@@ -26,6 +26,7 @@ CONTAINER="lumen-dsv4-bootstrap-extract-$$"
 MEGATRON_STAMP="${BOOTSTRAP_DIR}/.megatron_rocm_ref"
 SITE_PACKAGES="${BOOTSTRAP_DIR}/site-packages"
 VENV_SITE="/opt/venv/lib/python3.10/site-packages"
+THIRD_PARTY_IMAGE_SOURCES="${BOOTSTRAP_DIR}/THIRD_PARTY_IMAGE_SOURCES"
 
 _megatron_prepared() {
     [[ -f "${MEGATRON_STAMP}" ]] \
@@ -77,24 +78,50 @@ _resolve_extract_source() {
 _copy_from_extract_source() {
     local pkg="$1"
     local source="$2"
+    local cname=""
+    local remove_container=0
     echo "  - site-packages/${pkg} (docker extract)"
     if [[ "${source}" == container:* ]]; then
-        local cname="${source#container:}"
-        docker cp "${cname}:${VENV_SITE}/${pkg}" "${SITE_PACKAGES}/${pkg}" \
-            || echo "    (skip missing ${pkg})"
+        cname="${source#container:}"
     else
         local image="${source#image:}"
         docker rm -f "${CONTAINER}" 2>/dev/null || true
-        docker create --name "${CONTAINER}" "${image}" >/dev/null
-        docker cp "${CONTAINER}:${VENV_SITE}/${pkg}" "${SITE_PACKAGES}/${pkg}" \
-            || echo "    (skip missing ${pkg})"
+        docker create --name "${CONTAINER}" --entrypoint sleep "${image}" infinity \
+            >/dev/null
+        docker start "${CONTAINER}" >/dev/null
+        cname="${CONTAINER}"
+        remove_container=1
+    fi
+
+    if ! docker cp "${cname}:${VENV_SITE}/${pkg}" "${SITE_PACKAGES}/${pkg}"; then
+        echo "    (skip missing ${pkg})"
+    else
+        local metadata_paths
+        metadata_paths="$(
+            docker exec "${cname}" python3 -c \
+                "import importlib.metadata as m; print(*[d._path for n in m.packages_distributions().get('${pkg}', []) for d in [m.distribution(n)]], sep='\\n')" \
+                2>/dev/null || true
+        )"
+        while IFS= read -r metadata_path; do
+            [[ -n "${metadata_path}" ]] || continue
+            echo "    + $(basename "${metadata_path}")"
+            docker cp "${cname}:${metadata_path}" \
+                "${SITE_PACKAGES}/$(basename "${metadata_path}")"
+        done <<< "${metadata_paths}"
+        printf '%s\t%s\t%s\n' "${source}" "${pkg}" \
+            "${metadata_paths//$'\n'/,}" >> "${THIRD_PARTY_IMAGE_SOURCES}"
+    fi
+
+    if [[ "${remove_container}" == 1 ]]; then
         docker rm -f "${CONTAINER}" >/dev/null
     fi
 }
 
 _install_site_packages() {
     mkdir -p "${SITE_PACKAGES}"
+    : > "${THIRD_PARTY_IMAGE_SOURCES}"
     _install_pip_packages
+    printf '%s\t%s\n' "pip" "mbridge" >> "${THIRD_PARTY_IMAGE_SOURCES}"
 
     local extract_source=""
     if extract_source="$(_resolve_extract_source)"; then

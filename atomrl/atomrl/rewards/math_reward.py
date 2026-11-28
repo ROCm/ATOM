@@ -1,6 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-# Copyright 2026 Advanced Micro Devices, Inc.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/utils/reward_score/math_dapo.py
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

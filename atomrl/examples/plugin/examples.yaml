@@ -2,19 +2,35 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2026 ATOM Project Contributors
 
-# AtomRL as a plugin of other frameworks (verl/README.md, vime/README.md).
+# AtomRL as a plugin of other frameworks (verl, vime, miles, and slime).
 # Each needs its framework's image; the run is skipped where it is absent.
 
 images:
   verl-plugin:
-    ref: atomrl-verl-plugin:latest
+    ref: atomrl-plugin-test-verl:latest
     atomrl_mount: /workspace/ATOM/atomrl
     run_args: ["--entrypoint", "", "--tmpfs", "/tmp:exec,size=10g"]
-    build: docker build -f atomrl/examples/plugin/verl/Dockerfile.test -t atomrl-verl-plugin:latest .
+    build: >-
+      docker build -f atomrl/examples/plugin/Dockerfile.plugin
+      --target verl-test -t atomrl-plugin-test-verl:latest .
   vime-plugin:
-    ref: atomrl-vime-plugin:latest
+    ref: atomrl-plugin-test-vime:latest
     atomrl_mount: /workspace/ATOM/atomrl
-    build: docker build -f atomrl/examples/plugin/vime/Dockerfile -t atomrl-vime-plugin:latest .
+    build: >-
+      docker build -f atomrl/examples/plugin/Dockerfile.plugin
+      --target vime-test -t atomrl-plugin-test-vime:latest .
+  miles-plugin:
+    ref: atomrl-plugin-test-miles:latest
+    atomrl_mount: /workspace/ATOM/atomrl
+    build: >-
+      docker build -f atomrl/examples/plugin/Dockerfile.plugin
+      --target miles-test -t atomrl-plugin-test-miles:latest .
+  slime-plugin:
+    ref: atomrl-plugin-test-slime:latest
+    atomrl_mount: /workspace/ATOM/atomrl
+    build: >-
+      docker build -f atomrl/examples/plugin/Dockerfile.plugin
+      --target slime-test -t atomrl-plugin-test-slime:latest .
 
 defaults:
   tier: t1
@@ -32,7 +48,7 @@ defaults:
 
 examples:
   - id: verl-plugin-qwen3-8b-vllm
-    title: "verl 0.9 GRPO on Qwen3-8B with the AtomRL FSDP2 engine, vLLM rollout"
+    title: "verl 0.9.1 GRPO on Qwen3-8B with the AtomRL FSDP2 engine, vLLM rollout"
     image: verl-plugin
     command: >-
       cd {atomrl} && CONFIG=examples/plugin/verl/qwen3_8b_grpo_fp8.yaml STEPS={steps}
@@ -43,3 +59,17 @@ examples:
     image: vime-plugin
     command: cd {atomrl} && STEPS={steps} LOG={log}.vime bash examples/plugin/vime/run.sh
     notes: Needs VIME_ROOT in the image (see vime/README.md); pass --env VIME_ROOT=<path>.
+
+  - id: miles-plugin-qwen3-8b
+    title: "miles RL on Qwen3-8B with AtomRL Megatron/Lumen hooks"
+    image: miles-plugin
+    command: cd {atomrl} && STEPS={steps} LOG={log}.miles bash examples/plugin/miles/run.sh
+    notes: miles is pinned to fe7037f561910f26ac4eccf9082bc5f4410488f8.
+
+  - id: slime-plugin-contract
+    title: "slime pinned install and AtomRL plugin contract"
+    image: slime-plugin
+    requires: []
+    prepare:
+    command: cd {atomrl} && bash examples/plugin/slime/run.sh
+    notes: slime is pinned to 79aa41a884ab0bf65222c94418f6357d3c31192b; no training result is claimed.

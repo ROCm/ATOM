@@ -11,7 +11,7 @@ RL frameworks.
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    Host RL Framework                      │
-│    (verl / vime)                                          │
+│    (verl / vime / miles / slime)                          │
 │                                                           │
 │  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐  │
 │  │  Training    │    │  Rollout     │    │  Weight     │  │
@@ -33,8 +33,8 @@ RL frameworks.
 ```
 
 The plugin layer (`atomrl/plugin/`) sits between the host framework and
-AtomRL's core modules. Each plugin file contains only import + forwarding
-calls — no business logic.
+AtomRL's core modules. Framework files preserve host-defined signatures while
+private helpers centralize lifecycle, checkpoint reload, and output conversion.
 
 ---
 
@@ -42,16 +42,15 @@ calls — no business logic.
 
 ### 1. Thin wiring only
 
-Plugin files must not implement algorithms, manage state, or duplicate logic
-from core AtomRL modules. If a hook grows beyond forwarding a call, the logic
-belongs in the core package.
+Plugin files must not implement RL algorithms or duplicate core AtomRL logic.
+Framework-neutral adapter behavior belongs in private shared plugin helpers.
 
-### 2. Weight sync is host-framework-native
+### 2. Weight sync uses public ATOM reload APIs
 
-AtomRL does **not** inject weight synchronization. Each host framework (verl
-or vime) uses its own mechanism (NCCL broadcast, P2P RDMA, disk-delta, CUDA
-IPC). ATOM manages its own weight lifecycle through
-`sleep` / `wake_up` / `load_weights` on `ATOMRayServer`.
+Host frameworks still decide when and how to export weights. Once an
+HF-format checkpoint is available, plugin hooks call
+`ATOMReplicaManager.reload_weights_from_path()` on rank zero. verl's tensor
+stream is converted in a scoped temporary safetensors directory.
 
 ### 3. Function signatures are frozen by the host framework
 
@@ -64,6 +63,8 @@ exactly. Extending them requires a change in the host framework.
 |---|---|---|
 | verl | Python packaging entry-points (`importlib.metadata`) | On `import verl` |
 | vime | `importlib.import_module` triggered by CLI args | At training startup |
+| miles | `importlib.import_module` triggered by CLI args | At training startup |
+| slime | `importlib.import_module` triggered by CLI args | At training startup |
 
 ---
 
@@ -116,7 +117,7 @@ EngineRegistry.register(
 
 | Class | Role |
 |---|---|
-| `ATOMRolloutAdapter` | Implements verl's `BaseRollout` ABC; forwards `resume()` → `wake_all()`, `release()` → `sleep_all()`, `update_weights()` → no-op |
+| `ATOMRolloutAdapter` | Implements verl's `BaseRollout` ABC; forwards lifecycle calls and reloads streamed weights through a scoped checkpoint |
 | `AtomRLFSDP2Engine` | Wraps `atomrl.engine.training.fsdp_engine.FSDP2EngineWithLMHead`; supports FP8 via `quant_config` |
 | `AtomRLMegatronEngine` | Wraps `atomrl.engine.training.megatron_engine.MegatronEngineWithLMHead`; delegates via `__getattr__` |
 
@@ -172,6 +173,7 @@ must be a top-level function in its module.
 | `--custom-megatron-init-path` | `atomrl.plugin.vime.hooks.custom_megatron_init` | `(args: Namespace) -> None` |
 | `--custom-model-provider-path` | `atomrl.plugin.vime.hooks.custom_model_provider` | `(pre_process: bool, post_process: bool, vp_stage: int \| None = None) -> GPTModel` |
 | `--rollout-function-path` | `atomrl.plugin.vime.hooks.generate_rollout` | `(args, rollout_id: int, data_source, evaluation: bool = False) -> RolloutFnTrainOutput \| RolloutFnEvalOutput` |
+| `--custom-update-weight-post-write-path` | `atomrl.plugin.vime.hooks.custom_update_weight_post_write` | `(args, version_dir: str, rollout_engines: list) -> None` |
 
 ### Hook sequencing
 
@@ -193,17 +195,16 @@ vime startup
 
 ### Prerequisites
 
-Before training starts, the trainer script must set up the ATOM manager:
+Before training starts, use the lifecycle helper:
 
 ```python
-from atomrl.engine.inference.atom_ray_server import ATOMReplicaManager
+from atomrl.plugin.vime.lifecycle import setup_atom_manager, teardown_atom_manager
 
-args._atomrl_atom_manager = ATOMReplicaManager(
-    actor_wg=my_worker_group,
-    model_name="/path/to/model",
-    engine_kwargs={"tensor_parallel_size": 8},
-)
-args._atomrl_atom_manager.create()
+setup_atom_manager(args, my_worker_group)
+try:
+    train()
+finally:
+    teardown_atom_manager(args)
 ```
 
 For FP8 training, set `args.atomrl_fp8_config` before Megatron init:
@@ -218,15 +219,27 @@ args.atomrl_fp8_config = QuantizationConfig(
 
 ---
 
+## miles and slime integration
+
+miles and slime expose the same Megatron, FP8 reset, lifecycle, and checkpoint
+reload hooks as vime. Their rollout wrappers import host-native `Sample` and
+`RolloutFn*Output` classes only when called.
+
+The miles smoke assets live in `examples/plugin/miles/`. No slime example was
+present in the synced Lumen-RL revision, so only the adapter and unit coverage
+are provided.
+
+---
+
 ## Injection scope summary
 
-| Component | verl | vime |
-|---|---|---|
-| **Lumen FSDP2 training** | `AtomRLFSDP2Engine` (`atomrl_fsdp2`) | N/A (Megatron-only) |
-| **Lumen Megatron training** | `AtomRLMegatronEngine` (`atomrl_megatron`) | `custom_megatron_init` + `custom_model_provider` |
-| **ATOM rollout** | `ATOMRolloutAdapter` in `_ROLLOUT_REGISTRY` | `generate_rollout` |
-| **Weight sync** | Not injected | Not injected |
-| **Megatron bridge** | Inside engine adapter | Inside `custom_model_provider` |
+| Component | verl | vime | miles | slime |
+|---|---|---|---|---|
+| **Lumen FSDP2 training** | `AtomRLFSDP2Engine` | — | — | — |
+| **Lumen Megatron training** | `AtomRLMegatronEngine` | hooks | hooks | hooks |
+| **ATOM rollout** | adapter | native output | native output | native output |
+| **Weight reload** | tensor stream → scoped checkpoint | rank-zero checkpoint hook | rank-zero checkpoint hook | rank-zero checkpoint hook |
+| **Lifecycle** | adapter helper | args helper | args helper | args helper |
 
 ---
 
@@ -241,8 +254,8 @@ To support an additional framework:
    - CLI path? → Write functions matching the exact expected signatures.
    - Hardcoded import? → Create the expected package/module name.
 
-3. Write one function per hook. Each body should be a single delegation call
-   to an existing `atomrl.*` module.
+3. Write top-level host-signature wrappers and delegate shared behavior to the
+   private helpers in `atomrl.plugin`.
 
 4. Add usage instructions to this document and `atomrl/plugin/README.md`.
 
@@ -253,7 +266,22 @@ To support an additional framework:
 | File | What |
 |---|---|
 | `atomrl/plugin/verl/register.py` | verl entry-point, `ATOMRolloutAdapter`, `AtomRLMegatronEngine` |
-| `atomrl/plugin/vime/hooks.py` | `custom_megatron_init`, `custom_model_provider`, `generate_rollout` |
+| `atomrl/plugin/{vime,miles,slime}/hooks.py` | host-signature wrappers and native rollout types |
+| `atomrl/plugin/_lifecycle.py` | public `ATOMReplicaManager` setup/teardown |
+| `atomrl/plugin/_megatron_hooks.py` | shared Megatron, FP8 reset, and checkpoint reload logic |
 | `atomrl/quantization/fp8_training.py` | `FP8TrainingManager` (core FP8 logic) |
 | `atomrl/engine/inference/atom_ray_server.py` | `ATOMReplicaManager`, `ATOMRayServer` (core ATOM logic) |
 | `atomrl/engine/training/megatron_engine.py` | `MegatronEngine`, `MegatronEngineWithLMHead` |
+
+## Isolated compatibility validation
+
+Plugin compatibility is not part of the public AtomRL unit suite and does not
+install host frameworks into public images. `examples/plugin/Dockerfile.plugin`
+creates four isolated targets on top of the public base and pins:
+
+- verl `0.9.1`
+- vime `8707a5a7156223ce1d92c65279e2eed748addb82`
+- miles `fe7037f561910f26ac4eccf9082bc5f4410488f8`
+- slime `79aa41a884ab0bf65222c94418f6357d3c31192b`
+
+Run all targets with `bash atomrl/examples/plugin/test.sh`.

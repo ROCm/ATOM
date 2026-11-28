@@ -1,5 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
-# Copyright 2026 Advanced Micro Devices, Inc.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# Modified by Advanced Micro Devices, Inc.
+# Source: https://github.com/verl-project/verl/blob/8357f1e0a7ce4c06dc970c2c637d49b33815f5cc/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+# Source: https://github.com/vllm-project/vllm/blob/fad09e8a1f51b31eba1f42ff5d651256c77a734d/examples/offline_inference/rlhf_utils.py
+
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

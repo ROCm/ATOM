@@ -1,4 +1,12 @@
-"""Contracts copied from the MILES DSV4 Megatron training flow."""
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+
+"""Behavioral compatibility checks for the MILES DSV4 Megatron training flow.
+
+The assertions inspect AtomRL/Lumen source behavior; they do not copy MILES
+implementation code.
+"""
 
 import ast
 from pathlib import Path

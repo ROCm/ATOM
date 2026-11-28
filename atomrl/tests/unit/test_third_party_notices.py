@@ -5,12 +5,42 @@
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 NOTICES = REPO_ROOT / "atomrl" / "THIRD_PARTY_NOTICES.md"
+ATOMRL_ROOT = REPO_ROOT / "atomrl"
+
+APACHE_DERIVED = (
+    "atomrl/atomrl/algorithms/advantage_estimators.py",
+    "atomrl/atomrl/algorithms/dapo_sampling.py",
+    "atomrl/atomrl/algorithms/kl_controller.py",
+    "atomrl/atomrl/algorithms/loss_functions.py",
+    "atomrl/atomrl/algorithms/rollout_correction.py",
+    "atomrl/atomrl/data/sft_dataset.py",
+    "atomrl/atomrl/engine/inference/bucketed_weight_transfer.py",
+    "atomrl/atomrl/engine/inference/vllm_colocate_worker_ext.py",
+    "atomrl/atomrl/engine/training/base_engine.py",
+    "atomrl/atomrl/engine/training/fsdp_engine.py",
+    "atomrl/atomrl/engine/training/vllm_colocate_worker_ext.py",
+    "atomrl/atomrl/rewards/math_reward.py",
+    "atomrl/atomrl/trainer/metric_utils.py",
+    "atomrl/atomrl/utils/fsdp_utils.py",
+    "atomrl/atomrl/utils/lr_scheduler.py",
+    "atomrl/atomrl/utils/seqlen_balancing.py",
+    "atomrl/atomrl/utils/torch_functional.py",
+    "atomrl/atomrl/utils/ulysses.py",
+    "atomrl/atomrl/utils/vocab_parallel.py",
+    "atomrl/atomrl/workers/base_worker.py",
+    "atomrl/lumen/examples/dsv4/dsv4_flash_megatron_args.sh",
+    "atomrl/lumen/examples/dsv4/tools/param_name_remap.py",
+    "atomrl/lumen/examples/perf-veomni/qwen_image_1024.yaml",
+    "atomrl/lumen/examples/perf-veomni/qwen_image_smoke.yaml",
+    "atomrl/lumen/examples/perf-veomni/wan_video.yaml",
+)
 
 
 def test_third_party_notice_lists_imported_sources():
@@ -24,29 +54,71 @@ def test_third_party_notice_lists_imported_sources():
     ):
         assert path in text
 
-    assert "https://github.com/volcengine/verl" in text
+    assert "https://github.com/verl-project/verl" in text
     assert "https://github.com/vllm-project/vllm" in text
     assert "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro" in text
 
 
 def test_derived_sources_keep_file_level_license_provenance():
-    apache_files = (
-        REPO_ROOT / "atomrl" / "atomrl" / "data" / "sft_dataset.py",
-        REPO_ROOT / "atomrl" / "atomrl" / "rewards" / "math_reward.py",
-        REPO_ROOT
-        / "atomrl"
-        / "atomrl"
-        / "engine"
-        / "inference"
-        / "bucketed_weight_transfer.py",
-    )
+    for relative in APACHE_DERIVED:
+        path = REPO_ROOT / relative
+        header = "\n".join(path.read_text(encoding="utf-8").splitlines()[:30])
+        assert "SPDX-License-Identifier: Apache-2.0" in header, relative
+        assert "SPDX-License-Identifier: MIT" not in header, relative
+        assert "Advanced Micro Devices, Inc." in header, relative
 
-    for path in apache_files:
-        header = "\n".join(path.read_text(encoding="utf-8").splitlines()[:8])
-        assert (
-            "SPDX-License-Identifier: Apache-2.0" in header
-            or "Licensed under the Apache License, Version 2.0" in header
-        )
+    expected_upstream_copyrights = {
+        "atomrl/atomrl/algorithms/advantage_estimators.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+            "Copyright 2022 The HuggingFace Team. All rights reserved.",
+        ),
+        "atomrl/atomrl/algorithms/kl_controller.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+            "Copyright 2022 The HuggingFace Team. All rights reserved.",
+        ),
+        "atomrl/atomrl/algorithms/rollout_correction.py": (
+            "Copyright 2025 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/algorithms/loss_functions.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+            "Copyright 2022 The HuggingFace Team. All rights reserved.",
+        ),
+        "atomrl/atomrl/algorithms/dapo_sampling.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/engine/inference/vllm_colocate_worker_ext.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/engine/training/vllm_colocate_worker_ext.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/trainer/metric_utils.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/utils/seqlen_balancing.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/atomrl/utils/vocab_parallel.py": (
+            "Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.",
+        ),
+        "atomrl/atomrl/engine/inference/bucketed_weight_transfer.py": (
+            "SPDX-FileCopyrightText: Copyright contributors to the vLLM project",
+        ),
+        "atomrl/atomrl/workers/base_worker.py": (
+            "Copyright 2024 Bytedance Ltd. and/or its affiliates",
+        ),
+        "atomrl/lumen/examples/dsv4/tools/param_name_remap.py": (
+            "Copyright 2023-2024 SGLang Team",
+        ),
+        "atomrl/lumen/examples/dsv4/dsv4_flash_megatron_args.sh": (
+            "Copyright 2025 RadixArk, Inc.",
+            "Copyright 2025 Zhipu AI",
+        ),
+    }
+    for relative, copyrights in expected_upstream_copyrights.items():
+        text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        for copyright_line in copyrights:
+            assert copyright_line in text, relative
 
     deepseek = (
         REPO_ROOT
@@ -61,6 +133,92 @@ def test_derived_sources_keep_file_level_license_provenance():
     header = "\n".join(deepseek.read_text(encoding="utf-8").splitlines()[:6])
     assert "SPDX-License-Identifier: MIT" in header
     assert "DeepSeek" in header
+
+
+def test_notices_cover_every_derived_file_and_pinned_source():
+    text = NOTICES.read_text(encoding="utf-8")
+    for relative in APACHE_DERIVED:
+        assert relative in text
+    for revision in (
+        "8357f1e0a7ce4c06dc970c2c637d49b33815f5cc",
+        "246cac4ca6b0e3ce1009bc48aaa798689e0600af",
+        "ca439aa5afcfe913c075570a9cb3f0f83730904d",
+        "fad09e8a1f51b31eba1f42ff5d651256c77a734d",
+        "573848a00fcd7329c2411346c6f4a983e9f67e3f",
+        "88c10654aedd7d3cc8ae7f16699020aff53efee0",
+        "9437366e0aa3a25294720f70d18b081067595f85",
+        "b5968e9190ef611bbf34a7229255be88a0e937c1",
+    ):
+        assert revision in text
+
+
+def test_atomrl_distribution_packages_apache_terms():
+    apache = ATOMRL_ROOT / "LICENSE-APACHE"
+    assert apache.read_bytes() == (REPO_ROOT / "atom" / "mesh" / "LICENSE").read_bytes()
+    pyproject = (ATOMRL_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"LICENSE-APACHE"' in pyproject
+    assert '"THIRD_PARTY_NOTICES.md"' in pyproject
+
+
+def test_non_derived_wrappers_and_contract_tests_are_mit_owned():
+    wrapper = (
+        ATOMRL_ROOT / "atomrl" / "quantization" / "rollout_correction.py"
+    ).read_text(encoding="utf-8")
+    assert "SPDX-License-Identifier: MIT" in wrapper
+    assert "Re-exports the Apache-2.0-derived implementation" in wrapper
+    assert "Derived from verl" not in wrapper
+
+    contract = (
+        ATOMRL_ROOT
+        / "tests"
+        / "lumen"
+        / "models"
+        / "dsv4"
+        / "test_miles_qat_forward_semantics.py"
+    ).read_text(encoding="utf-8")
+    assert "SPDX-License-Identifier: MIT" in contract
+    assert "Behavioral compatibility" in contract
+    assert "Contracts copied" not in contract
+
+
+def test_bootstrap_preserves_distribution_license_metadata():
+    script = (
+        ATOMRL_ROOT / "lumen" / "examples" / "dsv4" / "prepare_bootstrap.sh"
+    ).read_text(encoding="utf-8")
+    assert "packages_distributions" in script
+    assert 'docker cp "${cname}:${metadata_path}"' in script
+    assert "THIRD_PARTY_IMAGE_SOURCES" in script
+
+
+def test_dsv4_trainer_preserves_base_image_pythonpath():
+    dockerfile = (
+        ATOMRL_ROOT / "examples" / "GRPO" / "docker" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    assert 'ENV PYTHONPATH="/workspace/ATOM/atomrl:${PYTHONPATH:-}"' in dockerfile
+
+
+def test_build_py_removes_stale_deleted_package_sources(tmp_path):
+    build_lib = tmp_path / "build"
+    stale = build_lib / "atomrl" / "trainer" / "bf16_optimizer.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("must not ship\n", encoding="utf-8")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "setup.py",
+            "build_py",
+            "--build-lib",
+            str(build_lib),
+        ],
+        cwd=ATOMRL_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert not stale.exists()
+    assert (build_lib / "atomrl" / "trainer" / "rl_trainer.py").is_file()
 
 
 def test_blocked_unapproved_sources_are_not_distributed():
