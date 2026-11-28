@@ -76,8 +76,9 @@ async fn run_chat_stream(
     cfg: ChatStreamConfig,
     tx: &UnboundedSender<Result<Bytes, io::Error>>,
 ) -> Result<(), String> {
-    let start_time = Instant::now();
-    let mut first_token_time: Option<Instant> = None;
+    let clock = stream.clock();
+    let start_time = clock.map_or_else(Instant::now, |c| c.started);
+    let mut first_token_time: Option<Instant> = clock.and_then(|c| c.first_token);
 
     let separate_reasoning = chat_request.separate_reasoning;
     let tool_choice = &chat_request.tool_choice;

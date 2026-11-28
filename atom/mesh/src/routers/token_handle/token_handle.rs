@@ -2,10 +2,11 @@
 //!
 //! Single mode holds one source; PD mode holds both upstreams. Drop in
 //! either case propagates cancellation downward (single mode → the inner
-//! tonic stream's `AbortOnDropStream`; PD mode → both upstreams' Drop).
+//! source's Drop, which cancels its call; PD mode → both upstreams' Drop).
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use futures::Stream;
 
@@ -17,6 +18,19 @@ use super::token_chunk::TokenChunk;
 /// cancellation RPC).
 pub trait TokenSource: Stream<Item = Result<TokenChunk, EngineError>> + Send + Unpin {
     fn mark_completed(&mut self);
+
+    /// For a source that reads ahead of the renderer; None: the renderer's own clock.
+    fn clock(&self) -> Option<SourceClock> {
+        None
+    }
+}
+
+/// When a source's call began and its first token arrived, from which the
+/// streaming renderers measure TTFT.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceClock {
+    pub started: Instant,
+    pub first_token: Option<Instant>,
 }
 
 pub struct TokenHandle {
@@ -54,6 +68,14 @@ impl TokenHandle {
                 prefill: Box::new(prefill),
                 decode: Box::new(decode),
             },
+        }
+    }
+
+    pub fn clock(&self) -> Option<SourceClock> {
+        match &self.inner {
+            Inner::Single(s) => s.clock(),
+            #[cfg(test)]
+            Inner::Pair { decode, .. } => decode.clock(),
         }
     }
 

@@ -1,13 +1,17 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use dashmap::DashSet;
 
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::super::planner::{idx2idx, Idx2Idx};
 use super::super::types::AdapterError;
 use super::{BackendAdapter, PairCtx};
-use crate::core::Worker;
+use crate::config::types::AtomPdRankMappingPolicy;
+use crate::core::{Worker, WorkerRegistry};
 
 #[derive(Default)]
 pub struct AtomPrefillInfo {
@@ -21,6 +25,29 @@ impl std::fmt::Debug for AtomPrefillInfo {
             .field("prefill_count", &self.tp_sizes.len())
             .finish()
     }
+}
+
+/// Read one ATOM prefill's `kv_transfer_info`: its TP size and chunked-transfer template.
+/// A missing `tp_size` errs naming `source`, a role other than `kv_producer` naming `base_url`.
+pub fn parse_atom_prefill_info(
+    data: &Value,
+    source: &str,
+    base_url: &str,
+) -> Result<(usize, Option<Value>), String> {
+    let tp = data
+        .get("tp_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| format!("Missing tp_size in {} response", source))? as usize;
+    let kv_role = data.get("kv_role").and_then(|v| v.as_str());
+    if kv_role != Some("kv_producer") {
+        return Err(format!(
+            "{} is not a prefill (kv_role={:?}, expected kv_producer)",
+            base_url, kv_role
+        ));
+    }
+    info!("ATOM prefill {} tp_size={}", base_url, tp);
+    let chunked = data.get("chunked_transfer").filter(|v| v.is_object());
+    Ok((tp, chunked.cloned()))
 }
 
 #[derive(Debug)]
@@ -208,6 +235,91 @@ impl BackendAdapter for AtomAdapter {
 
     fn correlation_id(&self, ctx: &PairCtx) -> Option<String> {
         downcast(ctx).ok().map(|c| c.transfer_id.clone())
+    }
+}
+
+/// The prefill worker that the ATOM P/D rank-mapping `policy` pairs with `decode`.
+pub fn apply_atom_pd_rank_mapping_policy(
+    policy: AtomPdRankMappingPolicy,
+    worker_registry: &WorkerRegistry,
+    prefill: Arc<dyn Worker>,
+    decode: &Arc<dyn Worker>,
+) -> Arc<dyn Worker> {
+    match policy {
+        AtomPdRankMappingPolicy::None => prefill,
+        AtomPdRankMappingPolicy::Idx2Idx => {
+            map_atom_prefill_idx2idx(worker_registry, prefill, decode)
+        }
+    }
+}
+
+fn map_atom_prefill_idx2idx(
+    worker_registry: &WorkerRegistry,
+    prefill: Arc<dyn Worker>,
+    decode: &Arc<dyn Worker>,
+) -> Arc<dyn Worker> {
+    let decode_dp_rank = match idx2idx(prefill.as_ref(), decode.as_ref()) {
+        Idx2Idx::Move(rank) => rank,
+        Idx2Idx::Keep => {
+            debug!(
+                "ATOM PD rank mapping policy=idx2idx keeps prefill={} decode={}",
+                prefill.url(),
+                decode.url()
+            );
+            return prefill;
+        }
+        Idx2Idx::OutOfRange { rank, size } => {
+            // A deployment fault rather than a request's: warn once per prefill.
+            static WARNED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+            if WARNED.insert(prefill.base_url().to_string()) {
+                warn!(
+                    "ATOM PD rank mapping policy=idx2idx: decode rank {} is outside prefill {} dp_size {}, so its ranks are not mapped; check the prefill and decode DP sizes",
+                    rank,
+                    prefill.base_url(),
+                    size
+                );
+            }
+            return prefill;
+        }
+    };
+
+    let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
+    match worker_registry.get_by_url(&mapped_url) {
+        Some(mapped)
+            if mapped.is_available()
+                && mapped.model_id() == prefill.model_id()
+                && matches!(
+                    mapped.worker_type(),
+                    crate::core::WorkerType::Prefill { .. }
+                )
+                && mapped.connection_mode().matches(prefill.connection_mode()) =>
+        {
+            info!(
+                "ATOM PD rank mapping policy=idx2idx: prefill {} -> {}, decode={}",
+                prefill.url(),
+                mapped.url(),
+                decode.url()
+            );
+            mapped
+        }
+        Some(mapped) => {
+            warn!(
+                "ATOM PD rank mapping policy=idx2idx target {} is unhealthy; keeping prefill {} (decode={})",
+                mapped.url(),
+                prefill.url(),
+                decode.url()
+            );
+            prefill
+        }
+        None => {
+            warn!(
+                "ATOM PD rank mapping policy=idx2idx target {} not found; keeping prefill {} (decode={})",
+                mapped_url,
+                prefill.url(),
+                decode.url()
+            );
+            prefill
+        }
     }
 }
 

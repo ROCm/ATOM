@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    let start = Instant::now();
+    let start = stream.clock().map_or_else(Instant::now, |c| c.started);
 
     if !matches!(&ctx.original, ProtocolRequest::Generate(_)) {
         return error::internal_error(
@@ -190,5 +190,8 @@ fn engine_error_to_response(err: EngineError) -> Response {
             error::service_unavailable("engine_connection_failed", r)
         }
         EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+        EngineError::Http { status, message } => {
+            error::create_error(status, "engine_error", message)
+        }
     }
 }

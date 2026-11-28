@@ -178,11 +178,13 @@ fn determine_runtime_type(
     if let Some(ref detected_runtime) = data.detected_runtime_type {
         match detected_runtime.as_str() {
             "vllm" => RuntimeType::Vllm,
+            "atom" => RuntimeType::Atom,
             _ => RuntimeType::Sglang,
         }
     } else if let Some(ref runtime) = config.runtime {
         match runtime.as_str() {
             "vllm" => RuntimeType::Vllm,
+            "atom" => RuntimeType::Atom,
             _ => RuntimeType::Sglang,
         }
     } else {

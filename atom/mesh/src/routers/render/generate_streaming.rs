@@ -86,8 +86,9 @@ async fn run_generate_stream(
     cfg: GenerateStreamConfig,
     tx: &UnboundedSender<Result<Bytes, io::Error>>,
 ) -> Result<(), String> {
-    let start_time = Instant::now();
-    let mut first_token_time: Option<Instant> = None;
+    let clock = stream.clock();
+    let start_time = clock.map_or_else(Instant::now, |c| c.started);
+    let mut first_token_time: Option<Instant> = clock.and_then(|c| c.first_token);
 
     let mut accumulated_text = String::new();
     let mut completion_tokens: u32 = 0;

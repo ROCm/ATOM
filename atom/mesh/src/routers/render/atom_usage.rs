@@ -3,8 +3,8 @@
 //! (`prompt_tokens_details.cached_tokens`, the first sibling's), the slowest
 //! sibling's `ttft_s` / `tpot_s` / `latency_s`, and `num_choices` past one,
 //! on a chat; a completion's are not carried yet.
-//! Only the ATOM standalone backend sets `WorkerMeta.timing`; for any other
-//! the usage is left as it is.
+//! Only ATOM workers, the standalone backend and gRPC workers, set
+//! `WorkerMeta.timing`; for any other the usage is left as it is.
 
 use serde_json::{json, Map, Value};
 

@@ -989,6 +989,8 @@ mod e_generation_payload {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            dp_session_id: None,
+            dp_parent_session_id: None,
         }
     }
 
@@ -1050,6 +1052,40 @@ mod e_generation_payload {
         } else {
             panic!("expected array");
         }
+    }
+    #[test]
+    fn session_ids_follow_atom_http_header_order_and_skip_empty_values() {
+        use http::HeaderMap;
+
+        use crate::routers::prepare::dp_session_ids;
+
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        let all = headers(&[
+            ("x-correlation-id", "corr"),
+            ("x-session-id", "sess"),
+            ("x-dynamo-session-id", "dyn"),
+            ("x-dynamo-parent-session-id", "parent"),
+        ]);
+        assert_eq!(
+            dp_session_ids(Some(&all)),
+            (Some("dyn".into()), Some("parent".into()))
+        );
+        let empty_first = headers(&[
+            ("x-dynamo-session-id", ""),
+            ("x-correlation-id", "corr"),
+            ("x-dynamo-parent-session-id", ""),
+        ]);
+        assert_eq!(
+            dp_session_ids(Some(&empty_first)),
+            (Some("corr".into()), None)
+        );
+        assert_eq!(dp_session_ids(None), (None, None));
     }
 }
 

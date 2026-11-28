@@ -53,6 +53,8 @@ mod a_payload_to_proto {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            dp_session_id: None,
+            dp_parent_session_id: None,
         }
     }
 
@@ -817,6 +819,8 @@ mod e_engine_dispatch {
             stream: false,
             return_hidden_states: false,
             log_metrics: false,
+            dp_session_id: None,
+            dp_parent_session_id: None,
         }
     }
 

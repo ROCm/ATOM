@@ -126,7 +126,7 @@ pub fn prepare_chat_with(
     );
 
     let request_id = format!("chatcmpl-{}", Uuid::new_v4());
-    let payload = build_chat_payload(
+    let mut payload = build_chat_payload(
         request_id.clone(),
         &req,
         &body_ref,
@@ -134,6 +134,7 @@ pub fn prepare_chat_with(
         token_ids,
         tool_constraints,
     );
+    (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -187,8 +188,9 @@ pub fn prepare_generate(
         .rid
         .clone()
         .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
-    let payload =
+    let mut payload =
         build_generate_payload(request_id.clone(), &req, original_text.clone(), token_ids);
+    (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -212,6 +214,26 @@ pub fn prepare_generate(
     };
 
     Ok((payload, ctx))
+}
+
+/// The session headers ATOM's HTTP routes read, in their order of preference
+/// (`_get_dp_session_affinity_ids`), and the parent session's.
+const SESSION_HEADERS: [&str; 3] = ["x-dynamo-session-id", "x-session-id", "x-correlation-id"];
+const PARENT_SESSION_HEADER: &str = "x-dynamo-parent-session-id";
+
+/// A request's DP session and parent session ids; an empty header is absent.
+pub(crate) fn dp_session_ids(headers: Option<&HeaderMap>) -> (Option<String>, Option<String>) {
+    let header = |name: &str| {
+        headers?
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    (
+        SESSION_HEADERS.iter().find_map(|name| header(name)),
+        header(PARENT_SESSION_HEADER),
+    )
 }
 
 pub(crate) fn build_chat_payload(
@@ -270,6 +292,8 @@ pub(crate) fn build_chat_payload(
         stream: req.stream,
         return_hidden_states: req.return_hidden_states,
         log_metrics: false,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 
@@ -321,6 +345,8 @@ pub(crate) fn build_generate_payload(
         stream: req.stream,
         return_hidden_states: req.return_hidden_states,
         log_metrics: req.log_metrics,
+        dp_session_id: None,
+        dp_parent_session_id: None,
     }
 }
 

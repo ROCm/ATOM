@@ -21,6 +21,9 @@ pub struct GenerationPayload {
     /// REST surface; chat path leaves at `false` to match the upstream chat
     /// builder which does not touch this field).
     pub log_metrics: bool,
+    /// ATOM only: the request's DP session and its parent, from its headers.
+    pub dp_session_id: Option<String>,
+    pub dp_parent_session_id: Option<String>,
 }
 
 pub struct SamplingParams {

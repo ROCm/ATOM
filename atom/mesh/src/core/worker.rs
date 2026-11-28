@@ -365,6 +365,8 @@ pub enum RuntimeType {
     Sglang,
     /// vLLM runtime
     Vllm,
+    /// ATOM's own gRPC service, `atom.grpc.v1.AtomEngine`
+    Atom,
 }
 
 impl fmt::Display for RuntimeType {
@@ -372,6 +374,7 @@ impl fmt::Display for RuntimeType {
         match self {
             RuntimeType::Sglang => write!(f, "sglang"),
             RuntimeType::Vllm => write!(f, "vllm"),
+            RuntimeType::Atom => write!(f, "atom"),
         }
     }
 }
@@ -385,6 +388,8 @@ impl std::str::FromStr for RuntimeType {
             Ok(RuntimeType::Sglang)
         } else if s.eq_ignore_ascii_case("vllm") {
             Ok(RuntimeType::Vllm)
+        } else if s.eq_ignore_ascii_case("atom") {
+            Ok(RuntimeType::Atom)
         } else {
             Err(format!("Unknown runtime type: {}", s))
         }

@@ -1,4 +1,4 @@
-//! Unified gRPC client wrapper for SGLang and vLLM backends, plus the
+//! Unified gRPC client wrapper for SGLang, vLLM and ATOM backends, plus the
 //! per-worker client lookup used by dispatch.
 
 use std::sync::Arc;
@@ -9,6 +9,8 @@ use tracing::error;
 
 use crate::core::Worker;
 use crate::routers::comm::error;
+#[cfg(feature = "grpc-client")]
+use crate::routers::grpc::engine::atom::AtomClient;
 use crate::routers::grpc::engine::proto_stream_wrapper::{
     ProtoEmbedRequest, ProtoEmbedResponse, ProtoGenerateRequest, ProtoStream,
 };
@@ -23,6 +25,8 @@ pub struct HealthCheckResponse {
 pub enum GrpcClient {
     Sglang(SglangSchedulerClient),
     Vllm(VllmEngineClient),
+    #[cfg(feature = "grpc-client")]
+    Atom(AtomClient),
 }
 
 impl GrpcClient {
@@ -30,6 +34,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client,
             Self::Vllm(_) => panic!("Expected SGLang client, got vLLM"),
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(_) => panic!("Expected SGLang client, got ATOM"),
         }
     }
 
@@ -37,6 +43,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client,
             Self::Vllm(_) => panic!("Expected SGLang client, got vLLM"),
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(_) => panic!("Expected SGLang client, got ATOM"),
         }
     }
 
@@ -44,6 +52,8 @@ impl GrpcClient {
         match self {
             Self::Vllm(client) => client,
             Self::Sglang(_) => panic!("Expected vLLM client, got SGLang"),
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(_) => panic!("Expected vLLM client, got ATOM"),
         }
     }
 
@@ -51,6 +61,8 @@ impl GrpcClient {
         match self {
             Self::Vllm(client) => client,
             Self::Sglang(_) => panic!("Expected vLLM client, got SGLang"),
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(_) => panic!("Expected vLLM client, got ATOM"),
         }
     }
 
@@ -69,6 +81,8 @@ impl GrpcClient {
         match runtime_type {
             "sglang" => Ok(Self::Sglang(SglangSchedulerClient::connect(url).await?)),
             "vllm" => Ok(Self::Vllm(VllmEngineClient::connect(url).await?)),
+            #[cfg(feature = "grpc-client")]
+            "atom" => Ok(Self::Atom(AtomClient::connect(url).await?)),
             _ => Err(format!("Unknown runtime type: {}", runtime_type).into()),
         }
     }
@@ -91,6 +105,14 @@ impl GrpcClient {
                     message: resp.message,
                 })
             }
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(client) => {
+                let resp = client.health_check().await?;
+                Ok(HealthCheckResponse {
+                    healthy: resp.healthy,
+                    message: resp.message,
+                })
+            }
         }
     }
 
@@ -105,6 +127,11 @@ impl GrpcClient {
             Self::Vllm(client) => {
                 let info = client.get_model_info().await?;
                 Ok(ModelInfo::Vllm(info))
+            }
+            #[cfg(feature = "grpc-client")]
+            Self::Atom(client) => {
+                let info = client.get_model_info().await?;
+                Ok(ModelInfo::Atom(Box::new(info)))
             }
         }
     }
@@ -143,6 +170,8 @@ impl GrpcClient {
 pub enum ModelInfo {
     Sglang(Box<mesh_grpc::sglang_proto::GetModelInfoResponse>),
     Vllm(mesh_grpc::vllm_proto::GetModelInfoResponse),
+    #[cfg(feature = "grpc-client")]
+    Atom(Box<crate::atom_engine::grpc::GetModelInfoResponse>),
 }
 
 impl ModelInfo {
@@ -153,6 +182,8 @@ impl ModelInfo {
         let value = match self {
             ModelInfo::Sglang(info) => serde_json::to_value(info).ok(),
             ModelInfo::Vllm(info) => serde_json::to_value(info).ok(),
+            #[cfg(feature = "grpc-client")]
+            ModelInfo::Atom(info) => serde_json::to_value(info).ok(),
         };
 
         if let Some(serde_json::Value::Object(obj)) = value {

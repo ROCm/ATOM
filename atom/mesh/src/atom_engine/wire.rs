@@ -2,6 +2,8 @@
 //! `atom/model_engine/zmq_protocol/engine_v1.proto` (the spec) and the multipart
 //! frames they ride in.
 
+use std::ops::Deref;
+
 use prost::Message as _;
 
 #[allow(clippy::all, unused_qualifications)]
@@ -32,14 +34,15 @@ pub fn token_frame(tokens: &[u32]) -> Vec<u8> {
         .collect()
 }
 
-/// A received message: its envelope and the frames its `BufferRef`s index.
-pub struct Inbound {
+/// A received message: its envelope and the frames its `BufferRef`s index,
+/// as ZMQ delivers them or as the byte strings of a gRPC `Frames`.
+pub struct Inbound<F> {
     pub body: pb::envelope::Body,
-    frames: Vec<zmq::Message>,
+    frames: Vec<F>,
 }
 
-impl Inbound {
-    pub fn decode(frames: Vec<zmq::Message>) -> Result<Self, String> {
+impl<F: Deref<Target = [u8]>> Inbound<F> {
+    pub fn decode(frames: Vec<F>) -> Result<Self, String> {
         let head = frames.first().ok_or("empty message")?;
         let envelope = pb::Envelope::decode(&head[..]).map_err(|e| e.to_string())?;
         if envelope.protocol_version != PROTOCOL_VERSION {

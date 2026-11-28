@@ -15,6 +15,11 @@ pub enum EngineError {
     DecodeIncomplete,
     ConnectionAcquireFailed(String),
     RequestBuildFailed(String),
+    /// The worker's own error, with the status its HTTP routes answer it with.
+    Http {
+        status: http::StatusCode,
+        message: String,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -27,6 +32,7 @@ impl fmt::Display for EngineError {
             Self::DecodeIncomplete => f.write_str("decode stream closed without Complete"),
             Self::ConnectionAcquireFailed(r) => write!(f, "connection acquire failed: {}", r),
             Self::RequestBuildFailed(r) => write!(f, "request build failed: {}", r),
+            Self::Http { status, message } => write!(f, "engine error ({status}): {message}"),
         }
     }
 }

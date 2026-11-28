@@ -8,7 +8,7 @@ use futures::Stream;
 
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{InputLogprobs, TokenChunk};
-use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
+use crate::routers::token_handle::token_handle::{SourceClock, TokenHandle, TokenSource};
 
 pub fn merge_pd_streams(
     prefill: TokenHandle,
@@ -22,10 +22,18 @@ pub fn merge_pd_streams(
             pending_input_logprobs: None,
         }
     };
+    // D's clock, from whichever call began first: both were open before the merge.
+    let clock = decode.clock().map(|clock| SourceClock {
+        started: prefill
+            .clock()
+            .map_or(clock.started, |p| p.started.min(clock.started)),
+        ..clock
+    });
     TokenHandle::new(PdMerger {
         prefill: Some(prefill),
         decode: Some(decode),
         state,
+        clock,
     })
 }
 
@@ -33,6 +41,7 @@ struct PdMerger {
     prefill: Option<TokenHandle>,
     decode: Option<TokenHandle>,
     state: State,
+    clock: Option<SourceClock>,
 }
 
 enum State {
@@ -148,5 +157,9 @@ impl TokenSource for PdMerger {
         if let Some(d) = self.decode.as_mut() {
             d.mark_completed();
         }
+    }
+
+    fn clock(&self) -> Option<SourceClock> {
+        self.clock
     }
 }

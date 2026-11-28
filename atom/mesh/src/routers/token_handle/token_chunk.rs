@@ -69,9 +69,9 @@ pub struct WorkerMeta {
     pub request_id: String,
     pub weight_version: Option<String>,
     pub cached_tokens: u32,
-    /// The ATOM standalone backend's alone: a sequence's timing, as ATOM's
-    /// Python server reports it in `usage`. Where it is set, the OpenAI
-    /// renderers add ATOM's usage fields (`render::atom_usage`).
+    /// ATOM workers alone, the standalone backend's and gRPC workers': a sequence's
+    /// timing, as ATOM's Python server reports it in `usage`. Where it is set, the
+    /// OpenAI renderers add ATOM's usage fields (`render::atom_usage`).
     pub timing: Option<SeqTiming>,
 }
 
