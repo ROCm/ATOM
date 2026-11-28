@@ -1,25 +1,19 @@
 # Kimi-K3 1P1D on MI455X (gfx1250): P = PP8 × TP1, D = DP8 EP8
 
 > [!WARNING]
-> **Reconstructed, not re-run. These commands may be wrong; please correct this file when you run it.**
+> **11-28 update, not yet run as a 1P1D.** This version runs the image `rocm/fw-bringup:gfx1250-atom-k3-20261126` with
+> local integration branches (`zejun/k3-1p1d-int`, see [Software](#software)) and the P / D settings the separate
+> runs found best since 11-24. What each part has been run as:
+> - **P** (PP8 × TP1): standalone, without the KV connector. #813 config F on e15-07 + e15-05 (PP mailbox in the tray,
+>   fabric hop across the trays, split 12,13,13,13,12,11,11,8, `ATOM_PP_STATE_CHECKPOINT_SLOTS=1600`); gyu's prefill
+>   stack on e15-09 + e15-06 (NCCL hops). Not yet both together, and not yet with the MoRIIO producer.
+> - **D** (DP8 EP8 + MegaMoE, S1F on): aggregated on the 1126 image (e15-07 + e15-05, 11-26), without the consumer.
+> - **1P1D as a whole:** last run on the G13 trays (11-22, the 1119 image), whose kit died with them. The commands
+>   below were reconstructed from that history (#578, #635, #714, #246) and updated; correct this file when you run it.
 >
-> The G13 trays this 1P1D ran on died (P on g13-03 + g13-11, D on g13-05 + g13-08). The launch kit went with them:
-> `kit_pp` with `make_pd_launchers.py`, `make_dpep_launcher.py` and `run_pd.sh`.
-> Everything below was pieced together from the run history and checked against the flags and environment variables
-> this branch defines. Nobody has launched it as written.
->
-> What has been checked, on a CPU host only:
-> - This branch's own argument parser accepts both server commands.
-> - Without DSpark, the engine `Config` builds for both: multi-node PP for P (four stages per tray), multi-node
->   DP with EP for D.
-> - The DSpark flags parse. Their `Config` imports the GPU stack, so it was not built.
->
-> Sources, all in wuhuikx/LLM-Booster:
-> - #578: comment 1 (the 1P1D handbook, TP8 + DCP8 era); comments 4, 10, 15, 20 and 27 (the PP → DP8EP8 runs; 27 is
->   the 11-22 status with the best configuration per point).
-> - #635: the P route, PQ4.
-> - #714: the PP → DP+EP transfer.
-> - #246.
+> Checked on a CPU host: both integration branches install on the 1126 image and import; ATOM's PP mailbox / fabric
+> tests (42) and the touched model-op tests pass; the K3 / PP / MLA test files give the same results as plain
+> k3-455-dev.
 
 ## What it reproduces
 
@@ -40,17 +34,22 @@ GSM8K 5-shot through the router: 0.966–0.968.
 
 ## Software
 
-- **Code: this branch with ROCm/aiter `k3-455-dev`.**
-  - This ATOM branch carries the PD code, one commit per PR. Those commits are the same code the runs used (internal
-    tree `82385ab30`), rebased.
-  - aiter `k3-455-dev` carries the MegaMoE S1F fix: #8189 + #8483.
-  - No image built from the two branches exists yet (11-24).
-  - The runs used `rocm/fw-bringup:gfx1250-atom-k3-20261119` (aiter face19800, mori 695d4c03, FlyDSL 0.5.0) with the PD
-    tree first on `PYTHONPATH`.
-  - Putting this ATOM on `PYTHONPATH` in such an image works the same way. The aiter in those images is much older than
-    aiter `k3-455-dev` (hundreds of files, C++ included), so build an image from both branches. Without the S1F fix,
-    D needs `AITER_MEGA_S1F=0`.
-- **Model.** `Kimi-K3` and the DSpark draft `Kimi-K3-DSpark` (Inferact) in one directory, mounted at `/models`.
+- **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261126` (aiter and ATOM at ROCm `k3-455-dev`: aiter 8dc36011 with the
+  MegaMoE S1F fix #8189 + #8483 and the MLA PS1 work #8736; ATOM 9b6bb9d2 with the PD code; mori 695d4c03; FlyDSL 0.5.3).
+- **Code under test: local branches `zejun/k3-1p1d-int`,** installed over the image's editable `/app/aiter` and
+  `/app/ATOM` by `install_int.sh` from two git bundles (only Python sources change, so aiter's prebuilt JIT modules
+  stay):
+  - aiter = `k3-455-dev` + gyu's `gyu/k3-p-prefill-stack` (71d956af, 8 commits: FP8 prefill FMHA carry_state, XCD-balanced
+    grid and persistent split-KV, inner-loop cuts; gather_kv_b_proj head-loop kernel and its AOT; K3 EP1 grouped-MoE
+    rows at 8192 / 16384) + ROCm/aiter#8778 (K3 TP1 a8w8 GEMM: N tail, underfilled tiles, aligned A-scale loads,
+    retuned rows; one commit, its 19 files equal to the PR head ea7a5d83).
+  - ATOM = `k3-455-dev` + `gyu/k3-p-prefill-stack` (cf068d31, 3 commits: chunked prefill through carry_state, cached-prefix
+    single pass gathered straight to FP8, attn_res Gluon kernel) + ROCm/ATOM#3948 (PP mailbox in the tray over HIP IPC
+    and across trays over the UALink fabric, ace7ab16) + a test-stub fix.
+  - Rebuild the bundles after a change: `git bundle create aiter-k3-1p1d-int.bundle 8dc36011d..zejun/k3-1p1d-int`
+    (ATOM: `9b6bb9d24..`), and write the heads to `aiter.head` / `atom.head`.
+- **Model.** `Kimi-K3` and the DSpark draft `Kimi-K3-DSpark` (Inferact), mounted at `/models/Kimi-K3` and
+  `/models/Kimi-K3-DSpark` (on the e15 trays: `/mnt/data/k3/Kimi-K3`, `/mnt/data/gyu/Kimi-K3-DSpark`).
 
 ## Host preparation (all four trays)
 
@@ -65,19 +64,24 @@ GSM8K 5-shot through the router: 0.966–0.968.
     a KFD eviction storm.
   - The TP8 + DCP8-era kit has the helpers this setup still needs (`memguard.sh`, `fabric_pairs.sh`, `preflight.sh`).
     It is in `zejunchen-zejun/ATOM`, branch `zejun/k3-455-1p1d-ualink`, directory `recipes/k3-455-pd/`.
+- **Keep the JIT caches per tray** (`/root/.flydsl` and `/root/.triton`, mounted below). A cold FlyDSL / Triton cache
+  stalls a P stage for ~1 s per first-use kernel, and the PP coupling spreads each stall over the pipeline: #813's
+  cold runs overstated P's slow stretches. Warm a new tray (or a code change) with one warmup round before measuring.
 
 ## Container (all four trays)
 
 ```bash
-IMAGE=<image built from ROCm/ATOM + ROCm/aiter k3-455-dev>
-docker run -d --name k3pd -w /tmp \
+IMAGE=rocm/fw-bringup:gfx1250-atom-k3-20261126
+docker run -d --name k3pd -w /tmp --init \
   --device=/dev/kfd --device=/dev/dri --network=host --ipc=host --pid=host \
   --group-add "$(getent group video | cut -d: -f3)" --group-add "$(getent group render | cut -d: -f3)" \
   --cap-add=SYS_PTRACE --cap-add=SYS_ADMIN --security-opt seccomp=unconfined --shm-size=128g --ulimit memlock=-1:-1 \
   -v <dir with Kimi-K3/ and Kimi-K3-DSpark/>:/models:ro \
-  -v <work>/cache:/root/.cache -v <work>/triton:/root/.triton \
+  -v <work>/cache:/root/.cache -v <work>/triton:/root/.triton -v <work>/flydsl:/root/.flydsl \
+  -v <dir with the two bundles, aiter.head, atom.head>:/bundles:ro -v <kit>:/kit:ro \
   --entrypoint sleep "$IMAGE" infinity
 docker exec k3pd mkdir -p /root/.cache/logs
+docker exec k3pd bash /kit/install_int.sh   # /app/aiter and /app/ATOM: k3-455-dev, then zejun/k3-1p1d-int
 ```
 
 - Pass the group IDs as numbers: passing `render` by name fails.
@@ -85,20 +89,18 @@ docker exec k3pd mkdir -p /root/.cache/logs
 - `--pid=host` means a plain `pkill` inside the container can reach other users' processes. Stop by PID (see
   [Stop](#stop)).
 
-If the image's ATOM is not this branch, check out this branch and put it first on `PYTHONPATH`:
-
-```bash
-docker exec k3pd git clone -q -b k3-455-dev https://github.com/ROCm/ATOM.git /root/.cache/atom-k3-455-dev
-# then add  -e PYTHONPATH=/root/.cache/atom-k3-455-dev  to the docker exec that starts each server
-```
+`install_int.sh` checks out branch `k3-455-dev` at the image's commits, fetches `zejun/k3-1p1d-int` from the bundles,
+checks the heads against `aiter.head` / `atom.head`, clears ATOM's compile cache and imports the new modules. It is
+idempotent; run it again after a container restart.
 
 ## Server script (all four trays)
 
 Save this as `/root/.cache/k3pd_server.sh` in each container. It starts one tray's half of an instance and is
 mostly the image's `k3_455_tp8dcp8_server.sh` environment. The P and D parts come from the runs.
 
-- **P parts:** PQ4 plus the 11-22 P settings.
-- **D parts:** the #712 / #722 DP8 EP8 launch plus the PD settings.
+- **P parts:** PQ4, the 11-22 P settings and #813's config F (split, checkpoint slots, PP mailbox with the fabric
+  hop), with the c1024 P kernel switches at every point.
+- **D parts:** the #712 / #722 DP8 EP8 launch plus the PD settings; S1F on (the image has the fix).
 
 ```bash
 #!/bin/bash
@@ -108,7 +110,10 @@ mostly the image's `k3_455_tp8dcp8_server.sh` environment. The P and D parts com
 # Environment knobs:
 #   POINT   c1024 | c512 | c192 (default c512): picks the per-point settings below
 #   D_SEQS  max-num-seqs per D DP rank (default 96 at c1024, else 64)
-#   AITER_MEGA_S1F  1 (default; needs aiter #8189 + #8483) | 0 (as the runs, on an aiter without the fix)
+#   AITER_MEGA_S1F  1 (default; the 1126 image has aiter #8189 + #8483) | 0 (fallback)
+#   P_MAILBOX  fabric (default: the in-tray mailbox plus the fabric hop, #813 F) | tray (the cross-tray hop on NCCL)
+#              | off (every hop on NCCL, as before #3948)
+#   P_SPLIT    PP layer split (default 12,13,13,13,12,11,11,8, #813)
 #   IFNAME  data-plane NIC that reaches the other trays (enp4s0np0 on the G13 / E15 trays)
 set -euo pipefail
 ROLE=${1:?usage: k3pd_server.sh <P|D> <0|4>} FIRST=${2:?usage: k3pd_server.sh <P|D> <0|4>}
@@ -154,17 +159,25 @@ P)
   # HSA_NO_SCRATCH_RECLAIM avoid the TP1 long-prefix OOM. One loader thread: a TP1 stage pins 160-176 GiB of host
   # memory while it loads its experts.
   export ATOM_PP_MAX_INFLIGHT=16 HSA_NO_SCRATCH_RECLAIM=1 ATOM_LOADER_NUM_THREADS=1
-  # KDA state images in a per-stage store taking 0.75 of the KV budget; a session's spent anchor goes first
-  export ATOM_PP_STATE_CHECKPOINT_KV_SHARE=0.75 ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE=0 \
+  # KDA state images: a fixed 1600 per stage (#813: with the split below the KV pool grows 11.7M -> 38.8M tokens
+  # against the 0.75 share); a session's spent anchor goes first
+  export ATOM_PP_STATE_CHECKPOINT_SLOTS=1600 ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE=0 \
     ATOM_STATE_CHECKPOINT_DEMAND=0 ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE=1
-  if [ "$POINT" = c1024 ]; then
-    # P is the bottleneck only at c1024: a lighter stage 0 (it holds the dense FFN layer; the DSpark drafter sits
-    # on stage 7) and the P kernel switches of PD36
-    export VLLM_PP_LAYER_PARTITION=7,13,13,13,13,13,13,8
-    export AITER_SITUV2_A4W4=1 AITER_FLYDSL_STAGE2_FP8=1 ATOM_USE_ASM_FP8_PREFILL_ATTN=0 ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
-  else
-    export ATOM_PP_LAYER_PARTITION=kv_balanced
-  fi
+  # #813 split: 3 MLA layers per stage; pp7 keeps 8 layers for the drafter's KV and the head
+  export VLLM_PP_LAYER_PARTITION=${P_SPLIT:-12,13,13,13,12,11,11,8}
+  # P kernel switches (PD36), now at every point: gyu's prefill stack (carry_state FMHA, gather to FP8) is on the
+  # FlyDSL FP8 prefill attention
+  export AITER_SITUV2_A4W4=1 AITER_FLYDSL_STAGE2_FP8=1 ATOM_USE_ASM_FP8_PREFILL_ATTN=0 ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
+  # PP hand-off without NCCL send / recv (#3948, #813 F): in the tray a ring in the next stage's memory (HIP IPC,
+  # copy engine, no CU-holding spin); pp3 -> pp4 across the trays over the UALink fabric (torch.symm_mem on mori),
+  # pulled by the receiver, waited on with hipStreamWaitValue64. TRIM_BANK sends only the AttnRes bank blocks the next
+  # stage reads. #813 (c1024, P alone): bubble 37.6% -> 15.3%, same work 95 -> 68 s.
+  case ${P_MAILBOX:-fabric} in
+    fabric) export ATOM_PP_MAILBOX=1 ATOM_PP_TRIM_BANK=1 ATOM_PP_MAILBOX_FABRIC=1 ATOM_PP_MAILBOX_FABRIC_MODE=pull \
+              ATOM_PP_MAILBOX_FABRIC_WAIT=stream ;;
+    tray) export ATOM_PP_MAILBOX=1 ATOM_PP_TRIM_BANK=1 ;;
+    off) ;;
+  esac
   KV='{"kv_role": "kv_producer", "kv_connector": "moriio", "moriio_backend": "fabric", "backend": "fabric", "moriio_mode": "write", "handshake_port": 6301}'
   cd /tmp   # from /app, the image's aiter checkout would shadow the aiter package
   # PP runs eager (PP requires --enforce-eager)
@@ -220,6 +233,9 @@ until curl -sf -m 5 http://<P0_IP>:8000/health && curl -sf -m 5 http://<D0_IP>:8
   - `MoRIIO backend FABRIC (UALink), transfer_mode=write`
   - `KV pool and per-request state come from a fabric MemPool (UALink)`
   - The `PP state checkpoint store:` line (images per stage, KV blocks with and without the store).
+  - One `PP mailbox: stage N layers [a, b): ...` line per stage: in-tray hops say `mailbox`, and with
+    `P_MAILBOX=fabric` stage 3 says `send mailbox over the fabric (pull, wait stream)` and stage 4
+    `recv mailbox over the fabric (pull, wait stream)`. A hop still on NCCL says `nccl`.
 
 ## Router
 
@@ -321,16 +337,20 @@ cat <results>/k3pd-c1024/report.txt   # divide system tok/s by 16 for tok/s/GPU
 
 `POINT` selects these in the script.
 
-| | c1024 (PD36) | c512 (PD29) | c192 (PD29) |
+| | c1024 | c512 | c192 |
 |---|---|---|---|
 | D max-num-seqs per DP rank | 96 | 64 | 64 |
-| P layer split | `VLLM_PP_LAYER_PARTITION=7,13,13,13,13,13,13,8` | `ATOM_PP_LAYER_PARTITION=kv_balanced` | kv_balanced |
-| P kernel switches (`AITER_SITUV2_A4W4`, `AITER_FLYDSL_STAGE2_FP8`, FlyDSL FP8 prefill attention) | on | off | off |
+| P layer split | 12,13,13,13,12,11,11,8 | same | same |
+| P checkpoint store | 1600 images per stage | same | same |
+| P kernel switches (`AITER_SITUV2_A4W4`, `AITER_FLYDSL_STAGE2_FP8`, FlyDSL FP8 prefill attention) | on | on | on |
+| P hand-off (`P_MAILBOX`) | fabric | fabric | fabric |
 | Everything else | same | same | same |
 
-**Why the split and the P switches are c1024-only.** P is the bottleneck only at c1024; at c512 and c192, P does not
-queue, so neither changes anything there. With the switches alone, the c1024 plateau gained +2.3%; on top of the new
-split they added nothing (PD33 without them: 732).
+**Why P is the same at every point now.** The 11-22 runs kept the split and the P switches for c1024 because P only
+queued there. Since then the P-side work is all about how fast one prefill gets through the pipeline: the mailbox
+removes most of the bubble, and gyu's prefill stack is on the FlyDSL path (+19% prompt throughput, TTFT p50 −27% at
+c1024, P alone). Both lower TTFT at c192 / c512 too, where TTFT p50 was 1.7–2.0 s. The store with 1600 images keeps
+the prefix hit up over a long run instead of trading KV for images.
 
 ## Ports
 
@@ -359,10 +379,22 @@ After a code change, clear at least `/root/.cache/atom` before the restart: a st
 
 ## Where this differs from the runs, and what to watch
 
-- **`AITER_MEGA_S1F`.** The runs had S1F off: the 1119 aiter crashed with `hipErrorInvalidValue` (#722).
-  - aiter `k3-455-dev` carries the fix. S1F on is validated for aggregated DP8 EP8 (06 + 05: GSM8K equal, TPOT
-    −1% to −6%), not yet behind P.
+- **`AITER_MEGA_S1F`.** The 11-22 runs had S1F off: the 1119 aiter crashed with `hipErrorInvalidValue` (#722).
+  - The 1126 image carries the fix (#8189 + #8483, the newer #8189 with tile_m 128 on 5..8 ranks). Aggregated DP8 EP8 on
+    the 1126 image against 1120 (S1F off): decode forward per step −2.0% (24 sequences a rank, 8K context), −3.5%
+    (24, 32K), −7.9% (8, 32K), with the MLA PS1 work (#8736) included. Not yet behind P.
   - If D fails at startup with `hipErrorInvalidValue` or `compact plan needs ... LDS`, set `AITER_MEGA_S1F=0`.
+- **P with both the fabric mailbox and the MoRIIO producer is new.** Both use mori in the same processes (the mailbox a
+  torch.symm_mem ring on the MORI backend, the producer the MoRIIO engine). If P fails to start, or a fabric hop never
+  completes, run `P_MAILBOX=tray` (the pp3 -> pp4 hop back on NCCL, the in-tray hops stay on the mailbox), then `off`.
+  The fabric hop needs the PP group to be the whole world, which P's instance is.
+- **The fabric hop and the trays' boot batches.** #813's fabric probe and config F ran on e15-07 + e15-05 from
+  different boot batches without a fault, but cross-tray mori has also taken trays down (05 + 07 on 11-23, 05 on 11-27).
+  Run `tools/pp_fabric_probe.py` on P's pair first, and prefer trays whose driver was loaded together.
+- **First-use JIT stalls.** Even with warm disk caches, each P stage still loads 4-6 kernel specializations for the
+  first time per run (~0.35 s each). Measure after the warmup round, never on the first minutes of a fresh server.
+- **gyu's prefill stack switches** (both default on): `ATOM_MLA_CHUNK_CARRY` (0 = merge chunks with
+  `merge_attn_states` again) and the causal FMHA grid launch. Use them to bisect a P accuracy problem.
 - **`ATOM_ENABLE_PREFILL_DELAYER=0` on D** is new. On main-based ATOM, the default-on delayer deadlocks aggregated
   DP8 EP8. The runs' tree may not have had it.
 - **`ATOM_MEGA_MASK_PAD_ROWS=1`** was set on D in the runs. Nothing on this branch reads it, so the script leaves it
