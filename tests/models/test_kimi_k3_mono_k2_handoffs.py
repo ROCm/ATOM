@@ -125,6 +125,9 @@ def _resources(launcher):
 def test_compile_takes_the_hand_offs(rows, tmp_path, monkeypatch):
     monkeypatch.setenv("ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
+    # on a GPU runner an earlier test may have initialized CUDA; the build
+    # itself must not
+    cuda_was_initialized = torch.cuda.is_initialized()
     launcher = k2.build(k2.K2Build(tokens=rows, nblocks=4))
     rec = trace(launcher, k2.ABI)
     assert not rec.unnamed
@@ -137,5 +140,5 @@ def test_compile_takes_the_hand_offs(rows, tmp_path, monkeypatch):
     assert ("k2.lnorm", "lsq", Space.PEER, "put") in access
     assert ("k2.lnorm", "lsq", Space.PEER, "poll") in access
     assert not {a[1] for a in access} & {"rpart", "rlog", "lmsq"}
-    assert not torch.cuda.is_initialized()
+    assert cuda_was_initialized or not torch.cuda.is_initialized()
     print({"rows": rows, "vgpr": r["vgpr"], "lds": r["lds"]})
