@@ -2829,6 +2829,10 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     if const_expr(not by_unit):
         stamp(timeline, tls, tid, tl0 + shift + 6)
     enter_stage("k2b.reduce")
+    # (RQW) a caller's side work on the reduce stage's idle waves (``layer_run``)
+    reduce_side = c.get("reduce_side")
+    if const_expr(reduce_side is not None):
+        reduce_side()
     # token parallel: this rank's tokens' sums only (``out`` from its first
     # token's row, or from row 0: ``out_local``)
     if const_expr(c["tok_par"]):

@@ -41,7 +41,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import const_expr, gpu
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.meta import capture_user_location
 from flydsl.expr.typing import T, Int32, Int64
 
@@ -95,7 +95,8 @@ from atom.models.deepseek_v41.mono.kernels.moe import (
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import route_shape
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, bf_hi, bf_lo, fresh, kernel_symbol, launcher, traced
+from atom.mono.device.ops import CM_DEV, bf_hi, bf_lo, fresh, kernel_symbol, launcher, rsrc, traced, uniform
+from atom.mono.plan.execution import WAVES
 from atom.mono.device.stamps import stamp_begin
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, first_task
@@ -114,6 +115,11 @@ RUN_ARG_NAMES = kl.ABI.names
 # loaded at device scope: a CU's resident line of an earlier iteration is never
 # returned (measured stale otherwise, cache_tb); ATOM_MONO_HANDCM=0: the old loads
 HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
+K_WQKV = RUN_ARG_NAMES.index("k1_wqkv")
+K_WQKV_S = RUN_ARG_NAMES.index("k1_wqkv_s")
+# (RQW) the reduce CTAs' wave 7 reads the next layer's q-task wqkv_a tile into L2
+# during the reduce; at build: ATOM_MONO_RQW=1
+RQW_SITE = os.environ.get("ATOM_MONO_RQW", "0") == "1"
 K_MOE = 146
 assert RUN_ARG_NAMES[K_MOE] == "moe_layer"
 # CDNA buffer resource flags (DATA_FORMAT 32, NUM_FORMAT float: raw loads ignore them)
@@ -207,6 +213,37 @@ class LayerTable:
         return _s_load(self.r, 8 * k, 1)
 
 
+def _rqw_loads(tid, w, ws, task):
+    """(RQW) The 16 rows of q task ``task`` (``_fp8_step_load``'s row group:
+    16 x HIDDEN fp8, contiguous) a dword an L2 line, and its scale row
+    (``(task // 2)``'s HIDDEN // 32 bytes) whole, every load in flight at once,
+    kept by one sink: one wait, after the last issue."""
+    lane = tid % 64
+    r = rsrc(w + fx.Int64(task) * (16 * HIDDEN), 16 * HIDDEN)
+    vals = [
+        fx.Int32(bo.buffer_load(r, (lane + 64 * k) * 32, vec_width=1, dtype=T.i32))
+        for k in range_constexpr(16 * HIDDEN // (64 * 128))
+    ]
+    rs = rsrc(ws + fx.Int64(task // 2) * (HIDDEN // 32), HIDDEN // 32)
+    vals.append(fx.Int32(bo.buffer_load(rs, lane % (HIDDEN // 128), vec_width=1, dtype=T.i32)))
+    llvm.inline_asm(
+        None, [v.ir_value() for v in vals],
+        "; rqw l2 " + " ".join(f"${i}" for i in range(len(vals))),
+        ",".join(["v"] * len(vals)), has_side_effects=True,
+    )  # fmt: skip
+
+
+@traced
+def _rqw_site(tid, on, row, task, scratch):
+    """(RQW, absw bit 1) Wave 7 of a CTA where ``on``: the switch word read
+    there only; bit 1 -> ``_rqw_loads`` of the weights of the table row at
+    ``row`` (layer i+1's; an A/A build: the base's path, no loads); the
+    reduce's waves 0-1 skip it all."""
+    if on & (uniform(tid // 64) == WAVES - 1):
+        nxt = LayerTable(row, 0)
+        _rqw_loads(tid, nxt.i64(K_WQKV), nxt.i64(K_WQKV_S), task)
+
+
 def pend_poll(mb, pnd, s, tp, tid, live, j):
     """A slice thread's two ``pend`` values from PND (slice task j of this
     rank's, the thread's (row, column pair) as ``slice_direct_loads_live``'s),
@@ -222,7 +259,7 @@ def pend_poll(mb, pnd, s, tp, tid, live, j):
 
 
 @traced
-def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail):
+def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
     key = C["key"]
     pre = C["pre"]
     post = C["post"]
@@ -510,6 +547,18 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail):
     cb["x_cm"], cb["x_ready"] = CM_DEV, True
     # (run) every iteration's reduce puts its columns to PND too
     cb["pnd"] = pnd
+    if const_expr(RQW_SITE):
+        # (RQW) layer i+1's q-task wqkv_a tile into L2 from the
+        # reduce CTAs' idle wave 7 (their q weights otherwise issue only past
+        # the reduce)
+        nxt_row = fx.Int64(ltab) + fx.Int64(fx.min(it + 1, nlay - 1)) * (8 * RUN_ARGS)
+        rqw_task = first_task(bid, k1.GATE0)
+        cb["reduce_side"] = lambda: _rqw_site(
+            tid,
+            (it + 1 < nlay) & (rqw_task < k1.Q_TASKS)
+            & ((bid - rot + BLOCKS) % BLOCKS < k1.SLICES // pre.tp),
+            nxt_row, rqw_task, scratch,
+        )
     # the MoE output reduce-scattered too: the next seam A folds this
     # rank's columns only
     cb["shard_f"] = pre.shard
@@ -644,7 +693,7 @@ def _loop(C, ltab, nlay, tid, bid, lds, tls, pnd_off, shared, tail):
             _volatile(peers, True), _volatile(rank, False),
         )  # fmt: skip
         with _iter_ids(t, b):
-            _iter(C, ltab, it, t, b, lds, tls, pnd_off, shared, tail_i)
+            _iter(C, ltab, it, t, b, lds, tls, pnd_off, shared, tail_i, nlay)
         # the iteration's LDS union handed over to the next
         gpu.barrier()
         scf.YieldOp([], loc=capture_user_location())
@@ -683,7 +732,7 @@ def build_layer_run(rkey: RunBuild):
         tls: fx.Array[fx.Int64, 1, 16]
 
     name = kernel_symbol(
-        "v41_lrun", s=s, w=int(warm_iter), l=int(late), hc=int(HAND_CM != 0), kv8=int(post.kv_fp8), sh=int(pre.shard),
+        "v41_lrun", s=s, w=int(warm_iter), l=int(late), q=int(RQW_SITE), hc=int(HAND_CM != 0), kv8=int(post.kv_fp8), sh=int(pre.shard),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
