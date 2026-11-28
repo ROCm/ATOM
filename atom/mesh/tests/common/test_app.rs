@@ -54,6 +54,7 @@ pub fn create_test_app(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
+        router_config.backend,
         router_config.worker_startup_check_interval_secs,
     )));
 
