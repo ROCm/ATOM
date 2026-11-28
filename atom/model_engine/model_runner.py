@@ -223,6 +223,45 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+# The smallest prefill token bucket `ModelRunner.warmup_model` opens; smaller
+# ones open at decode graph capture, whose forwards run as many rows.
+MIN_WARMUP_TOKEN_BUCKET = 16
+
+
+def warmup_token_buckets(warmed_tokens: int, min_seqs: int = 1) -> list[int]:
+    """The power-of-two prefill token counts `ModelRunner.warmup_model` runs
+    after its first forward of ``warmed_tokens``: each from
+    `MIN_WARMUP_TOKEN_BUCKET` up to the largest below ``warmed_tokens``, as
+    ``min_seqs`` equal sequences. None unless ATOM_WARMUP_PREFILL_BUCKETS=1.
+
+    A power of two is where per-bucket host work is keyed: aiter's fused MoE
+    looks its tuned config up at `get_padded_M(tokens)`, the next power of two
+    below 32768, and caches the answer per bucket.
+    """
+    if not envs.ATOM_WARMUP_PREFILL_BUCKETS:
+        return []
+    buckets = []
+    tokens = max(MIN_WARMUP_TOKEN_BUCKET, min_seqs)
+    tokens = 1 << (tokens - 1).bit_length()
+    while tokens < warmed_tokens:
+        buckets.append(tokens)
+        tokens *= 2
+    return buckets
+
+
+def warmup_gemm_token_counts(warmed_tokens: int, buckets: list[int]) -> list[int]:
+    """The token counts `ModelRunner._warm_linear_gemms` runs each linear at:
+    every bucket and ``warmed_tokens``, plus 5/8, 6/8 and 7/8 of each.
+
+    A GEMM picks its kernel from the exact row count, not its power-of-two
+    bucket (aiter's gfx950 mxfp8 GEMM takes the tile whose grid fills the
+    CUs), so a 1280-row prefill can need a kernel no 1024 or 2048 run built.
+    Four points an octave reach most of those choices."""
+    tops = sorted(set(buckets) | {warmed_tokens})
+    counts = {top * eighths // 8 for top in tops for eighths in (5, 6, 7, 8)}
+    return sorted(n for n in counts if n >= tops[0])
+
+
 def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
     """Capture ladder for SP, which splits a batch's rows over ranks: one batch
     size per local bucket.
@@ -1577,6 +1616,80 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
+        total_tokens_num = num_seqs * seq_len
+        self.forward(self._warmup_prefill_batch(num_seqs, seq_len))
+        self.tokenID_processor.clean()
+        # A prefill at a power-of-two token count no forward of this rank has
+        # run pays that bucket's first-use host work (aiter's tuned MoE configs
+        # are keyed by it) in its own launch. Pay it here instead, from the
+        # smallest bucket up to the one the forward above ran.
+        buckets = warmup_token_buckets(total_tokens_num, min_seqs)
+        for tokens in buckets:
+            self.forward(self._warmup_prefill_batch(min_seqs, tokens // min_seqs))
+            self.tokenID_processor.clean()
+        # A dummy forward skips the layers that need a KV cache (DeepSeek-V4's
+        # attention returns zeros), so their linear GEMMs would still open
+        # each bucket on a live request: run those directly.
+        gemms = (
+            self._warm_linear_gemms(warmup_gemm_token_counts(total_tokens_num, buckets))
+            if buckets
+            else 0
+        )
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
+            f", then {len(buckets)} power-of-two token buckets below it"
+            f" and {gemms} distinct linear GEMMs at each"
+        )
+
+    @torch.inference_mode()
+    def _warm_linear_gemms(self, token_counts: list[int]) -> int:
+        """Run each distinct linear layer once on zeros at every count in
+        ``token_counts``, without its TP reduction, and return how many.
+
+        A GEMM's kernel is picked per token count, and some are compiled at
+        first use: aiter's gfx950 mxfp8 GEMM (FlyDSL) picks its tile from M and
+        JIT-compiles it. Layers alike in class, quantization and weight shape
+        share their kernels, so one of each is enough. A layer whose forward
+        will not take a plain bf16 input is left to its first request."""
+        from atom.model_ops.linear import LinearBase
+
+        dtype = self.config.torch_dtype
+        distinct: dict[tuple, LinearBase] = {}
+        for module in self.model.modules():
+            weight = getattr(module, "weight", None)
+            if not isinstance(module, LinearBase) or not isinstance(
+                weight, torch.Tensor
+            ):
+                continue
+            scale = getattr(module, "weight_scale", None)
+            key = (
+                type(module),
+                module.quant_type,
+                weight.dtype,
+                tuple(weight.shape),
+                tuple(scale.shape) if isinstance(scale, torch.Tensor) else None,
+                module.input_size,
+            )
+            distinct.setdefault(key, module)
+        for module in distinct.values():
+            reduce_results = module.reduce_results
+            module.reduce_results = False
+            try:
+                for tokens in token_counts:
+                    module(
+                        torch.zeros(
+                            tokens, module.input_size, dtype=dtype, device=self.device
+                        )
+                    )
+            except Exception as e:  # noqa: BLE001 - a warm must not stop startup
+                logger.debug("linear warm skipped %s: %s", module.prefix, e)
+            finally:
+                module.reduce_results = reduce_results
+        return len(distinct)
+
+    def _warmup_prefill_batch(self, num_seqs: int, seq_len: int) -> ScheduledBatch:
+        """A dummy prefill of ``num_seqs`` sequences of ``seq_len`` tokens."""
         seqs = [
             Sequence(
                 [0] * seq_len,
@@ -1591,7 +1704,7 @@ class ModelRunner:
         num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
         total_tokens_num = int(num_scheduled_tokens.sum())
 
-        dummy_batch = ScheduledBatch(
+        return ScheduledBatch(
             seqs=seqs,
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num,
@@ -1599,12 +1712,6 @@ class ModelRunner:
             total_seqs_num=num_seqs,
             total_seqs_num_prefill=num_seqs,
             is_dummy_run=True,
-        )
-        self.forward(dummy_batch)
-        self.tokenID_processor.clean()
-        torch.cuda.empty_cache()
-        logger.info(
-            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
 
     def profile_dynamic_chunking(self):
