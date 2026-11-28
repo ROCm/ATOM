@@ -89,6 +89,16 @@ def peer_memory_refusals(atom_config) -> list[tuple[bool, str]]:
     ]
 
 
+def routed_experts_refusal(atom_config) -> tuple[bool, str]:
+    """``(holds, why not)`` for a mono model whose kernels route experts
+    in-kernel: they never write the routed-expert capture, so it would
+    return ``-1`` rows for those layers."""
+    return (
+        not atom_config.enable_return_routed_experts,
+        "routed-expert capture",
+    )
+
+
 def common_refusals(
     atom_config,
     dims,

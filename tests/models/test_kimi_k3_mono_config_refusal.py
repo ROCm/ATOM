@@ -77,6 +77,7 @@ def _atom_config(**hf_overrides):
         is_multinode_tp=False,
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_return_routed_experts=False,
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(
             level=3,
@@ -138,6 +139,18 @@ def test_lmcache_mp_can_run_beside_k3_and_shared_dsa_mono(servable, connector):
     expected = None if connector == "lmcache_mp" else f"KV connector {connector}"
     assert config_refusal(atom_config) == expected
     assert dsa_refusal(atom_config) == expected
+
+
+def test_routed_expert_capture_refuses_only_the_in_kernel_moe(servable):
+    """K3's K2 routes in-kernel and would never write the capture; the shared
+    checks the DSA indexer also uses must not refuse it."""
+    from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
+
+    atom_config = _atom_config()
+    atom_config.enable_return_routed_experts = True
+    assert config_refusal(atom_config) == "routed-expert capture"
+    checks = deployment.common_refusals(atom_config, Dims, SUPPORTED_TP)
+    assert deployment.first_refusal(checks) is None
 
 
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):

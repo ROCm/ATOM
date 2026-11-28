@@ -240,6 +240,8 @@ def _model_runner_worker(pc, layout, global_rank):
         port=0,
     )
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.config = config
     runner._setup_device_and_distributed(global_rank % stage_span, config)
     try:

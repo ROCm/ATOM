@@ -66,6 +66,8 @@ CHANNEL = {"required_channel": object()}
 def test_release_reaches_the_grammar_through_the_runner():
     grammar = mock.Mock()
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.structured_output = grammar
     mod.ModelRunner.release_constraints(runner, [3, 4])
     grammar.release.assert_called_once_with([3, 4])
@@ -132,6 +134,8 @@ def test_forward_without_a_grammar_prepares_nothing(rule):
 
 def _postprocess_runner(ids, grammar):
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner._served = None
     # the head: the hidden states are the logits
     runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
@@ -140,7 +144,7 @@ def _postprocess_runner(ids, grammar):
     runner.forward_done_event = SimpleNamespace(record=lambda stream=None: None)
 
     def prepare_sampled_ids(batch, sampled, event, payload, **kwargs):
-        return dict(ids), None
+        return dict(ids), None, None
 
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=False,

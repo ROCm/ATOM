@@ -5154,6 +5154,7 @@ def test_the_scheduler_publishes_touches_with_the_state_loads(offload_clock):
     idx.want_touch(7)
     sent = []
     s = Scheduler.__new__(Scheduler)
+    s._return_routed_experts = False
     s.kv_connector = SimpleNamespace(
         enqueue_state_touches=lambda hs: sent.extend(hs) or True
     )
@@ -5169,6 +5170,7 @@ def test_the_scheduler_applies_touch_verdicts(offload_clock):
     idx.want_touch(7)
     assert idx.take_touches() == [7]
     s = Scheduler.__new__(Scheduler)
+    s._return_routed_experts = False
     s.kv_connector = SimpleNamespace(take_state_touch_verdicts=lambda: {7: False})
     s.block_manager = SimpleNamespace(state_offload=idx)
     s.finished_recving_kv_req_ids = []

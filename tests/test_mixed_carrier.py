@@ -358,6 +358,7 @@ def test_runner_builds_the_banks_before_warmup(monkeypatch, mixed):
         max_model_len=16,
         quant_config=Mock(),
         enable_tbo=False,
+        enable_return_routed_experts=False,
         enable_mixed_prefill_decode=mixed,
     )
     monkeypatch.setattr(mr, "set_current_atom_config", lambda _: None)

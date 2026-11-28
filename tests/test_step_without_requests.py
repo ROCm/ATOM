@@ -60,6 +60,8 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
     monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
     monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
     runner = object.__new__(mod.ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.structured_output = None
     runner.device = torch.device("cpu")
     runner.sampler = lambda logits, *args, **kwargs: logits.argmax(-1)
@@ -71,7 +73,7 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
         prev_batch=None,
         zero_spec_counts=torch.zeros(8, dtype=torch.int32),
         prepare_sampled_ids=lambda b, ids, *a, **k: (
-            sampled.update(ids=ids) or ({}, {})
+            sampled.update(ids=ids) or ({}, {}, None)
         ),
     )
     batch = types.SimpleNamespace(

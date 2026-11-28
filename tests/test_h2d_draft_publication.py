@@ -32,6 +32,8 @@ def make_runner(
 
     monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", str(int(replay)))
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
         pipeline_parallel_size=pp_size, hf_config=SimpleNamespace()

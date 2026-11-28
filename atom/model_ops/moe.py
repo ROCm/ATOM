@@ -1610,11 +1610,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton_ep = False
 
         # AITER_FLYDSL_USE_HERD: aiter's gfx1250 HERD drop, TP only (no expert_mask).
+        # Off under routed-expert replay: fused_moe drops one of the K+1
+        # candidates inside the kernel, so the K ids it ran are never seen here
+        # to capture; the plain routing captures them.
         self.use_flydsl_herd = (
             _FLYDSL_USE_HERD
             and self.is_gfx1250
             and self.is_guinterleave
             and not ep_moe
+            and not get_current_atom_config().enable_return_routed_experts
             and not getattr(get_current_atom_config(), "eplb_enable", False)
             and _herd_sees_own_rows(self.moe.moe_parallel_config)
             and _aiter_serves_flydsl_herd()

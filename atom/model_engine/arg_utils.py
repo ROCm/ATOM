@@ -115,6 +115,20 @@ def _is_offload_connector(cfg: object) -> bool:
     return KVConnectorFactory.is_offload_backend(canonical)
 
 
+def refuse_server_routed_experts(parser: argparse.ArgumentParser, args) -> None:
+    """Exit with a usage error when a server is started with R3 on.
+
+    Routes reach callers only through ``generate()``; no server endpoint
+    returns them, so the capture's cost would buy nothing.
+    """
+    if args.enable_return_routed_experts:
+        parser.error(
+            "--enable-return-routed-experts is offline-only: routes are "
+            "returned by LLMEngine.generate(), and no server endpoint returns "
+            "them"
+        )
+
+
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -137,6 +151,7 @@ class EngineArgs:
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     enable_mixed_prefill_decode: bool = False
+    enable_return_routed_experts: bool = False
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
@@ -348,6 +363,18 @@ class EngineArgs:
             help="Pack prefill chunks and decode seqs into the same forward "
             "pass (DeepSeek-V4 only; refused at launch elsewhere). Profiles "
             "mixed workspace before sizing the KV cache. Off by default.",
+        )
+        parser.add_argument(
+            "--enable-return-routed-experts",
+            dest="enable_return_routed_experts",
+            action="store_true",
+            help="Return per-request MoE expert ids on generate() as "
+            "routed_experts int16 [seq_len-1, num_layers, top_k]. "
+            "Requires DCP=PCP=PP=SP=1, no plugin mode, and no KV transfer, "
+            "offload, RapidServe, or --fake-eplb; after weight load, a MoE model whose "
+            "attention supplies per-token KV slots (not DeepSeek-V4 / V4.1). "
+            "Mono decode turns off for models that route in-kernel. "
+            "Offline only: the OpenAI and atomesh servers refuse it.",
         )
         parser.add_argument(
             "--port",

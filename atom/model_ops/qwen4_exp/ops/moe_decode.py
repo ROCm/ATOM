@@ -156,14 +156,16 @@ def moe_decode_single_token(
     s2: torch.Tensor,
     router_logits: torch.Tensor | None = None,
     top_k: int | None = None,
-) -> torch.Tensor:
+    return_topk_ids: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """`sum_k w_k * expert_k(x)` for one token.
 
     `w13 [E, 2I, H]` (gate rows then up rows) and `w2 [E, H, I]` are FP8 in
     the (16, 16) shuffled layout; `s13 [E, 2I]` / `s2 [E, H]` are per-channel.
     Either pass `topk_ids` / `topk_weights`, or `router_logits [1, E]` (routed
     logits then the shared expert's gate logit) and `top_k`, in which case the
-    routing runs inside the first kernel.
+    routing runs inside the first kernel. With `return_topk_ids`, also returns
+    the `[1, top_k + 1]` int32 ids it ran (routed experts, then the shared one).
     """
     if x.shape[0] != 1:
         raise ValueError("moe_decode_single_token expects exactly one token")
@@ -210,4 +212,6 @@ def moe_decode_single_token(
         BN=bn2,
         num_warps=4,
     )
+    if return_topk_ids:
+        return out, topk_ids
     return out

@@ -113,6 +113,7 @@ class MockConfig:
             "scheduler_delay_factor": 0.0,
             "prefill_admit_policy": "interval",
             "speculative_config": None,
+            "enable_return_routed_experts": False,
             # What `Config` resolves: the env override, else the global default.
             "offload_min_load_tokens": int(
                 os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192")

@@ -26,6 +26,9 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     plan_pools,
     state_pool,
 )
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    capture_bytes_per_kv_block,
+)
 
 
 def make_store(num_units=20, unit_bytes=10, slot_bytes=25):
@@ -847,3 +850,14 @@ def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
     assert pool.has_free()
+
+
+def test_page_unit_excludes_draft_kv_and_routed_expert_surcharge():
+    """The draft pool and the R3 capture rows share the PAGE block id, so the
+    plan charges them, but they are not part of the state image."""
+    target = _Builder([page_pool(4096), state_pool("ssm", 777, entries_per_req=1)])
+    draft = [page_pool(1024)]
+    surcharge = page_pool(capture_bytes_per_kv_block(16, 4, 2))
+    plan = plan_pools(list(target.sub_pool_specs()) + draft + [surcharge], 1 << 30, 4)
+    assert plan.entry_bytes[plan.paged_class] == 4096 + 1024 + surcharge.entry_bytes
+    assert published_page_unit_bytes(target) == 4096

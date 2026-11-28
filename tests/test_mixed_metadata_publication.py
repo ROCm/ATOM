@@ -126,6 +126,7 @@ def _runner(monkeypatch, slots):
     from atom.model_ops.attentions import deepseek_v4_attn as v4
 
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
     runner.device = torch.device("cuda", 0)
     runner.block_size = 256
     runner.max_num_batched_tokens = 32

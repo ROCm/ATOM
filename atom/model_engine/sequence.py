@@ -276,6 +276,29 @@ class Sequence:
     # True only for a decode leg whose prefill kept the media, set in __init__.
     media_on_prefill_instance = False
 
+    # Routed-expert replay state. Class defaults, assigned on an instance only
+    # by the R3 paths, so with R3 off none of it is in a pickled sequence.
+    # MoE routes: int16 [seq_len-1, layers, top_k], in a buffer whose capacity
+    # doubles as it grows; a patch is written at its absolute position.
+    # `_routed_expert_rows` is the live length; the tail is unused.
+    _routed_expert_buf: np.ndarray | None = None
+    _routed_expert_rows: int = 0
+    # Positions some scheduled forward already returns routes for since the
+    # last preemption; a prefix-cache hit past it has its rows read from the
+    # cache.
+    routed_forwarded_end: int = 0
+    # First position whose routes a scheduled forward still owes (its patch
+    # not yet received), or None. A request finishing early can be that
+    # short; one finishing with nothing owed must hold every row.
+    routed_owed_from: int | None = None
+    # First position of a pure middle chunk whose routes are still on the
+    # device, waiting for the next step's copy (`add_held_routed_experts`),
+    # or None. They stay owed one output past that step.
+    routed_held_from: int | None = None
+    # Preemptions so far. A patch segment scheduled under an older epoch is
+    # from a forward the resumed request no longer owes, and is dropped.
+    routed_epoch: int = 0
+
     def __init__(
         self,
         token_ids: list[int],
@@ -644,6 +667,97 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def routed_expert_rows(self) -> int:
+        """How many MoE-route rows have already been accumulated."""
+        return self._routed_expert_rows
+
+    @property
+    def routed_experts(self) -> np.ndarray | None:
+        """int16 [rows, layers, top_k], or None if no patch ever arrived.
+
+        A view of the live rows, read-only once ``finish_routed_experts`` has
+        run. A finished request has ``num_tokens - 1`` rows, except:
+
+        - one that finished from ``running`` (aborted, a structured-output or
+          logprob error) while a scheduled forward still owed it routes, or
+          while still mid-prefill / mid-recompute after a preemption: it
+          holds the rows that arrived (short of ``num_tokens - 1``), since
+          the rest never ran or their patch has not landed;
+        - one finished from ``waiting`` (``_finish_rejected_waiting``): it
+          keeps the rows it had, unchecked -- 0 after a preemption (which
+          clears the buffer), ``None`` if it was never scheduled.
+        """
+        buf = self._routed_expert_buf
+        # Zero rows is still [0, layers, top_k]; only a request no patch ever
+        # reached has no shape to report.
+        if buf is None:
+            return None
+        return buf[: self._routed_expert_rows]
+
+    def _ensure_routed_expert_capacity(
+        self, need: int, layers: int, top_k: int
+    ) -> None:
+        buf = self._routed_expert_buf
+        if buf is None:
+            self._routed_expert_buf = np.empty((need, layers, top_k), dtype=np.int16)
+            return
+        if need <= buf.shape[0]:
+            return
+        cap = max(buf.shape[0], 1)
+        while cap < need:
+            cap *= 2
+        grown = np.empty((cap, buf.shape[1], buf.shape[2]), dtype=np.int16)
+        n = self._routed_expert_rows
+        if n:
+            grown[:n] = buf[:n]
+        self._routed_expert_buf = grown
+
+    def apply_routed_expert_patch(self, start: int, rows: np.ndarray | None) -> None:
+        """Merge an absolute-range patch; overlap overwrites.
+
+        A patch starting past the rows already held would leave positions no
+        step returned, so it raises rather than handing the trainer -1 rows.
+        """
+        if rows is None or self.is_finished:
+            return
+        arr = np.ascontiguousarray(rows, dtype=np.int16)
+        n = int(arr.shape[0])
+        if n == 0:
+            return
+        start = int(start)
+        have = self._routed_expert_rows
+        if start > have:
+            raise RuntimeError(
+                f"routed experts: request {self.id} got rows from position "
+                f"{start} but holds only {have}; positions {have}..{start - 1} "
+                "were never returned"
+            )
+        end = start + n
+        self._ensure_routed_expert_capacity(end, arr.shape[1], arr.shape[2])
+        self._routed_expert_buf[start:end] = arr
+        # A repeated range (stale deferred output, a resumed prefill) only
+        # overwrites; dropping rows is `truncate_routed_experts`'s job.
+        self._routed_expert_rows = max(have, end)
+
+    def truncate_routed_experts(self, keep_rows: int) -> None:
+        """Drop trailing route rows (spec reject, stop trim, or preemption)."""
+        keep = max(int(keep_rows), 0)
+        if keep >= self._routed_expert_rows:
+            return
+        self._routed_expert_rows = keep
+
+    def finish_routed_experts(self, keep_rows: int) -> None:
+        """Trim to ``keep_rows`` and freeze, so the pickle carries the live rows
+        rather than the growable buffer's spare capacity."""
+        self.truncate_routed_experts(keep_rows)
+        buf = self._routed_expert_buf
+        if buf is None:
+            return
+        buf = buf[: self._routed_expert_rows]
+        buf.flags.writeable = False
+        self._routed_expert_buf = buf
 
     @property
     def num_completion_tokens(self):

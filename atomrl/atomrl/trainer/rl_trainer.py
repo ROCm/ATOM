@@ -797,6 +797,12 @@ class RLTrainer:
             engine_kwargs["max_model_len"] = int(max_model_len)
         if quant_cfg:
             engine_kwargs["online_quant_config"] = quant_cfg
+        r3_enabled = bool(getattr(self.config.moe.r3, "enabled", False))
+        if r3_enabled or self._r3_rollout_replay:
+            # ATOM returns the expert ids it selected for every completion
+            # ([seq_len-1, num_layers, top_k]); ATOMRayServer forwards them and
+            # _assemble_ray_rollout packs them as ``rollout_routing``.
+            engine_kwargs["enable_return_routed_experts"] = True
 
         extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
         if extra:
@@ -964,9 +970,10 @@ class RLTrainer:
                 raw_routes = res.get("routed_experts")
                 if raw_routes is None:
                     raise RuntimeError(
-                        "moe.r3.enabled=true but vLLM returned no routed_experts. "
-                        "The rollout image must include the MILES vLLM patch and "
-                        "enable_return_routed_experts support."
+                        "R3 is on but the rollout engine returned no routed_experts. "
+                        "vLLM needs the MILES patch and enable_return_routed_experts; "
+                        "ATOM needs enable_return_routed_experts (set automatically "
+                        "by the Ray ATOM rollout)."
                     )
                 routes = torch.as_tensor(raw_routes)
                 expected = len(p_ids) + len(g_ids) - 1

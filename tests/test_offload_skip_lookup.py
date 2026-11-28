@@ -192,6 +192,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._return_routed_experts = False
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s.enable_mixed_prefill_decode = False
@@ -537,6 +538,7 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._return_routed_experts = False
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -562,6 +564,8 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
+
+    s._return_routed_experts = False
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.enable_mixed_prefill_decode = False

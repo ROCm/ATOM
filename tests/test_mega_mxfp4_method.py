@@ -41,7 +41,9 @@ def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
 def _mxfp4_method(monkeypatch, gfx, fp8_activations):
     """An Mxfp4MoEMethod on `gfx` with ATOM_MOE_GU_ITLV off."""
     monkeypatch.setattr(
-        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, enable_return_routed_experts=False),
     )
     monkeypatch.setattr(moe_mod, "get_gfx", lambda: gfx)
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)

@@ -54,6 +54,8 @@ def make_runner(
         if hasattr(module, "get_dcp_rank"):
             monkeypatch.setattr(module, "get_dcp_rank", lambda: dcp - 1)
     runner = ModelRunner.__new__(ModelRunner)
+    runner._return_routed_experts = False
+    runner._routed_experts_capturer = None
     runner.device = torch.device("cuda", 0)
     runner.max_bs = 4
     runner.max_num_batched_tokens = 64

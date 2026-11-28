@@ -140,6 +140,56 @@ def test_herd_declines_gathered_rows(
     assert moe_mod._herd_sees_own_rows(parallel_config) is own_rows
 
 
+@pytest.mark.parametrize("replay", [False, True])
+def test_herd_is_off_under_routed_expert_replay(monkeypatch, decode_step, replay):
+    """fused_moe drops one HERD candidate in the kernel, out of capture's sight:
+    under replay the layer routes its top-k as a plain step, which a bind's
+    wrapper of `select_experts` captures."""
+    monkeypatch.setattr(
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, enable_return_routed_experts=replay),
+    )
+    monkeypatch.setattr(moe_mod, "_FLYDSL_USE_HERD", True)
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(moe_mod, "_herd_sees_own_rows", lambda _config: True)
+    monkeypatch.setattr(moe_mod, "_aiter_serves_flydsl_herd", lambda: True)
+    monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", False)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE_DECODE", False)
+    method = moe_mod.Mxfp4MoEMethod(
+        SimpleNamespace(
+            quant_type=object(),
+            quant_dtype=object(),
+            quant_method=None,
+            is_dynamic=True,
+        ),
+        SimpleNamespace(
+            a_quant_dtype=None,
+            mxfp4_fp8_activations=False,
+            use_ep=False,
+            moe_parallel_config=None,
+        ),
+    )
+    assert method.use_flydsl_herd is not replay
+
+    top_ks = []
+    monkeypatch.setattr(
+        moe_mod.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **kw: top_ks.append(kw["top_k"]) or ("weights", "ids")),
+    )
+    layer = _layer(
+        *HERD_PROFILES["deepseek_v4"],
+        expert_layout=SimpleNamespace(num_routed=128, uses_all2all_fusion=False),
+        shared_expert_scoring_func=None,
+    )
+
+    method.select_experts(layer, "x", torch.empty(64, 8))
+
+    assert top_ks == [layer.top_k if replay else layer.top_k + 1]
+
+
 def test_herd_stays_off_without_aiters_herd_route(monkeypatch):
     from aiter.ops.flydsl import herd_topk
 

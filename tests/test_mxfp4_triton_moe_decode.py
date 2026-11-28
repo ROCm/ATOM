@@ -36,7 +36,9 @@ def _make_method(
     a4w4=False,
 ):
     monkeypatch.setattr(
-        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, enable_return_routed_experts=False),
     )
     monkeypatch.setattr(moe_mod, "get_gfx", lambda: gfx)
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
@@ -129,7 +131,9 @@ def test_a4w4_still_refuses_when_ep_triton_is_declined(monkeypatch):
 
 def test_mega_backend_keeps_decode_triton_off(monkeypatch):
     monkeypatch.setattr(
-        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, enable_return_routed_experts=False),
     )
     monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx1250")
     monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)

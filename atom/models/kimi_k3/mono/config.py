@@ -41,6 +41,7 @@ from atom.mono.runtime.deployment import (
     common_refusals,
     first_refusal,
     resident_grid_refusals,
+    routed_experts_refusal,
 )
 from atom.utils import envs
 
@@ -246,6 +247,7 @@ def config_refusal(atom_config) -> str | None:
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
         + resident_grid_refusals(atom_config, _served_connectors(atom_config))
     ) + [
+        routed_experts_refusal(atom_config),
         # the KDA recurrence reads and writes the state in place as fp32 or as
         # fp16; any other pool would be reinterpreted rather than converted
         (

@@ -1071,6 +1071,7 @@ class InputOutputProcessor:
         1) Compute stats for logging
         2) Detokenize"""
         outputs = {}
+        return_routed_experts = self.config.enable_return_routed_experts
         for req in reqs:
             self.requests.pop(req.id)
             external_request_id = self._internal_to_external.pop(req.id, None)
@@ -1110,6 +1111,10 @@ class InputOutputProcessor:
                 "ttft": ttft,  # Time to first token in seconds
                 "tpot": tpot,  # Time per output token in seconds
             }
+            if return_routed_experts:
+                routed_experts = req.routed_experts
+                if routed_experts is not None:
+                    outputs[req.id]["routed_experts"] = routed_experts
         return outputs
 
     def has_pending_requests(self):
