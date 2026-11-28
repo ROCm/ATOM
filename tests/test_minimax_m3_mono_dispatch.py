@@ -209,6 +209,13 @@ def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
 
 
+@pytest.mark.parametrize("n, taken", [(1, True), (8, True), (9, False), (16, False)])
+def test_max_rows_caps_the_steps_mono_takes(monkeypatch, n, taken):
+    monkeypatch.setenv("ATOM_MONO_MAX_ROWS", "8")
+    md = _forward_context(_decode_md(rows=16))
+    assert _mono(monkeypatch, md).supports(*_step(n), None, None) is taken
+
+
 def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
     """``prepare`` is the TP-wide verdict: false on every rank, so every rank
     falls back.

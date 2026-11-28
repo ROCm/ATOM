@@ -123,7 +123,7 @@ class MonoDecode:
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
             return False
-        if not 1 <= n <= MAX_TOKENS:
+        if not 1 <= n <= min(MAX_TOKENS, envs.ATOM_MONO_MAX_ROWS):
             return False
         # the kernels read every token's position and slot as an int64's low word
         if positions.dtype != torch.int64:

@@ -732,6 +732,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # MiniMax-M3 mono: the largest decode step (rows, cudagraph pad rows included)
+    # routed to mono; a larger step takes the regular model. Default: no cap, every
+    # step mono can serve (`MAX_TOKENS`). Measured on TP4 decode: mono wins at 8
+    # rows and loses at 16 on some shapes, so serving stacks may cap it.
+    "ATOM_MONO_MAX_ROWS": lambda: int(os.getenv("ATOM_MONO_MAX_ROWS", "1000000")),
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8
