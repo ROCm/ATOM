@@ -1725,6 +1725,9 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # launch outside the model's eager regions is sized by the token count
     # alone.
     supports_token_graph = False
+    # Whether a recorded bucket is one request of that many rows, so it may not
+    # exceed ``max_model_len`` (the request's block table has no more columns).
+    token_graph_within_model_len = False
 
     # The `running_bs` a prefill's model records some of its layers at as
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
