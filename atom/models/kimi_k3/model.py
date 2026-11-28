@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+from collections.abc import Callable
 from typing import ClassVar
 
 import torch
@@ -18,6 +19,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.tuned_gemm import tgemm
 from einops import rearrange
 from torch import nn
 
@@ -315,10 +317,69 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
+        return self.act_and_down_proj(self.gate_up_proj(x, x_scale))
+
+    def act_and_down_proj(
+        self, gate_up: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # act_fn always returns (activation, scale): (fp8, scale) when it fused the
         # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
-        act, act_scale = self.act_fn(self.gate_up_proj(x, x_scale))
-        return self.down_proj(act, x_scale=act_scale)
+        act, act_scale = self.act_fn(gate_up)
+        if out is None:
+            return self.down_proj(act, x_scale=act_scale)
+        return self.down_proj(act, x_scale=act_scale, out=out)
+
+
+class MergedBF16Linears(nn.Module):
+    """One BF16 GEMM for linears that read the same input, over their weights
+    concatenated by rows; returns each linear's output as a view.
+
+    `linears` returns them, looked up on use so that building this does not
+    reach into the owner's children. The post-load hook builds the merged
+    weight and points each linear's weight at its rows, releasing the old
+    storage after the temporary load-time copy. The linears still serve
+    callers that run them alone. The owner
+    registers this after those linears: the loader runs a module's hook before
+    its children's, so a sibling registered last sees their settled layouts.
+    If any of them is not a plain BF16 GEMM by then, `merged_weight` stays None
+    and the owner runs them apart.
+    """
+
+    def __init__(self, linears: Callable[[], tuple[nn.Module, ...]]):
+        super().__init__()
+        self.linears = linears
+        self.merged_weight: torch.Tensor | None = None
+
+    def process_weights_after_loading(self) -> None:
+        linears = self.linears()
+        if self.merged_weight is not None or any(
+            type(linear) not in (MergedColumnParallelLinear, ReplicatedLinear)
+            for linear in linears
+        ):
+            return
+        weights = [linear.weight for linear in linears]
+        if not all(
+            linear.quant_type.value == QuantType.No.value
+            and linear.native_a8_group_rows is None
+            and not linear.is_output_padded
+            and not linear.reduce_results
+            and linear.bias is None
+            and w.dtype == torch.bfloat16
+            and w.is_contiguous()
+            and w.shape == (linear.output_size, linear.input_size)
+            and w.shape[1] == weights[0].shape[1]
+            and w.device == weights[0].device
+            for linear, w in zip(linears, weights)
+        ):
+            return
+        self.merged_weight = torch.cat(weights)
+        rows = self.merged_weight.split([w.shape[0] for w in weights])
+        for w, merged_rows in zip(weights, rows):
+            w.data = merged_rows
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        y = tgemm.mm(x, self.merged_weight, otype=dtypes.bf16)
+        return y.split([linear.weight.shape[0] for linear in self.linears()], dim=-1)
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -445,6 +506,19 @@ class KimiSparseMoeBlock(nn.Module):
                 else None
             )
 
+        # Registered last, so its hook runs after the linears it merges.
+        self.front_proj = (
+            MergedBF16Linears(
+                lambda: (
+                    self.shared_experts.gate_up_proj,
+                    self.gate,
+                    self.routed_expert_down_proj,
+                )
+            )
+            if self.use_latent_moe and self.shared_experts is not None
+            else None
+        )
+
         # Dual-stream gate: overlap the shared-expert GEMMs (on alt_stream) with
         # the routed-expert path (on the main stream). Only meaningful when a
         # shared branch exists and an alt_stream was threaded in. TBO already
@@ -546,16 +620,24 @@ class KimiSparseMoeBlock(nn.Module):
             return summed, None
         return self.split_moe_forward(hidden_states)
 
-    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def routed_expert_forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+        routed_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Routed-expert path only. For the latent MoE this includes the routed
         all-reduce (required before the nonlinear routed_expert_norm); the shared
-        branch is handled by the caller."""
-        router_logits = self.gate(hidden_states)
-        routed_input = (
-            self.routed_expert_down_proj(hidden_states)
-            if self.use_latent_moe
-            else hidden_states
-        )
+        branch is handled by the caller. A caller that already ran the gate and
+        the latent down-projection passes their outputs."""
+        if router_logits is None:
+            router_logits = self.gate(hidden_states)
+        if routed_input is None:
+            routed_input = (
+                self.routed_expert_down_proj(hidden_states)
+                if self.use_latent_moe
+                else hidden_states
+            )
         routed_output = self.experts(routed_input, router_logits)
         if self.use_latent_moe:
             # self.experts runs with reduce_results=False, so routed_output is a
@@ -610,6 +692,23 @@ class KimiSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Routed and shared branches, returned unsummed where deferring is
         legal. See `forward` for why the add is worth deferring."""
+        if (
+            self.front_proj is not None
+            and self.front_proj.merged_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            gate_up, router_logits, routed_input = self.front_proj(hidden_states)
+            if self.tp_size > 1 and self.shared_experts.down_proj.supports_out():
+                return self._one_reduce_split(
+                    hidden_states, gate_up, router_logits, routed_input
+                )
+            routed_output = self.routed_expert_forward(
+                hidden_states, router_logits, routed_input
+            )
+            shared_output = self.shared_experts.act_and_down_proj(gate_up)
+            if self.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            return routed_output, shared_output
         identity = hidden_states
         routed_output = self.routed_expert_forward(hidden_states)
         if self.use_latent_moe:
@@ -638,6 +737,35 @@ class KimiSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output, None
+
+    def _one_reduce_split(
+        self,
+        hidden_states: torch.Tensor,
+        gate_up: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce contiguous latent/shared blocks together, before routed norm."""
+        latent_numel = routed_input.numel()
+        partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
+        self.experts(
+            routed_input,
+            router_logits,
+            out=partials[:latent_numel].view_as(routed_input),
+        )
+        self.shared_experts.act_and_down_proj(
+            gate_up, out=partials[latent_numel:].view_as(hidden_states)
+        )
+        reduced = tensor_model_parallel_all_reduce(partials)
+        return self._finish_latent_tail(
+            reduced[:latent_numel].view_as(routed_input),
+            reduced[latent_numel:].view_as(hidden_states),
+        )
+
+    def _finish_latent_tail(
+        self, latent: torch.Tensor, shared: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._apply_routed_norm_and_up_proj(latent), shared
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Summed dual-stream dispatch target, for callers that cannot defer."""
