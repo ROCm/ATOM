@@ -5181,10 +5181,26 @@ class RapidServeModelRunner(ModelRunner):
 
     def _maybe_warmup(self):
         # Decode owns no GPU memory yet (weights/kvcache imported from prefill
-        # later), so warmup would run against meta-device tensors — skip it.
+        # later), so warmup would run against meta-device tensors — skip it
+        # here; DecodeEngineCore runs it later through `warmup_decode`.
         if self.config.disagg_is_decode:
             return
         super()._maybe_warmup()
+
+    def warmup_decode(self) -> bool:
+        """The warmup decode skipped, run once its weights and kvcache are
+        imported, before it reports READY (`DecodeEngineCore`, under
+        `--enforce-eager`; CUDA graph capture runs the model otherwise).
+
+        torch.compile traces the model's first call. Left to the first request,
+        that is a one-token decode, whose size-1 token dim `mark_dynamic`
+        cannot keep dynamic: the graph compiles for one token and the next
+        forward fails in the piecewise backend (no symbolic size to dispatch
+        on). Returns True because `call_func(wait_out=True)` waits for a
+        reply, and the worker sends none for None.
+        """
+        self.warmup_model()
+        return True
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         # Two processes share the GPU in disagg mode; reserve extra headroom so
@@ -5536,11 +5552,11 @@ class RapidServeModelRunner(ModelRunner):
     def create_decode_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated decode.
 
-        Called once by DecodeEngineCore._init_disagg().  In constrained mode,
-        complementary to the prefill pool: for fraction F, decode gets CUs
-        [F*total, total).  forward() selects the stream dynamically each
-        iteration.  In unconstrained mode, only the plain full-CU stream
-        (None key) is created.
+        Called once by DecodeEngineCore.__init__() after IPC import.  In
+        constrained mode, complementary to the prefill pool: for fraction F,
+        decode gets CUs [F*total, total).  forward() selects the stream
+        dynamically each iteration.  In unconstrained mode, only the plain
+        full-CU stream (None key) is created.
         """
         self._decode_streams = {}
         if getattr(self.config, "disagg_constrained", False):

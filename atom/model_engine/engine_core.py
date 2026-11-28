@@ -1731,9 +1731,16 @@ class DecodeEngineCore(EngineCore):
         )
         logger.info("DecodeEngineCore: kvcache IPC import complete")
 
-        # --- Capture CUDA graphs now that kvcache is real ---
         config.num_kvcache_blocks = num_kvcache_blocks
 
+        # Create pool of CU-masked CUDA streams for decode forward passes; the
+        # warmup below runs on it too.
+        self.runner_mgr.call_func("create_decode_stream_pool", wait_out=True)
+
+        # --- Run the model once now that weights and kvcache are real, before
+        # READY: torch.compile traces the first call, which must not be a
+        # one-token decode. Capture CUDA graphs, or else run the warmup the
+        # runner skipped while it had neither.
         if not config.enforce_eager:
             cap_cost, decode_sizes, _ = self.runner_mgr.call_func(
                 "capture_cudagraph", wait_out=True
@@ -1742,6 +1749,8 @@ class DecodeEngineCore(EngineCore):
                 f"DecodeEngineCore: cudagraph capture{decode_sizes} cost: "
                 f"{cap_cost:.2f}s"
             )
+        else:
+            self.runner_mgr.call_func("warmup_decode", wait_out=True)
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(
@@ -1802,12 +1811,10 @@ class DecodeEngineCore(EngineCore):
         """Start runtime coordination sockets and threads.
 
         Called from run_engine() after __init__().  The kvcache+weight bootstrap
-        was already handled in __init__(), so _init_disagg only sets up the
-        per-request BlockAssignment/PrefillDone channel.
+        and the decode stream pool were already handled in __init__(), so
+        _init_disagg only sets up the per-request BlockAssignment/PrefillDone
+        channel.
         """
-        # Create pool of CU-masked CUDA streams for decode forward passes.
-        self.runner_mgr.call_func("create_decode_stream_pool", wait_out=True)
-
         # Decode PUSH connects to prefill's bound PULL (d2p channel).
         self._d2p_sock = self._disagg_ctx.socket(zmq.PUSH)
         self._d2p_sock.connect(self._disagg_d2p_addr)
