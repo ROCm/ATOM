@@ -847,3 +847,74 @@ def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
     assert pool.has_free()
+
+
+def _read(store, prefix_hash):
+    """One restore from `prefix_hash`'s image, carried through its batch."""
+    assert store.begin_restore(prefix_hash, dst_slot=4) is not None
+    assert len(store.take_restore_ops()) == 1
+    store.complete_inflight()
+
+
+def test_a_restore_refreshes_the_image_it_reads_by_default():
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 101)
+    # A fourth image spends the least recently used: 202, as 101 was just read.
+    ready(store, 404)
+    assert store.lookup(101) >= 0
+    assert store.lookup(202) == -1
+
+
+def test_an_image_read_once_ages_from_where_it_was_filed(monkeypatch):
+    """ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE=0: a session's anchor, read
+    once by its next turn (which files the anchor replacing it), is spent ahead
+    of images filed after it; an image read a second time is shared and kept."""
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE", "0")
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 101)
+    ready(store, 404)
+    assert store.lookup(101) == -1
+    assert store.lookup(202) >= 0
+    assert store.records[store.lookup(202)].restores == 0
+
+    _read(store, 202)
+    _read(store, 202)
+    assert store.records[store.lookup(202)].restores == 2
+    # 202 was refreshed by its second read, so 303 goes next, then 404.
+    ready(store, 505)
+    assert store.lookup(303) == -1
+    assert store.lookup(202) >= 0
+    ready(store, 606)
+    assert store.lookup(404) == -1
+    assert store.lookup(202) >= 0
+
+
+def test_an_image_read_once_is_spent_first_when_demoted(monkeypatch):
+    """ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE=1: a session's anchor, once
+    read by its next turn, is spent before every image not yet read, those
+    filed before it included, so live anchors outlast superseded ones; an image
+    read a second time is shared and refreshed as before."""
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_REFRESH_FIRST_RESTORE", "0")
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMOTE_FIRST_RESTORE", "1")
+    _, store = make_store(num_units=9)
+    ready(store, 101)
+    ready(store, 202)
+    ready(store, 303)
+    _read(store, 303)
+    # The newest image, read once, goes before the older ones nobody has read.
+    ready(store, 404)
+    assert store.lookup(303) == -1
+    assert store.lookup(101) >= 0 and store.lookup(202) >= 0
+
+    _read(store, 202)
+    _read(store, 202)
+    # Demoted by its first read, refreshed by its second: 101 is spent next.
+    ready(store, 505)
+    assert store.lookup(101) == -1
+    assert store.lookup(202) >= 0 and store.lookup(404) >= 0
