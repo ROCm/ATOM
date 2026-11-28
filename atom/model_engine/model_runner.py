@@ -48,6 +48,7 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
+from atom.distributed.pp_mailbox import PPMailbox
 from atom.distributed.ulysses_sp import (
     get_sp_world_size,
     local_num_kv_heads,
@@ -140,6 +141,7 @@ from atom.model_ops.verify_head import (
 )
 from atom.model_ops.verify_ids import IdVerifiers
 from atom.models.registry import mono_decode_installers
+from atom.models.utils import IntermediateTensors
 from atom.mono.lm_head.serves import deployment_refusal as mono_head_refusal
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
@@ -1104,6 +1106,10 @@ class ModelRunner:
             drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         self._refuse_unrelayed_pp_taps(drafter)
+        # Collective over the PP group when on: every stage builds it here.
+        self.pp_mailbox = PPMailbox.build(
+            self.config, self.model, self.pp_aux_relay, self.device
+        )
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -3518,7 +3524,18 @@ class ModelRunner:
 
                 intermediate_tensors = recv_aux = None
                 if pp_enabled and not pp_group.is_first_rank:
-                    intermediate_tensors = recv_intermediate_tensors()
+                    box = self.pp_mailbox
+                    if box is not None and box.recv_enabled:
+                        # The previous stage's payload, through its mailbox:
+                        # the compute stream waits on the copy-in, the CPU on
+                        # nothing.
+                        intermediate_tensors = IntermediateTensors(
+                            box.recv(input_ids.shape[0])
+                        )
+                    else:
+                        intermediate_tensors = recv_intermediate_tensors()
+                        if box is not None:
+                            box.expand_from_nccl(intermediate_tensors.tensors)
                     # GLM-5.2 IndexShare: load prior rank's top-k for leading
                     # shared layers. Pop so compiled model sees only hidden_states.
                     recv_sparse = intermediate_tensors.tensors.pop(
@@ -3565,12 +3582,26 @@ class ModelRunner:
                         )
                         if aux is not None:
                             model_output.tensors[PP_AUX_KEY] = aux
-                    if self._pp_pending_send:
-                        commit_pp_send_work(self._pp_pending_send)
-                    # The relay hands its payload over: no clone needed.
-                    self._pp_pending_send = async_send_intermediate_tensors(
-                        model_output, owned=(PP_AUX_KEY,)
-                    )
+                    box = self.pp_mailbox
+                    if box is not None and box.send_enabled:
+                        # Queued on the mailbox's copy stream; nothing to commit.
+                        box.send(
+                            model_output.tensors,
+                            model_output.tensors["hidden_states"].shape[0],
+                        )
+                    else:
+                        trimmed = (
+                            ()
+                            if box is None
+                            else box.trim_for_nccl(model_output.tensors)
+                        )
+                        if self._pp_pending_send:
+                            commit_pp_send_work(self._pp_pending_send)
+                        # The relay hands its payload over (and a trimmed bank
+                        # is a fresh tensor): no clone needed.
+                        self._pp_pending_send = async_send_intermediate_tensors(
+                            model_output, owned=(PP_AUX_KEY, *trimmed)
+                        )
                     hidden_states = None
                 elif self._is_pure_middle_chunk(batch):
                     if _pcp_tbo_balanced:
@@ -3658,7 +3689,11 @@ class ModelRunner:
         self.verify_head = resolve_obj_by_qualname(MONO_VERIFY_HEAD)(picks, max_rows)
 
     def flush_pp_send(self) -> bool:
-        """Flush pending PP isend. Returns True for call_func wait_out."""
+        """Flush pending PP isend. Returns True for call_func wait_out.
+
+        A mailbox hop has nothing to flush: its copies run on the GPU without
+        the CPU, and waiting for them here could hang a shutdown whose next
+        stage is already gone."""
         if self._pp_pending_send:
             commit_pp_send_work(self._pp_pending_send)
         return True
