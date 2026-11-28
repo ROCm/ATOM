@@ -9,6 +9,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    get_dp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -17,7 +18,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -41,6 +42,12 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     mxfp4_k_pad_align,
 )
+from atom.model_ops.minimax_m3.router import (
+    fused_router_enabled,
+    fused_router_supported,
+    m31_route,
+    register_presorted_moe,
+)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
@@ -58,7 +65,9 @@ from atom.models.utils import (
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
+from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import pass_scheduled_tokens_gpu
 from atom.utils.region_graph import token_graph
 
 
@@ -348,6 +357,15 @@ class MiniMaxM3MoE(nn.Module):
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
 
+        # The routed experts run inside one custom op (`minimax_m3_routed_moe`)
+        # that may route with the fused decode router; it finds this module here.
+        compilation_config = get_current_atom_config().compilation_config
+        self.routed_layer_name = f"{prefix}.routed"
+        if self.routed_layer_name in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {self.routed_layer_name}")
+        compilation_config.static_forward_context[self.routed_layer_name] = self
+        self.fused_router_op = self._may_fuse_router()
+
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
@@ -358,15 +376,75 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+    def _may_fuse_router(self) -> bool:
+        """Static half of the fused-router choice, made once at construction: a
+        plain TP MoE whose routing is the router's sigmoid top-k alone. Row
+        count and operands are checked per call inside the op."""
+        experts = self.experts
+        return (
+            fused_router_enabled()
+            and self.e_score_correction_bias is not None
+            and not self.fuse_shared_experts
+            and getattr(experts, "balance_router_logits", None) is None
+            and getattr(experts, "sp_mega_moe", None) is None
+            and get_dp_group().world_size == 1
+            and not experts.moe_parallel_config.pcp_merge
+            and experts.moe_parallel_config.dp_logical_ratio == 1
+            and not experts.reduce_results
+        )
+
+    def routed_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The routed experts' output before routed scaling, routed by the
+        fused decode router where it serves the step, else by the gate and
+        FusedMoE's own top-k and sort."""
+        experts = self.experts
+        bias = self.e_score_correction_bias
+        if fused_router_supported(hidden_states, self.gate.weight, bias):
+            routed = m31_route(
+                hidden_states,
+                self.gate.weight,
+                bias,
+                routed_scaling_factor=1.0,
+                n_local=pass_scheduled_tokens_gpu(hidden_states.shape[0]),
+            )
+            if routed is not None:
+                topk_weights, topk_ids, presort = routed
+                topk_weights, topk_ids = experts.quant_method.place_experts(
+                    experts, topk_weights, topk_ids
+                )
+                # Consumed by the fused_moe right below. Padding rows carry no
+                # routes, so the call runs without a token count (a presort is
+                # only taken without one).
+                register_presorted_moe(presort)
+                return experts.quant_method.apply(
+                    layer=experts,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    global_num_experts=experts.global_num_experts,
+                    expert_map=experts.expert_map,
+                    activation=experts.activation,
+                    apply_router_weight_on_input=experts.apply_router_weight_on_input,
+                    prefix=f"{experts.prefix}.fused_moe",
+                    x_scale=None,
+                    scheduled_tokens_gpu=None,
+                )
+        router_logits = self.gate(hidden_states)
+        return experts.forward_impl(hidden_states, router_logits)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = self.gate(hidden_states)
-
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        if self.fused_router_op:
+            routed_output = torch.ops.aiter.minimax_m3_routed_moe(
+                hidden_states, self.routed_layer_name
+            )
+        else:
+            router_logits = self.gate(hidden_states)
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
@@ -374,6 +452,31 @@ class MiniMaxM3MoE(nn.Module):
             routed_output = routed_output + self.shared_experts(hidden_states)
 
         return routed_output.view(orig_shape)
+
+
+def _minimax_m3_routed_moe(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    moe = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return moe.routed_moe(hidden_states)
+
+
+def _minimax_m3_routed_moe_fake(
+    hidden_states: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+# Declared like FusedMoE's moe_forward, whose experts path it may run.
+direct_register_custom_op(
+    op_name="minimax_m3_routed_moe",
+    op_func=_minimax_m3_routed_moe,
+    mutates_args=["hidden_states"],
+    fake_impl=_minimax_m3_routed_moe_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 class MiniMaxM3Attention(nn.Module):
