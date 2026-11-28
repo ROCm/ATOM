@@ -729,6 +729,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 prefill rows under 1024 blocks: 1 sends them to aiter's
+    # topk_per_row_small_k like the wider rows (gfx950, k=16; an aiter whose small_k has
+    # the one-wave build is 2-4x faster than the Triton selector there). Opt-in (default 0
+    # until the GSM8K gate is clean: one flag-on run scored 0.5 pt below the flag-off run).
+    # Wider rows take aiter regardless. 0 keeps the Triton selector for the narrow rows.
+    "ATOM_M3_PREFILL_TOPK_FLYDSL": lambda: (
+        os.getenv("ATOM_M3_PREFILL_TOPK_FLYDSL", "0") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

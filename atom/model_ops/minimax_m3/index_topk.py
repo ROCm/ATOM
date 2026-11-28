@@ -45,6 +45,7 @@ PREFILL_TOPK_NUM_WARPS = _prefill_policy.PREFILL_TOPK_NUM_WARPS
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
+from atom.utils import envs
 
 
 @functools.cache
@@ -869,6 +870,28 @@ def _aiter_selector_wins(
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
 
 
+def _prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q):
+    """`ATOM_M3_PREFILL_TOPK_FLYDSL`: hand the prefill rows narrower than `_AITER_MIN_WIDTH`
+    to `topk_per_row_small_k` too. On gfx950 an aiter that carries its one-wave k=16 build
+    beats the Triton selector from a few dozen blocks up (aiter#8581); an older one does
+    not, which is why the flag stays off by default. Rows it cannot serve (width under k)
+    decline in `_select_with_aiter` and keep the selectors below.
+
+    Not id-for-id the Triton selector in every tie: the one-wave build orders -0.0 below
+    +0.0 and ranks a NaN as -inf (`_pack_score_key` gives -0.0 and +0.0 one key and puts a
+    NaN below -inf), and an aiter with only the chunked build may pick any of several
+    equal-scored blocks. Either way the chosen blocks carry the same ranked scores; they can
+    differ in id only when equal scores straddle the top-16 cutoff, and in the order of
+    `sparse_bt`, not in which scores are attended."""
+    return (
+        envs.ATOM_M3_PREFILL_TOPK_FLYDSL
+        and arch == "gfx950"
+        and decode_max_q == 0
+        and topk == 16
+        and not emit
+    )
+
+
 @triton.jit
 def _prefill_partial_topk_kernel(
     score_ptr,
@@ -1189,13 +1212,16 @@ def _launch_select(
     )
     arch = get_gfx_runtime()
     compute_units = _compute_units(device_index)
-    take_aiter = n_valid_column_per_row is not None and _aiter_selector_wins(
-        score.shape[2],
-        emit,
-        arch=arch,
-        selector_rows=score.shape[0] * score.shape[1],
-        compute_units=compute_units,
-        decode_max_q=decode_max_q,
+    take_aiter = n_valid_column_per_row is not None and (
+        _aiter_selector_wins(
+            score.shape[2],
+            emit,
+            arch=arch,
+            selector_rows=score.shape[0] * score.shape[1],
+            compute_units=compute_units,
+            decode_max_q=decode_max_q,
+        )
+        or _prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q)
     )
     if take_aiter and _select_with_aiter(
         score, topk_idx, n_valid_column_per_row, topk, init_blocks, local_blocks

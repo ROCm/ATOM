@@ -22,6 +22,8 @@ abort the run for every other test as well.
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -1008,3 +1010,161 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(tuned, previous))
+
+
+class TestPrefillNarrowRowsGate:
+    """`_prefill_narrow_rows_to_aiter`: the flag hands the prefill rows under `_AITER_MIN_WIDTH`
+    to aiter's `topk_per_row_small_k`, on gfx950 at k=16 without the emission launch."""
+
+    @pytest.fixture
+    def gate(self, monkeypatch):
+        monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True, raising=False)
+
+        def call(arch="gfx950", emit=False, topk=TOPK, decode_max_q=0):
+            return m._prefill_narrow_rows_to_aiter(arch, emit, topk, decode_max_q)
+
+        return call
+
+    def test_a_prefill_without_emission_is_taken(self, gate):
+        assert gate()
+
+    def test_declines_what_the_one_wave_build_does_not_cover(self, gate):
+        assert not gate(decode_max_q=1)  # decode keeps its selectors
+        assert not gate(topk=8)
+        assert not gate(arch="gfx942")
+        assert not gate(emit=True)  # one more launch than the fused Triton selector
+
+    def test_off_by_default(self, monkeypatch):
+        # Exercise the real lazy default, not a forced value: no `gate` fixture (it shadows
+        # `envs.ATOM_M3_PREFILL_TOPK_FLYDSL` with a module attribute), clear the env var, and
+        # assert nothing shadows the lazy lookup. This way a flip of the registered default
+        # from "0" to "1" -- which re-introduces the GSM8K regression this flag guards --
+        # fails here instead of being hidden by a forced-False flag.
+        monkeypatch.delenv("ATOM_M3_PREFILL_TOPK_FLYDSL", raising=False)
+        assert "ATOM_M3_PREFILL_TOPK_FLYDSL" not in vars(m.envs)
+        assert not m._prefill_narrow_rows_to_aiter(
+            "gfx950", emit=False, topk=TOPK, decode_max_q=0
+        )
+
+
+def _pinned(score, nvalid, init, local):
+    """The scores the selection ranks: the first `init` blocks and the last `local` live
+    ones forced above every real score (local outranks init), blocks past the row's end
+    at -inf."""
+    heads, rows, width = score.shape
+    s = score.clone()
+    blk = torch.arange(width, device=s.device)
+    nv = nvalid.view(heads, rows, 1).long()
+    s = torch.where(blk < init, torch.full_like(s, 1e30), s)
+    s = torch.where(blk >= nv - local, torch.full_like(s, 1e29), s)
+    return torch.where(blk < nv, s, torch.full_like(s, float("-inf")))
+
+
+def _selected_values(score, nvalid, init, local, ids):
+    """The ranked scores of the chosen blocks, best first (-inf for a -1 pad), for comparing
+    selections that may pick different blocks among equal scores (`-0.0 == +0.0` here).
+    """
+    s = _pinned(score, nvalid, init, local)
+    vals = torch.gather(s, -1, ids.long().clamp(min=0))
+    vals = torch.where(ids >= 0, vals, torch.full_like(vals, float("-inf")))
+    return torch.sort(vals, dim=-1, descending=True).values
+
+
+def _one_wave_build():
+    """Whether the installed aiter's `topk_per_row_small_k` has the one-wave k=16 build
+    (aiter#8581), whose ties go to the larger block like the definition below; the older
+    chunked build may pick any of several equal-scored blocks."""
+    try:
+        return (
+            importlib.util.find_spec(
+                "aiter.ops.flydsl.kernels.topk.topk_per_row_small_k_wave"
+            )
+            is not None
+        )
+    except (ImportError, ValueError):
+        return False
+
+
+def _select_definition(score, nvalid, init, local):
+    """The selection by its definition: a row's live blocks, the first `init` and the last
+    `local` forced in (local outranks init), best score first, ties to the larger block.
+    """
+    heads, rows, width = score.shape
+    s = _pinned(score, nvalid, init, local)
+    nv = nvalid.view(heads, rows, 1).long()
+    order = torch.sort(s.flip(-1), dim=-1, descending=True, stable=True).indices
+    ids = (width - 1 - order)[..., :TOPK].int()
+    pos = torch.arange(TOPK, device=s.device)
+    return torch.where(pos < torch.minimum(nv, torch.tensor(width)), ids, -1)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "quantum,signed_zero",
+    # 0.25: heavy score ties; signed_zero keeps the -0.0 that rounding makes, which the
+    # one-wave build orders below +0.0 and the Triton selector treats as equal to it
+    [(0.0, False), (0.25, False), (0.25, True)],
+)
+@pytest.mark.parametrize(
+    "qlens,prefixes,heads",
+    [([2048], [30000], 1), ([700, 300], [90000, 5000], 1), ([1024], [160000], 2)],
+)
+def test_prefill_selection_through_aiter_matches_the_definition(
+    monkeypatch, qlens, prefixes, heads, quantum, signed_zero
+):
+    """Through `_launch_select` with the flag on, ragged batches, init / local forced.
+    aiter's selector must actually take the call (it is not the Triton fallback). Ids equal
+    the definition exactly where aiter has the one-wave k=16 build (and no -0.0 / +0.0
+    mix); otherwise, and for the signed-zero mix, the chosen blocks carry exactly the
+    definition's ranked scores (equal scores may pick different blocks)."""
+    if m.get_gfx_runtime() != "gfx950":
+        pytest.skip("needs gfx950 and an aiter with topk_per_row_small_k")
+    monkeypatch.setattr(m.envs, "ATOM_M3_PREFILL_TOPK_FLYDSL", True, raising=False)
+    dev = "cuda"
+    kw = _inputs(qlens, prefixes, heads, dev)
+    total_q = sum(qlens)
+    width = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+    g = torch.Generator(device=dev).manual_seed(7)
+    score = torch.randn(heads, total_q, width, generator=g, device=dev) * 3
+    if quantum:
+        score = torch.round(score / quantum) * quantum
+        if not signed_zero:
+            # + 0.0 turns the -0.0 that rounding makes into +0.0, so the definition's
+            # value order and the selectors' bit order agree
+            score = score + 0.0
+        else:
+            assert torch.signbit(score[score == 0]).any()  # the mix is really there
+    cu, pre = kw["cu_seqlens_q"], kw["prefix_lens"]
+    bounds = m.build_n_valid_column_per_row(
+        cu, pre, batch=len(qlens), total_q=total_q, num_idx_heads=heads, decode_max_q=0
+    )
+    served = []
+    real = m._select_with_aiter
+
+    def tracked(*a):
+        served.append(real(*a))
+        return served[-1]
+
+    monkeypatch.setattr(m, "_select_with_aiter", tracked)
+    topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+    _, emit_args = m._alloc_emit(total_q, heads, TOPK, kw["block_table"], False, dev, 8)
+    m._launch_select(
+        score, topk_idx, cu, pre, len(qlens), TOPK, INIT, LOCAL, kw["block_table"],
+        emit_args, heads, rows_per_req=max(qlens), decode_max_q=0,
+        block_size_k=_prefill_topk_block_size_k(width),
+        num_warps=m.PREFILL_TOPK_NUM_WARPS, emit=False,
+        block_page_stride=8, n_valid_column_per_row=bounds, pages_per_block=8,
+    )  # fmt: skip
+    assert served == [True], "aiter declined: the Triton fallback served the rows"
+    # No block may be read twice (equal-score ties must still pick distinct blocks);
+    # -1 padding may repeat.
+    ids = torch.sort(topk_idx, dim=-1).values
+    assert not ((ids[..., 1:] == ids[..., :-1]) & (ids[..., 1:] >= 0)).any()
+    assert torch.equal(
+        _selected_values(score, bounds, INIT, LOCAL, topk_idx),
+        _selected_values(
+            score, bounds, INIT, LOCAL, _select_definition(score, bounds, INIT, LOCAL)
+        ),
+    )
+    if _one_wave_build() and not signed_zero:
+        assert torch.equal(topk_idx, _select_definition(score, bounds, INIT, LOCAL))
