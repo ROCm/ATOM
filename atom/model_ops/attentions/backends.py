@@ -49,7 +49,7 @@ from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.block_tables import block_table_state
-from atom.utils.forward_context import AttentionMetaData, AttnState
+from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from atom.utils.h2d import h2d_producer
 from atom.utils.tbo.ubatch_splitting import (
     NUM_TBO_UBATCHES,
@@ -1725,6 +1725,31 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # launch outside the model's eager regions is sized by the token count
     # alone.
     supports_token_graph = False
+
+    def build_for_token_graph_capture(
+        self, tokens: int
+    ) -> tuple[AttentionMetaData, Context]:
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: the model's eager regions hand back
+        a tensor of their output's shape (Kimi-K3's split regions, zeros) and
+        write no KV or state -- a replay runs them on the live step -- and the
+        segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     # The `running_bs` a prefill's model records some of its layers at as
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step

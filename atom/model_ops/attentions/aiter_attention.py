@@ -1191,6 +1191,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 index_scorer=self._index_scorers.get(f"ub{ubatch_idx}_"),
             )
 
+    @property
+    def supports_token_graph(self) -> bool:
+        """MiniMax-M3 sizes every launch outside its attention regions by the
+        token count alone, so its prefill may pad to a recorded token-graph
+        bucket; the attention region runs its scheduled rows
+        (`base_attention._attention_region`). Only a MiniMax-M3 config with
+        its sparse attention sets `_has_sparse_attention`, so the other models
+        this builder serves keep eager prefills.
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Nor under Ulysses SP, whose attention records inline
+        into the decode token graphs on the premise that no prefill one is
+        recorded (`sp_attention`). Nor under PCP: a bucket is recorded on a
+        dummy step, whose MoE skips the PCP all-reduce a live prefill needs."""
+        config = self.model_runner.config
+        return (
+            self._has_sparse_attention
+            and config.parallel_config.data_parallel_size == 1
+            and config.sequence_parallel_size == 1
+            and config.prefill_context_parallel_size == 1
+        )
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        if (
+            self.supports_token_graph
+            and batch.total_tokens_num_prefill > 0
+            and batch.multimodal_data
+        ):
+            return True
+        return super().step_needs_eager(batch)
+
     def build_for_cudagraph_capture(
         self, bs: int, *, decode_ubatch_slices=None
     ) -> AttentionMetaData:

@@ -1071,8 +1071,54 @@ def _attention(
         )
 
 
-# The attention as one break in a recorded forward.
-_attention_region = eager_region()(_attention)
+def _padded_prefill_rows(height: int) -> int:
+    """The scheduled rows of a prefill padded to a ``height``-row token-graph
+    bucket (MiniMax-M3): the rows its eager step attends, which an attention
+    region cuts the bucket to. 0 when nothing is padded."""
+    context = get_forward_context().context
+    rows = context.scheduled_tokens if context is not None and context.is_prefill else 0
+    return rows if 0 < rows < height else 0
+
+
+def _scheduled_rows(rows: int, height: int, positions: torch.Tensor, *tensors):
+    """``positions`` and ``tensors`` cut to the first ``rows`` rows: positions
+    by its last dim (an mrope table leads with its axes), a tensor only when
+    it has the bucket's ``height`` rows; None or a scalar stays as it is."""
+    return positions[..., :rows], *(
+        t[:rows] if t is not None and t.dim() and t.shape[0] == height else t
+        for t in tensors
+    )
+
+
+@eager_region()
+def _attention_region(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention as one break in a recorded forward. On a prefill padded
+    to a token-graph bucket (MiniMax-M3) it attends the scheduled rows alone,
+    as the eager step does, and hands the bucket back with zeros past them.
+    Unlike a split MLA layer's regions, which run the whole bucket, it serves
+    kernels not all known to skip a pad row: M3's FP8 index top-k runs every
+    row of ``q``."""
+    height = q.shape[0]
+    rows = _padded_prefill_rows(height)
+    if not rows:
+        return _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    positions, q, q_scale, k, v, qkv = _scheduled_rows(
+        rows, height, positions, q, q_scale, k, v, qkv
+    )
+    out = _attention(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+    padded = out.new_empty((height, *out.shape[1:]))
+    padded[:rows].copy_(out)
+    padded[rows:].zero_()
+    return padded
 
 
 @mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
@@ -1088,19 +1134,29 @@ def unified_attention_fp8(
 ) -> torch.Tensor:
     """`unified_attention_with_output_base` for a layer whose impl writes its
     output as OCP FP8 plus per-token descales (`supports_output_quant`): the
-    output, and its descales into ``scale``."""
+    output, and its descales into ``scale``. A padded prefill attends its
+    scheduled rows alone, as `_attention_region` does; the rows past them are
+    FP8 zeros with a unit descale, as aiter writes a pad row."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    height = q.shape[0]
     output = torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
+    out, out_scale = output, scale
+    rows = _padded_prefill_rows(height)
+    if rows:
+        positions, q, k, v, qkv = _scheduled_rows(rows, height, positions, q, k, v, qkv)
+        out, out_scale = output[:rows], scale[:rows]
+        output[rows:].zero_()
+        scale[rows:].fill_(1.0)
     self.impl.forward_impl(
         q=q,
         k=k,
         v=v,
         position=positions,
         qkv=qkv,
-        quantized_output=output,
-        output_scale=scale,
+        quantized_output=out,
+        output_scale=out_scale,
     )
     return output
 
