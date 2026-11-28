@@ -1246,6 +1246,9 @@ class MooncakeConnector(KVConnectorBase):
         # them. A rank that acknowledged but never answers is bounded by its
         # write window (see _expire_pending_recvs).
         self._pending_recv_failed: set[ReqId] = set()
+        # Requests a producer rank may have written (any write-done but one
+        # saying it never started): only their failures hold the pages.
+        self._pending_recv_wrote: set[ReqId] = set()
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
         # Producer ranks that acknowledged a request, and when each one's write
@@ -2854,8 +2857,9 @@ class MooncakeConnector(KVConnectorBase):
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
         for data in failures:
+            # None of these started a write, so D need not hold its pages.
             self._send_executor.submit(
-                self._notify_transfer_result, data, success=False
+                self._notify_transfer_result, data, success=False, wrote=False
             )
         for data, state in submissions:
             self._send_executor.submit(self._execute_chunked_transfer, data, state)
@@ -4184,7 +4188,9 @@ class MooncakeConnector(KVConnectorBase):
                 sock.close()
                 raise
 
-    def _notify_transfer_result(self, request_data: dict, *, success: bool) -> None:
+    def _notify_transfer_result(
+        self, request_data: dict, *, success: bool, wrote: bool = True
+    ) -> None:
         host = request_data.get("notify_host")
         port = request_data.get("notify_port")
         req_id = request_data.get("request_id")
@@ -4207,6 +4213,7 @@ class MooncakeConnector(KVConnectorBase):
                 else None
             ),
             handoff=request_data.get("prefill_handoff"),
+            wrote=wrote,
         )
 
     def _send_write_done(
@@ -4220,6 +4227,7 @@ class MooncakeConnector(KVConnectorBase):
         success: bool = True,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
+        wrote: bool = True,
     ) -> None:
         """Send write-done notification to consumer via persistent socket.
 
@@ -4228,7 +4236,8 @@ class MooncakeConnector(KVConnectorBase):
         echoed from the write request. The consumer dedups by distinct
         producer rank and validates the nonce, so duplicates are harmless
         (see _record_write_done). ``success=False`` unblocks the consumer
-        without treating the KV as ready.
+        without treating the KV as ready; ``wrote=False`` says this stage
+        never started writing it.
         """
         path = make_zmq_path("tcp", host, port)
         notification = msgpack.dumps(
@@ -4240,6 +4249,7 @@ class MooncakeConnector(KVConnectorBase):
                 "success": success,
                 "landed_slots": landed_slots,
                 "prefill_handoff": handoff,
+                "wrote": wrote,
             }
         )
         self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
@@ -4280,6 +4290,8 @@ class MooncakeConnector(KVConnectorBase):
                                 success=data.get("success", True),
                                 landed_slots=data.get("landed_slots"),
                                 handoff=data.get("prefill_handoff"),
+                                # Missing from an older producer: it may have.
+                                wrote=data.get("wrote", True),
                             )
                         except Exception:
                             # Every later receive on this rank needs this thread.
@@ -4330,6 +4342,7 @@ class MooncakeConnector(KVConnectorBase):
         success: bool = True,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
+        wrote: bool = True,
     ) -> bool:
         """Register a producer rank's write-done for ``req_id``.
 
@@ -4343,8 +4356,9 @@ class MooncakeConnector(KVConnectorBase):
         Only the message that completes the last distinct producer rank runs
         slot scatter / block fence and marks the request done, or failed if
         any rank reported a failure: an earlier failure would let the
-        scheduler reuse pages a rank still running then writes. Returns True
-        when this was that final message.
+        scheduler reuse pages a rank still running then writes. A failure
+        skips the failed-write hold only when no rank wrote (``wrote``).
+        Returns True when this was that final message.
 
         A request with MLA landing slots settles in ``LandingReceiver``
         instead: it completes only once its landed slots are scattered too,
@@ -4368,7 +4382,7 @@ class MooncakeConnector(KVConnectorBase):
                     pending.stages.add(pp_rank)
                     success = pending.fold(req_id, success, handoff)
         if landing is not None and landing.stage_done(
-            req_id, pp_rank, write_nonce, success, landed_slots
+            req_id, pp_rank, write_nonce, success, landed_slots, wrote
         ):
             return False
         with self._completion_lock:
@@ -4385,6 +4399,8 @@ class MooncakeConnector(KVConnectorBase):
                     write_nonce,
                 )
                 return False
+            if wrote:
+                self._pending_recv_wrote.add(req_id)
             pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
                 stages = self._pending_recv_stages.setdefault(req_id, set())
@@ -4421,8 +4437,10 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_stall_watch.pop(req_id, None)
             failed = req_id in self._pending_recv_failed
             self._pending_recv_failed.discard(req_id)
+            wrote = req_id in self._pending_recv_wrote
+            self._pending_recv_wrote.discard(req_id)
 
-        self._complete_recv(req_id, failed)
+        self._complete_recv(req_id, failed, wrote)
         return True
 
     def _record_write_ack(self, data: dict) -> None:
@@ -4505,6 +4523,7 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
                 self._pending_recv_failed.discard(req_id)
+                self._pending_recv_wrote.discard(req_id)
                 self._pending_recv_stall_watch.pop(req_id, None)
         for req_id, waited, reported, expected, unacked in stalled:
             (logger.error if unacked > 0 else logger.warning)(
@@ -4515,8 +4534,9 @@ class MooncakeConnector(KVConnectorBase):
                 reported,
                 expected,
                 (
-                    f"; {unacked} never acknowledged it, so it waits for them "
-                    "without a deadline and its pages stay held"
+                    f"; {unacked} have not started sending it (the producer may "
+                    "still be queueing it), so it waits for them without a deadline "
+                    "and its pages stay held"
                     if unacked > 0
                     else ""
                 ),
@@ -4535,7 +4555,7 @@ class MooncakeConnector(KVConnectorBase):
                 # The other expired requests still have to be reported.
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
-    def _complete_recv(self, req_id: str, failed: bool) -> None:
+    def _complete_recv(self, req_id: str, failed: bool, wrote: bool = True) -> None:
         """Publish a finished receive and let stage-0 free its page table.
 
         A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
@@ -4543,13 +4563,14 @@ class MooncakeConnector(KVConnectorBase):
         cancelling the work it posted, so a failed write may still land in
         the request's pages, which the scheduler frees once it hears of the
         failure (it aborts the request). The staging row and stage-0's page
-        table stay held as long.
+        table stay held as long. A failure no producer stage wrote any of
+        (``wrote=False``) is reported at once.
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
         if failed:
             hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
-            if hold_s > 0:
+            if hold_s > 0 and wrote:
                 with self._completion_lock:
                     self._held_failures[req_id] = time.monotonic() + hold_s
                 logger.warning(

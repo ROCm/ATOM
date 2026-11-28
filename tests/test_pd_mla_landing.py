@@ -234,7 +234,7 @@ class _Dest:
             region_block_bytes=[PAGE_BYTES] * num_regions,
             region_indices=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
-            finish=lambda req, failed: self.finished.append((req, failed)),
+            finish=lambda req, failed, wrote: self.finished.append((req, failed)),
             table_segments=segment_table_capacity(pool_slots * 64),
         )
         pool = self.recv.pool
@@ -702,7 +702,7 @@ def test_a_failed_report_does_not_stop_the_sweep():
         dest.recv.begin(req_id, 5, [1], {0: "stage0"})
         assert dest.recv.stage_acked(req_id, 0, 5, time.monotonic() - 1)
 
-    def finish(req_id, failed):
+    def finish(req_id, failed, wrote):
         if req_id == "a":
             raise RuntimeError("notify socket gone")
         dest.finished.append((req_id, failed))
@@ -1260,6 +1260,7 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
+    conn._pending_recv_wrote = set()
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._release_targets = {}
