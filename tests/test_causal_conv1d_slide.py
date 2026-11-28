@@ -150,6 +150,7 @@ def test_dispatch_by_width(monkeypatch, width, slides):
             k_dim_size=kd,
             v_dim_size=kd,
             metadata=_metadata(cu, x.shape[1]),
+            token_tiles=True,
         )
         return out, p
 

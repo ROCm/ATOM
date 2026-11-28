@@ -267,13 +267,13 @@ def bound(k3, targets, batch):
 )
 def test_a_split_runs_on_flash_kdas_chunk(targets, scheduled, monkeypatch, k3):
     monkeypatch.setattr(k3.split, "_flash_kda", lambda: flash_kda())
-    assert bound(k3, targets, step(scheduled)).runs(12, 128)
+    assert bound(k3, targets, step(scheduled)).runs()
 
 
 def test_no_split_runs_on_another_chunk(monkeypatch, k3):
     monkeypatch.setattr(k3.split, "_flash_kda", lambda: flash_kda(FLASH_KDA_CHUNK=64))
     split = bound(k3, [(0, 7, 1024, 0, 10)], step([1025]))
-    assert not split.runs(12, 128)
+    assert not split.runs()
 
 
 def test_flash_kda_takes_the_bounds_off_a_blocks_cu_seqlens(fake_aiter, k3):
@@ -380,7 +380,7 @@ def test_the_builder_cuts_off_flash_kdas_chunk_grid_too(monkeypatch, k3):
 
 class Verdict:
     def __init__(self, runs):
-        self.runs = lambda heads, head_dim: runs and (heads, head_dim) == (12, 128)
+        self.runs = lambda: runs
 
 
 @pytest.mark.parametrize(
@@ -396,7 +396,6 @@ class Verdict:
 )
 def test_a_split_step_runs_on_the_paged_state(ckpt, paged, k3):
     layer = object.__new__(k3.model.KimiKDAAttention)
-    layer.num_local_heads, layer.head_dim = 12, 128
     meta = SimpleNamespace(has_state_fork=False, ssm_checkpoints=ckpt)
     # The stub's FlashKDA flags are MagicMocks, so FlashKDA reads as enabled.
     assert layer._paged_prefill(meta, torch.zeros(2, 1, 2, 2)) is paged

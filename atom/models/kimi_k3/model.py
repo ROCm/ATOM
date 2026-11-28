@@ -41,6 +41,7 @@ from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 from atom.model_ops.kimi_k3.flash_kda_tuning import (
     apply_flash_kda_schedules,
     balanced_chunks_per_seg,
+    check_flash_kda_names,
 )
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
@@ -1218,6 +1219,9 @@ class KimiKDAAttention(nn.Module):
         in_proj_type, _ = effective_layer_quant(quant_config, f"{prefix}.in_proj")
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
+        # The prefill reaches into private FlashKDA names: fail here, naming
+        # the missing one, rather than at the first prefill.
+        check_flash_kda_names()
 
         # f_a is a column slice of the fused in_proj output, so it needs a
         # row-contiguous copy before f_b_proj's GEMM. When f_b_proj runs
@@ -1385,10 +1389,7 @@ class KimiKDAAttention(nn.Module):
             or (
                 ckpt is not None
                 and "kda_tokens" in ckpt
-                and not (
-                    split is not None
-                    and split.runs(self.num_local_heads, self.head_dim)
-                )
+                and not (split is not None and split.runs())
             )
             or ssm_state.dtype != torch.float32
             or not ssm_state[0].is_contiguous()
@@ -1634,6 +1635,7 @@ class KimiKDAAttention(nn.Module):
                 k_dim_size=self.local_proj_size,
                 v_dim_size=self.local_proj_size,
                 metadata=kda_metadata,
+                token_tiles=True,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1945,6 +1947,7 @@ class KimiKDAAttention(nn.Module):
             k_dim_size=self.local_proj_size,
             v_dim_size=self.local_proj_size,
             metadata=kda_metadata,
+            token_tiles=True,
         )
         q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
         k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)

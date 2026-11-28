@@ -13,9 +13,8 @@ from aiter_stub import atom_without_aiter
 
 # `atom.model_ops.kimi_k3` binds AITER kernels at import; the CPU job has no AITER.
 with atom_without_aiter() as load:
-    balanced_chunks_per_seg = load(
-        "atom.model_ops.kimi_k3.flash_kda_tuning"
-    ).balanced_chunks_per_seg
+    tuning = load("atom.model_ops.kimi_k3.flash_kda_tuning")
+    balanced_chunks_per_seg = tuning.balanced_chunks_per_seg
 
 H, V = 12, 128
 PACKAGE = "aiter.ops.triton._triton_kernels.kimi_delta_attn"
@@ -70,3 +69,30 @@ def test_left_to_flash_kda(fk, lens):
     idle CU to fill (7 x 48 blocks > 256 CUs)."""
     assert balanced_chunks_per_seg(cu(*lens), H, V) is None
     assert fk.calls == []
+
+
+@pytest.fixture
+def flash_kda_modules(monkeypatch):
+    """Stand-in FlashKDA modules holding every name in `FLASH_KDA_NAMES`."""
+    tuning.check_flash_kda_names.cache_clear()
+    modules = {}
+    for module_name, names in tuning.FLASH_KDA_NAMES.items():
+        module = SimpleNamespace(**dict.fromkeys(names, object()))
+        modules[module_name] = module
+        monkeypatch.setitem(sys.modules, f"{PACKAGE}.{module_name}", module)
+    yield modules
+    tuning.check_flash_kda_names.cache_clear()
+
+
+def test_the_flash_kda_names_are_all_there(flash_kda_modules):
+    tuning.check_flash_kda_names()
+
+
+def test_a_missing_flash_kda_name_fails_the_model_build(flash_kda_modules, monkeypatch):
+    del flash_kda_modules["flash_kda"]._k2_gluon_schedule
+    monkeypatch.setattr(tuning, "_aiter_version", lambda: "9.9.9")
+    with pytest.raises(RuntimeError) as error:
+        tuning.check_flash_kda_names()
+    message = str(error.value)
+    assert f"{PACKAGE}.flash_kda._k2_gluon_schedule" in message
+    assert "aiter 9.9.9" in message

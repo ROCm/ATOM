@@ -7,8 +7,75 @@ length of a multi-sequence step and the gfx950 pass A / pass B schedules."""
 from __future__ import annotations
 
 import functools
+import importlib
 
 import torch
+
+_FLASH_KDA_PACKAGE = "aiter.ops.triton._triton_kernels.kimi_delta_attn"
+
+#: Every FlashKDA name the Kimi-K3 KDA prefill reads, calls or rebinds (here,
+#: in `kda_ckpt_split` and in the model), by module of
+#: ``aiter.ops.triton._triton_kernels.kimi_delta_attn``. None of them is
+#: public aiter API; `check_flash_kda_names` makes a renamed one fail at model
+#: build instead of at the first prefill. The follow-up is a public aiter
+#: entry point for the schedule choice, the segment length and the host
+#: bounds.
+FLASH_KDA_NAMES = {
+    "flash_kda": (
+        "AITER_FDA_ENABLE",
+        "AITER_FDA_SCAN_PREFETCH",
+        "DEVICE_ARCH",
+        "FLASH_KDA_CHUNK",
+        "_K2_GLUON_FALLBACK",
+        "_SCAN_PREFETCH",
+        "_SEG_MIN_CHUNKS",
+        "_choose_chunks_per_seg",
+        "_k2_gluon_schedule",
+        "_seq_bounds",
+        "chunk_delta_attn_tuned_config",
+        "flash_kda_fwd",
+        "flash_kda_supported",
+        "get_num_sms",
+        "prepare_chunk_indices",
+    ),
+    "chunk_fwd": ("prepare_chunk_indices",),
+}
+
+
+def _aiter_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("amd-aiter")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+@functools.cache
+def check_flash_kda_names() -> None:
+    """Raise if this aiter lacks a FlashKDA name in `FLASH_KDA_NAMES`.
+
+    Raises:
+        RuntimeError: Naming each missing module or attribute and the aiter
+            version.
+    """
+    missing = []
+    for module_name, names in FLASH_KDA_NAMES.items():
+        qualified = f"{_FLASH_KDA_PACKAGE}.{module_name}"
+        try:
+            module = importlib.import_module(qualified)
+        except ImportError as error:
+            missing.append(f"{qualified} ({error})")
+            continue
+        missing += [f"{qualified}.{n}" for n in names if not hasattr(module, n)]
+    if missing:
+        raise RuntimeError(
+            "Kimi-K3's KDA prefill uses private FlashKDA names that aiter "
+            f"{_aiter_version()} does not have: {', '.join(missing)}. Use an "
+            "aiter that provides them, or update "
+            "atom/model_ops/kimi_k3/flash_kda_tuning.py and kda_ckpt_split.py "
+            "to the renamed ones."
+        )
 
 
 def balanced_chunks_per_seg(

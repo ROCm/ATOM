@@ -95,12 +95,10 @@ def _run(x, w, b, pool, cu, idx, idx_in, init, tiled, tile=()):
             *tile,
         )
     elif tiled is None:
-        out = cc.causal_conv1d_fn(x, w, b, **args)
+        out = cc.causal_conv1d_fn(x, w, b, token_tiles=True, **args)
     else:
-        # The reference: `causal_conv1d_fn` on the row kernel.
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(cc, "_tiled_conv1d_applies", lambda *args: False)
-            out = cc.causal_conv1d_fn(x, w, b, **args)
+        # The reference: `causal_conv1d_fn` on the row kernel (no opt-in).
+        out = cc.causal_conv1d_fn(x, w, b, **args)
     return out, pool
 
 

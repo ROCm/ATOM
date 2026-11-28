@@ -1183,6 +1183,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    token_tiles: bool = False,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -1240,6 +1241,13 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
+    token_tiles: bool
+        Opt in to the [tokens x channels] tile kernels (width 4 on the
+        sliding-window kernel) for a channel-last prefill without prefix
+        caching. Their bit-identity with the row kernel and their tile
+        choices are established at Kimi-K3's KDA shape (width 4, no bias),
+        so only that caller passes True; every other caller keeps the row
+        kernel.
 
     Returns (query, key, value): the conv output split along dim, shaped
     (cu_seq_len, k_dim_size), (cu_seq_len, k_dim_size) and
@@ -1251,17 +1259,22 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    # Channel-last prefill without prefix caching runs on [tokens x channels]
-    # tiles (width 4 on the sliding-window kernel) instead of the 8-token row
-    # kernel below: same per-element arithmetic, bit-identical output.
-    if block_idx_last_scheduled_token is None and _tiled_conv1d_applies(
-        x,
-        weight,
-        conv_states,
-        k_dim_size,
-        v_dim_size,
-        cache_indices,
-        has_initial_state,
+    # With `token_tiles`, a channel-last prefill without prefix caching runs on
+    # [tokens x channels] tiles (width 4 on the sliding-window kernel) instead
+    # of the 8-token row kernel below: same per-element arithmetic,
+    # bit-identical output at the KDA shape the caller opts in with.
+    if (
+        token_tiles
+        and block_idx_last_scheduled_token is None
+        and _tiled_conv1d_applies(
+            x,
+            weight,
+            conv_states,
+            k_dim_size,
+            v_dim_size,
+            cache_indices,
+            has_initial_state,
+        )
     ):
         fwd = (
             _causal_conv1d_fwd_slide

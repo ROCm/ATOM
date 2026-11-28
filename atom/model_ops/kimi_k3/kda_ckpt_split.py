@@ -131,7 +131,7 @@ class CheckpointSplit:
     def __init__(self, blocks):
         self.blocks = tuple(blocks)
 
-    def runs(self, num_heads: int, head_dim: int) -> bool:
+    def runs(self) -> bool:
         """Whether the forward takes the blocks rather than the heads: the
         builder's cuts assume FlashKDA's chunk."""
         return _flash_kda().FLASH_KDA_CHUNK == CHUNK
