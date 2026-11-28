@@ -409,6 +409,7 @@ def publish_intermediate_states(h):
     Publishing them keeps one contract for consumers that only see the layer
     from outside (the SGLang radix cache): same logical [K, V] layout and the
     same row per chunk boundary over the flattened varlen batch, whichever
-    kernel ran the prefill.
+    kernel ran the prefill. The layout is logical only -- FlyDSL's states are
+    a view over its VK storage -- so consumers address them by their strides.
     """
     ChunkGatedDeltaRuleFunction.last_h = h
