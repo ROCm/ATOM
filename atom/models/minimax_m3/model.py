@@ -756,7 +756,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         norm = self.post_attention_layernorm
         if self.is_moe_layer:
             moe = self.block_sparse_moe
-            normed, residual, q8, s8 = tp1_prefill.norm_moe_input(
+            normed, residual, q8, s8, q4, s4 = tp1_prefill.norm_moe_input(
                 attn_out,
                 residual,
                 norm.weight,
@@ -764,7 +764,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 moe.shared_experts.gate_up_proj.weight.shape[0],
             )
             out = tp1_prefill.moe_ffn(
-                normed, q8, s8, moe.gate(normed), self.tp1_ffn_name
+                normed, q8, s8, q4, s4, moe.gate(normed), self.tp1_ffn_name
             )
             if not self.tp1_defer:
                 out = tp1_prefill.materialize(*out)

@@ -2235,6 +2235,112 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         topk_physical = eplb_map_and_record_fused(layer, topk_ids, gathered)
         return layer.to_dispatch_space(topk_weights, topk_physical)
 
+    def apply_tp1_routes(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        x_fp4: torch.Tensor | None,
+        x_fp4_scale: torch.Tensor | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scheduled_tokens_gpu: torch.Tensor | None,
+        routes: torch.Tensor,
+        allow_routes: bool,
+    ) -> bool:
+        """MiniMax-M3.1's TP1 prefill path (`tp1_prefill.moe_ffn`): the routed
+        experts of ``x`` into ``routes`` [M, top_k, H]. Where ``allow_routes`` and
+        aiter runs its MXMOE pipeline with the v2 "reduce" GEMM2, that GEMM2
+        writes each route's bf16 row, for the caller to sum in moe_reduction's
+        order: True. Otherwise the summed output fills the first M*H elements:
+        False. ``x_fp4`` / ``x_fp4_scale``: ``x`` in aiter's per-1x32 MXFP4."""
+        from aiter.fused_moe import (
+            _flydsl_v2_stage2_wrapper,
+            _mxfp4_a4w4_stage2_fw,
+            fused_moe_prepare_stage2,
+            fused_moe_run_stage2,
+        )
+
+        m, h = x.shape
+        reduced = routes.view(-1)[: m * h].view(m, h)
+        if (
+            not allow_routes
+            or self.fused_experts is not None
+            or self.use_triton
+            or self.fp8_activations
+            or layer.apply_router_weight_on_input
+        ):
+            reduced.copy_(
+                self.apply(
+                    layer,
+                    x,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts=layer.global_num_experts,
+                    expert_map=layer.expert_map,
+                    activation=layer.activation,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    scheduled_tokens_gpu=scheduled_tokens_gpu,
+                )
+            )
+            return False
+        prequant = x_fp4 is not None
+        inputs = fused_moe_prepare_stage2(
+            x_fp4 if prequant else x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            expert_mask=layer.expert_mask,
+            activation=layer.activation,
+            quant_type=self.quant_type,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=x_fp4_scale if prequant else layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            num_local_tokens=scheduled_tokens_gpu,
+            dtype=x.dtype,
+            bias1=layer.w13_bias,
+            bias2=layer.w2_bias,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            gate_mode=(
+                GateMode.INTERLEAVE.value
+                if self.is_guinterleave
+                else GateMode.SEPARATED.value
+            ),
+        )
+        stage2 = inputs._stage2
+        kernel = str(getattr(stage2, "keywords", {}).get("kernelName2", ""))
+        if not (
+            getattr(stage2, "func", stage2) is _mxfp4_a4w4_stage2_fw
+            and kernel.startswith("flydsl_moe2_layout_afp4_wfp4_bf16_")
+            and "_reduce" in kernel
+        ):
+            fused_moe_run_stage2(inputs, out=reduced)
+            return False
+        _, w2, sorted_ids, sorted_expert_ids, num_valid_ids, _, topk = inputs._args
+        kw = inputs._kwargs
+        _flydsl_v2_stage2_wrapper(
+            inter_states=inputs.a2,
+            w1=None,
+            w2=w2.view(torch.uint8),
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=None,
+            topk=topk,
+            kernelName=kernel,
+            model_dim=w2.shape[1],
+            inter_dim=layer.w13_weight.shape[1] // 2,
+            num_experts=w2.shape[0],
+            w2_scale=kw["w2_scale"],
+            a2_scale=inputs.a2_scale,
+            sorted_weights=kw["sorted_weights"],
+            block_m=kw["block_m"],
+            use_valid_token_count=kw.get("use_valid_token_count", False),
+            per_slot_out=routes,
+        )
+        return True
+
     @mark_trace
     def apply(
         self,
@@ -5695,6 +5801,36 @@ class FusedMoE(torch.nn.Module):
             hidden_states,
             self._routing_logits(hidden_states, router_logits),
             self.layer_name,
+        )
+
+    def forward_tp1_routes(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        x_fp4: torch.Tensor | None,
+        x_fp4_scale: torch.Tensor | None,
+        routes: torch.Tensor,
+        allow_routes: bool,
+    ) -> bool:
+        """`forward_impl`'s routing (TP1, no DP / EP / PCP), then
+        `Mxfp4MoEMethod.apply_tp1_routes`, which says what lands in ``routes``.
+        Called inside the opaque `tp1_prefill.moe_ffn` op."""
+        topk_weights, topk_ids = self.quant_method.select_experts(
+            self, hidden_states, self._routing_logits(hidden_states, router_logits)
+        )
+        topk_weights, topk_ids = self.quant_method.place_experts(
+            self, topk_weights, topk_ids
+        )
+        return self.quant_method.apply_tp1_routes(
+            self,
+            hidden_states,
+            x_fp4,
+            x_fp4_scale,
+            topk_weights,
+            topk_ids,
+            pass_scheduled_tokens_gpu(topk_ids.shape[0]),
+            routes,
+            allow_routes,
         )
 
     def combine_accepts_shared(self, rows: int) -> bool:
