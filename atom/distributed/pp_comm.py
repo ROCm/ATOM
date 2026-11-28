@@ -3,6 +3,7 @@
 
 import logging
 import pickle
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -19,6 +20,8 @@ from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+_pp_recv_stream: torch.cuda.Stream | None = None
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
@@ -69,6 +72,13 @@ def init_pp_aware_dist_env(
     device_communicators: bool = True,
 ) -> None:
     """PP-aware distributed init (aiter's init_dist_env pins pp=1)."""
+    global _pp_recv_stream
+    if (
+        envs.ATOM_PP_EARLY_RECV
+        and pipeline_model_parallel_size > 1
+        and tensor_model_parallel_size != 1
+    ):
+        raise ValueError("ATOM_PP_EARLY_RECV requires tensor parallel size 1")
     set_custom_all_reduce(not disable_custom_all_reduce)
     init_distributed_environment(
         world_size=world_size,
@@ -86,6 +96,12 @@ def init_pp_aware_dist_env(
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
         device_communicators=device_communicators,
     )
+
+    _pp_recv_stream = None
+    if envs.ATOM_PP_EARLY_RECV and pipeline_model_parallel_size > 1:
+        pp = get_pp_group()
+        if not pp.is_first_rank:
+            _pp_recv_stream = torch.cuda.Stream(device=pp.device)
 
     # No per-rank signal/input-buffer registration here (this used to copy
     # aiter init_dist_env's signal/buffer block). All of it was vestigial --
@@ -121,7 +137,28 @@ def recv_intermediate_tensors() -> IntermediateTensors:
     """Receive hidden_states/residual from the previous PP stage."""
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
-    tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
+    consumer = (
+        torch.cuda.current_stream(_pp_recv_stream.device)
+        if _pp_recv_stream is not None
+        else None
+    )
+    # Fresh receive storage is allocated on this stream by recv_tensor_dict.
+    # Do not wait on the consumer here: its previous forward may still be busy.
+    context = (
+        torch.cuda.stream(_pp_recv_stream)
+        if _pp_recv_stream is not None
+        else nullcontext()
+    )
+    with context:
+        tensors = pp.recv_tensor_dict(
+            src=src, all_gather_group=pp_send_allgather_group()
+        )
+    if consumer is not None:
+        consumer.wait_stream(_pp_recv_stream)
+        for tensor in tensors.values():
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                # Includes aux views retained by P2PWork through send commit.
+                tensor.record_stream(consumer)
     return IntermediateTensors(tensors)
 
 
@@ -180,8 +217,16 @@ def async_send_intermediate_tensors(
 
 
 def commit_pp_send_work(works: list[P2PWork]) -> None:
-    """Block until all in-flight isend operations complete, then clear."""
+    """Join in-flight isends to the current stream, then release their payloads."""
     for p2p in works:
         if p2p.work is not None:
             p2p.work.wait()
+            if (
+                _pp_recv_stream is not None
+                and p2p.payload is not None
+                and p2p.payload.is_cuda
+            ):
+                # An owned aux view can originate on the receive stream. This
+                # wait may run on a different stream from its model consumer.
+                p2p.payload.record_stream(torch.cuda.current_stream(p2p.payload.device))
     works.clear()

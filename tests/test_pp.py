@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
@@ -307,6 +308,156 @@ def test_recv_wraps_from_group_relative_prev(monkeypatch):
     assert isinstance(out, IntermediateTensors)
     assert torch.equal(out["hidden_states"], torch.ones(2, 2))
     assert torch.equal(out["residual"], torch.zeros(2, 2))
+
+
+@pytest.mark.parametrize("drain_receive_first", [False, True])
+def test_early_recv_orders_consumers_without_waiting_for_previous_forward(
+    monkeypatch, drain_receive_first
+):
+    """Execute deferred stream work, including the consumer's receive join."""
+    executed = []
+
+    class Stream:
+        device = torch.device("cuda:3")
+
+        def __init__(self):
+            self.pending = deque()
+
+        def wait_stream(self, other):
+            self.pending.append(other.drain)
+
+        def drain(self):
+            while self.pending:
+                self.pending.popleft()()
+
+    consumer, receiver = Stream(), Stream()
+    current = [consumer]
+
+    @contextmanager
+    def use_stream(stream):
+        previous = current[0]
+        current[0] = stream
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def current_stream(device):
+        assert device == receiver.device
+        return current[0]
+
+    monkeypatch.setattr(pp_comm, "_pp_recv_stream", receiver)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
+    allocated = []
+
+    def receive(**_kwargs):
+        assert current[0] is receiver
+        # Each call allocates fresh tensors on the receiving stream, as aiter
+        # does. Include the bank, aux view, empty GPU, CPU and metadata fields.
+        payload = {
+            key: MagicMock(spec=torch.Tensor, is_cuda=True)
+            for key in ("hidden_states", "block_residual", "pp_aux", "empty")
+        }
+        payload.update(cpu=torch.empty(0), optional=None)
+        allocated.append(payload)
+        receiver.pending.append(lambda: executed.append("received"))
+        return payload
+
+    grp.recv_tensor_dict.side_effect = receive
+    consumer.pending.append(lambda: executed.append("previous forward"))
+    received = pp_comm.recv_intermediate_tensors()
+    assert current[0] is consumer
+
+    def consume():
+        assert "received" in executed
+        executed.append("consume")
+
+    consumer.pending.append(consume)
+    if drain_receive_first:
+        receiver.drain()
+        assert executed == ["received"]  # no reverse wait on compute
+    consumer.drain()  # must also make the receive ready without host polling
+    assert executed[-1] == "consume"
+    assert "previous forward" in executed
+    for key in ("hidden_states", "block_residual", "pp_aux", "empty"):
+        received[key].record_stream.assert_called_once_with(consumer)
+
+    second = pp_comm.recv_intermediate_tensors()
+    for key in ("hidden_states", "block_residual", "pp_aux", "empty"):
+        assert second[key] is not received[key]
+    assert len(allocated) == 2
+
+
+@pytest.mark.parametrize(
+    "enabled,pp_size,is_first,creates_stream",
+    [
+        (False, 2, False, False),
+        (True, 1, True, False),
+        (True, 2, True, False),
+        (True, 2, False, True),
+    ],
+)
+def test_pp_init_owns_receive_stream(
+    monkeypatch, enabled, pp_size, is_first, creates_stream
+):
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_EARLY_RECV", enabled)
+    monkeypatch.setattr(pp_comm, "_pp_recv_stream", None)
+    monkeypatch.setattr(pp_comm, "init_distributed_environment", MagicMock())
+    monkeypatch.setattr(pp_comm, "ensure_model_parallel_initialized", MagicMock())
+    monkeypatch.setattr(pp_comm, "set_custom_all_reduce", MagicMock())
+    grp = types.SimpleNamespace(is_first_rank=is_first, device=torch.device("cuda:3"))
+    monkeypatch.setattr(pp_comm, "get_pp_group", lambda: grp)
+    make_stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    pp_comm.init_pp_aware_dist_env(1, pp_size, 0, pp_size, "env://")
+    if creates_stream:
+        make_stream.assert_called_once_with(device=grp.device)
+        assert pp_comm._pp_recv_stream is make_stream.return_value
+    else:
+        make_stream.assert_not_called()
+        assert pp_comm._pp_recv_stream is None
+
+
+def test_early_recv_rejects_multi_tp_before_distributed_init(monkeypatch):
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_EARLY_RECV", True)
+    init = MagicMock()
+    monkeypatch.setattr(pp_comm, "init_distributed_environment", init)
+    with pytest.raises(ValueError, match="tensor parallel size 1"):
+        pp_comm.init_pp_aware_dist_env(2, 2, 0, 4, "env://")
+    init.assert_not_called()
+
+
+@pytest.mark.parametrize("early_recv", [False, True])
+def test_pp_commit_protects_received_payload_on_actual_wait_stream(
+    monkeypatch, early_recv
+):
+    events = []
+    wait_stream = object()
+    monkeypatch.setattr(pp_comm, "_pp_recv_stream", object() if early_recv else None)
+    current = MagicMock(return_value=wait_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", current)
+    payload = MagicMock(spec=torch.Tensor, is_cuda=True, device=torch.device("cuda:3"))
+    payload.record_stream.side_effect = lambda stream: events.append(("record", stream))
+    work = MagicMock()
+    work.wait.side_effect = lambda: events.append("wait")
+
+    class Works(list):
+        def clear(self):
+            events.append("release")
+            super().clear()
+
+    works = Works([pp_comm.P2PWork(work, payload)])
+    pp_comm.commit_pp_send_work(works)
+    if early_recv:
+        current.assert_called_once_with(payload.device)
+        assert events == ["wait", ("record", wait_stream), "release"]
+    else:
+        current.assert_not_called()
+        payload.record_stream.assert_not_called()
+        assert events == ["wait", "release"]
+    assert not works
 
 
 def test_roundtrip_preserves_proxy_tensors(monkeypatch):
