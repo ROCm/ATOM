@@ -707,7 +707,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
         tp1_prefill.want_w4_scales(*linears)
         from atom.config import get_current_atom_config
 
-        context = get_current_atom_config().compilation_config.static_forward_context
+        atom_config = get_current_atom_config()
+        if self.is_moe_layer:
+            experts = ffn.experts
+            experts.tp1_g2_relayout = (
+                experts.hidden_size == 6144
+                and experts.intermediate_size_per_partition == 3072
+                and tp1_prefill.moe_g2_ragged(atom_config.pipeline_parallel_size)
+            )
+        context = atom_config.compilation_config.static_forward_context
         self.tp1_ffn_name = f"{prefix}.tp1_ffn"
         if self.tp1_ffn_name in context:
             raise ValueError(f"Duplicate layer: {self.tp1_ffn_name}")

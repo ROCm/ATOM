@@ -1267,6 +1267,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3.1 as a TP1 P/D prefill producer on gfx950: decoder layers on fused
     # kernels, same bits (atom/model_ops/minimax_m3/tp1_prefill.py). 0: generic.
     "ATOM_M3_TP1_PREFILL": lambda: _flag_env("ATOM_M3_TP1_PREFILL", "1"),
+    # Under it and PP: MoE route rows from aiter's ragged-tile GEMM2, which reads
+    # a second w2 copy (+1.28 GB a MoE layer). 0 keeps the v2 GEMM2 (same bits).
+    "ATOM_M3_TP1_MOE_G2_P6": lambda: _flag_env("ATOM_M3_TP1_MOE_G2_P6", "1"),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.

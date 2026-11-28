@@ -105,6 +105,23 @@ def model_enabled(atom_config, hidden_size: int) -> bool:
     )
 
 
+def moe_g2_ragged(pp_size: int) -> bool:
+    """Whether MoE layers keep the second w2 copy aiter's ragged-tile GEMM2
+    reads (+1.28 GB a layer): ATOM_M3_TP1_MOE_G2_P6 under PP (at PP1 the copies
+    do not fit beside the weights) with aiter's moe_g2_p6."""
+    if not envs.ATOM_M3_TP1_MOE_G2_P6 or pp_size == 1:
+        return False
+    if _K is None or not hasattr(_K, "moe_g2_p6"):
+        _log_once("MiniMax-M3 TP1 prefill: aiter has no moe_g2_p6, the v2 GEMM2 runs")
+        return False
+    return True
+
+
+@functools.cache
+def _log_once(msg: str) -> None:
+    logger.info(msg)
+
+
 def linear_supported(linear) -> bool:
     """A native MXFP8 1x32 linear without bias, its weight stored preshuffled
     for aiter's group32 GEMM (gfx950: ATOM_GROUP32_WEIGHT_PRESHUFFLE)."""

@@ -2061,6 +2061,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         # ── C. FlyDSL fused_moe ───────────────────────────────────────────────
+        if getattr(layer, "tp1_g2_relayout", False):
+            from aiter.ops.m3_tp1_prefill import relayout_w2
+
+            # MiniMax-M3.1's TP1 prefill path: a second w2 copy, from the raw
+            # bytes, in the layout of aiter's ragged-tile GEMM2 (moe_g2_p6).
+            w2_b, w2_bs = relayout_w2(layer.w2_weight.data, layer.w2_weight_scale.data)
+            layer.register_buffer("w2_g2_weight", w2_b, persistent=False)
+            layer.register_buffer("w2_g2_scale", w2_bs, persistent=False)
         # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
         # WMMA tile shuffle internally, other archs use the lane-level path)
         layer.w13_weight.data = moe_shuffle_weight(
@@ -2319,6 +2327,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return False
         _, w2, sorted_ids, sorted_expert_ids, num_valid_ids, _, topk = inputs._args
         kw = inputs._kwargs
+        # The ragged-tile GEMM2 (same bits) takes up to 4096 sort blocks of 128 rows.
+        if (
+            hasattr(layer, "w2_g2_weight")
+            and kw["block_m"] == 128
+            and sorted_ids.shape[0] // 128 <= 4096
+        ):
+            from aiter.ops.m3_tp1_prefill import moe_g2_p6
+
+            moe_g2_p6(
+                inputs.a2.view(torch.uint8),
+                inputs.a2_scale.view(torch.uint8),
+                layer.w2_g2_weight,
+                layer.w2_g2_scale,
+                sorted_ids,
+                kw["sorted_weights"],
+                sorted_expert_ids,
+                num_valid_ids,
+                routes,
+                m,
+                topk,
+            )
+            return True
         _flydsl_v2_stage2_wrapper(
             inter_states=inputs.a2,
             w1=None,
