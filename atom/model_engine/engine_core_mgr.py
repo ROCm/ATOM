@@ -312,6 +312,18 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
 # per rank, so 6M waits at most about 150 s, half the admission deadline.
 EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS = 6_000_000
 
+# The legacy parameters an early request falls back on (set by the API server,
+# `Sequence.pd_legacy_kv_transfer_params`); never pickled to the engine.
+_EARLY_FALLBACK_ATTR = "pd_legacy_kv_transfer_params"
+
+
+def _drop_early_fallback(seqs: list[Sequence]) -> None:
+    """Where no per-rank load is tracked (one routable engine, PP), an early
+    request keeps its early answer: only its fallback parameters are dropped
+    before the frame is pickled."""
+    for seq in seqs:
+        vars(seq).pop(_EARLY_FALLBACK_ATTR, None)
+
 
 class CoreManager:
     # Class-level defaults so bare instances built via ``__new__`` (the DP
@@ -1224,8 +1236,8 @@ class CoreManager:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            for seq in seqs:
-                self._settle_early_handoff(seq, 0, None)
+            # No per-rank load here: an early request keeps its early answer.
+            _drop_early_fallback(seqs)
             self._send_request(0, _add_frame(seqs))
             # The pipeline is one DP rank; D reaches every stage through
             # `remote_pp_size` (ATOM_PD_EARLY_HANDOFF).
@@ -1234,8 +1246,7 @@ class CoreManager:
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            for seq in seqs:
-                self._settle_early_handoff(seq, 0, None)
+            _drop_early_fallback(seqs)
             self._send_request(0, _add_frame(seqs))
             for seq in seqs:
                 seq.pd_routed_dp_rank = 0
@@ -1255,7 +1266,7 @@ class CoreManager:
         None (no per-rank load is tracked here) keeps the early answer.
         """
         # Popped either way: the engine's copy never carries it.
-        legacy = vars(seq).pop("pd_legacy_kv_transfer_params", None)
+        legacy = vars(seq).pop(_EARLY_FALLBACK_ATTR, None)
         if legacy is None or queued_tokens is None:
             return
         declined = queued_tokens > EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS
