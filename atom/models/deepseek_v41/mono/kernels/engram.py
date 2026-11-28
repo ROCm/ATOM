@@ -93,9 +93,17 @@ class EngramBuild:
     # the residual column-sharded (every rank its columns of every row, the
     # gate's sums exchanged); else every column of ``rows`` on this rank
     split: bool = True
+    # 0: both stages, the gate waiting on the projection's EPF flags; 1: the
+    # projection alone, no flag (``host_project``: in a host layer's launch);
+    # 2: the gate alone, on PARTS an earlier launch left (no wait: the stream
+    # orders them)
+    mode: int = 0
+    # the CTAs the projection is placed on (a host layer's idle CTAs)
+    ctas: int = BLOCKS
 
     def __post_init__(self):
         assert HIDDEN % (self.ranks * RG) == 0
+        assert self.parts <= self.ctas <= BLOCKS
         assert WIDTH % PART == 0 and PART // 128 == WAVES, "a K step a wave"
         assert self.rows * HC <= BLOCKS, "a (row, stream) a CTA"
         assert self.lds_words * 4 <= 160 * 1024
@@ -131,7 +139,7 @@ class EngramBuild:
 
     @property
     def gctas(self) -> int:
-        return BLOCKS // self.parts * self.parts
+        return self.ctas // self.parts * self.parts
 
     @property
     def stride(self) -> int:
@@ -239,7 +247,8 @@ def project(c):
             g = j + i * p.stride
             if g < p.groups:
                 _group(c, part, g, q[i])
-        publish(c["mb"].put, c["epf"], t, 1, tid == 0)
+        if const_expr(p.mode == 0):
+            publish(c["mb"].put, c["epf"], t, 1, tid == 0)
 
 
 @traced
@@ -330,7 +339,8 @@ def gate(c, i):
             v = fx.Float32(fmath.fma(rr[h], comb_b[h], v))
         rs.append(bf16_round(v))
         ws.append(_ld_f32(a["gate_w"], b * HIDDEN + col))
-    await_project(c)
+    if const_expr(p.mode == 0):
+        await_project(c)
     ks, vs = [], []
     zero = fx.Float32(0.0)
     s1, s2, s3 = zero, zero, zero
@@ -411,10 +421,29 @@ def gates(c):
         gate(c, c["t"])
 
 
+def host_project(key: EngramBuild, t, tid, lds, rank, emb, w, ws, parts):
+    """The projection (module docstring, 1.) of ``key`` (mode 1) inside
+    another launch: its CTA ``t`` (< ``key.gctas``, the host's dense index of
+    this CTA) with the host's ``lds`` (an Int32 pointer to ``key.lds_words``
+    words free until the call returns): the same tasks, quantization, MFMAs and
+    PARTS layout as the projection launch's, no EPF flag."""
+    assert key.mode == 1
+    c = {
+        "key": key, "tid": tid, "lane": tid % 64, "wave": tid // 64, "t": t,
+        "rank": rank, "lds": lds, "ldsf": fx.recast_iter(fx.Float32, lds),
+        "args": {"emb": emb, "w": w, "ws": ws, "parts": parts},
+    }  # fmt: skip
+    project(c)
+    gpu.barrier()
+
+
 def build_engram(key: EngramBuild):
     keyed = key_tuple(key, SOURCES)
     peer = peer_offsets(key.step_rows, Dims(key.tp))
-    name = kernel_symbol("v41_engram", s=key.rows, tp=key.tp, sp=int(key.split))
+    name = kernel_symbol(
+        "v41_engram", s=key.rows, tp=key.tp, sp=int(key.split),
+        **({"m": key.mode} if key.mode else {}),
+    )  # fmt: skip
 
     @fx.struct
     class Smem:
@@ -442,8 +471,10 @@ def build_engram(key: EngramBuild):
             "eng": preg(sym, peer["eng"], "eng"),
             "eng_fan": [preg(bases[r], peer["eng"], "eng") for r in range(key.ranks)],
         }  # fmt: skip
-        project(c)
-        gates(c)
+        if const_expr(key.mode != 2):
+            project(c)
+        if const_expr(key.mode != 1):
+            gates(c)
         _ = keyed
 
     @launcher(name)

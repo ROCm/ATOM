@@ -51,6 +51,7 @@ from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import compress as cp
+from atom.models.deepseek_v41.mono.kernels import engram as eg
 from atom.models.deepseek_v41.mono.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.attn_post import (
@@ -88,6 +89,7 @@ from atom.models.deepseek_v41.mono.kernels.moe import (
     run_moe,
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import route_shape
+from atom.models.deepseek_v41.mono.kernels.moe import stage_lds
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
@@ -166,6 +168,11 @@ class LayerBuild:
     compress_ratio: int = 0
     compress_eps: float = 0.0
     compress_k_eps: float = 0.0
+    # an Engram layer's projection hosted here (``engram_host``): its
+    # weight, scales, embedding rows and partials in the compressor's
+    # ``c_w`` / ``c_wk`` / ``c_ape`` / ``c_parts`` (a layer that compresses
+    # nothing), 0 in ``c_w`` where a step hosts none
+    engram_host: bool = False
 
     @property
     def q_apart(self) -> bool:
@@ -202,6 +209,8 @@ class LayerBuild:
         assert pre.tok_par == post.tok_par and post.dp_ranks == 1
         assert pre.kv_fp8 == post.kv_fp8, "one pool's rows"
         assert pre.shard == post.shard, "both seams sharded or neither"
+        if self.engram_host:
+            assert not self.compress_ratio, "the projection's in the compressor's args"
 
 
 # K1's arguments (prefixed: K2 has its own residual, gates, tables) less its
@@ -295,6 +304,63 @@ def scratch_bytes(key: LayerBuild) -> int:
     return max(o + n for layout in scratch_layouts(key) for o, n in layout.values())
 
 
+def engram_busy(s: int, rs) -> list:
+    """K2b's (turned) CTAs with a task before ug -- xq, router, route,
+    shared, the FFN gates (``gates0`` turned back: ``route0`` + s) -- as sorted
+    [lo, hi) intervals: the others wait in ug for the route, the projection's
+    window."""
+    busy = set()
+    for b0, n in ((0, s), (rs.router0, rs.router_tasks), (rs.route0, s),
+                  (rs.shared0, rs.shared_units), (rs.route0 + s, s)):  # fmt: skip
+        busy.update((b0 + k) % BLOCKS for k in range(n))
+    out, lo = [], None
+    for b in range(BLOCKS + 1):
+        if b < BLOCKS and b in busy:
+            lo = b if lo is None else lo
+        elif lo is not None:
+            out.append((lo, b))
+            lo = None
+    return out
+
+
+# fewer idle CTAs than this: no hosted projection (s24: none idle)
+ENGRAM_HOST_MIN_CTAS = 64
+
+
+def engram_host_build(key: LayerBuild):
+    """The projection build ``key`` hosts (mode 1 on its idle CTAs), None
+    where it hosts none (not asked, or too few idle CTAs at its width)."""
+    if not key.engram_host:
+        return None
+    s = key.pre.tokens
+    rs = route_shape(key.post.halves()[1])
+    idle = BLOCKS - sum(hi - lo for lo, hi in engram_busy(s, rs))
+    if idle < ENGRAM_HOST_MIN_CTAS:
+        return None
+    eng = eg.EngramBuild(rows=s, tp=key.pre.tp, eps=0.0, split=True, mode=1, ctas=idle)
+    # its LDS from K2b's: red, tab, pair, stage (free in this window)
+    moe_words = 2 * WAVES * 64 * 4 + rs.tab_words + 16 * s + sum(stage_lds(s, rs)["words"].values())
+    assert eng.lds_words <= moe_words, (eng.lds_words, moe_words)
+    return eng
+
+
+def _engram_hosted(eng, s, rs, mbid, tid, moe_lds, rank, emb, w, ws, parts):
+    """This CTA's share of the hosted projection: an idle CTA (none of
+    ``engram_busy``'s) in its dense order, where ``w`` is set."""
+    on = w != fx.Int64(0)
+    q = fx.Int32(mbid)
+    for lo, hi in engram_busy(s, rs):
+        on = on & ((mbid < lo) | (mbid >= hi))
+        q = q - (mbid >= hi).select(fx.Int32(hi - lo), fx.Int32(0))
+    _engram_hosted_run(eng, on, q, tid, fx.recast_iter(fx.Int32, moe_lds.red.ptr), rank, emb, w, ws, parts)
+
+
+@traced
+def _engram_hosted_run(eng, on, q, tid, lds, rank, emb, w, ws, parts):
+    if on:
+        eg.host_project(eng, q, tid, lds, rank, emb, w, ws, parts)
+
+
 def build_layer(key: LayerBuild):
     pre, post = key.pre, key.post
     s, timeline = pre.tokens, pre.timeline
@@ -314,6 +380,7 @@ def build_layer(key: LayerBuild):
     comp = key.compress
     if comp is not None:
         members["cp"] = compress_smem(comp)
+    eng = engram_host_build(key)
     Parts = lds_union("LayerLds", members)
     warm = CODE_WARM_SPAN > 0
     if warm:
@@ -526,9 +593,17 @@ def build_layer(key: LayerBuild):
         # the FFN gates on the CTAs past the route's (K2b's placement, turned):
         # the ug tasks' first round reaches them only with many experts
         gates0 = (rs.route0 + s + rot) % BLOCKS
+
+        def before_ug():
+            # the hosted Engram projection on the CTAs waiting for the route
+            if const_expr(eng is not None):
+                _engram_hosted(
+                    eng, s, rs, mbid, tid, lds["moe"], rank, c_ape, c_w, c_wk, c_parts
+                )
+            run_gates(ca, key_a, bid, gates0)
+
         run_moe(
-            cb, key_b, mbid, tls, tl1 + len(k2a.TL_STAGES) - 1,
-            before_ug=lambda: run_gates(ca, key_a, bid, gates0),
+            cb, key_b, mbid, tls, tl1 + len(k2a.TL_STAGES) - 1, before_ug=before_ug,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed

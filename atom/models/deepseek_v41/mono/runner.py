@@ -753,7 +753,9 @@ class V41MonoDecodeRunner:
         if not pre.feeds_index:
             post = replace(post, index_bound_max=0, index_fp4=False, index_mfma=False)
         if not ratio:
-            return kl.LayerBuild(pre=pre, post=post)
+            return kl.LayerBuild(
+                pre=pre, post=post, engram_host=self._hosts_engram(s, pre)
+            )
         eps, k_eps = self.compressor.eps[ratio]
         return kl.LayerBuild(
             pre=pre, post=post, compress_ratio=ratio, compress_eps=eps,
@@ -960,7 +962,7 @@ class V41MonoDecodeRunner:
         if build.head is not None:
             kernels.append((build.head, lk.ABI))
         if build.engram is not None:
-            kernels.append((build.engram, eg.ABI))
+            kernels += [(launcher, eg.ABI) for launcher in build.engram.values()]
         if build.ctx is not None:
             kernels.append((build.ctx, dc.ABI))
         if build.layer_post is not None:
@@ -1222,6 +1224,9 @@ class V41MonoDecodeRunner:
         engram_joined = getattr(rows_staged, "stage", None) is not None
         if engram_joined:
             rows_staged.join()
+        # the Engram layers a host layer projected this step
+        self._engram_hosted = set()
+        self._engram_joined = engram_joined
         write_step_meta(
             step,
             cache.geometry,
@@ -1346,6 +1351,47 @@ class V41MonoDecodeRunner:
             timeline.step_done(rows)
         return hidden.squeeze(0)
 
+    def _engram_host_of(self) -> dict:
+        """host layer id -> the Engram layer whose projection it hosts:
+        layer 0 (its own launch, ``embed_in``) the first's; the first Engram
+        layer (its own launch: it takes a settled residual) the second's."""
+        if self.engram is None:
+            return {}
+        ids = sorted(self.engram.blocks)
+        out = {0: ids[0]} if ids and ids[0] > 0 else {}
+        if len(ids) > 1:
+            out[ids[0]] = ids[1]
+        return out
+
+    def _hosts_engram(self, s: int, pre) -> bool:
+        """Whether the layer build over K1 key ``pre`` at s rows hosts an
+        Engram projection: layer 0's (``embed_in``) and the first Engram
+        layer's (no fold, no index), on a sharded step the Engram launch
+        serves."""
+        how = None if self.engram is None else self._engram_rows(s)
+        if how is None or not how[0] or not self._engram_host_of():
+            return False
+        return pre.embed_in or (not pre.fold and not pre.feeds_index)
+
+    def _engram_host_args(self, layer_id, key) -> dict:
+        """A host layer's compressor-slot arguments for its Engram
+        projection, recorded in ``_engram_hosted`` (the Engram launch then
+        runs its gate alone); {} where it hosts none this step."""
+        target = self._engram_host_of().get(layer_id)
+        if target is None or not self._hosts_engram(key.tokens, key):
+            return {}
+        if kl.engram_host_build(self._layer_build(key.tokens, key)) is None:
+            return {}
+        how = self._engram_rows(key.tokens)
+        got = self.engram.host_args(
+            target, get_forward_context().attn_metadata, t0=how[1],
+            joined=getattr(self, "_engram_joined", False),
+        )  # fmt: skip
+        if got is None:
+            return {}
+        self.__dict__.setdefault("_engram_hosted", set()).add(target)
+        return got
+
     def _engram_rows(self, s: int):
         """(split, first row, rows) of an s-row step's Engram launch: a
         sharded step's every row on the rank's columns; a token-parallel
@@ -1373,6 +1419,7 @@ class V41MonoDecodeRunner:
         if how is not None and self.engram.launch(
             self.build.engram, spec.layer_id, state, metadata,
             self.peers.kernel_args(), t0=how[1], joined=joined,
+            hosted=spec.layer_id in getattr(self, "_engram_hosted", ()),
         ):  # fmt: skip
             return SinglePassHCState(self.engram.gated(rows), state.pre_mix)
         if sharded:
@@ -1657,6 +1704,8 @@ class V41MonoDecodeRunner:
             cargs = self.compressor.layer_args(key.tokens, spec, cache, step, rope)
             if cargs is None:
                 return None
+        else:
+            cargs.update(self._engram_host_args(layer_id, key))
         own, residual, gates = self._front_args(
             layer_id, key, weights, state, cache, step, rope
         )
