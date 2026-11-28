@@ -12,8 +12,6 @@ use futures::Stream;
 use http::HeaderMap;
 use tracing::error;
 
-#[cfg(feature = "grpc-client")]
-use super::engine::atom::pair::AtomPairs;
 use super::engine::{Dispatcher, GrpcEngine};
 use crate::{
     app_context::AppContext,
@@ -197,11 +195,11 @@ impl Pipeline {
         Self::with_label(worker_registry, policy_registry, metrics_labels::BACKEND_PD)
     }
 
-    /// Runs ATOM pairs through `pairs` rather than the dual dispatch.
+    /// Dispatches through `engine`, which the router built from its config.
     #[cfg(feature = "grpc-client")]
-    pub(crate) fn with_atom_pairs(self, pairs: AtomPairs) -> Self {
+    pub(crate) fn with_engine(self, engine: GrpcEngine) -> Self {
         Self {
-            engine: Arc::new(GrpcEngine::with_atom_pairs(pairs)),
+            engine: Arc::new(engine),
             ..self
         }
     }

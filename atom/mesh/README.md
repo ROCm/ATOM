@@ -253,6 +253,26 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 Supported reasoning parsers: `deepseek-r1`, `qwen3`, `qwen3-thinking`, `kimi`, `glm45`, `glm47`, `step3`, `minimax`.  
 Supported tool parsers: `json`, `python`, `xml`.
 
+#### ATOM gRPC workers
+
+An ATOM instance started with `--grpc-port` serves its own gRPC service,
+`atom.grpc.v1.AtomEngine` (`atom/entrypoints/grpc/atom_grpc.proto`). atomesh detects it
+without a runtime flag (probing SGLang, then vLLM, then ATOM) and reads its model,
+tokenizer path, chat template, default template kwargs and reasoning markers from
+GetModelInfo; with `--dp-aware`, its DP size from GetServerInfo.
+
+```bash
+python -m atom.entrypoints.openai_server --model <model> --server-port 8000 --grpc-port 31001
+./target/release/atomesh launch --worker-urls grpc://worker1:31001
+```
+
+atomesh renders and tokenizes each chat and sends ATOM token ids, the stop strings as
+token ids and the chat's structured-output fields; ATOM P/D pairs keep ATOM's relay or
+chunked KV transfer. Image, video, audio and embedding input is refused for ATOM
+workers, as is `/v1/responses`. Each request is one Generate call; with
+`--atom-grpc-session`, every request to an instance shares one Session stream instead,
+one message per engine step.
+
 ## Architecture
 
 ### Control plane

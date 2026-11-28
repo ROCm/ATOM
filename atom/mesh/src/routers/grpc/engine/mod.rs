@@ -86,6 +86,9 @@ pub struct GrpcEngine {
     /// Runs ATOM pairs; without it, an ATOM pair fails.
     #[cfg(feature = "grpc-client")]
     atom_pairs: Option<Arc<atom::pair::AtomPairs>>,
+    /// How each ATOM request is sent, alone or as a pair's leg.
+    #[cfg(feature = "grpc-client")]
+    atom_calls: atom::AtomCalls,
 }
 
 impl GrpcEngine {
@@ -98,7 +101,26 @@ impl GrpcEngine {
     pub(crate) fn with_atom_pairs(pairs: atom::pair::AtomPairs) -> Self {
         Self {
             atom_pairs: Some(Arc::new(pairs)),
+            ..Self::default()
         }
+    }
+
+    /// With `workers`, every ATOM request goes over its instance's Session rather than
+    /// a Generate call of its own; a Session is released once none of its instance's
+    /// workers is in `workers`.
+    #[cfg(feature = "grpc-client")]
+    pub(crate) fn with_atom_session(
+        self,
+        workers: Option<Arc<crate::core::WorkerRegistry>>,
+    ) -> Self {
+        let atom_calls = match workers {
+            Some(workers) => {
+                let sessions = atom::session::AtomSessions::releasing_removed(workers);
+                atom::AtomCalls::Session(Arc::new(sessions))
+            }
+            None => atom::AtomCalls::Generate,
+        };
+        Self { atom_calls, ..self }
     }
 
     /// Without a tokenizer, a request with stop strings fails for an ATOM worker;
@@ -133,8 +155,9 @@ impl GrpcEngine {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 message: "an ATOM pair needs the gRPC P/D router".to_string(),
             })?;
+            let tokenizer = tokenizer.map(|t| t.as_ref());
             return pairs
-                .dispatch(prefill, decode, payload, tokenizer.map(|t| t.as_ref()))
+                .dispatch(&self.atom_calls, prefill, decode, payload, tokenizer)
                 .await;
         }
         #[cfg(feature = "grpc-client")]
@@ -192,7 +215,9 @@ impl GrpcEngine {
             GrpcClient::Atom(atom_client) => {
                 let tokenizer = tokenizer.map(|t| t.as_ref());
                 let request = atom::request::generate_request(payload, worker.as_ref(), tokenizer)?;
-                let stream = atom::stream::AtomStream::open(atom_client, request).await?;
+                let (streamed, started) = (request.stream, std::time::Instant::now());
+                let responses = self.atom_calls.start(worker, atom_client, request).await?;
+                let stream = atom::stream::AtomStream::start(responses, streamed, started).await?;
                 return Ok(TokenHandle::new(stream));
             }
         };

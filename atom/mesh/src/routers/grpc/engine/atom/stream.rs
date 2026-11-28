@@ -10,11 +10,11 @@ use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
-use tonic::{Status, Streaming};
+use tonic::Status;
 
-use super::AtomClient;
+use super::Responses;
 use crate::atom_engine::grpc::{
-    generate_response::Response, GenerateComplete, GenerateError, GenerateRequest, GenerateResponse,
+    generate_response::Response, GenerateComplete, GenerateError, GenerateResponse,
 };
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::routers::token_handle::token_chunk::{
@@ -22,7 +22,7 @@ use crate::routers::token_handle::token_chunk::{
 };
 use crate::routers::token_handle::token_handle::{SourceClock, TokenSource};
 
-pub(crate) struct AtomStream<S = Streaming<GenerateResponse>> {
+pub(crate) struct AtomStream<S = Responses> {
     inner: S,
     /// The first message, read by `start`.
     first: Option<TokenChunk>,
@@ -32,22 +32,6 @@ pub(crate) struct AtomStream<S = Streaming<GenerateResponse>> {
     completes: Vec<(u32, TokenChunk)>,
     finished: bool,
     clock: SourceClock,
-}
-
-impl AtomStream {
-    /// Starts the call and reads its first message, as `start` does.
-    pub(crate) async fn open(
-        client: &AtomClient,
-        request: GenerateRequest,
-    ) -> Result<Self, EngineError> {
-        let streamed = request.stream;
-        let started = Instant::now();
-        let inner = client
-            .generate(request)
-            .await
-            .map_err(EngineError::Transport)?;
-        Self::start(inner, streamed, started).await
-    }
 }
 
 impl<S: Stream<Item = Result<GenerateResponse, Status>> + Unpin> AtomStream<S> {

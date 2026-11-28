@@ -17,7 +17,7 @@ use tracing::error;
 
 use super::request::generate_request;
 use super::stream::{http_error, AtomStream};
-use super::AtomClient;
+use super::{AtomCalls, AtomClient};
 use crate::atom_engine::grpc::{
     generate_response::Response, GenerateComplete, GenerateRequest, GenerateResponse,
 };
@@ -235,10 +235,11 @@ impl AtomPairs {
         Ok(AtomAdapter::new(info.clone()))
     }
 
-    /// One attempt on the planned pair, P picked by the rank mapping. Both loads
-    /// are taken first, as `ReservedPair` takes them; P's ends when P completes.
+    /// One attempt on the planned pair (P by the rank mapping), each leg through `calls`. Both
+    /// loads are taken first, as `ReservedPair` takes them; P's ends when P completes.
     pub(crate) async fn dispatch(
         &self,
+        calls: &AtomCalls,
         prefill: &Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
         payload: &GenerationPayload,
@@ -256,7 +257,7 @@ impl AtomPairs {
         }
         .emit();
         let stream = self
-            .run(&prefill, decode, payload, tokenizer, prefill_load)
+            .run(calls, &prefill, decode, payload, tokenizer, prefill_load)
             .await
             .inspect_err(|e| {
                 error!(prefill = prefill.url(), decode = decode.url(), error = %e, "ATOM P/D failed")
@@ -270,6 +271,7 @@ impl AtomPairs {
 
     async fn run(
         &self,
+        calls: &AtomCalls,
         prefill: &Arc<dyn Worker>,
         decode: &Arc<dyn Worker>,
         payload: &GenerationPayload,
@@ -306,15 +308,15 @@ impl AtomPairs {
             // and so cancels, the other's call.
             let (_, stream) = tokio::try_join!(
                 async {
-                    run_prefill(&prefill_client, prefill_request).await?;
+                    run_prefill(calls, prefill, &prefill_client, prefill_request).await?;
                     drop(prefill_load);
                     Ok::<_, EngineError>(())
                 },
-                open_decode(&decode_client, decode_request),
+                open_decode(calls, decode, &decode_client, decode_request),
             )?;
             return Ok(stream);
         }
-        let complete = run_prefill(&prefill_client, prefill_request).await?;
+        let complete = run_prefill(calls, prefill, &prefill_client, prefill_request).await?;
         // P has completed; D's stream must not keep P loaded.
         drop(prefill_load);
         let kv = complete
@@ -324,7 +326,7 @@ impl AtomPairs {
             .map_err(|e| bad_gateway(format!("Prefill kv_transfer_params parse error: {e}")))?;
         adapter.enrich_decode_kv(&mut kv, &ctx).map_err(internal)?;
         decode_request.kv_transfer_params_json = Some(kv.to_string());
-        open_decode(&decode_client, decode_request).await
+        open_decode(calls, decode, &decode_client, decode_request).await
     }
 }
 
@@ -430,36 +432,46 @@ fn take_view(request: &mut GenerateRequest, view: &Value) {
 /// P's call up to its Complete. Failures that are not ATOM's own GenerateError
 /// take the 502 ATOM's HTTP P/D router answers them with.
 async fn run_prefill(
+    calls: &AtomCalls,
+    prefill: &Arc<dyn Worker>,
     client: &AtomClient,
     request: GenerateRequest,
 ) -> Result<GenerateComplete, EngineError> {
-    let mut stream = client
-        .generate(request)
+    let mut stream = calls
+        .start(prefill, client, request)
         .await
-        .map_err(|s| bad_gateway(format!("Prefill server error: {s}")))?;
+        .map_err(|e| match e {
+            EngineError::Transport(s) => bad_gateway(format!("Prefill server error: {s}")),
+            e => e,
+        })?;
     loop {
-        match stream.message().await {
-            Ok(Some(GenerateResponse { response })) => match response {
+        match stream.next().await {
+            Some(Ok(GenerateResponse { response })) => match response {
                 Some(Response::Complete(complete)) => return Ok(complete),
                 Some(Response::Error(error)) => return Err(http_error(error)),
                 Some(Response::Chunk(_)) | None => {}
             },
-            Ok(None) => return Err(bad_gateway("Prefill stream ended without Complete".into())),
-            Err(s) => return Err(bad_gateway(format!("Prefill read error: {s}"))),
+            None => return Err(bad_gateway("Prefill stream ended without Complete".into())),
+            Some(Err(s)) => return Err(bad_gateway(format!("Prefill read error: {s}"))),
         }
     }
 }
 
 async fn open_decode(
+    calls: &AtomCalls,
+    decode: &Arc<dyn Worker>,
     client: &AtomClient,
     request: GenerateRequest,
 ) -> Result<AtomStream, EngineError> {
-    AtomStream::open(client, request)
-        .await
-        .map_err(|e| match e {
-            EngineError::Transport(s) => bad_gateway(format!("Decode server error: {s}")),
-            e => e,
-        })
+    let (streamed, started) = (request.stream, Instant::now());
+    let opened = match calls.start(decode, client, request).await {
+        Ok(responses) => AtomStream::start(responses, streamed, started).await,
+        Err(e) => Err(e),
+    };
+    opened.map_err(|e| match e {
+        EngineError::Transport(s) => bad_gateway(format!("Decode server error: {s}")),
+        e => e,
+    })
 }
 
 fn no_client(worker: &Arc<dyn Worker>) -> EngineError {
