@@ -27,6 +27,7 @@ from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
 )
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
+    sparse_attn_v41_paged_2src_bf16,
 )
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
@@ -636,11 +637,14 @@ class Attention(nn.Module):
         if cache.packed and not a8w4:
             pool = (pool, cache.ring_view(self.spec.layer_id))
         kwargs = {"out": flat_query}
-        if a8w4 or cache.kv_fp8:
+        if query_fp8 is not None:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
             if a8w4:
                 kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
+        elif cache.kv_fp8:
+            attend = sparse_attn_v41_paged_2src_bf16
+            attending = flat_query
         else:
             attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             attending = flat_query

@@ -41,7 +41,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
 CORE_PREPARE_DIGEST = "9aa3c02a741f9b0b"
-CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
+CORE_FORWARD_DIGEST = "4598a274e076a316"
 
 
 @pytest.fixture
@@ -318,10 +318,124 @@ def test_the_copy_still_covers_both_dispatch_arms():
         "packed_decode",
         "packed_prefill",
         "sparse_attn_v4_paged_2src",
+        "sparse_attn_v41_paged_2src_bf16",
         "write_window",
         "rope_quant_window",
     ):
         assert name in copy, f"the attention copy lost {name}"
+
+
+def _undecorated(path, name, scope, class_name=None):
+    """Function `name` of `path` (a method of `class_name`), without its
+    decorators, compiled into `scope`."""
+    nodes = ast.parse(path.read_text()).body
+    if class_name is not None:
+        nodes = next(
+            n for n in nodes if isinstance(n, ast.ClassDef) and n.name == class_name
+        ).body
+    fn = next(n for n in nodes if isinstance(n, ast.FunctionDef) and n.name == name)
+    fn.decorator_list = []
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
+        compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), scope
+    )
+    return scope[name]
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("source", ["core", "plugin"])
+def test_fp8_kv_attends_with_a_bf16_query_where_aiter_has_no_mxfp8_attention(
+    source, decode, native
+):
+    """With AITER's MXFP8 sparse attention unavailable (gfx942), the cache
+    hands out no MXFP8 query, and core's `_attend` and the plugin's
+    `_attend_block` follow it to the BF16-query attention over the FP8
+    planes."""
+    tokens, heads, dim = 3, 2, 64
+    chosen = []
+
+    def recorder(name):
+        def attend(attending, *args, out):
+            chosen.append((name, attending))
+            return torch.zeros_like(out)
+
+        return attend
+
+    def refused(*args, **kwargs):
+        pytest.fail("an FP8 KV cache took a BF16-pool attention")
+
+    scope = {
+        "torch": torch,
+        "FP8_DTYPE": torch.float8_e4m3fn,
+        "native_fp8_attention": lambda query: native,
+        "join_stream": Mock(),
+        "sparse_attn_v41_paged_2src": recorder("mxfp8"),
+        "sparse_attn_v41_paged_2src_bf16": recorder("bf16"),
+        "sparse_attn_v4_paged_2src": refused,
+        "packed_prefill": refused,
+        "packed_decode": refused,
+    }
+    query_fp8 = _undecorated(
+        ROOT / "atom/model_ops/attentions/deepseek_v41/cache.py",
+        "query_fp8",
+        scope,
+        "PagedAttentionCache",
+    )
+    query = torch.randn(1, tokens, heads, dim).bfloat16()
+    step = SimpleNamespace(requests=[0], attention_inputs=None, decode=decode)
+    indices = tuple(torch.zeros(tokens + 1, dtype=torch.int32) for _ in range(4))
+    cache = SimpleNamespace(
+        kv_fp8=True,
+        packed=False,
+        current_step=step,
+        attention_indices=Mock(return_value=indices),
+        main_view=Mock(return_value=object()),
+        ring_view=Mock(return_value=object()),
+        write_window=Mock(),
+        rope_quant_window=Mock(return_value=(object(), object())),
+    )
+    handed = []
+    cache.query_fp8 = lambda query, a8w4=False: (
+        handed.append(query_fp8(cache, query, a8w4=a8w4)) or handed[-1]
+    )
+    owner = SimpleNamespace(
+        spec=SimpleNamespace(layer_id=0, kv_owner=0),
+        attn_sink=torch.zeros(heads),
+        softmax_scale=dim**-0.5,
+    )
+    if source == "core":
+        attend = _undecorated(CORE, "_attend", scope, "Attention")
+        prepared = (False, cache.query_fp8(query), object(), object())
+        attend(owner, query, cache, step, None, prepared)
+    else:
+        owner.__dict__.update(
+            heads=heads,
+            head_dim=dim,
+            index_stream=None,
+            compress_stream=None,
+            _fork_compress=Mock(return_value=False),
+            project_qkv=Mock(return_value=(object(), object())),
+            qk_norm=Mock(return_value=(object(), object(), object())),
+            _fork_select=Mock(),
+            wq_b=Mock(return_value=query.flatten(-2)),
+            _use_a8w4_attention=Mock(return_value=False),
+        )
+        attend = _undecorated(PLUGIN, "_attend_block", scope)
+        attend(owner, torch.empty_like(query), None, None, cache, step, None, None)
+    ((name, attending),) = chosen
+    # The cache alone decides: no MXFP8 pair also means the BF16 query is the
+    # one rotated in place.
+    assert len(handed) == 1 and (handed[0] is None) is not native
+    if native:
+        assert name == "mxfp8"
+        assert [part.dtype for part in attending] == [
+            torch.float8_e4m3fn,
+            torch.float8_e8m0fnu,
+        ]
+    else:
+        assert name == "bf16"
+        assert attending.dtype == torch.bfloat16
+        assert attending.shape == (tokens, heads, dim)
 
 
 @pytest.mark.parametrize(

@@ -36,6 +36,7 @@ from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer, upload_numpy
 
+from .fp8_attention import native_fp8_attention
 from .indices import (
     build_indices,
     build_window_rows,
@@ -227,7 +228,8 @@ class PagedAttentionCache:
         self.prefill_window_staging = prefill_window_staging
         self.packed = geometry.packed
         self.window_fp8 = geometry.window_fp8
-        # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
+        # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`, or by
+        # `sparse_attn_v41_paged_2src_bf16` where AITER has no MXFP8 attention
         self.kv_fp8 = geometry.kv_dtype == "fp8"
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         if self.window_fp8:
@@ -1042,7 +1044,7 @@ class PagedAttentionCache:
 
     def query_fp8(self, query, *, a8w4=False):
         """MXFP8 Q for A8W8 or A8W4 attention; None for the BF16 adapter."""
-        if not (self.kv_fp8 or a8w4):
+        if not (a8w4 or (self.kv_fp8 and native_fp8_attention(query))):
             return None
         *rows, dim = query.shape
         return (
