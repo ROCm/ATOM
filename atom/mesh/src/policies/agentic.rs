@@ -26,6 +26,10 @@ const TEXT_BYTES_PER_TOKEN: usize = 4;
 ///      + request_token_equivalent * inflight_requests
 ///      - stay_margin, on a worker whose device cache holds the prompt's prefix
 /// ```
+///
+/// `uncached_tokens` counts what a worker would load from a store at the store's
+/// weight and load cost, until every candidate has `busy_tokens` queued: from
+/// there a load counts in full and costs one token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgenticCost {
     /// Cost of one in-flight request, in tokens. The engine's `least_tokens`
@@ -39,6 +43,15 @@ pub struct AgenticCost {
     /// from the store or computed again, and the queue it leaves is mostly other
     /// requests' short suffixes. Default: 0, the cost alone decides.
     pub stay_margin: u64,
+    /// Prefill tokens queued on every candidate from which none of them is about
+    /// to idle: a request then waits wherever it goes, and the least queue saves
+    /// more than a store load costs. From there a prefix a worker would load from
+    /// the store counts in full and the load costs one token, which keeps a tie
+    /// on the device that holds the prefix: the engine's `share_cache` placement
+    /// counts a load the same way. Below it, a load keeps the store's
+    /// weight and load cost, which hold a request on the worker whose device has
+    /// its prefix while queues are short. Default: 0, never.
+    pub busy_tokens: u64,
 }
 
 impl Default for AgenticCost {
@@ -46,6 +59,7 @@ impl Default for AgenticCost {
         Self {
             request_token_equivalent: 512,
             stay_margin: 0,
+            busy_tokens: 0,
         }
     }
 }
@@ -344,9 +358,14 @@ impl LoadBalancingPolicy for AgenticPolicy {
             _ => None,
         };
         let copies = shared.is_some();
+        // With a queue on every candidate, a load is counted as the engine counts it.
+        let busy = self.cost.busy_tokens > 0
+            && (healthy.iter())
+                .all(|&idx| workers[idx].prefill_tokens() as u64 >= self.cost.busy_tokens);
         let (index_hits, held, copiers) = match (index_hits, matchable.zip(provider)) {
             (Some(device), Some((tokens, provider))) if copies || provider.store_weight() > 0.0 => {
                 let (share_weight, weight) = (provider.share_weight(), provider.store_weight());
+                let weight = if busy && weight > 0.0 { 1.0 } else { weight };
                 let pooled = shared.unwrap_or_else(|| device.clone());
                 let copied = |device: u32, pooled: u32| {
                     (share_weight * f64::from(pooled.saturating_sub(device))).round() as u32
@@ -364,7 +383,9 @@ impl LoadBalancingPolicy for AgenticPolicy {
                     let credited = credited.collect::<Vec<_>>();
                     (Some(credited), Some(pooled), Some(copiers))
                 } else {
+                    // One token keeps a tie on the worker whose device holds the prefix.
                     let load_cost = provider.store_load_cost();
+                    let load_cost = if busy { load_cost.min(1) } else { load_cost };
                     let cached = provider.cached_tokens(tokens, workers, &pooled).await;
                     // A store that does not answer (its lookup timed out, or its breaker
                     // is open) is taken to hold the longest prefix on a device, which the
@@ -934,6 +955,49 @@ mod tests {
         assert_eq!(decide(&policy, &workers, &info).await, stays);
         workers[1].charge_prefill_tokens(2);
         assert_eq!(decide(&policy, &workers, &info).await, moves);
+    }
+
+    #[tokio::test]
+    async fn with_a_queue_on_every_worker_a_store_load_counts_in_full_and_costs_a_token() {
+        let workers = workers();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        // b's device holds 98 of the 100 tokens; a's 90, and its store the 8 more. At
+        // half weight and 1000 a load, a is credited nothing: the turn stays on b until
+        // b's queue is 98 ahead of a's.
+        let stored = || Stored(vec![(90, Some(98)), (98, Some(98))].into(), 0.5, 1000);
+        let busy_from = |busy_tokens| {
+            let cost = AgenticCost {
+                busy_tokens,
+                ..AgenticCost::default()
+            };
+            let policy = AgenticPolicy::new(AgenticConfig {
+                cost,
+                eviction_interval_secs: 0,
+                ..AgenticConfig::default()
+            });
+            policy.set_kv_events(Arc::new(stored()));
+            policy
+        };
+        let stays = (Some(1), "hit", Some(0.98), Some(2));
+        let moves = (Some(0), "relocate", Some(0.98), Some(2));
+        // a has 40 queued and b 60: 20 ahead, far from 98.
+        workers[0].charge_prefill_tokens(40);
+        workers[1].charge_prefill_tokens(60);
+        assert_eq!(decide(&busy_from(0), &workers, &info).await, stays);
+        // Not every worker has 50 queued: the load keeps its price.
+        assert_eq!(decide(&busy_from(50), &workers, &info).await, stays);
+        // Both have 40 queued: a's load counts in full and costs one token, and b's
+        // queue, 20 longer, sends the turn to a.
+        assert_eq!(decide(&busy_from(40), &workers, &info).await, moves);
+        // With equal queues that token keeps the turn where the device holds it.
+        workers[0].charge_prefill_tokens(20);
+        assert_eq!(decide(&busy_from(40), &workers, &info).await, stays);
+        workers[0].release_prefill_tokens(60);
+        workers[1].release_prefill_tokens(60);
     }
 
     #[tokio::test]

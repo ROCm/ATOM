@@ -467,6 +467,11 @@ pub enum PolicyConfig {
         /// device cache holds its prefix before it is placed elsewhere (default: 0)
         #[serde(default)]
         stay_margin: u64,
+        /// Prefill tokens queued on every worker from which a store load counts in
+        /// full and costs one token, as the engine's share_cache counts it (default:
+        /// 0, never)
+        #[serde(default)]
+        busy_tokens: u64,
     },
 
     /// Lowest outstanding decode load at `url@rank`. By `order`: reserved KV tokens
@@ -1104,6 +1109,7 @@ mod tests {
                 eviction_interval_secs: 120,
                 max_tree_size: 67108864,
                 stay_margin: 0,
+                busy_tokens: 0,
             }
         ));
     }
