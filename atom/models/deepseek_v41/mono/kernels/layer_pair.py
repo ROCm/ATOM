@@ -25,9 +25,6 @@ x-independent loads with layer l's tail. Body a warms its own code only
 a), body b its own at its start. Every other stage of body b waits on its own
 hand-offs as in a launch (tags apart by layer); K1's and K2b's regions are
 disjoint, so nothing body b writes early is still read by body a.
-
-Measured (TP8 s6, 10 pairs a step on V4.1-Flash): about -1.2 us a pair
-boundary, all layer kernels -12.0 / -11.8 us a step at 133K / 400K.
 """
 
 import os
@@ -116,7 +113,7 @@ assert RED_COLS == k1.COLS
 PAIR_MAX_TOKENS = 10
 # hand-off rows this launch rereads (res_pair / gates_pair, res_attn / gates_attn)
 # loaded at device scope: a CU's resident line of an earlier iteration is never
-# returned (measured stale otherwise, cache_tb); ATOM_MONO_HANDCM=0: the old loads
+# returned (default policy can return it stale); ATOM_MONO_HANDCM=0: the old loads
 HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
 
 
@@ -354,8 +351,8 @@ def _body(C, A, role, mode, tid, bid, lds, tls, pnd_off, pnd_tag, shared):
     tl = A["tl"]
     if const_expr(role == 0):
         # body a warms its own code only (a single layer's span):
-        # the whole pair's 210 KB kept the warming CTAs 248..255 0.9 us late
-        # into body a (their kv wqkv_a tasks -> KVT -> the merge); body b
+        # warming the whole pair's code would keep the warming CTAs 248..255
+        # late into body a (their kv wqkv_a tasks -> KVT -> the merge); body b
         # warms its own at its start
         warm_pair_code(warm, tid, bid, PAIR_WARM_A)
     else:

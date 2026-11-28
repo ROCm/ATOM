@@ -227,7 +227,7 @@ def _staging_in_line(metadata):
     before its first layer (the all-gather spins on CUs: beside a kernel that
     needs every CU resident it deadlocks), so the side stream overlaps
     nothing, while its fork and join, captured, are 2-parent graph nodes a
-    replay pays ~4 us of idle each for (G368; hblk/h1a unit test). In line,
+    replay pays as idle before each. In line,
     the fork, the join and the ``done`` records are same-stream no-ops. Not
     where the step was staged outside the forward (the plugin's metadata
     builder) or where taking a layer's rows gathers on the main stream itself

@@ -113,7 +113,7 @@ RUN_ARG_NAMES = kl.ABI.names
 # the slot of the layer's MoE tag (the next iteration's PND tag)
 # hand-off rows this launch rereads (res_pair / gates_pair, res_attn / gates_attn)
 # loaded at device scope: a CU's resident line of an earlier iteration is never
-# returned (measured stale otherwise, cache_tb); ATOM_MONO_HANDCM=0: the old loads
+# returned (default policy can return it stale); ATOM_MONO_HANDCM=0: the old loads
 HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
 K_WQKV = RUN_ARG_NAMES.index("k1_wqkv")
 K_WQKV_S = RUN_ARG_NAMES.index("k1_wqkv_s")
@@ -131,8 +131,8 @@ RUN_MAX_TOKENS = 10
 
 def run_mode() -> int:
     """``ATOM_MONO_RUN`` (0: no run kernel; 1, the default: the run kernel, its
-    code warmed at the launch's entry only; 2: at every iteration's top too
-    (measured slower); 3: as 1, PND polled before the slice's row loads (a
+    code warmed at the launch's entry only; 2: at every iteration's top too;
+    3: as 1, PND polled before the slice's row loads (a
     diagnostic))."""
     return int(os.environ.get("ATOM_MONO_RUN", "1"))
 

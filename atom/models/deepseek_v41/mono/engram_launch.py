@@ -62,7 +62,7 @@ def _staged_rows(rows, layer, joined: bool):
     ``done`` event (no main-stream gather of its own: ``fallback_done``
     empty), they are read in place: that wait, captured, adds a redundant
     edge from the side stream's all-gather to this launch, which a graph
-    replay pays as ~4 us of idle before it (G368). Else ``get``."""
+    replay pays as idle before it (a 2-parent graph node). Else ``get``."""
     staging = getattr(rows, "staging", None)
     if (
         joined
