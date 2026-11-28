@@ -38,6 +38,11 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
 )
 from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+from atom.model_ops.kimi_k3.flash_kda_tuning import (
+    apply_flash_kda_schedules,
+    balanced_chunks_per_seg,
+    check_flash_kda_names,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1218,6 +1223,9 @@ class KimiKDAAttention(nn.Module):
         in_proj_type, _ = effective_layer_quant(quant_config, f"{prefix}.in_proj")
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
+        # The prefill reaches into private FlashKDA names: fail here, naming
+        # the missing one, rather than at the first prefill.
+        check_flash_kda_names()
 
         # f_a is a column slice of the fused in_proj output, so it needs a
         # row-contiguous copy before f_b_proj's GEMM. When f_b_proj runs
@@ -1306,9 +1314,7 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
-
-        return chunk_kimi_delta_attn(
+        return self._chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -1336,6 +1342,93 @@ class KimiKDAAttention(nn.Module):
             state_v_first=True,
         )
 
+    def _chunk_kda(self, **kwargs):
+        """``chunk_kimi_delta_attn`` under the gfx950 FlashKDA schedules
+        (`apply_flash_kda_schedules`). A multi-sequence FlashKDA call goes
+        straight to ``flash_kda_fwd`` at `balanced_chunks_per_seg`'s segment
+        length, which the wrapper does not forward."""
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+        apply_flash_kda_schedules()
+        cu = kwargs["cu_seqlens"]
+        if cu is not None and cu.shape[0] > 2:
+            from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
+
+            q, v = kwargs["q"], kwargs["v"]
+            flags = (
+                "use_qk_l2norm_in_kernel",
+                "use_gate_in_kernel",
+                "use_beta_sigmoid_in_kernel",
+            )
+            if flash_kda.AITER_FDA_ENABLE and flash_kda.flash_kda_supported(
+                q=q,
+                v=v,
+                chunk_size=flash_kda.FLASH_KDA_CHUNK,
+                safe_gate=kwargs["safe_gate"],
+                lower_bound=kwargs["lower_bound"],
+                A_log=kwargs["A_log"],
+                **{f: kwargs[f] for f in flags},
+            ):
+                cps = balanced_chunks_per_seg(cu, q.shape[2], v.shape[-1])
+                if cps is not None:
+                    for f in (*flags, "safe_gate"):
+                        del kwargs[f]
+                    return flash_kda.flash_kda_fwd(
+                        scale=q.shape[-1] ** -0.5, chunks_per_seg=cps, **kwargs
+                    )
+        return chunk_kimi_delta_attn(**kwargs)
+
+    def _paged_prefill(self, kda_metadata, ssm_state) -> bool:
+        """Whether this prefill runs on the slot pool in place (FlashKDA's
+        paged ``state_cache``) instead of gathering the initial states, copying
+        them K-first and scattering the final states back. A fork reads one
+        slot and writes another, and interior checkpoints need the heads' final
+        states, so both keep the gather path unless the builder cut the step at
+        its checkpoints and the cut runs (``kda_split``, `kda_ckpt_split`); end
+        checkpoints read the pool either way."""
+        ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+        split = (ckpt or {}).get("kda_split")
+        if (
+            getattr(kda_metadata, "has_state_fork", True)
+            or (
+                ckpt is not None
+                and "kda_tokens" in ckpt
+                and not (split is not None and split.runs())
+            )
+            or ssm_state.dtype != torch.float32
+            or not ssm_state[0].is_contiguous()
+        ):
+            return False
+        from aiter.ops.triton._triton_kernels.kimi_delta_attn import flash_kda
+
+        return bool(flash_kda.AITER_FDA_ENABLE)
+
+    def _run_kda_paged(self, q, k, v, g, beta, kda_metadata, ssm_state):
+        """`_run_kda` with the state read from and written back to
+        ``ssm_state[state_indices]`` by the kernels themselves."""
+        out, _ = self._chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta.float(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            cu_seqlens=kda_metadata.non_spec_query_start_loc,
+            state_v_first=True,
+            out=torch.empty_like(v),
+            state_cache=ssm_state,
+            state_indices=kda_metadata.non_spec_state_indices_tensor,
+            has_initial_state=kda_metadata.has_initial_state,
+        )
+        return out
+
     def _prefill_kda(self, q, k, v, gate, beta, initial, ckpt):
         """Run prefill with the interior checkpoint heads described by ``ckpt``.
 
@@ -1349,6 +1442,80 @@ class KimiKDAAttention(nn.Module):
         initial = initial.index_select(0, ckpt["kda_rows"])
         out, state = self._run_kda(q, k, v, gate, beta, initial, cu, True)
         return out[:, :num_tokens], state[:num_rows], state[num_rows:]
+
+    def _settle_prefill(
+        self,
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        initial,
+        kda_metadata,
+        mixed_qkv,
+        conv_state,
+        ssm_state,
+    ) -> torch.Tensor:
+        """An eager prefill's recurrence, each request's final state and the
+        step's checkpoints; returns ``[1, T, heads, head_dim]``. ``initial`` is
+        None on the paged path (`_paged_prefill`), else the gathered initial
+        states."""
+        split = (getattr(kda_metadata, "ssm_checkpoints", None) or {}).get("kda_split")
+        if initial is None and split is not None:
+            from atom.model_ops.kimi_k3.kda_ckpt_split import run_checkpoint_split
+
+            return run_checkpoint_split(
+                self,
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                kda_metadata,
+                mixed_qkv,
+                conv_state,
+                ssm_state,
+                split,
+            )
+        state_indices = kda_metadata.non_spec_state_indices_tensor
+        query_start_loc = kda_metadata.non_spec_query_start_loc
+        ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
+        if initial is None:
+            # The kernels wrote the final states into the pool.
+            kda_out = self._run_kda_paged(q, k, v, gate, beta, kda_metadata, ssm_state)
+            head_states = ssm_state
+        elif ckpt is not None and "kda_tokens" in ckpt:
+            kda_out, last_state, head_states = self._prefill_kda(
+                q, k, v, gate, beta, initial, ckpt
+            )
+        else:
+            kda_out, last_state = self._run_kda(
+                q, k, v, gate, beta, initial, query_start_loc, True
+            )
+            head_states = last_state
+        if initial is not None:
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
+        if ckpt is not None:
+            write_state_checkpoints(
+                head_states,
+                ssm_state,
+                mixed_qkv,
+                conv_state,
+                ckpt["rows"],
+                ckpt["slots"],
+                ckpt["offs"],
+                ckpt["is_end"],
+                ckpt["runtime"],
+                query_start_loc,
+                query_start_loc,
+                chunk_size=1,
+                conv_state_len=kda_metadata.ssm_conv_state_len,
+                h_rows=ckpt["h_rows"],
+            )
+        return kda_out
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1472,6 +1639,7 @@ class KimiKDAAttention(nn.Module):
                 k_dim_size=self.local_proj_size,
                 v_dim_size=self.local_proj_size,
                 metadata=kda_metadata,
+                token_tiles=True,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1481,40 +1649,26 @@ class KimiKDAAttention(nn.Module):
             # replacing the gather + separate zero-write.
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices_in, kda_metadata.has_initial_state
+            # None: `_paged_prefill`, the kernels read the pool in place.
+            initial = (
+                None
+                if self._paged_prefill(kda_metadata, ssm_state)
+                else gather_kda_initial_state(
+                    ssm_state, state_indices_in, kda_metadata.has_initial_state
+                )
             )
-            ckpt = getattr(kda_metadata, "ssm_checkpoints", None)
-            if ckpt is not None and "kda_tokens" in ckpt:
-                kda_out, last_state, head_states = self._prefill_kda(
-                    q, k, v, gate, beta, initial, ckpt
-                )
-            else:
-                kda_out, last_state = self._run_kda(
-                    q, k, v, gate, beta, initial, query_start_loc, True
-                )
-                head_states = last_state
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
-            if ckpt is not None:
-                write_state_checkpoints(
-                    head_states,
-                    ssm_state,
-                    mixed_qkv,
-                    conv_state,
-                    ckpt["rows"],
-                    ckpt["slots"],
-                    ckpt["offs"],
-                    ckpt["is_end"],
-                    ckpt["runtime"],
-                    query_start_loc,
-                    query_start_loc,
-                    chunk_size=1,
-                    conv_state_len=kda_metadata.ssm_conv_state_len,
-                    h_rows=ckpt["h_rows"],
-                )
+            kda_out = self._settle_prefill(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial,
+                kda_metadata,
+                mixed_qkv,
+                conv_state,
+                ssm_state,
+            )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (
@@ -1801,6 +1955,7 @@ class KimiKDAAttention(nn.Module):
             k_dim_size=self.local_proj_size,
             v_dim_size=self.local_proj_size,
             metadata=kda_metadata,
+            token_tiles=True,
         )
         q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
         k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1810,23 +1965,27 @@ class KimiKDAAttention(nn.Module):
         # replacing the gather + separate zero-write.
         from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-        initial = gather_kda_initial_state(
-            ssm_state, state_indices_in, kda_metadata.has_initial_state
-        )
-        kda_out, last_state = self._run_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            initial,
-            query_start_loc,
-            True,
-        )
-        # last_state already has ssm_state's dtype (fla preserves the
-        # initial_state dtype; the gathered initial is allocated as such),
-        # so no .to() cast is needed.
-        ssm_state[state_indices] = last_state
+        if self._paged_prefill(kda_metadata, ssm_state):
+            # The kernels read and write the states in the pool.
+            kda_out = self._run_kda_paged(q, k, v, gate, beta, kda_metadata, ssm_state)
+        else:
+            initial = gather_kda_initial_state(
+                ssm_state, state_indices_in, kda_metadata.has_initial_state
+            )
+            kda_out, last_state = self._run_kda(
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                initial,
+                query_start_loc,
+                True,
+            )
+            # last_state already has ssm_state's dtype (fla preserves the
+            # initial_state dtype; the gathered initial is allocated as such),
+            # so no .to() cast is needed.
+            ssm_state[state_indices] = last_state
         # `_kda_recurrence` returns this tensor itself, and `_project_out`'s
         # o_norm reads it (on a replay, the copy the region's step makes).
         assert kda_out.dtype == mixed_qkv.dtype, (

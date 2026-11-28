@@ -460,6 +460,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return None
         rows = midstep_rerun_rows(found, batch.num_scheduled_tokens)
         head_ranges = rows.pop("head_ranges", ())
+        split = None
+        if head_ranges:
+            from atom.model_ops.kimi_k3.kda_ckpt_split import plan_checkpoint_split
+
+            split = plan_checkpoint_split(found, batch)
+            if split is not None:
+                rows.update(split.values)
         # One small metadata transfer; token-sized ranges are built on the device.
         packed = torch.tensor(
             [value for values in rows.values() for value in values],
@@ -470,6 +477,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         for name, values in rows.items():
             result[name] = packed[offset : offset + len(values)]
             offset += len(values)
+        if split is not None:
+            # The heads stay planned: `_paged_prefill` may still turn the
+            # step down, and the gather path runs them.
+            result["kda_split"] = split.bind(
+                {name: result.pop(name) for name in split.values}
+            )
         if head_ranges:
             result["kda_tokens"] = torch.cat(
                 [torch.arange(sum(batch.num_scheduled_tokens), device=self.device)]
