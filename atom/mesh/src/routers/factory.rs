@@ -96,6 +96,13 @@ impl RouterFactory {
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
+        ctx.policy_registry
+            .set_encode_policy(PolicyFactory::create_from_config(
+                ctx.router_config
+                    .encode_policy
+                    .as_ref()
+                    .unwrap_or(main_policy_config),
+            ));
 
         // Workers are registered before the router is built, but the P/D policy
         // OnceLocks are only filled just above -- so the init call made during
@@ -104,8 +111,12 @@ impl RouterFactory {
         // to random placement and never inserts, so affinity never forms.
         let prefill_workers = ctx.worker_registry.get_prefill_workers();
         let decode_workers = ctx.worker_registry.get_decode_workers();
-        ctx.policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        let encode_workers = ctx.worker_registry.get_encode_workers();
+        ctx.policy_registry.init_pd_cache_aware_policies(
+            &prefill_workers,
+            &decode_workers,
+            &encode_workers,
+        );
 
         let router = PDRouter::new(ctx).await?;
 
@@ -133,6 +144,13 @@ impl RouterFactory {
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
+        ctx.policy_registry
+            .set_encode_policy(PolicyFactory::create_from_config(
+                ctx.router_config
+                    .encode_policy
+                    .as_ref()
+                    .unwrap_or(main_policy_config),
+            ));
 
         // Workers are registered before the router is built, but the P/D policy
         // OnceLocks are only filled just above -- so the init call made during
@@ -141,8 +159,12 @@ impl RouterFactory {
         // to random placement and never inserts, so affinity never forms.
         let prefill_workers = ctx.worker_registry.get_prefill_workers();
         let decode_workers = ctx.worker_registry.get_decode_workers();
-        ctx.policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        let encode_workers = ctx.worker_registry.get_encode_workers();
+        ctx.policy_registry.init_pd_cache_aware_policies(
+            &prefill_workers,
+            &decode_workers,
+            &encode_workers,
+        );
 
         let router = GrpcPDRouter::new(ctx).await?;
 

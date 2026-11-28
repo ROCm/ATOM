@@ -72,6 +72,12 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// Encode workers; valid only in PD mode
+    #[serde(default)]
+    pub encode_urls: Vec<String>,
+    /// Encode worker policy (falls back to `policy` when unset)
+    #[serde(default)]
+    pub encode_policy: Option<PolicyConfig>,
     /// ATOM PD relay: open D's leg together with P's and send P's KV metadata
     /// late (`--atom-pd-concurrent`; D needs `ATOM_PD_LATE_KV=1`).
     #[serde(default)]
@@ -555,6 +561,8 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            encode_urls: vec![],
+            encode_policy: None,
             atom_pd_concurrent: false,
             model_path: None,
             tokenizer_path: None,

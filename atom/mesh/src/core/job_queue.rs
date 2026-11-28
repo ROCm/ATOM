@@ -390,7 +390,15 @@ impl JobQueue {
                         let decode_workers =
                             decode_urls.iter().map(|url| (url.clone(), "decode", None));
 
-                        prefill_workers.chain(decode_workers).collect()
+                        let encode_workers = router_config
+                            .encode_urls
+                            .iter()
+                            .map(|url| (url.clone(), "encode", None));
+
+                        prefill_workers
+                            .chain(decode_workers)
+                            .chain(encode_workers)
+                            .collect()
                     }
                 };
 

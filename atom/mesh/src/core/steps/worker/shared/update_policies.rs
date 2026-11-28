@@ -137,16 +137,22 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // `init_workers` is idempotent, so re-running per registration is safe.
             let prefill_workers = app_context.worker_registry.get_prefill_workers();
             let decode_workers = app_context.worker_registry.get_decode_workers();
+            let encode_workers = app_context.worker_registry.get_encode_workers();
             let prefill_is_ca =
                 app_context.policy_registry.get_prefill_policy().name() == "cache_aware";
             let decode_is_ca =
                 app_context.policy_registry.get_decode_policy().name() == "cache_aware";
+            let encode_is_ca =
+                app_context.policy_registry.get_encode_policy().name() == "cache_aware";
             if (prefill_is_ca && !prefill_workers.is_empty())
                 || (decode_is_ca && !decode_workers.is_empty())
+                || (encode_is_ca && !encode_workers.is_empty())
             {
-                app_context
-                    .policy_registry
-                    .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+                app_context.policy_registry.init_pd_cache_aware_policies(
+                    &prefill_workers,
+                    &decode_workers,
+                    &encode_workers,
+                );
             }
 
             if !updated_models.contains(&model_id) {

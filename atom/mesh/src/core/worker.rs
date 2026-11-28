@@ -111,7 +111,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
     fn url(&self) -> &str;
     /// Get the worker's API key
     fn api_key(&self) -> &Option<String>;
-    /// Get the worker's type (Regular, Prefill, or Decode)
+    /// Get the worker's type (Regular, Prefill, Decode or Encode)
     /// Returns a reference to avoid cloning on every access
     fn worker_type(&self) -> &WorkerType;
 
@@ -403,6 +403,9 @@ pub enum WorkerType {
     },
     /// Decode worker for PD disaggregated mode
     Decode,
+    /// Encode worker for PD disaggregated mode: runs a request's vision
+    /// encoder ahead of prefill
+    Encode,
 }
 
 impl fmt::Display for WorkerType {
@@ -414,6 +417,7 @@ impl fmt::Display for WorkerType {
                 None => write!(f, "Prefill"),
             },
             WorkerType::Decode => write!(f, "Decode"),
+            WorkerType::Encode => write!(f, "Encode"),
         }
     }
 }
@@ -425,6 +429,7 @@ impl WorkerType {
             WorkerType::Regular => metrics_labels::WORKER_REGULAR,
             WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
             WorkerType::Decode => metrics_labels::WORKER_DECODE,
+            WorkerType::Encode => metrics_labels::WORKER_ENCODE,
         }
     }
 }
@@ -1119,6 +1124,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
+        WorkerType::Encode => "encode",
     };
 
     let bootstrap_port = match worker_type {

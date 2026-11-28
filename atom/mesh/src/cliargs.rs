@@ -315,6 +315,18 @@ pub struct CliArgs {
     )]
     pub decode_policy: Option<String>,
 
+    /// Encode server URLs in PD mode (can be specified multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
+    pub encode: Vec<String>,
+
+    /// Specific policy for encode nodes in PD mode
+    #[arg(
+        long,
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "PD Disaggregation"
+    )]
+    pub encode_policy: Option<String>,
+
     /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks; idx2idx
     /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
@@ -653,6 +665,7 @@ impl CliArgs {
                 all_urls.extend(decode_urls.clone());
             }
         }
+        all_urls.extend(self.encode.clone());
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
         let builder = RouterConfig::builder();
@@ -661,6 +674,8 @@ impl CliArgs {
 
         builder
             .mode(mode)
+            .encode_urls(self.encode.clone())
+            .encode_policy(self.encode_policy.as_ref().map(|p| self.parse_policy(p)))
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .atom_pd_concurrent(self.atom_pd_concurrent)
@@ -982,6 +997,45 @@ mod tests {
             PolicyConfig::DpSticky
         ));
     }
+
+    #[test]
+    fn cli_encode_urls_and_policy_reach_router_config() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--pd-disaggregation",
+            "--decode",
+            "http://decode:8000",
+            "--encode",
+            "http://encode1:8000",
+            "--encode",
+            "http://encode2:8000",
+            "--encode-policy",
+            "round_robin",
+        ])
+        .expect("--encode and --encode-policy should parse");
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        let config = args
+            .to_router_config(vec![("http://prefill:8000".to_string(), None)])
+            .unwrap();
+        assert_eq!(
+            config.encode_urls,
+            vec!["http://encode1:8000", "http://encode2:8000"]
+        );
+        assert!(matches!(
+            config.encode_policy,
+            Some(PolicyConfig::RoundRobin)
+        ));
+
+        let regular = CliArgs {
+            encode: vec!["http://encode1:8000".to_string()],
+            ..CliArgs::default()
+        };
+        assert!(regular.to_router_config(Vec::new()).is_err());
+    }
 }
 
 impl Default for CliArgs {
@@ -1011,6 +1065,8 @@ impl Default for CliArgs {
             decode: Vec::new(),
             prefill_policy: None,
             decode_policy: None,
+            encode: Vec::new(),
+            encode_policy: None,
             atom_pd_rank_mapping_policy: "none".to_string(),
             atom_pd_concurrent: false,
             worker_startup_timeout_secs: 1800,

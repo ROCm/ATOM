@@ -161,6 +161,7 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
                 bootstrap_port: config.bootstrap_port,
             },
             "decode" => WorkerType::Decode,
+            "encode" => WorkerType::Encode,
             _ => WorkerType::Regular,
         })
         .unwrap_or(WorkerType::Regular)
@@ -349,4 +350,56 @@ fn create_single_worker(
     );
 
     vec![worker]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_type(worker_type: &str) -> WorkerConfigRequest {
+        WorkerConfigRequest {
+            url: "http://worker:8000".to_string(),
+            model_id: None,
+            api_key: None,
+            worker_type: Some(worker_type.to_string()),
+            priority: None,
+            cost: None,
+            labels: HashMap::new(),
+            bootstrap_port: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            runtime: None,
+            health_check_timeout_secs: 30,
+            health_check_interval_secs: 60,
+            health_success_threshold: 2,
+            health_failure_threshold: 3,
+            disable_health_check: false,
+            max_connection_attempts: 20,
+            dp_aware: false,
+        }
+    }
+
+    /// The startup job registers config workers by these literals; a typo on
+    /// either side would register an encode worker as Regular.
+    #[test]
+    fn parse_worker_type_maps_startup_literals() {
+        assert_eq!(
+            parse_worker_type(&config_with_type("encode")),
+            WorkerType::Encode
+        );
+        assert_eq!(
+            parse_worker_type(&config_with_type("decode")),
+            WorkerType::Decode
+        );
+        assert!(matches!(
+            parse_worker_type(&config_with_type("prefill")),
+            WorkerType::Prefill { .. }
+        ));
+        assert_eq!(
+            parse_worker_type(&config_with_type("bogus")),
+            WorkerType::Regular
+        );
+    }
 }

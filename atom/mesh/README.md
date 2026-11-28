@@ -222,6 +222,21 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
+For E/P/D, add encode-only ATOM workers with `--encode <url>` (repeatable) and
+pick their policy with `--encode-policy` (defaults to `--policy`):
+
+```bash
+./target/release/atomesh launch --pd-disaggregation \
+  --prefill http://prefill1:30001 \
+  --decode http://decode1:30011 \
+  --encode http://encode1:30021 \
+  --encode http://encode2:30022 \
+  --encode-policy round_robin
+```
+
+Startup waits for encode workers like prefill and decode, and `/workers`
+counts them as `encode_count`.
+
 With `--backend atom`, `--atom-pd-concurrent` (default off) sends a relay-mode
 `/v1/chat/completions` request to decode while prefill runs, as a two-line body
 on `/v1/pd/late_kv/chat/completions`: the request, then prefill's
@@ -290,7 +305,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
-In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
+In PD mode, use `--prefill-policy`, `--decode-policy` and `--encode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return

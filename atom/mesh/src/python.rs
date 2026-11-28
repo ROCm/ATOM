@@ -128,6 +128,7 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
         None => cli.router_args,
     };
     let server_config = build_server_config(&cli_args, prefill_urls.clone())?;
+    let encode_urls = cli_args.encode.clone();
 
     let parsed = PyDict::new(py);
     let cli_args_dict = PyDict::new(py);
@@ -245,6 +246,7 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     parsed.set_item("cli_args", cli_args_dict)?;
     parsed.set_item("prefill_urls", prefill_urls)?;
     parsed.set_item("decode_urls", decode_urls)?;
+    parsed.set_item("encode_urls", encode_urls)?;
     parsed.set_item("server_config", Py::new(py, server_config)?)?;
     Ok(parsed.unbind())
 }

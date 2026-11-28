@@ -392,6 +392,11 @@ impl WorkerRegistry {
         self.get_by_type(&WorkerType::Decode)
     }
 
+    /// Get all encode workers
+    pub fn get_encode_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.get_by_type(&WorkerType::Encode)
+    }
+
     /// Get all workers by connection mode
     pub fn get_by_connection(&self, connection_mode: &ConnectionMode) -> Vec<Arc<dyn Worker>> {
         self.connection_workers
@@ -529,6 +534,7 @@ impl WorkerRegistry {
         let mut regular_count = 0;
         let mut prefill_count = 0;
         let mut decode_count = 0;
+        let mut encode_count = 0;
         let mut http_count = 0;
         let mut grpc_count = 0;
         let mut cb_open_count = 0;
@@ -546,6 +552,7 @@ impl WorkerRegistry {
                 WorkerType::Regular => regular_count += 1,
                 WorkerType::Prefill { .. } => prefill_count += 1,
                 WorkerType::Decode => decode_count += 1,
+                WorkerType::Encode => encode_count += 1,
             }
 
             match worker.connection_mode() {
@@ -569,6 +576,7 @@ impl WorkerRegistry {
             regular_workers: regular_count,
             prefill_workers: prefill_count,
             decode_workers: decode_count,
+            encode_workers: encode_count,
             http_workers: http_count,
             grpc_workers: grpc_count,
             circuit_breaker_open: cb_open_count,
@@ -671,6 +679,8 @@ pub struct WorkerRegistryStats {
     pub prefill_workers: usize,
     /// Number of decode workers (PD mode)
     pub decode_workers: usize,
+    /// Number of encode workers (PD mode)
+    pub encode_workers: usize,
     /// Number of HTTP-connected workers
     pub http_workers: usize,
     /// Number of gRPC-connected workers

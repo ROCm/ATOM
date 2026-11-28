@@ -95,6 +95,7 @@ fn pool_tag(worker_type: &WorkerType) -> &'static str {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
+        WorkerType::Encode => "encode",
     }
 }
 

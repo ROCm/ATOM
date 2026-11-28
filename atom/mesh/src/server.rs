@@ -68,6 +68,7 @@ fn configured_worker_urls(config: &RouterConfig) -> Vec<String> {
             .iter()
             .map(|(url, _)| url.clone())
             .chain(decode_urls.iter().cloned())
+            .chain(config.encode_urls.iter().cloned())
             .collect(),
     }
 }
@@ -656,9 +657,11 @@ async fn serve_with_prepare_pool(
     // Wait for workers to be registered before creating the router.
     // The InitializeWorkersFromConfig job spawns AddWorker sub-jobs asynchronously,
     // so we poll until all expected workers appear in the registry.
-    let expected_workers = config.router_config.mode.worker_count();
+    // Encode workers are waited on like prefill and decode, so an E/P/D
+    // launch does not report ready with an empty encode pool.
+    let expected_worker_urls = configured_worker_urls(&config.router_config);
+    let expected_workers = expected_worker_urls.len();
     if expected_workers > 0 {
-        let expected_worker_urls = configured_worker_urls(&config.router_config);
         let max_wait = Duration::from_secs(config.router_config.worker_startup_timeout_secs + 60);
         let poll_interval = Duration::from_millis(500);
         let start = std::time::Instant::now();
@@ -873,5 +876,30 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received terminate signal, starting graceful shutdown");
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_worker_urls_include_encode_workers_in_pd_mode() {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![("http://prefill:8000".to_string(), None)],
+                vec!["http://decode:8000".to_string()],
+            )
+            .encode_urls(vec!["http://encode:8000".to_string()])
+            .build_unchecked();
+
+        assert_eq!(
+            configured_worker_urls(&config),
+            vec![
+                "http://prefill:8000".to_string(),
+                "http://decode:8000".to_string(),
+                "http://encode:8000".to_string(),
+            ]
+        );
     }
 }

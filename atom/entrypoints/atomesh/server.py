@@ -384,6 +384,7 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
     cli_args = parsed_args["cli_args"]
     prefill_urls = parsed_args["prefill_urls"]
     decode_urls = parsed_args["decode_urls"]
+    encode_urls = parsed_args["encode_urls"]
 
     print("\033[32mAtomesh starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
@@ -399,6 +400,8 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
         print(f"Prefill nodes: {prefill_urls}")
     if cli_args["pd_disaggregation"] and decode_urls:
         print(f"Decode nodes: {decode_urls}")
+    if cli_args["pd_disaggregation"] and encode_urls:
+        print(f"Encode nodes: {encode_urls}")
 
     atomesh_runner.launch_mesh(server_config=parsed_args["server_config"])
 
