@@ -409,11 +409,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Keep MLA K/V absorb weights in BF16 instead of quantizing them to FP8.
+    "ATOM_MLA_ABSORB_BF16": lambda: os.getenv("ATOM_MLA_ABSORB_BF16", "0") == "1",
+    # Opt in to direct K-up output when aiter's capability query supports it.
+    "ATOM_MLA_ABSORB_BF16_FUSE_QOUT": lambda: (
+        os.getenv("ATOM_MLA_ABSORB_BF16_FUSE_QOUT", "0") == "1"
+    ),
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # gfx1250 MLA decode, BF16 absorb + fp8 shuffled KV + prestored q_out:
+    # one Gluon kernel for K-up GEMM + q_pe RoPE + KV-cache write. Default off
+    # pending current-head GPU byte comparisons and end-to-end measurements.
+    "ATOM_MLA_FUSED_KUP_QPE": lambda: _flag_env("ATOM_MLA_FUSED_KUP_QPE", "0"),
     # Shuffled MLA KV cache: block_size=64 pages, NoPE/RoPE split into 16x16
     # tiles. Independent of the decode kernel.
     # Also set by the legacy ATOM_USE_TRITON_MLA=1 + ATOM_USE_TRITON_MLA_SHUFFLE_KV=1.
