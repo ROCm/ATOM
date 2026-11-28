@@ -221,8 +221,14 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
 
 
 # Rows per CU up to which `triton_topk_softmax` is faster than AITER's
-# `topk_softmax`, measured per architecture; others run AITER.
-TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
+# `topk_softmax`, measured per architecture; others run AITER. gfx1250: Triton
+# wins up to 16 rows/CU at every admitted shape (32-512 experts, top-4 to top-32);
+# past it the small-expert shapes lose.
+TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20, "gfx1250": 16}
+# Architectures where `renormalize=False` (full-softmax weights) may take Triton
+# too. On gfx1250 its weights did not match AITER's bit for bit from 16 rows up,
+# so it stays on AITER there.
+TRITON_TOPK_SOFTMAX_UNNORMALIZED_ARCHS = frozenset({"gfx950"})
 
 
 @lru_cache
@@ -250,8 +256,11 @@ def triton_topk_softmax_rows(
         and num_shared in (0, 1, 2, 4, 8)
     ):
         return None
-    per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(get_gfx_runtime())
+    arch = get_gfx_runtime()
+    per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(arch)
     if per_cu is None:
+        return None
+    if not renormalize and arch not in TRITON_TOPK_SOFTMAX_UNNORMALIZED_ARCHS:
         return None
     cus = get_cu_num()
     config = get_current_atom_config()

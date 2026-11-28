@@ -67,10 +67,16 @@ def test_unscored_shared_experts_route_like_none(topK, gpu):
         ("gfx950", 256, 5120),
         ("gfx950", 128, 2560),
         ("gfx942", 304, None),
-        ("gfx1250", 256, None),
+        ("gfx1250", 256, 4096),
     ],
 )
 def test_cutoff_counts_the_cus(arch, cus, max_rows, topK, gpu):
     gpu(arch, cus)
     assert topK.triton_topk_softmax_rows(512, 10, True, 1, "sigmoid") == max_rows
     assert topK.triton_topk_softmax_rows(32, 4, True, 0, None) == max_rows
+
+
+@pytest.mark.parametrize("arch,max_rows", [("gfx950", 5120), ("gfx1250", None)])
+def test_unnormalized_weights_take_triton_where_validated(arch, max_rows, topK, gpu):
+    gpu(arch, 256)
+    assert topK.triton_topk_softmax_rows(512, 10, False, 0, None) == max_rows

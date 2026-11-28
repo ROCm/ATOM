@@ -1160,6 +1160,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # Qwen3.8-Flash-Next on gfx1250: decode-sized hyper-connections run the
+    # scaled SiLU, up projection and gated mean as one aiter FlyDSL kernel.
+    # Needs aiter with `aiter.ops.flydsl.hc_mix_gfx1250`.
+    "ATOM_QWEN38_HC_SILU_UP_MIX": lambda: _flag_env("ATOM_QWEN38_HC_SILU_UP_MIX", "1"),
     # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
     # (eager prefill) keep the hyper-connection residual streams token-sharded
     # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),

@@ -20,8 +20,19 @@ Parameters are replicated, not TP-sharded: ~13 MB per module.
 """
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.tuned_gemm import tgemm
 from torch import nn
+
+try:
+    from aiter.ops.flydsl.hc_mix_gfx1250 import (
+        HC_SILU_UP_MIX_MAX_M,
+        hc_interleave_up_weight,
+        hc_silu_up_mix,
+    )
+except ImportError:
+    HC_SILU_UP_MIX_MAX_M = 0
+    hc_interleave_up_weight = hc_silu_up_mix = None
 
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.ops.gated import (
@@ -49,6 +60,7 @@ HC_ROWS_MAX = 2
 HC_QUANT_ROWS_MAX = 1024
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
 
 
 class Qwen4ExpGroupedRMSNorm(nn.Module):
@@ -152,6 +164,17 @@ class Qwen4ExpHyperConnection(nn.Module):
             self.block_inject_weight.weight.data = fused[rank:]
         self.fused_w_cat = fused
         self.fused_rank = rank
+        # Stream-minor copy of the up weight for `hc_silu_up_mix`; the original
+        # stays for `mix` and for batches past HC_SILU_UP_MIX_MAX_M.
+        self.w_up_interleaved = None
+        if (
+            hc_silu_up_mix is not None
+            and envs.ATOM_QWEN38_HC_SILU_UP_MIX
+            and get_gfx_runtime() == "gfx1250"
+        ):
+            self.w_up_interleaved = hc_interleave_up_weight(
+                self.input_mix_weight_up.weight.data, self.hc_count
+            )
 
     def mix_fused(
         self,
@@ -244,6 +267,14 @@ class Qwen4ExpHyperConnection(nn.Module):
         )
         rank = self.fused_rank
         d = tgemm.mm(normed, self.fused_w_cat, otype=normed.dtype)
+        raw = d[:, rank : rank + self.hc_count] if has_inject else None
+        if (
+            quant_dtype is None
+            and self.w_up_interleaved is not None
+            and hyper_input.shape[0] <= HC_SILU_UP_MIX_MAX_M
+        ):
+            mixed = hc_silu_up_mix(d, self.w_up_interleaved, normed, self.hc_count)
+            return mixed, None, (h, raw)
         gate = scaled_silu(d[:, :rank], self.hc_count)
         up = tgemm.mm(gate, w_up, otype=gate.dtype)
         quantized = None
@@ -254,7 +285,6 @@ class Qwen4ExpHyperConnection(nn.Module):
                 normed, up, self.hc_count, quant_dtype
             )
             quantized = (mixed_q, mixed_scale)
-        raw = d[:, rank : rank + self.hc_count] if has_inject else None
         return mixed, quantized, (h, raw)
 
     def apply_pending(

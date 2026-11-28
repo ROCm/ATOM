@@ -292,7 +292,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
-`rocm_aiter_topk_softmax` runs `triton_topk_softmax` instead (bit-identical) in launches of up to `triton_topk_softmax_rows` rows: 20 per CU on gfx950, for the shapes it takes. Under an `HSA_CU_MASK` set outside ATOM, export `CU_NUM` (the CUs it leaves) at process start: the cutoff counts AITER's cached `get_cu_num()`, which ignores the mask.
+`rocm_aiter_topk_softmax` runs `triton_topk_softmax` instead (bit-identical) in launches of up to `triton_topk_softmax_rows` rows: 20 per CU on gfx950 and 16 per CU on gfx1250, for the shapes it takes (on gfx1250 only with `renormalize=True`). Under an `HSA_CU_MASK` set outside ATOM, export `CU_NUM` (the CUs it leaves) at process start: the cutoff counts AITER's cached `get_cu_num()`, which ignores the mask.
 
 **Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`. Under DP attention with MoRI EP, fusion is wired up only for MXFP4 / NVFP4 routed experts; FP8 MoE models such as DeepSeek-V3 must run with `ATOM_FUSE_SHARED_EXPERT=0`, or `FusedMoE` raises `NotImplementedError`.
 
