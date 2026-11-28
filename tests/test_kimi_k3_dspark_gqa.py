@@ -1055,9 +1055,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
         dev,
         max_bs=8,
         max_model_len=W * E,
-        num_heads=hq,
         num_kv_heads=hkv,
-        block_rows=T,
         head_size=d,
         block_size=E,
         kv_dtype=k_pool.dtype,
@@ -1094,21 +1092,18 @@ def test_gqa_draft_is_refused_on_a_non_k3_target():
 
 def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):
     """The cast follows aiter's own gate, asked once when the read is built,
-    with every field the deployment fixes: q in the pool's dtype, the folded
-    query's heads (8 heads x 7 rows over 2 KV heads), the pool's head and
-    entry sizes, the read's scale and key bound, the device's CUs, no softcap,
-    all-decode. Only the fields no deployment fixes are left unset."""
+    with what the gate reads: q in the pool's dtype, the pool's head and entry
+    sizes. Everything else keeps the gate's defaults, which are the read's: no
+    softcap, alibi or qq_bias, and an unshuffled cache."""
     torch = pytest.importorskip("torch")
     dba = _fold_mod()
-    ua = dba.ua
     seen = []
 
-    def gate(params):
-        seen.append(params)
-        return params.head_size == 64
+    def gate(**kwargs):
+        seen.append(kwargs)
+        return kwargs["head_size"] == 64
 
-    monkeypatch.setattr(ua, "_gfx950_gluon_supported", gate)
-    monkeypatch.setattr(dba, "get_num_sms", lambda: 256)
+    monkeypatch.setattr(dba.ua, "gfx950_gluon_supported", gate)
     fp8 = torch.float8_e4m3fn
 
     def build(head_size, kv_dtype):
@@ -1116,9 +1111,7 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
             "cpu",
             max_bs=2,
             max_model_len=4096,
-            num_heads=8,
             num_kv_heads=2,
-            block_rows=7,
             head_size=head_size,
             block_size=1024,
             kv_dtype=kv_dtype,
@@ -1126,25 +1119,14 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
         )
 
     assert build(64, fp8).casts_q
-    (p,) = seen
-    assert (p.head_size, p.head_size_v, p.block_size) == (64, 64, 1024)
-    assert p.q_dtype == p.kv_cache_dtype == fp8
-    assert (p.num_query_heads, p.num_kv_heads, p.num_queries_per_kv) == (56, 2, 28)
-    assert (p.softmax_scale, p.max_seqlen_k, p.num_sms) == (0.125, 4096, 256)
-    assert p.softcap == 0 and p.causal and p.sliding_window == 0
-    assert p.max_seqlen_q == 1 and p.all_decode
-    assert not (p.shuffled_kv_cache or p.use_alibi_slopes or p.use_qq_bias)
-    unset = {f for f in ua._UAParams._fields if getattr(p, f) is None}
-    optional = set(ua._UAParams._field_defaults)
-    assert unset - optional == set(dba._UNFIXED_FIELDS)
+    assert seen == [
+        {"q_dtype": fp8, "kv_cache_dtype": fp8, "head_size": 64, "block_size": 1024}
+    ]
 
     assert not build(96, fp8).casts_q
     # A bf16 pool takes q as it is, without asking.
     assert not build(64, torch.bfloat16).casts_q
     assert len(seen) == 2
-
-    monkeypatch.delattr(ua, "_gfx950_gluon_supported")
-    assert not build(64, fp8).casts_q
 
 
 def test_the_block_read_refuses_a_pool_it_was_not_built_for():
@@ -1157,9 +1139,7 @@ def test_the_block_read_refuses_a_pool_it_was_not_built_for():
         "cpu",
         max_bs=2,
         max_model_len=4096,
-        num_heads=8,
         num_kv_heads=2,
-        block_rows=7,
         head_size=64,
         block_size=256,
         kv_dtype=torch.bfloat16,
@@ -1193,9 +1173,7 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
         dev,
         max_bs=4,
         max_model_len=E,
-        num_heads=hkv * g,
         num_kv_heads=hkv,
-        block_rows=T,
         head_size=d,
         block_size=E,
         kv_dtype=dtypes.fp8,

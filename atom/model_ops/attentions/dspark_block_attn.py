@@ -31,88 +31,8 @@ pool is not, so q stays bf16 there, as everywhere else.
 
 from __future__ import annotations
 
-import logging
-
 import torch
 from aiter.ops.triton.attention import unified_attention as ua
-from aiter.ops.triton.utils.device_info import get_num_sms
-
-logger = logging.getLogger("atom")
-
-
-# The `_UAParams` fields a deployment does not fix: a call's tensors and the
-# counts read off them, and what aiter derives inside the call from its own
-# constants (`k_width`, `scale_k_width`, `block_scales_size`, `target_num_prgms`).
-_UNFIXED_FIELDS = (
-    "q",
-    "k",
-    "v",
-    "out",
-    "cu_seqlens_q",
-    "seqused_k",
-    "block_table",
-    "num_tokens",
-    "num_seqs",
-    "total_num_q_blocks",
-    "num_2d_prgms",
-    "num_blocks",
-    "k_width",
-    "scale_k_width",
-    "block_scales_size",
-    "target_num_prgms",
-)
-
-
-def gluon_takes_pool_dtype_q(
-    num_query_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    block_size: int,
-    kv_dtype: torch.dtype,
-    softmax_scale: float,
-    max_seqlen_k: int,
-) -> bool:
-    """Whether aiter's gfx950 Gluon gate accepts this read with q in ``kv_dtype``.
-
-    aiter exposes no public form of the gate, so this calls its private
-    ``_gfx950_gluon_supported`` on a ``_UAParams`` carrying every field the
-    read fixes for the deployment, as `DSparkGQABlockAttention.__call__`
-    passes it: ``num_query_heads`` is the folded query's. Only
-    ``_UNFIXED_FIELDS`` are ``None``; the optional fields keep aiter's own
-    defaults. A missing gate leaves q uncast and says so; a renamed
-    or added field raises.
-    """
-    supported = getattr(ua, "_gfx950_gluon_supported", None)
-    params_t = getattr(ua, "_UAParams", None)
-    if supported is None or params_t is None:
-        logger.warning(
-            "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
-            "the DSpark block read keeps q in bf16 over an fp8 pool"
-        )
-        return False
-    params = params_t(
-        **dict.fromkeys(_UNFIXED_FIELDS),
-        softmax_scale=softmax_scale,
-        softcap=0,
-        causal=True,
-        sliding_window=0,
-        max_seqlen_q=1,
-        max_seqlen_k=max_seqlen_k,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        num_queries_per_kv=num_query_heads // num_kv_heads,
-        head_size=head_size,
-        head_size_v=head_size,
-        block_size=block_size,
-        q_dtype=kv_dtype,
-        kv_cache_dtype=kv_dtype,
-        all_decode=True,
-        shuffled_kv_cache=False,
-        use_alibi_slopes=False,
-        use_qq_bias=False,
-        num_sms=get_num_sms(),
-    )
-    return bool(supported(params))
 
 
 def fold_block_queries(
@@ -153,10 +73,9 @@ def unfold_block_output(
 class DSparkGQABlockAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block.
 
-    Built once per deployment, for the block it folds, ``block_rows`` rows of
-    ``num_heads`` query heads over ``num_kv_heads`` KV heads per rank, and the
-    pool it reads: K and V heads of ``head_size``, entries of ``block_size``
-    tokens, stored in ``kv_dtype``.
+    Built once per deployment, for the pool it reads: ``num_kv_heads`` KV heads
+    per rank, K and V heads of ``head_size``, entries of ``block_size`` tokens,
+    stored in ``kv_dtype``.
     """
 
     def __init__(
@@ -164,9 +83,7 @@ class DSparkGQABlockAttention:
         device,
         max_bs: int,
         max_model_len: int,
-        num_heads: int,
         num_kv_heads: int,
-        block_rows: int,
         head_size: int,
         block_size: int,
         kv_dtype: torch.dtype,
@@ -182,15 +99,13 @@ class DSparkGQABlockAttention:
         self.block_size = block_size
         self.kv_dtype = kv_dtype
         self.softmax_scale = softmax_scale
-        # Whether a read casts q to the pool's dtype.
-        self.casts_q = kv_dtype.itemsize == 1 and gluon_takes_pool_dtype_q(
-            num_heads * block_rows,
-            num_kv_heads,
-            head_size,
-            block_size,
-            kv_dtype,
-            softmax_scale,
-            max_model_len,
+        # Whether a read casts q to the pool's dtype: over an fp8 pool, where
+        # aiter's gfx950 Gluon gate takes this read with q in that dtype.
+        self.casts_q = kv_dtype.itemsize == 1 and ua.gfx950_gluon_supported(
+            q_dtype=kv_dtype,
+            kv_cache_dtype=kv_dtype,
+            head_size=head_size,
+            block_size=block_size,
         )
         # q's descale when it is cast: the cast is a plain one, so 1.0.
         self._q_descale = torch.ones(1, dtype=torch.float32, device=device)

@@ -374,16 +374,13 @@ class KimiK3DSparkGQA(DSparkDraftModel):
 
         # One block read for every layer, built before any capture, for the
         # pool `draft_kv_builder` builds from the same two calls, and the
-        # per-rank heads the layers project. The block is `mtp_k` rows wide,
-        # which is `num_speculative_tokens`.
+        # per-rank KV heads the layers project.
         attn = self.layers[0].self_attn
         block_attn = DSparkGQABlockAttention(
             torch.get_default_device(),
             max_bs=int(atom_config.max_num_seqs),
             max_model_len=int(atom_config.max_model_len),
-            num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
-            block_rows=int(atom_config.speculative_config.num_speculative_tokens),
             head_size=attn.head_dim,
             block_size=int(self.kv_pool_spec.entry_tokens(atom_config)),
             kv_dtype=draft_kv_dtype(atom_config),
