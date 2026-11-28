@@ -471,6 +471,12 @@ class tokenIDProcessor:
         # (`prepare_input_ids`' `defer_spec_status`), owed until
         # `take_deferred_spec_status`.
         self.spec_status_owed = False
+        # The status `spec_status_queue` carries to the host, still on the
+        # device: [bonus, rejected] x `prev_batch`'s requests, from the
+        # forward stream, for a builder that consumes the verdict there
+        # (`AttentionMetadataBuilder.consumes_device_verdict`). None when the
+        # last output forward left none on that stream.
+        self.device_spec_counts: torch.Tensor | None = None
 
     def verify_ctx_lens(
         self, context_lens: np.ndarray, num_rejected: np.ndarray | None = None
@@ -3956,6 +3962,11 @@ class ModelRunner:
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
+                )
+                # An overridden step leaves its verdict on its own output
+                # stream; a builder reads this one on the forward stream.
+                self.tokenID_processor.device_spec_counts = (
+                    spec_counts if self._served is None else None
                 )
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # A producer that skips propose keeps the bookkeeping above:

@@ -208,6 +208,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     BACKEND = Qwen4ExpBackend
     # Whether any bound GDN layer runs FlyDSL prefill; set at cache binding.
     _flydsl_prefill_enabled = False
+    # Its QSA and PLE decode metadata are not moved on the device: a verify
+    # waits for the previous verdict on the host, as before.
+    rebases_decode_on_verdict = False
 
     @cached_property
     def _gdn_flydsl_policies(self) -> dict:

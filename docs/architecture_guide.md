@@ -152,7 +152,13 @@ is specific to one model, and a model that uses neither runs exactly as before.
   `prepare_model`): `tokenIDProcessor.prepare_input_ids` then builds the step
   from zero rejected / bonus counts and the runner takes the status
   (`take_deferred_spec_status`) right after the target's launch, where
-  `postprocess` needs it.
+  `postprocess` needs it. The GDN builder (Qwen3-Next, Qwen3.5) does so on
+  every MTP verify that carries requests over
+  (`AiterAttentionMetadataBuilder.rebases_decode_on_verdict`): it lays the
+  step out at the scheduler's lengths and moves it on the device, from the
+  verdict the previous forward left there (`tokenIDProcessor.device_spec_counts`,
+  `atom/model_ops/decode_verdict.py`): context lengths, `kv_indptr`, positions
+  (or MRoPE planes), slots and GDN's `num_accepted_tokens`.
 
 DeepSeek-V4.1's metadata builder also takes a model's decode round
 (`atom/model_engine/model_hooks.py`, `DecodeRound`, handed over by the model's

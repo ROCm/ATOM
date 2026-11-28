@@ -23,6 +23,7 @@ from atom.model_engine.state_runtime import (
     snapped_checkpoint_interval,
 )
 from atom.model_ops.attention_gdn import GatedDeltaNet
+from atom.model_ops.decode_verdict import accepted_from_verdict
 from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 from atom.model_ops.fla_ops.index import prepare_chunk_offsets
 from atom.model_ops.fla_ops.replayssm import (
@@ -1554,7 +1555,8 @@ class GDNStateMixin(PoolRowsMixin):
         `CpuGpuBuffer` is not used: its GPU half would be per PP ring slot,
         while this destination is one tensor shared by every slot.
         """
-        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        processor = self.model_runner.tokenID_processor
+        num_bonus = processor.num_bonus
         if num_bonus is None:
             self.num_accepted_tokens.fill_(1)
             return
@@ -1562,6 +1564,15 @@ class GDNStateMixin(PoolRowsMixin):
         host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
         host[: num_bonus.shape[0]] = num_bonus + 1
         self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
+        # A step that rebases on the verdict published 1 for the requests
+        # carried over (zero bonus): their counts come from the device.
+        if getattr(self, "_rebases_this_step", False) and processor.carries_over:
+            bs = batch.total_seqs_num_decode
+            accepted_from_verdict(
+                self.num_accepted_tokens,
+                self.model_runner.forward_vars["decode_src"].gpu[:bs],
+                processor.device_spec_counts[0],
+            )
 
     def prepare_gdn_metadata(
         self,
@@ -1957,6 +1968,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+    # The MHA layers' metadata is the MHA builder's, and `num_accepted_tokens`
+    # is the one other input a verify reads off the previous verdict
+    # (`prepare_num_accepted_tokens`).
+    rebases_decode_on_verdict = True
 
     def _uses_paged_checkpoints(self) -> bool:
         """PAGE image for the Qwen GDN hybrids, whose pages are the MHA pool or,
