@@ -9,6 +9,7 @@ Every forward (including warmup) records the same kernels, fork and joins on
 fixed addresses (`EngramStep`): a replay reads its own step.
 """
 
+import ctypes
 import logging
 import os
 from collections.abc import Mapping
@@ -36,6 +37,36 @@ def _expandable_segments() -> bool:
         "expandable_segments:True" in os.environ.get(name, "")
         for name in ALLOC_CONF_ENVS
     )
+
+
+def _own_queue_stream(device):
+    """A stream on a hardware queue of its own, else a plain one.
+
+    The HIP runtime maps its streams onto a few hardware queues and shares one
+    between streams once there are more streams than queues; the lookup is a
+    long kernel, and a forward kernel queued behind it on a shared queue waits
+    for all of it. A CU-masked stream always gets a queue of its own; the mask
+    here names every CU, so where the lookup runs is unchanged.
+    """
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+        create = hip.hipExtStreamCreateWithCUMask
+    except (OSError, AttributeError):
+        return torch.cuda.Stream(device)
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    words = -(-cus // 32)
+    mask = (ctypes.c_uint32 * words)(
+        *[
+            0xFFFFFFFF if 32 * (i + 1) <= cus else (1 << (cus - 32 * i)) - 1
+            for i in range(words)
+        ]
+    )
+    handle = ctypes.c_void_p()
+    with torch.cuda.device(device):
+        if create(ctypes.byref(handle), ctypes.c_uint32(words), mask) != 0:
+            hip.hipGetLastError()
+            return torch.cuda.Stream(device)
+    return torch.cuda.ExternalStream(handle.value, device=device)
 
 
 @dataclass(frozen=True)
@@ -66,7 +97,7 @@ class EngramStaging:
     def __init__(self, uva):
         self.uva = uva
         self.host = host = uva.host
-        self.stream = torch.cuda.Stream(host.device)
+        self.stream = _own_queue_stream(host.device)
         self.done = {layer: torch.cuda.Event() for layer in host.layer_ids}
         self.snapshot = torch.empty(
             host.max_num_tokens,
