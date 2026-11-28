@@ -62,7 +62,8 @@ from atom.distributed.pcp_utils import (
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
 # shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
-# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
+# `_use_moe_dispatch_op` is True so torch.compile/Dynamo treats stream code and
+# the per-call row tests as opaque.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
@@ -94,7 +95,7 @@ from atom.model_ops.linear import (
     use_triton_gemm,
     uses_mxfp4_n32k4_scale,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Iq2rMoEMethod
 from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
     sparse_indexer_fp4_enabled,
@@ -1150,6 +1151,9 @@ class DeepseekV2MoE(nn.Module):
         # computation using a separate CUDA stream. Registered as a custom op
         # (dual_stream_moe_forward) so it is opaque to torch.compile/Dynamo.
         self._use_dual_stream = False
+        # Rows up to which `fused_moe_forward` runs (the shared expert inside
+        # the routed launches); set after loading, 0 = never.
+        self.fused_moe_forward_rows = 0
         self._dual_stream_token_threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
         self._dual_stream_decode_token_threshold = self._dual_stream_token_threshold
         self.alt_stream = alt_stream
@@ -1182,7 +1186,16 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        if self._use_dual_stream:
+        # IQ2R experts may run the shared expert inside their launches
+        # (`process_weights_after_loading`). Fixed by the quant config alone,
+        # so the traced graph does not depend on ATOM_IQ2R_FUSE_SHARED.
+        self._iq2r_shared_fusable = isinstance(
+            self.experts.quant_method, Iq2rMoEMethod
+        ) and hasattr(self, "shared_experts")
+        # `maybe_dual_stream_forward` picks the fused, dual-stream or
+        # single-stream path per call, out of the traced graph.
+        self._use_moe_dispatch_op = self._use_dual_stream or self._iq2r_shared_fusable
+        if self._use_moe_dispatch_op:
             compilation_config = get_current_atom_config().compilation_config
             compilation_config.static_forward_context[prefix] = self
 
@@ -1239,6 +1252,34 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    def process_weights_after_loading(self) -> None:
+        """IQ2R experts: run the shared expert inside the IQ2R launches for
+        batches the fused kernels cover (``ATOM_IQ2R_FUSE_SHARED=0`` keeps it a
+        separate MLP). ``load_model`` (atom/model_loader/loader.py) walks
+        ``model.named_modules()`` parent first, so the shared expert's linears
+        still hold their checkpoint block-FP8 weights and scales here."""
+        if (
+            not self._iq2r_shared_fusable
+            or not envs.ATOM_IQ2R_FUSE_SHARED
+            or get_current_atom_config().load_dummy
+        ):
+            return
+        gate_up_proj = self.shared_experts.gate_up_proj
+        down_proj = self.shared_experts.down_proj
+        gate, up = _dequant_fp8_block(
+            gate_up_proj.weight, gate_up_proj.weight_scale
+        ).chunk(2, dim=0)
+        down = _dequant_fp8_block(down_proj.weight, down_proj.weight_scale)
+        method = self.experts.quant_method
+        method.attach_shared_expert(self.experts, gate, up, down)
+        self.fused_moe_forward_rows = method.fused_shared_tokens()
+
+    def fused_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The IQ2R launches add the shared expert (Iq2rMoEMethod.apply).
+        return self.combine_outputs(
+            self.routed_expert_forward(hidden_states), None, hidden_states
+        )
+
     def single_stream_moe_forward(
         self,
         hidden_states: torch.Tensor,
@@ -1264,7 +1305,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[1] == self.experts.hidden_size
         ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
-        if self._use_dual_stream:
+        if self._use_moe_dispatch_op:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
 
         # Non-dual-stream path: shared experts + routed experts sequentially
@@ -1306,6 +1347,16 @@ def _dequant_fp8_block_to_bf16(
     DeepSeek-V3.2 stores indexer.wk with block scales, while some PTPC
     quantized checkpoints store a per-output-channel scale vector.
     """
+    return _dequant_fp8_block(weight_fp8, scale, block_size).bfloat16()
+
+
+def _dequant_fp8_block(
+    weight_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """FP32 weight of an FP8 linear with block (or per-output-row) scales;
+    :func:`_dequant_fp8_block_to_bf16` rounds it to BF16."""
     out_dim, in_dim = weight_fp8.shape
     scale = scale.float()
     if scale.dim() == 1:
@@ -1314,9 +1365,9 @@ def _dequant_fp8_block_to_bf16(
                 "FP8 per-channel dequant expects one scale per output row, "
                 f"got scale {tuple(scale.shape)} for weight {tuple(weight_fp8.shape)}"
             )
-        return (weight_fp8.float() * scale[:, None]).bfloat16()
+        return weight_fp8.float() * scale[:, None]
     if scale.dim() == 2 and tuple(scale.shape) == (out_dim, 1):
-        return (weight_fp8.float() * scale).bfloat16()
+        return weight_fp8.float() * scale
 
     if out_dim % block_size != 0 or in_dim % block_size != 0:
         raise ValueError(
@@ -1335,7 +1386,7 @@ def _dequant_fp8_block_to_bf16(
         .unflatten(-1, (-1, block_size))
         .float()
     )
-    return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
+    return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1)
 
 
 class FusedIndexerProjection(MergedReplicatedLinear):
@@ -2968,8 +3019,8 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
-    # IQ2R checkpoints store each layer's routed and fused shared experts as one
-    # stacked gate/up and down matrix.
+    # IQ2R checkpoints store each layer's routed experts as one stacked gate/up
+    # and down matrix; the shared expert keeps its FP8 checkpoint weights.
     weights_mapping: ClassVar[dict[str, str]] = {
         ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",
         ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",

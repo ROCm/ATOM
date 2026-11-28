@@ -1264,6 +1264,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
+    # IQ2R GLM-5.3 MoE: run the block-FP8 shared expert inside the IQ2R
+    # launches, as MXFP8, for batches of up to aiter's FUSED_SHARED_TOKENS
+    # rows; larger batches keep it a separate MLP. 0 always keeps it separate.
+    "ATOM_IQ2R_FUSE_SHARED": lambda: os.getenv("ATOM_IQ2R_FUSE_SHARED", "1") == "1",
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.

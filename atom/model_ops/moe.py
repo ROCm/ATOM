@@ -962,14 +962,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 _IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
 # The kernels' N tile; checkpoints record theirs as `iq2r_tN`.
 _IQ2R_GLM53_TILE_N = 128
+# Codebook entries of each packed GLM-5.3 IQ2R-v2 layout: v3 is the
+# 1,024-entry (10-bit index) variant of the same format.
+_IQ2R_GLM53_LAYOUTS = {"glm53-packed-v2": 512, "glm53-packed-v3": 1024}
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
-    """AITER IQ2R experts in the ``glm53-packed-v1`` layout.
+    """AITER IQ2R-v2 experts in the ``glm53-packed-v2`` (512-entry codebooks)
+    or ``glm53-packed-v3`` (1,024-entry) layout.
 
-    The layout covers GLM-5.3 with the shared expert fused as expert 256, at
-    TP4/TP8. The checkpoint holds full layers; each rank slices its share of
-    the intermediate dimension as it loads.
+    The layouts cover GLM-5.3's 256 routed experts at TP4/TP8. The shared
+    expert is stored block-FP8 and loaded as an ordinary MLP outside the MoE;
+    for small batches (decode) it runs inside the IQ2R launches instead, as
+    MXFP8 (``attach_shared_expert``). The checkpoint holds full layers; each
+    rank slices its share of the intermediate dimension as it loads.
     """
 
     def __init__(
@@ -980,11 +986,13 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
-        if layout != "glm53-packed-v1":
+        if layout not in _IQ2R_GLM53_LAYOUTS:
             raise ValueError(
                 f"unsupported IQ2R layout {layout!r}; ATOM runs only "
-                "'glm53-packed-v1' checkpoints"
+                f"{sorted(_IQ2R_GLM53_LAYOUTS)} checkpoints"
             )
+        self.layout = layout
+        self.codebook_entries = _IQ2R_GLM53_LAYOUTS[layout]
 
     def create_weights(
         self,
@@ -1001,36 +1009,46 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         if (
             parallel.tp_size not in (4, 8)
             or parallel.ep_size != 1
+            or parallel.dp_size != 1
             or layer.has_bias
-            or layer.num_fused_shared_experts != 1
+            or layer.num_fused_shared_experts != 0
         ):
             raise NotImplementedError(
-                "the glm53-packed-v1 IQ2R layout runs at TP4/TP8 without EP, "
-                "with the shared expert fused"
+                f"the {self.layout} IQ2R layout runs at TP4/TP8 without EP or DP, "
+                "with the shared expert outside the MoE"
             )
         self.tp_size = parallel.tp_size
         self.tp_rank = parallel.tp_rank
 
-        from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+        from aiter.iq2r_glm53 import iq2r_glm53_aux_bytes, iq2r_glm53_gate_bytes
         from aiter.ops.iq2r_format import IQ2RMetadata
+        from aiter.ops.iq2r_v2 import IQ2R_V2_LEVELS_C4
 
-        gate_metadata = IQ2RMetadata(
-            logical_n=2 * intermediate_size_per_partition,
-            logical_k=hidden_size,
-        )
+        # IQ2R-v2 auxiliaries hold the codebook copies, a d table and the
+        # output gains (aiter/ops/iq2r_v2.py).
+        self.classes = IQ2R_V2_LEVELS_C4.classes
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        gate_n = 2 * intermediate_size_per_partition
+        entries = self.codebook_entries
         down_metadata = IQ2RMetadata(
             logical_n=hidden_size,
             logical_k=intermediate_size_per_partition,
+            codebook_entries=entries,
         )
-        self.num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size_per_partition
-        layer.iq2r_down_metadata = down_metadata
         shapes = {
-            "w13_weight": iq2r_glm53_gate_bytes(gate_metadata.logical_n),
-            "w13_weight_scale": gate_metadata.auxiliary_bytes,
+            "w13_weight": iq2r_glm53_gate_bytes(gate_n, entries),
+            "w13_weight_scale": iq2r_glm53_aux_bytes(
+                gate_n, hidden_size, self.classes, gate=True, codebook_entries=entries
+            ),
             "w2_weight": down_metadata.data_bytes,
-            "w2_weight_scale": down_metadata.auxiliary_bytes,
+            "w2_weight_scale": iq2r_glm53_aux_bytes(
+                hidden_size,
+                intermediate_size_per_partition,
+                self.classes,
+                gate=False,
+                codebook_entries=entries,
+            ),
         }
         tensors = {
             name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
@@ -1055,7 +1073,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             if loaded_weight.tolist() != [_IQ2R_GLM53_TILE_N]:
                 raise ValueError(
                     f"IQ2R {name} is {loaded_weight.tolist()}, but the "
-                    f"glm53-packed-v1 kernels need {_IQ2R_GLM53_TILE_N}"
+                    f"{self.layout} kernels need {_IQ2R_GLM53_TILE_N}"
                 )
         elif self.tp_size > 1:
             loaded_weight = self._glm53_tp_slice(name, loaded_weight)
@@ -1068,47 +1086,53 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
 
     def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
         """This rank's intermediate-dimension shard of a full packed layer."""
-        from aiter.iq2r_glm53 import iq2r_glm53_slice_gate
-        from aiter.ops.iq2r_format import (
-            IQ2RMetadata,
-            iq2r_slice_input_data,
-            iq2r_slice_output_auxiliary,
+        from aiter.iq2r_glm53 import (
+            iq2r_glm53_slice_down_aux,
+            iq2r_glm53_slice_gate,
+            iq2r_glm53_slice_gate_aux,
         )
+        from aiter.ops.iq2r_format import IQ2RMetadata, iq2r_slice_input_data
 
         shard = self.intermediate_size
         full = shard * self.tp_size
+        entries = self.codebook_entries
         if name == "w13_weight":
-            return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
+            return iq2r_glm53_slice_gate(
+                weight, 2 * shard * self.tp_rank, 2 * shard, entries
+            )
         if name == "w13_weight_scale":
-            return iq2r_slice_output_auxiliary(
+            return iq2r_glm53_slice_gate_aux(
                 weight,
-                IQ2RMetadata(logical_n=2 * full, logical_k=self.hidden_size),
                 2 * shard * self.tp_rank,
                 2 * shard,
+                2 * full,
+                self.classes,
+                entries,
             )
         if name == "w2_weight":
             return iq2r_slice_input_data(
                 weight,
-                IQ2RMetadata(logical_n=self.hidden_size, logical_k=full),
+                IQ2RMetadata(
+                    logical_n=self.hidden_size, logical_k=full, codebook_entries=entries
+                ),
                 shard * self.tp_rank,
                 shard,
             )
-        # Down codebooks and exponents cover all output columns.
-        return weight
+        # The d table runs along the down input, so it shards like the data.
+        return iq2r_glm53_slice_down_aux(
+            weight, shard * self.tp_rank, shard, full, self.classes, entries
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from aiter.ops.iq2r_format import iq2r_validate_expert_weights
+        from aiter.ops.iq2r_v2 import iq2r_v2_check_codebook
 
-        # Only the down records keep the canonical layout the validator checks.
-        # `--load_dummy` writes no codebooks, so their reserved all-zero entry
-        # is checked only for checkpoint weights.
-        iq2r_validate_expert_weights(
-            layer.w2_weight,
-            layer.w2_weight_scale,
-            layer.iq2r_down_metadata,
-            expert_count=self.num_experts,
-            verify_reserved_zero=not get_current_atom_config().load_dummy,
-        )
+        # load_weight checked every shape. Most kernels form codebook copies
+        # 1-3 from copy 0 (the first entries x 8 bytes), exact only for bytes
+        # 0x08..0x78; `--load_dummy` writes no codebooks.
+        if not get_current_atom_config().load_dummy:
+            book_bytes = self.codebook_entries * 8
+            for aux in (layer.w13_weight_scale, layer.w2_weight_scale):
+                iq2r_v2_check_codebook(aux[:, :book_bytes].view(torch.float8_e4m3fn))
         self._glm53_workspace(layer.w13_weight.device)
 
     def _glm53_workspace(self, device: torch.device):
@@ -1128,51 +1152,54 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         return None
 
+    @staticmethod
+    def fused_shared_tokens() -> int:
+        """Largest batch whose shared expert runs inside the IQ2R launches."""
+        from aiter.iq2r_glm53 import FUSED_SHARED_TOKENS
+
+        return FUSED_SHARED_TOKENS
+
+    def attach_shared_expert(
+        self,
+        layer: torch.nn.Module,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        down: torch.Tensor,
+    ) -> None:
+        """Pack this rank's shared expert (``gate``/``up`` [I, H], ``down`` [H, I])
+        to MXFP8 for the IQ2R launches; :meth:`apply` then adds it for batches
+        of at most :meth:`fused_shared_tokens` tokens."""
+        from aiter.iq2r_glm53 import iq2r_glm53_pack_shared
+
+        layer.iq2r_shared = iq2r_glm53_pack_shared(gate, up, down)
+
     @mark_trace(prefix="iq2r_moe", torch_compile=False)
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: torch.Tensor | None = None,
-        fused_shared_experts_scoring_func: str | None = None,
         apply_router_weight_on_input: bool = False,
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
+        x_scale: torch.Tensor | None = None,
+        scheduled_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if activation != ActivationType.Silu:
             raise ValueError(f"IQ2R does not support {activation} here")
-
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
-            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
-            routed_scaling_factor=layer.routed_scaling_factor,
-        )
-        topk_ids = topk_ids.to(torch.int32).contiguous()
-        topk_weights = topk_weights.to(torch.float32).contiguous()
+        if x_scale is not None:
+            raise ValueError("IQ2R quantizes its own activations; it needs BF16 rows")
+        if apply_router_weight_on_input:
+            raise ValueError("IQ2R applies the router weights in its reduction")
 
         from aiter.iq2r_glm53 import iq2r_glm53_moe_out
 
+        shared = getattr(layer, "iq2r_shared", None)
+        if x.shape[0] > self.fused_shared_tokens():
+            shared = None
         output = torch.empty_like(x)
         iq2r_glm53_moe_out(
             x,
@@ -1180,10 +1207,11 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale,
             layer.w2_weight,
             layer.w2_weight_scale,
-            topk_weights,
-            topk_ids,
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
             output,
             self._glm53_workspace(x.device),
+            shared=shared,
         )
         return output
 

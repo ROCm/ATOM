@@ -1360,7 +1360,7 @@ class TestWillOnlineRequant:
 # and every other layer keeps the FP8 base format.
 IQ2R_SOURCE = {
     "quant_method": "iq2r",
-    "iq2r_layout": "glm53-packed-v1",
+    "iq2r_layout": "glm53-packed-v2",
     "iq2r_modules": ["model.layers.3.mlp.experts"],
     "base_quantization_config": {
         "quant_method": "fp8",

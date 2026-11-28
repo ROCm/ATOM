@@ -47,6 +47,13 @@ from atom.utils.forward_context import (
 #     (equal to the above unless the model sets its own decode default)
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
+#   - optional: `fused_moe_forward_rows: int` and
+#     `fused_moe_forward(hidden_states) -> Tensor` -- a module whose MoE
+#     kernels can also run its shared expert takes calls of 1 to
+#     `fused_moe_forward_rows` rows there, ahead of the dual-stream choice
+#     (absent or 0: never). Such a module calls this op even with
+#     `_use_dual_stream` False: the row test has to stay out of the traced
+#     graph like the dual-stream one.
 #
 # Per-call row gating: a call with more rows than its step's bound
 # (`_dual_stream_row_bound`) stays single-stream.
@@ -90,6 +97,8 @@ def maybe_dual_stream_forward(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    if 0 < hidden_states.shape[0] <= getattr(self, "fused_moe_forward_rows", 0):
+        return self.fused_moe_forward(hidden_states)
     if _dual_stream_is_active(self, hidden_states.shape[0]):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
