@@ -56,6 +56,13 @@ from atom.utils.gc_utils import (
     tune_gc,
     unfreeze_gc_heap,
 )
+from atom.utils.gpu_guard import (
+    GUARD_INTERVAL_S,
+    STEP_WATCHDOG_S,
+    GpuGuard,
+    describe,
+    scan,
+)
 
 logger = logging.getLogger("atom")
 
@@ -125,6 +132,13 @@ def publish_idle_state_work(scheduler) -> None:
     """Publish the state loads and stores `scheduler` holds while no batch runs."""
     scheduler._publish_state_loads()
     scheduler._publish_state_stores()
+
+
+def _step_text(kind: str, info: tuple) -> str:
+    prefill, decode, tokens, blocked = info
+    return f"{kind}: {prefill} prefill + {decode} decode reqs, {tokens} tokens" + (
+        ", Mono off: GPU guard" if blocked else ""
+    )
 
 
 class EngineCore:
@@ -327,8 +341,93 @@ class EngineCore:
         tracing.initialize()
         self._freeze_after_startup()
 
+        # Last: the processes on the GPUs now are this server's.
+        self.gpu_guard = GpuGuard(self.label, GUARD_INTERVAL_S)
+        # (start time, kind, counts) of the forward in flight, one object so
+        # the watchdog thread never pairs one step's start with another's text
+        self._step: tuple[float, str, str] | None = None
+        # forwards that ran past STEP_WATCHDOG_S, by step kind
+        self.long_forwards: dict[str, int] = {}
+        threading.Thread(
+            target=self._step_watchdog, daemon=True, name="step-watchdog"
+        ).start()
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    @staticmethod
+    def _forward_kind(batch) -> str:
+        """The watchdog's name for a step: Mono kernels only ever run in a
+        decode-only step, so a long prefill or mixed forward is not a Mono stall."""
+        prefill = getattr(batch, "total_seqs_num_prefill", 0)
+        if prefill and getattr(batch, "total_seqs_num_decode", 0):
+            return "mixed"
+        if prefill:
+            return "prefill"
+        return (
+            "decode (Mono off)" if getattr(batch, "mono_blocked", False) else "decode"
+        )
+
+    def _timed_forward(self, batch):
+        """The model forward for ``batch``, with the GPU guard's verdict on the
+        batch (decided here, once, so every rank of the TP group gets the same
+        answer) and the step published to the watchdog."""
+        guard = getattr(self, "gpu_guard", None)
+        batch.mono_blocked = guard is not None and guard.present()
+        kind = EngineCore._forward_kind(batch)
+        # the text is built by the watchdog, only for a step it reports
+        desc = (
+            getattr(batch, "total_seqs_num_prefill", 0),
+            getattr(batch, "total_seqs_num_decode", 0),
+            getattr(batch, "total_tokens_num", 0),
+            batch.mono_blocked,
+        )
+        self._step = (time.monotonic(), kind, desc)
+        try:
+            return self.runner_mgr.call_func("forward", batch, wait_out=True)
+        finally:
+            self._step = None
+
+    def _step_watchdog(self) -> None:
+        """Report a forward that has run past STEP_WATCHDOG_S: the engine
+        thread is blocked in it and logs nothing of its own meanwhile."""
+        guard = self.gpu_guard
+        hung = None  # the (start, kind, desc) being reported
+        next_report = 0.0
+        while True:
+            time.sleep(min(1.0, STEP_WATCHDOG_S / 4))
+            try:
+                step, now = self._step, time.monotonic()
+                if hung is not None and (step is None or step[0] != hung[0]):
+                    kind = hung[1]
+                    self.long_forwards[kind] = self.long_forwards.get(kind, 0) + 1
+                    logger.warning(
+                        "%s: the forward reported running long (%s) finished after "
+                        "%.1fs; long forwards so far %s",
+                        self.label,
+                        _step_text(hung[1], hung[2]),
+                        now - hung[0],
+                        self.long_forwards,
+                    )
+                    hung = None
+                if step is None or now - step[0] < STEP_WATCHDOG_S:
+                    continue
+                if hung is None or now >= next_report:
+                    hung = step
+                    next_report = now + 30.0
+                    others = {
+                        p: u for p, u in scan(guard.gpus).items() if p not in guard.own
+                    }
+                    logger.error(
+                        "%s: a forward has run for %.1fs (%s). Processes on this "
+                        "server's GPUs not its own: %s",
+                        self.label,
+                        now - step[0],
+                        _step_text(step[1], step[2]),
+                        describe(others) or "none",
+                    )
+            except Exception:
+                logger.exception("%s: step watchdog iteration failed", self.label)
 
     def _init_prefill_delayer(self, config: Config, cpu_group=None):
         if (
@@ -423,6 +522,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        guard = getattr(self, "gpu_guard", None)
+        if guard is not None:
+            guard.stop()
         # Frozen weights and KV cache are unreachable *and* uncollectable, so
         # an engine destroyed in-process would read as a GPU memory leak.
         unfreeze_gc_heap()
@@ -707,9 +809,7 @@ class EngineCore:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
-            fwd_out = self.runner_mgr.call_func(
-                "forward", scheduled_batch, wait_out=True
-            )
+            fwd_out = EngineCore._timed_forward(self, scheduled_batch)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -1892,7 +1992,7 @@ class DecodeEngineCore(EngineCore):
             return False
         self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
-        fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+        fwd_out = EngineCore._timed_forward(self, scheduled_batch)
         iter_ms = (time.perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "

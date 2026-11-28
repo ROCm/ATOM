@@ -308,6 +308,7 @@ def test_prepare_model_publishes_decode_local_query_spans(monkeypatch, spec):
         enable_tbo_decode=False,
     )
     runner._dspark_apply_q_bucket = lambda batch: None
+    runner._mono_blocked_step = lambda batch: False
     runner._local_tbo_eligibility = lambda batch: False
     runner._producer_graph_shapes = lambda: None
     runner._cut_ubatches = lambda mode, batch: mode

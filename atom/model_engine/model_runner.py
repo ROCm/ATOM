@@ -3107,8 +3107,23 @@ class ModelRunner:
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
+    def _mono_blocked_step(self, batch: ScheduledBatch) -> bool:
+        """Whether this step must stay off Mono (the engine's GPU guard saw another
+        process on the TP GPUs, ``atom.utils.gpu_guard``): the model is told, and
+        True when a graph captured on Mono could replay it, so it runs eagerly."""
+        blocked = bool(getattr(batch, "mono_blocked", False))
+        setter = getattr(self.model, "mono_set_blocked", None)
+        if setter is not None:
+            setter(blocked)
+        tokens = getattr(self.model, "mono_graph_tokens", None)
+        if not blocked or not tokens or batch.total_seqs_num_prefill:
+            return False
+        # a graph only pads rows up, so a step past the largest Mono graph replays none
+        return batch.total_seqs_num * (batch.num_spec_step + 1) <= max(tokens)
+
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
+        mono_blocked = self._mono_blocked_step(batch)
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
@@ -3120,7 +3135,8 @@ class ModelRunner:
             dp_size=dp_size,
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
-            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
+            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch)
+            or mono_blocked,
             capture_sizes=self.capture_sizes_np,
             is_block_drafter=(
                 hasattr(self, "drafter") and self.drafter.is_block_drafter

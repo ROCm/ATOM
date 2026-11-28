@@ -164,6 +164,7 @@ def test_prepare_model_builds_and_passes_mixed_verify_metadata(monkeypatch):
     runner.running_tokens_per_dp_rank = np.array([16], dtype=np.int32)
     runner.tbo_decode_graphs = False
     runner._dspark_apply_q_bucket = lambda b: None
+    runner._mono_blocked_step = lambda b: False
     runner._local_tbo_eligibility = lambda b: False
     runner._producer_graph_shapes = lambda: None
     runner._cut_ubatches = lambda m, b: m
