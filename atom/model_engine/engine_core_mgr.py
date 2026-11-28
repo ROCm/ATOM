@@ -2630,6 +2630,21 @@ def launch_engine_core(
     )
 
 
+def _apply_prefill_max_num_seqs(prefill_config, max_num_seqs: int) -> None:
+    """`disagg_prefill_max_num_seqs` for the prefill process's config copy.
+
+    The override replaces what the deepcopy carried, DSpark's engine sizing
+    included (`Config._size_engine_for_dspark_drafter`: an engine of 2 with the
+    scheduler admitting 1 for `--max-num-seqs 1`), so redo it for the prefill
+    process's own value: its warmup runs the block drafter at B=2 too.
+    """
+    prefill_config.max_num_seqs = max_num_seqs
+    prefill_config.scheduler_max_num_seqs = None
+    spec = prefill_config.speculative_config
+    if spec is not None and getattr(spec, "use_dspark", lambda: False)():
+        prefill_config._size_engine_for_dspark_drafter()
+
+
 class DisaggCoreManager(CoreManager):
     """CoreManager for intra-GPU prefill/decode disaggregation.
 
@@ -2682,7 +2697,9 @@ class DisaggCoreManager(CoreManager):
         # Build per-process configs.
         prefill_config = copy.deepcopy(config)
         if config.disagg_prefill_max_num_seqs is not None:
-            prefill_config.max_num_seqs = config.disagg_prefill_max_num_seqs
+            _apply_prefill_max_num_seqs(
+                prefill_config, config.disagg_prefill_max_num_seqs
+            )
         prefill_config.enforce_eager = True
         prefill_config.disagg_d2p_addr = d2p_addr
         prefill_config.disagg_p2d_addr = p2d_addr

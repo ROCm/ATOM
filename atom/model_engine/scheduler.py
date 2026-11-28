@@ -894,7 +894,7 @@ class Scheduler:
         # backend without `supports_token_graph` records none, and its decoding
         # rank has no bucket to yield its decode to.
         self.prefill_token_graphs = prefill_token_graphs
-        self.max_num_seqs = config.max_num_seqs
+        self.max_num_seqs = config.scheduler_max_num_seqs or config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self._unreserved_prefill_limits = PrefillLimits(self.max_num_batched_tokens)
         # DP prefill cost balancing, on whenever DP attention runs more than
@@ -6722,7 +6722,7 @@ class PrefillScheduler:
     pd_admission: PdAdmissionController | None = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
-        self.max_num_seqs = config.max_num_seqs
+        self.max_num_seqs = config.scheduler_max_num_seqs or config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
         pc = getattr(config, "parallel_config", None)

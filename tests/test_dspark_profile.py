@@ -200,3 +200,45 @@ def test_fp4_calibration_distinguishes_actual_target_backend(
     validate_calibration(
         {**profile(), "identity": adapter}, fallback, width=5, max_batch=4
     )
+
+
+def test_load_calibration_checks_the_admission_limit_not_the_engine_size(
+    tmp_path, monkeypatch
+):
+    # `--max-num-seqs 1` sizes the engine for 2 (max_num_seqs=2) but the
+    # scheduler admits 1; a profile measured for one sequence must load.
+    import json
+    from types import SimpleNamespace
+
+    from atom.spec_decode.calibration import load_calibration
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = SimpleNamespace(
+        model=str(model),
+        hf_config=SimpleNamespace(model_type="m"),
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
+        enforce_eager=False,
+        speculative_config=SimpleNamespace(
+            draft_kv_dtype="fp8", num_speculative_tokens=5
+        ),
+        max_num_seqs=2,
+        scheduler_max_num_seqs=1,
+    )
+    for name in ("config.json", "model.safetensors.index.json"):
+        (model / name).write_text("{}")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "gpu")
+    data = profile()
+    data["identity"] = calibration_identity(config, "cpu")
+    data["max_num_seqs"] = 1
+    data["sps_table"] = [100 / (i + 1) for i in range(12)]  # > 1 * (5 + 1)
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(data))
+    config.dspark = SimpleNamespace(calibration_profile=str(path))
+    sps, _ = load_calibration(config, "cpu")
+    assert sps.shape[0] == 12
+    config.scheduler_max_num_seqs = None  # no cap: the engine size applies
+    with pytest.raises(ValueError, match="does not cover"):
+        load_calibration(config, "cpu")
