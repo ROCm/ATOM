@@ -304,7 +304,11 @@ def _chat_with_grammar(monkeypatch, body, text="hello"):
     monkeypatch.setattr(api_server, "generate_async", generate)
     monkeypatch.setattr(api_server, "synthetic_token_text", None)
     monkeypatch.setattr(
-        api_server, "_get_engine_config", lambda: types.SimpleNamespace()
+        api_server,
+        "_get_engine_config",
+        lambda: types.SimpleNamespace(
+            pipeline_parallel_size=1, enable_rapidserve=False
+        ),
     )
     monkeypatch.setattr(
         api_server,

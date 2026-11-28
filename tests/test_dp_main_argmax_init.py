@@ -129,6 +129,7 @@ def test_other_modes_take_no_head_and_keep_the_sampler(monkeypatch, modules, mod
         ({"temperature": 0.0, "json_schema": "{}"}, False),
         ({"temperature": 0.0, "structured_tool_format": "kimi"}, False),
         ({"temperature": 0.0, "required_channel": object()}, False),
+        ({"temperature": 0.0, "presence_penalty": 1.5}, False),
     ],
 )
 def test_serves_greedy_ids(modules, params, serves):

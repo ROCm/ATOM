@@ -513,8 +513,10 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 ### Shared token constraints
 
 `TokenConstraints` in `atom/model_engine/token_constraints.py` is the shared
-pre-sampling boundary for K3 required channels and JSON Schema: K3 keeps its GPU
-state machine, llguidance keeps its packed vocabulary masks.
+pre-sampling boundary for K3 required channels, JSON Schema and the presence
+penalty: K3 keeps its GPU state machine, llguidance keeps its packed vocabulary
+masks, and the presence penalty a bit table of each request's generated tokens
+(`presence_penalty.py`, `triton_presence_penalty.py`).
 
 A request carries at most one of the two: request admission
 (`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the

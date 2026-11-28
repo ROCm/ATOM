@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sampling constraints shared by required channels and structured output.
+"""Sampling constraints shared by required channels, structured output and the
+presence penalty.
 
 A request carries at most one rule: a grammar (packed masks, overlapped token
-copies) or a required channel (fused GPU state machine). This boundary owns
-when their masks run and when accepted tokens advance their state. Neither
+copies) or a required channel (fused GPU state machine). A presence penalty
+(`presence_penalty.py`) may come with either. This boundary owns when their
+masks and penalties run and when accepted tokens advance their state. No
 backend is converted to a Python list of vocabulary IDs.
 """
 
@@ -17,14 +19,19 @@ from atom.model_ops.required_channel import DeviceChannel
 def has_constraints(batch):
     """Query the batch without creating instances or GPU work."""
     return batch is not None and (
-        bool(batch.structured_requests) or batch.required_channel is not None
+        bool(batch.structured_requests)
+        or batch.required_channel is not None
+        or batch.presence_penalties is not None
     )
 
 
 def needs_constraint_snapshot(batch, metadata):
-    """Whether logprob capture must copy the logits before they are masked."""
-    return bool(batch.structured_requests) or (
-        batch.required_channel is not None and metadata is None
+    """Whether logprob capture must copy the logits before they are masked or
+    penalized."""
+    return (
+        bool(batch.structured_requests)
+        or batch.presence_penalties is not None
+        or (batch.required_channel is not None and metadata is None)
     )
 
 
@@ -37,6 +44,7 @@ def prepare_token_constraints(runner, batch, metadata):
 def release_token_constraints(runner, request_ids):
     if runner.structured_output is not None:
         runner.structured_output.release(request_ids)
+    runner.presence_penalties.release(request_ids)
 
 
 def constraint_errors(runner):
@@ -86,7 +94,7 @@ class TokenConstraints:
         self.runner, self.batch, self.metadata = runner, batch, metadata
         self.source = logits
         self.logits = self.target = None
-        self.grammar = self.channel = None
+        self.grammar = self.channel = self.presence = None
         self.prefixes = {}
 
     @classmethod
@@ -94,6 +102,17 @@ class TokenConstraints:
         if not has_constraints(batch):
             return None
         step = cls(runner, batch, logits, metadata)
+        if batch.presence_penalties is not None:
+            from atom.model_ops.triton_presence_penalty import penalize_rows
+
+            step.presence = batch.presence_rows
+            penalize_rows(
+                runner.presence_penalties.seen,
+                step.presence,
+                logits,
+                None if metadata is None else metadata.input_ids,
+                0 if metadata is None else metadata.num_spec_steps,
+            )
         if batch.structured_requests:
             step.grammar = runner.structured_output
             if step.grammar is None:
@@ -122,6 +141,16 @@ class TokenConstraints:
             channel_states = advance_states(*self.channel, sampled_tokens)
         if self.prefixes:
             self.grammar.commit(sampled_tokens, batch, self.prefixes)
+        if self.presence is not None:
+            from atom.model_ops.triton_presence_penalty import mark_emitted
+
+            penalties = self.runner.presence_penalties
+            mark_emitted(
+                penalties.seen,
+                self.presence,
+                sampled_tokens,
+                penalties.vocab_size,
+            )
         return channel_states
 
     def gather(self):

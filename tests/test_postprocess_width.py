@@ -70,6 +70,7 @@ def _batch(seqs, mask=None):
         logprob_rows=rows,
         required_channel=None,
         structured_requests=None,
+        presence_penalties=None,
         num_spec_step=0,
     )
 

@@ -132,6 +132,10 @@ impl BridgeRequest {
                 payload.return_hidden_states,
                 "return_hidden_states is not supported by the ATOM engine",
             ),
+            (
+                payload.sampling.presence_penalty != 0.0,
+                "presence_penalty is not supported by the ATOM Rust frontend yet",
+            ),
         ];
         if let Some((_, reason)) = refused.iter().find(|(refuse, _)| *refuse) {
             return Err(reason.to_string());
@@ -289,5 +293,60 @@ fn py_err_to_engine(py: Python<'_>, error: &PyErr) -> EngineError {
         EngineError::RequestBuildFailed(message)
     } else {
         EngineError::Transport(tonic::Status::unavailable(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BridgeRequest, RequestExtras};
+    use crate::routers::prepare::generation_payload::{
+        GenerationPayload, LogprobConfig, SamplingParams, StopConfig,
+    };
+
+    fn payload(presence_penalty: f32) -> GenerationPayload {
+        GenerationPayload {
+            request_id: "req-1".to_string(),
+            text: String::new(),
+            token_ids: vec![1, 2, 3],
+            sampling: SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: -1,
+                min_p: 0.0,
+                frequency_penalty: 0.0,
+                presence_penalty,
+                repetition_penalty: 1.0,
+                max_new_tokens: Some(16),
+                min_new_tokens: 0,
+                n: 1,
+                ignore_eos: false,
+            },
+            stop: StopConfig {
+                stop: None,
+                stop_token_ids: None,
+                skip_special_tokens: true,
+                no_stop_trim: false,
+            },
+            logprob: LogprobConfig {
+                return_logprob: false,
+                top_logprobs_num: 0,
+                logprob_start_len: -1,
+                token_ids_logprob: Vec::new(),
+                input_logprobs: false,
+            },
+            tool_constraints: None,
+            pd_metadata: None,
+            stream: false,
+            return_hidden_states: false,
+            log_metrics: false,
+        }
+    }
+
+    #[test]
+    fn a_presence_penalty_is_refused_not_dropped() {
+        let extras = RequestExtras::default();
+        assert!(BridgeRequest::from_payload(&payload(0.0), &extras).is_ok());
+        let err = BridgeRequest::from_payload(&payload(1.5), &extras).err();
+        assert!(err.is_some_and(|e| e.contains("presence_penalty")));
     }
 }

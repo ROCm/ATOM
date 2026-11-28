@@ -378,8 +378,8 @@ class ChatCompletionRequest(BaseModel):
     # Without this field pydantic (extra="ignore") silently drops it, so effort
     # never reaches the template and the streaming reasoning gate never fires.
     thinking: dict[str, Any] | None = None
-    # Accepted for compatibility, not actively used:
     presence_penalty: float | None = 0.0
+    # Accepted for compatibility, not actively used:
     frequency_penalty: float | None = 0.0
     n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
@@ -482,6 +482,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
+    presence_penalty: float | None = 0.0
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
     stop: list[str] | None = None

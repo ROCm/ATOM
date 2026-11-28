@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -214,6 +215,7 @@ def _batch(**kw):
             "structured_requests": None,
             "any_logprobs": False,
             "required_channel": None,
+            "presence_penalties": None,
             "total_seqs_num": 8,
             "req_ids": [f"r{i}" for i in range(8)],
             **kw,
@@ -239,6 +241,7 @@ def test_a_decode_verify_step_is_served(model, verify_step):
         _batch(structured_requests=[1]),
         _batch(any_logprobs=True),
         _batch(required_channel=0),
+        _batch(presence_penalties=np.full(8, 1.5, dtype=np.float32)),
     ],
 )
 def test_steps_needing_logits_take_the_production_path(model, verify_step, batch):

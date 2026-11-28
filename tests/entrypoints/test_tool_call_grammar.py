@@ -411,8 +411,10 @@ def _params():
     )
 
 
+ENGINE = {"pipeline_parallel_size": 1, "enable_rapidserve": False}
 OFFLOAD = NS(
-    kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "kv_both"}
+    **ENGINE,
+    kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "kv_both"},
 )
 
 
@@ -454,7 +456,10 @@ def test_off_by_default():
 def test_offload_admits_response_format_and_p_d_still_refuses():
     params = _params()
     validation.validate_execution_options(OFFLOAD, params)
-    p_d = NS(kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_producer"})
+    p_d = NS(
+        **ENGINE,
+        kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_producer"},
+    )
     with pytest.raises(ValueError, match="P/D"):
         validation.validate_execution_options(p_d, params)
 
@@ -471,7 +476,7 @@ def test_requests_that_cannot_run_a_grammar_stay_unconstrained(
     elif case == "stop":
         params.stop_strings = ["END"]
     elif case == "p_d":
-        kwargs["config"] = NS(kv_transfer_config={"kv_connector": "moriio"})
+        kwargs["config"] = NS(**ENGINE, kv_transfer_config={"kv_connector": "moriio"})
     elif case == "missing":
         monkeypatch.setattr(validation.structured_output, "available", lambda: False)
     else:

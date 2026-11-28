@@ -27,7 +27,8 @@ import struct
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -222,6 +223,18 @@ class ScheduledBatch:
 
     scheduled_spec_decode_tokens: np.ndarray | None = None
 
+    # The presence penalty's inputs (`presence_penalty.py`). Set on a batch only
+    # when they are not empty: every batch is pickled to the TP workers, and a
+    # batch without a penalty must cost nothing there.
+    # Each request's penalty, or None when no request has one.
+    presence_penalties: np.ndarray | None = None
+    # A resumed request's earlier output, on the step that samples its
+    # recomputed prefill: its table row went back when it was preempted.
+    presence_resumed: Mapping[int, np.ndarray] = MappingProxyType({})
+    # Requests with a penalty preempted since the last batch: their rows go
+    # back before this batch claims any (`Scheduler.schedule` sets it).
+    presence_preempted: tuple[int, ...] | list[int] = ()
+
     def __init__(
         self,
         seqs: dict[int, Sequence],
@@ -335,6 +348,21 @@ class ScheduledBatch:
         )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        presence = np.asarray(
+            [seq.presence_penalty for seq in seqs.values()], dtype=np.float32
+        )
+        if presence.any():
+            self.presence_penalties = presence
+            resumed = {
+                seq.id: np.asarray(seq.output_tokens, dtype=np.int32)
+                for i, seq in enumerate(seqs.values())
+                if seq.presence_penalty
+                and seq.output_tokens
+                and seq.type == SequenceType.PREFILL
+                and (is_final_chunk is None or is_final_chunk[i])
+            }
+            if resumed:
+                self.presence_resumed = resumed
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
@@ -593,6 +621,7 @@ class ScheduledBatch:
             "scheduled_spec_decode_tokens",
             "last_block_num_tokens",
             "external_request_ids",
+            "presence_penalties",
         )
     )
     _STATE_FIELDS = frozenset(
@@ -609,6 +638,7 @@ class ScheduledBatch:
             "mrope_position_deltas",
             "multimodal_data",
             "remote_kv_seq_blocks",
+            "presence_resumed",
         )
     )
     _SHARED_FIELDS = frozenset(
@@ -648,6 +678,8 @@ class ScheduledBatch:
             "detailed_sqsq",
             "detailed_sqsk",
             "detailed_sk",
+            "presence_preempted",
+            "presence_rows",
         )
     )
 
@@ -715,6 +747,10 @@ class ScheduledBatch:
         # compact logits and must not be inherited by an attention segment.
         result.logprob_request_indices = None
         result.logprob_rows = None
+        # So do the presence penalty's staged table rows, and the rows the
+        # parent releases (`ModelRunner.prepare_sample`).
+        result.presence_rows = None
+        result.presence_preempted = ()
         result.total_seqs_num = stop - start
         result.total_seqs_num_prefill = max(
             0, min(stop, self.total_seqs_num_prefill) - start
@@ -1029,6 +1065,9 @@ class Scheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
+        # Request ids `preempt` took a presence-penalty row from, for the next
+        # batch (`ScheduledBatch.presence_preempted`).
+        self._presence_preempted: list[int] = []
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -2634,6 +2673,17 @@ class Scheduler:
             result = self._schedule()
         finally:
             self.block_manager.reserved_decode_blocks = 0
+        # Only a forwarded batch reaches `prepare_sample`, which releases the
+        # rows: `EngineCore` skips a batch without requests, which a pass that
+        # preempts every decode seq it pops returns. Keep the ids until then.
+        if (
+            result is not None
+            and self._presence_preempted
+            and not result[0].is_dummy_run
+            and len(result[0].req_ids) > 0
+        ):
+            result[0].presence_preempted = self._presence_preempted
+            self._presence_preempted = []
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
@@ -5253,6 +5303,8 @@ class Scheduler:
         if not self._is_preemptable(seq):
             return False
         self.total_preemptions += 1
+        if seq.presence_penalty:
+            self._presence_preempted.append(seq.id)
         # Routing credit describes the old allocation, which is surrendered.
         # A new admission must recheck HBM and tier availability.
         seq.dp_est_cached_tokens = 0

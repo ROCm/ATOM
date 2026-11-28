@@ -656,9 +656,11 @@ class EngineCore:
                 logger.exception("KV event publish after engine step failed")
 
     def _release_request_resources(self, sequences):
-        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
-        if structured_ids:
-            self.runner_mgr.call_func("release_constraints", structured_ids)
+        constrained_ids = [
+            seq.id for seq in sequences if is_structured(seq) or seq.presence_penalty
+        ]
+        if constrained_ids:
+            self.runner_mgr.call_func("release_constraints", constrained_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]

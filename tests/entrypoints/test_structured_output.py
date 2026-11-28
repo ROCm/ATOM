@@ -285,7 +285,10 @@ def test_relaxed_mtp_rejected_before_frontend_rpc(monkeypatch):
 
     monkeypatch.setattr(envs, "ATOM_ENABLE_RELAXED_MTP", True)
     rpc = Mock(side_effect=AssertionError("request must fail before RPC"))
-    monkeypatch.setattr(api_server, "engine", NS(core_mgr=NS(collective_rpc=rpc)))
+    config = NS(pipeline_parallel_size=1, enable_rapidserve=False)
+    monkeypatch.setattr(
+        api_server, "engine", NS(config=config, core_mgr=NS(collective_rpc=rpc))
+    )
     with pytest.raises(ValueError, match="relaxed MTP"):
         asyncio.run(
             api_server._configure_structured_output(NS(), "{}", ReasoningChannel())
@@ -722,7 +725,7 @@ def test_strict_tools_alone_configure_a_grammar():
         configure_request(
             engine,
             None,
-            NS(),
+            NS(pipeline_parallel_size=1, enable_rapidserve=False),
             params,
             None,
             ReasoningChannel(),

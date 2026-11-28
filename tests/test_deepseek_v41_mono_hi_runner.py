@@ -161,6 +161,7 @@ def test_postprocess_takes_the_verify_and_the_broadcast_ids(
         num_spec_step=5,
         any_logprobs=False,
         structured_requests={},
+        presence_penalties=None,
         required_channel=None,
     )
     hidden = torch.zeros(12, 4)

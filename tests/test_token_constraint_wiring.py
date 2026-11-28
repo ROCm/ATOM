@@ -51,6 +51,7 @@ def _batch(**rule):
         "any_logprobs": False,
         "num_spec_step": 0,
         "structured_requests": None,
+        "presence_penalties": None,
         "required_channel": None,
     }
     return SimpleNamespace(**{**fields, **rule})
@@ -63,12 +64,14 @@ CHANNEL = {"required_channel": object()}
 # -- release -----------------------------------------------------------------
 
 
-def test_release_reaches_the_grammar_through_the_runner():
+def test_release_reaches_the_grammar_and_the_presence_rows_through_the_runner():
     grammar = mock.Mock()
     runner = object.__new__(mod.ModelRunner)
     runner.structured_output = grammar
+    runner.presence_penalties = mock.Mock()
     mod.ModelRunner.release_constraints(runner, [3, 4])
     grammar.release.assert_called_once_with([3, 4])
+    runner.presence_penalties.release.assert_called_once_with([3, 4])
 
 
 # -- runner call sites -------------------------------------------------------

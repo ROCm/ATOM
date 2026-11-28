@@ -82,6 +82,7 @@ def test_postprocess_samples_nothing_without_a_request(monkeypatch):
         any_logprobs=False,
         required_channel=None,
         structured_requests=None,
+        presence_penalties=None,
         num_spec_step=0,
     )
 

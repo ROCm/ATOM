@@ -129,6 +129,7 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
+from atom.model_ops.presence_penalty import PresencePenalties
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.required_channel import DeviceChannel
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
@@ -1652,6 +1653,12 @@ class ModelRunner:
             "required_channel_states": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **i32_kwargs
             ),
+            # The presence penalty's rows (`PresencePenalties.stage`).
+            "presence_penalty_rows": CpuGpuBuffer(
+                PresencePenalties.staging_size(self.max_bs, logprob_width),
+                publication_group="sampling",
+                **i32_kwargs,
+            ),
             # Keep enough space for MTP decode (max_q_len > 1).
             # `extra_output_dims` lets a model insert dims between N and dim
             # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
@@ -1664,6 +1671,10 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        # Before the memory profile, so the KV budget counts it.
+        self.presence_penalties = PresencePenalties(
+            self.hf_text_config.vocab_size, self.max_bs, self.device
+        )
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
                 3,
@@ -3068,6 +3079,19 @@ class ModelRunner:
                 buffer.gpu[n + m : logprob_count].view(n, width),
             )
 
+        # A preempted request gives its row back; it marks its output again
+        # when it resumes (`PresencePenalties.stage`).
+        if batch.presence_preempted:
+            self.presence_penalties.release(batch.presence_preempted)
+        presence_count = None
+        batch.presence_rows = None
+        if batch.presence_penalties is not None:
+            lengths = None
+            if self._verifies_drafts(batch, batch.has_prefill):
+                _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
+            batch.presence_rows, presence_count = self.presence_penalties.stage(
+                batch, lengths, self.forward_vars["presence_penalty_rows"]
+            )
         # Read back by `postprocess` through the token-constraint boundary.
         channel_count = None
         if batch.required_channel is not None:
@@ -3083,6 +3107,7 @@ class ModelRunner:
                 "top_ks": top_k_count,
                 "top_ps": top_p_count,
                 "required_channel_states": channel_count,
+                "presence_penalty_rows": presence_count,
                 "logprob_request_indices": logprob_count,
             }
         )

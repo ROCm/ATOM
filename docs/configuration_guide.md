@@ -357,6 +357,7 @@ Defined in `atom/sampling_params.py`. Passed per-request to control generation.
 | `max_tokens` | `int` | `64` | Maximum number of tokens to generate |
 | `ignore_eos` | `bool` | `False` | Continue generating past the EOS token |
 | `stop_strings` | `Optional[list[str]]` | `None` | List of strings that trigger generation to stop |
+| `presence_penalty` | `float` | `0.0` | OpenAI presence penalty in [-2, 2], subtracted from the logits of tokens the request has generated (see `docs/token_constraint_interface.md`) |
 
 ## CLI arguments (`EngineArgs`)
 

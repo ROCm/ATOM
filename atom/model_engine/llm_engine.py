@@ -692,12 +692,14 @@ class LLMEngine:
 
 def serves_greedy_ids(params: SamplingParams) -> bool:
     """Whether a request can take `ATOM_DP_LM_HEAD_MODE=argmax`'s greedy ids:
-    temperature 0, no logprobs, no structured output or required channel."""
+    temperature 0, no logprobs, no structured output, required channel or
+    presence penalty (the greedy ids are taken before any logit is changed)."""
     return (
         params.temperature == 0
         and not params.logprobs
         and not is_structured(params)
         and params.required_channel is None
+        and not params.presence_penalty
     )
 
 
@@ -892,11 +894,15 @@ class InputOutputProcessor:
             kv_transfer=kv_transfer_params,
             multimodal=multimodal_data is not None,
         )
+        sampling_params.validate_presence_penalty(
+            self.config, kv_transfer=kv_transfer_params
+        )
         greedy_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"
         if greedy_only and not serves_greedy_ids(sampling_params):
             raise ValueError(
                 "ATOM_DP_LM_HEAD_MODE=argmax serves greedy requests only: "
-                "temperature 0, no logprobs, structured output or required tool"
+                "temperature 0, no logprobs, structured output, required tool "
+                "or presence_penalty"
             )
         if is_structured(sampling_params):
             if sampling_params.required_channel is not None:

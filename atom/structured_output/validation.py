@@ -537,21 +537,13 @@ def validate_execution_options(
     relaxed_mtp=False,
     synthetic=False,
 ):
-    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+    from atom.sampling_params import require_local_sampling
 
-    if getattr(config, "pipeline_parallel_size", 1) > 1:
-        raise ValueError("Structured output does not support pipeline parallelism")
+    require_local_sampling(config, "Structured output", kv_transfer=kv_transfer)
     if relaxed_mtp:
         raise ValueError("Structured output cannot use relaxed MTP verification")
-    # A KV offload tier (LMCache CPU) is not P/D: the request still decodes on
-    # this engine, so its grammar state is never handed to another one.
-    if (
-        kv_transfer
-        or multimodal
-        or getattr(config, "enable_rapidserve", False)
-        or disaggregated_kv_role(config) is not None
-    ):
-        raise ValueError("Structured output currently requires text without P/D")
+    if multimodal:
+        raise ValueError("Structured output currently requires text input")
     spec = getattr(config, "speculative_config", None)
     if synthetic or getattr(spec, "synthetic_acceptance_rates", None):
         raise ValueError("Structured output cannot use synthetic forced acceptance")
