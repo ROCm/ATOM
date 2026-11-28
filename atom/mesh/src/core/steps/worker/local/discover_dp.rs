@@ -12,7 +12,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use super::discover_metadata::{get_openai_model_id, get_server_info};
 use crate::core::{
     steps::workflow_data::LocalWorkerWorkflowData,
-    worker_manager::{get_text, parse_vllm_engine_loads},
+    worker_manager::{get_text, label_value, samples},
     UNKNOWN_MODEL_ID,
 };
 
@@ -66,23 +66,28 @@ async fn get_atom_dp_size(url: &str, api_key: Option<&str>) -> Result<usize, Str
 }
 
 /// vLLM serves no `dp_size`: count the engines `/metrics` reports, which must be `0..n`.
+///
+/// Engines come from `vllm:engine_sleep_state`, which vLLM sets for every engine
+/// when the API server starts. The load gauges cannot be used: with more than one
+/// API server (vLLM's default under DP) an engine's gauges have no sample until
+/// that engine has served a request.
 async fn get_vllm_dp_size(url: &str, api_key: Option<&str>) -> Result<usize, String> {
     let endpoint = format!("{}/metrics", url.trim_end_matches('/'));
     let body = get_text(&HTTP_CLIENT, &endpoint, api_key)
         .await
         .ok_or_else(|| format!("Failed to read {}", endpoint))?;
-    let engines: Vec<&str> = parse_vllm_engine_loads(&body)
-        .into_iter()
-        .filter(|(_, gauges)| gauges[0].is_some())
-        .map(|(engine, _)| engine)
+    let mut engines: Vec<&str> = samples(&body, "vllm:engine_sleep_state")
+        .filter_map(|(labels, _)| label_value(labels, "engine"))
         .collect();
+    engines.sort_unstable();
+    engines.dedup();
     let dp_size = engines.len();
     // Distinct labels covering 0..n are exactly 0..n.
     if dp_size > 0 && (0..dp_size).all(|rank| engines.contains(&rank.to_string().as_str())) {
         Ok(dp_size)
     } else {
         Err(format!(
-            "vllm:num_requests_running engines {:?} at {} are not 0..n",
+            "vllm:engine_sleep_state engines {:?} at {} are not 0..n",
             engines, endpoint
         ))
     }

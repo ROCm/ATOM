@@ -28,6 +28,33 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="m",reason="capacity"}
 vllm:kv_cache_usage_perc{engine="0",model_name="m"} 0.5
 vllm:kv_cache_usage_perc{engine="1",model_name="m"} 0.25
 vllm:prompt_tokens_total{engine="0",model_name="m"} 1234.0
+vllm:engine_sleep_state{engine="0",model_name="m",sleep_state="awake"} 1.0
+vllm:engine_sleep_state{engine="1",model_name="m",sleep_state="awake"} 1.0
+"#;
+
+/// A DP2 vLLM with `--api-server-count` 2 (its default for DP2) before any request,
+/// as served on MI355X by vLLM 0.32: the load gauges have no sample yet, while
+/// `vllm:engine_sleep_state` lists every engine.
+const DP2_BEFORE_ANY_REQUEST: &str = r#"
+# TYPE vllm:num_requests_running gauge
+# TYPE vllm:num_requests_waiting gauge
+# TYPE vllm:kv_cache_usage_perc gauge
+# TYPE vllm:engine_sleep_state gauge
+vllm:engine_sleep_state{engine="0",model_name="m",sleep_state="awake"} 1.0
+vllm:engine_sleep_state{engine="1",model_name="m",sleep_state="awake"} 1.0
+vllm:engine_sleep_state{engine="0",model_name="m",sleep_state="discard_all"} 0.0
+vllm:engine_sleep_state{engine="1",model_name="m",sleep_state="discard_all"} 0.0
+vllm:prompt_tokens_total{engine="0",model_name="m"} 0.0
+vllm:prompt_tokens_total{engine="1",model_name="m"} 0.0
+"#;
+
+/// The same server after one request reached engine 0 only: only engine 0 has gauges.
+const DP2_AFTER_ENGINE_0_SERVED: &str = r#"
+vllm:num_requests_running{engine="0",model_name="m"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="m"} 0.0
+vllm:kv_cache_usage_perc{engine="0",model_name="m"} 0.0
+vllm:engine_sleep_state{engine="0",model_name="m",sleep_state="awake"} 1.0
+vllm:engine_sleep_state{engine="1",model_name="m",sleep_state="awake"} 1.0
 "#;
 
 async fn loads_by_url(workers: &[Arc<dyn Worker>]) -> (WorkerLoadsResult, HashMap<String, isize>) {
@@ -87,12 +114,24 @@ async fn dp_discovery_counts_engines_from_zero() {
     assert_eq!(info.dp_size, 2);
 
     let shifted = metrics_server(
-        "vllm:num_requests_running{engine=\"2\",model_name=\"m\"} 0.0\n\
-         vllm:num_requests_running{engine=\"3\",model_name=\"m\"} 0.0\n",
+        "vllm:engine_sleep_state{engine=\"2\",model_name=\"m\",sleep_state=\"awake\"} 1.0\n\
+         vllm:engine_sleep_state{engine=\"3\",model_name=\"m\",sleep_state=\"awake\"} 1.0\n",
     )
     .await;
     let err = get_dp_info(&shifted, None).await.unwrap_err();
     assert!(err.contains("not 0..n"), "{err}");
+}
+
+#[tokio::test]
+async fn dp_discovery_counts_engines_before_any_request() {
+    let idle = metrics_server(DP2_BEFORE_ANY_REQUEST).await;
+    assert_eq!(get_dp_info(&idle, None).await.unwrap().dp_size, 2);
+}
+
+#[tokio::test]
+async fn dp_discovery_counts_an_engine_that_has_served_no_request() {
+    let partial = metrics_server(DP2_AFTER_ENGINE_0_SERVED).await;
+    assert_eq!(get_dp_info(&partial, None).await.unwrap().dp_size, 2);
 }
 
 #[tokio::test]

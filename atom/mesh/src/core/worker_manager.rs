@@ -373,7 +373,10 @@ fn vllm_load(engines: &HashMap<&str, [Option<f64>; 3]>, rank: Option<usize>) -> 
 }
 
 /// The label block and finite value of each `name` sample in a Prometheus text body.
-fn samples<'a>(body: &'a str, name: &'a str) -> impl Iterator<Item = (&'a str, f64)> + 'a {
+pub(crate) fn samples<'a>(
+    body: &'a str,
+    name: &'a str,
+) -> impl Iterator<Item = (&'a str, f64)> + 'a {
     body.lines().filter_map(move |line| {
         let rest = line.trim().strip_prefix(name)?;
         // `atom:dp_inflight_requests_total` and similar names are different metrics.
@@ -389,7 +392,7 @@ fn samples<'a>(body: &'a str, name: &'a str) -> impl Iterator<Item = (&'a str, f
     })
 }
 
-fn label_value<'a>(metric_rest: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn label_value<'a>(metric_rest: &'a str, name: &str) -> Option<&'a str> {
     let labels = metric_rest
         .trim_start()
         .strip_prefix('{')?
