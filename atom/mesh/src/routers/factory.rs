@@ -12,7 +12,6 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
-    policies::PolicyFactory,
     routers::atom_bridge::AtomBridgeRouter,
 };
 
@@ -89,10 +88,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let prefill_policy = ctx
+            .policy_registry
+            .create_policy(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy = ctx
+            .policy_registry
+            .create_policy(decode_policy_config.unwrap_or(main_policy_config));
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
@@ -126,10 +127,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let prefill_policy = ctx
+            .policy_registry
+            .create_policy(prefill_policy_config.unwrap_or(main_policy_config));
+        let decode_policy = ctx
+            .policy_registry
+            .create_policy(decode_policy_config.unwrap_or(main_policy_config));
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);

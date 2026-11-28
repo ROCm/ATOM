@@ -228,12 +228,17 @@ impl ConfigValidator {
             });
         }
 
-        if !(0.0..=1.0).contains(&config.kv_storage_weight) {
-            return Err(ConfigError::InvalidValue {
-                field: "kv_storage_weight".to_string(),
-                value: config.kv_storage_weight.to_string(),
-                reason: "Must be between 0 and 1".to_string(),
-            });
+        for (field, weight) in [
+            ("kv_storage_weight", config.kv_storage_weight),
+            ("kv_share_weight", config.kv_share_weight),
+        ] {
+            if !(0.0..=1.0).contains(&weight) {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: weight.to_string(),
+                    reason: "Must be between 0 and 1".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -474,6 +479,12 @@ mod tests {
             };
             let error = config.validate().unwrap_err();
             assert!(error.to_string().contains("kv_storage_weight"), "{error}");
+            let config = RouterConfig {
+                kv_share_weight: weight,
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("kv_share_weight"), "{error}");
         }
     }
 

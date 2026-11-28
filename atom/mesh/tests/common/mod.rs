@@ -286,7 +286,7 @@ pub async fn create_test_context(config: RouterConfig) -> (Arc<AppContext>, Prep
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::for_router(&config));
 
     // Initialize storage backends (Memory for tests)
     let response_storage = Arc::new(MemoryResponseStorage::new());
@@ -370,7 +370,7 @@ pub async fn create_test_context_with_parsers(
     // Initialize registries
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::for_router(&config));
 
     // Initialize storage backends (Memory for tests)
     let response_storage = Arc::new(MemoryResponseStorage::new());

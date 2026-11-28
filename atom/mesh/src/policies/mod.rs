@@ -17,6 +17,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod tiers;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
@@ -27,7 +28,10 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub(crate) use tiers::KvTiers;
 pub use tree::PrefixMatchResult;
+
+pub use crate::kv_tiers::TierWeights;
 
 /// Branch for selections that found no healthy candidate.
 pub const NO_HEALTHY_WORKERS: &str = "no_healthy_workers";
@@ -146,6 +150,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// With `--kv-events`, what a token of each tier below a worker's device cache counts
+    /// for in the match rate held against `cache_threshold`.
+    pub tier_weights: TierWeights,
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
@@ -156,6 +163,7 @@ impl Default for CacheAwareConfig {
     fn default() -> Self {
         Self {
             cache_threshold: 0.5,
+            tier_weights: TierWeights::default(),
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,

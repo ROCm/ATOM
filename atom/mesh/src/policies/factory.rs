@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, TierWeights,
 };
 use crate::config::PolicyConfig;
 
@@ -14,6 +14,15 @@ pub struct PolicyFactory;
 impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        Self::create_from_config_with_tier_weights(config, TierWeights::default())
+    }
+
+    /// Create a policy from configuration for a router: a cache-aware one counts the KV
+    /// tiers below a worker's device cache at the router's `tier_weights`
+    pub fn create_from_config_with_tier_weights(
+        config: &PolicyConfig,
+        tier_weights: TierWeights,
+    ) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -28,6 +37,7 @@ impl PolicyFactory {
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
+                    tier_weights,
                     balance_abs_threshold: *balance_abs_threshold,
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
@@ -50,12 +60,26 @@ impl PolicyFactory {
 
     /// Create a policy by name (for dynamic loading)
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
+        Self::create_by_name_with_tier_weights(name, TierWeights::default())
+    }
+
+    /// Create a policy by name for a router, a cache-aware one with its `tier_weights`
+    pub fn create_by_name_with_tier_weights(
+        name: &str,
+        tier_weights: TierWeights,
+    ) -> Option<Arc<dyn LoadBalancingPolicy>> {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
-            "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "cache_aware" | "cacheaware" => {
+                let config = CacheAwareConfig {
+                    tier_weights,
+                    ..Default::default()
+                };
+                Some(Arc::new(CacheAwarePolicy::with_config(config)))
+            }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             _ => None,
         }

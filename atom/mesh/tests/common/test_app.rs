@@ -42,7 +42,7 @@ pub fn create_test_app(
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::for_router(router_config));
 
     // Initialize storage backends
     let response_storage = Arc::new(MemoryResponseStorage::new());
@@ -159,7 +159,7 @@ pub async fn create_test_app_context() -> (Arc<AppContext>, PreparePoolRuntime) 
 
     // Initialize registries
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+    let policy_registry = Arc::new(PolicyRegistry::for_router(&router_config));
 
     // Initialize storage backends
     let response_storage = Arc::new(MemoryResponseStorage::new());
