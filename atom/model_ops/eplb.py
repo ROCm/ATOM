@@ -2187,6 +2187,13 @@ class EPLBManager:
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
+        # The window holds no real (non-dummy pure-prefill) load, e.g. only
+        # warm-up/dummy steps ran: a plan from zeros is meaningless, and with
+        # ATOM_EPLB_MAX_REBALANCES it would freeze that placement for good.
+        # Skip without counting. The load is all-reduced, so every rank agrees.
+        if int(physical_load.sum().item()) == 0:
+            logger.info("EPLB gate @interval: window has no load -> SKIP")
+            return
         if not self._need_rebalance(physical_load):
             return
         yield from self._execute_rebalance()

@@ -287,7 +287,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not. The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
+| **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not, nor does one whose load window is empty (only dummy or warm-up steps ran since startup). The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
 
 ## Fusion passes
 
