@@ -63,7 +63,6 @@ export ATOM_GDN_STATE_MIDSTEP=1
 # PrefillDelayer: protect 4 decode passes after each prefill; coalesce longer
 # from CONC 32 up.
 export ATOM_PREFILL_DECODE_INTERVAL=4
-export ATOM_PREFILL_INITIAL_RAMP=0
 export ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000
 if [ "${CONC}" -ge 32 ]; then
   export ATOM_PREFILL_DELAYER_STALL_TICKS=15

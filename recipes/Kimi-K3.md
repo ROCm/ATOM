@@ -154,13 +154,11 @@ the MLA layers:
 - At bs=1 K2 on the MLA layers cut the step ITL from 16.5 to 14.8 ms. The
   benchmark below has no C1 number for the old default (8 rows, no K2).
 
-`ATOM_PREFILL_DECODE_INTERVAL=1000000` with `ATOM_PREFILL_INITIAL_RAMP=0` delays
-admitting a new prefill while any request is decoding, using the existing
-`PrefillDelayer` (`atom/model_engine/prefill_delayer.py`) in its local mode
-(DP=1, PP=1). After a prefill runs, the interval holds further prefill until the
-running-decode count reaches zero, so for the agentic trace requests mostly
-decode one at a time. The initial ramp is off because it would release queued
-full-chunk prompts ahead of the interval each time decode drains. It
+`ATOM_PREFILL_DECODE_INTERVAL=1000000` delays admitting a new prefill while any
+request is decoding, using the existing `PrefillDelayer`
+(`atom/model_engine/prefill_delayer.py`) in its local mode (DP=1, PP=1). After a
+prefill runs, the interval holds further prefill until the running-decode count
+reaches zero, so for the agentic trace requests mostly decode one at a time. It
 is not a hard bs=1 guarantee: while another request is in chunked prefill the
 running-decode count is zero, so a second request can be admitted then and two
 can decode together afterward. Launch with

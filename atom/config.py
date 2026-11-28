@@ -2311,7 +2311,7 @@ class Config:
     # Prefill admission (`--prefill-admit-policy`): "interval" keeps
     # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
     # with the rent-or-buy rule in prefill_delayer.py. With a positive interval
-    # or "adaptive", ATOM_PREFILL_INITIAL_RAMP releases full chunks ahead of
+    # or "adaptive", ATOM_PREFILL_INITIAL_RAMP=1 releases full chunks ahead of
     # them while every rank can fill one (prefill_delayer.py, "Initial ramp").
     prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512

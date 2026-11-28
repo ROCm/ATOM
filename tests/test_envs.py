@@ -100,7 +100,7 @@ class TestEnvsDefaults:
     """Test default values when env vars are NOT set."""
 
     def test_initial_ramp_default(self):
-        assert _get_envs().ATOM_PREFILL_INITIAL_RAMP is True
+        assert _get_envs().ATOM_PREFILL_INITIAL_RAMP is False
 
     @pytest.mark.parametrize(
         "value,expected",

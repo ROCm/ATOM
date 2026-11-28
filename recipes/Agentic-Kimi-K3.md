@@ -46,7 +46,7 @@ changes.
 | Speculative decoding | DSpark (`--method dspark`), not native MTP |
 | Synthetic acceptance | `--spec-decode-acceptance-length` (performance-only; see below) |
 | Prefill attention | FlyDSL FP8 (`ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1`), every band |
-| PrefillDelayer | CONC ≥ 16: `ATOM_PREFILL_DECODE_INTERVAL=4` (4 decode passes after each prefill), `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`, `ATOM_PREFILL_INITIAL_RAMP=0` |
+| PrefillDelayer | CONC ≥ 16: `ATOM_PREFILL_DECODE_INTERVAL=4` (4 decode passes after each prefill), `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` |
 | Profiling duration | 3,600 seconds |
 | Warmup | 10 additional one-token requests per lane |
 | AIPerf | `0.12.0` (`agentx-v1.0.4`) |
@@ -89,8 +89,7 @@ seven speculative tokens); mono now serves any step up to 64 rows, with or
 without ReplaySSM, but the other bands have not been measured with it on, so
 they keep it off here.
 
-`ATOM_PREFILL_DECODE_INTERVAL=4`, `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` and
-`ATOM_PREFILL_INITIAL_RAMP=0` (the interval as measured, no ramp ahead of it) on
+`ATOM_PREFILL_DECODE_INTERVAL=4` and `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` on
 **C16 and up**; unset on C1…C14.
 
 The 4-token draft was measured at C14, C16, C48, C56 and C72; the other bands
@@ -233,7 +232,6 @@ AITER_REUSE_IDENTICAL_COMM_GROUPS="${AITER_REUSE_IDENTICAL_COMM_GROUPS:-0}"
 export AITER_REUSE_IDENTICAL_COMM_GROUPS
 if [[ "${CONC}" -ge 16 ]]; then
   export ATOM_PREFILL_DECODE_INTERVAL="${ATOM_PREFILL_DECODE_INTERVAL:-4}"
-  export ATOM_PREFILL_INITIAL_RAMP="${ATOM_PREFILL_INITIAL_RAMP:-0}"
   export ATOM_PREFILL_DELAYER_MAX_QUEUE_MS="${ATOM_PREFILL_DELAYER_MAX_QUEUE_MS:-5000}"
 fi
 export ATOM_ENABLE_REPLAYSSM
