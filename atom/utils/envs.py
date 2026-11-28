@@ -895,6 +895,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # MiniMax-M3.1 DSpark, one request: run the block's K Markov steps in one
+    # persistent launch (aiter's markov_argmax_chain, gfx1250;
+    # atom/model_ops/dspark_markov_chain.py) instead of K two-stage
+    # dspark_markov_argmax steps. Bit-identical to the two-stage path, which
+    # keeps every step the chain does not serve. "0" keeps the two-stage path,
+    # e.g. when the chain raises because something else holds CUs of the GPU.
+    # Applies only under ATOM_DSPARK_FUSED_MARKOV_SAMPLE=1, whose "0" samples
+    # with the unfused reference instead. Read once, at the first step the
+    # chain could serve.
+    "ATOM_DSPARK_FUSED_MARKOV_CHAIN": lambda: _flag_env(
+        "ATOM_DSPARK_FUSED_MARKOV_CHAIN", "1"
+    ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
     # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
