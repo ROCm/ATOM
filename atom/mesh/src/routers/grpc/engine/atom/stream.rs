@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2026 ATOM Project Contributors
-//! ATOM's Generate stream as `TokenChunk`s. A GenerateError keeps the HTTP
-//! status ATOM's HTTP routes answer the same request with.
+//! ATOM's Generate stream, or a Session request's stream of the same messages, as
+//! `TokenChunk`s. A GenerateError keeps the HTTP status ATOM's HTTP routes answer.
 
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use futures::{Stream, StreamExt};
 use http::StatusCode;
-use tonic::Streaming;
+use tonic::{Status, Streaming};
 
 use super::AtomClient;
 use crate::atom_engine::grpc::{
@@ -22,9 +22,9 @@ use crate::routers::token_handle::token_chunk::{
 };
 use crate::routers::token_handle::token_handle::{SourceClock, TokenSource};
 
-pub(crate) struct AtomStream {
-    inner: Streaming<GenerateResponse>,
-    /// The first message, read by `open`.
+pub(crate) struct AtomStream<S = Streaming<GenerateResponse>> {
+    inner: S,
+    /// The first message, read by `start`.
     first: Option<TokenChunk>,
     /// Unstreamed, each sibling's Complete arrives as it ends; all are read, then
     /// handed out by index.
@@ -35,8 +35,7 @@ pub(crate) struct AtomStream {
 }
 
 impl AtomStream {
-    /// Starts the call and reads its first message, so a request ATOM refuses
-    /// fails here, before a response has begun.
+    /// Starts the call and reads its first message, as `start` does.
     pub(crate) async fn open(
         client: &AtomClient,
         request: GenerateRequest,
@@ -47,6 +46,18 @@ impl AtomStream {
             .generate(request)
             .await
             .map_err(EngineError::Transport)?;
+        Self::start(inner, streamed, started).await
+    }
+}
+
+impl<S: Stream<Item = Result<GenerateResponse, Status>> + Unpin> AtomStream<S> {
+    /// Reads `inner`'s first message, so a request ATOM refuses fails here,
+    /// before a response has begun. `started`: when the call began.
+    pub(crate) async fn start(
+        inner: S,
+        streamed: bool,
+        started: Instant,
+    ) -> Result<Self, EngineError> {
         let mut stream = Self {
             inner,
             first: None,
@@ -68,7 +79,7 @@ impl AtomStream {
     }
 }
 
-impl Stream for AtomStream {
+impl<S: Stream<Item = Result<GenerateResponse, Status>> + Unpin> Stream for AtomStream<S> {
     type Item = Result<TokenChunk, EngineError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -121,9 +132,11 @@ impl Stream for AtomStream {
     }
 }
 
-impl TokenSource for AtomStream {
-    /// Nothing to suppress: a cancelled call is ATOM's abort, and a finished
-    /// call has nothing left to cancel.
+impl<S: Stream<Item = Result<GenerateResponse, Status>> + Send + Unpin> TokenSource
+    for AtomStream<S>
+{
+    /// Nothing to suppress: a cancelled call or a dropped Session request is
+    /// ATOM's abort, and a finished one has nothing left to cancel.
     fn mark_completed(&mut self) {}
 
     /// `open` reads the first message before any renderer starts its clock.
