@@ -113,7 +113,10 @@ class AtomEngineServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def Session(self, request_iterator, context):
-        """Many requests on one stream: each Frames is one engine_v1 message.
+        """Many requests on one stream: each Frames is one engine_v1 message. A client's
+        seq_ids lie below 2^24, 1 << _SEQ_ID_SHIFT (frontend_workers.py), which SEQ_IDS
+        in atom/mesh/src/routers/grpc/engine/atom/session.rs must equal. A client that
+        leaves 4096 messages unread ends its Session with RESOURCE_EXHAUSTED.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

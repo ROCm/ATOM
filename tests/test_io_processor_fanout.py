@@ -134,6 +134,25 @@ class TestPreprocessFanout:
         assert all(s.stream_callback is cb for s in seqs)
 
 
+class TestCallerAssignedIds:
+    """The Session assigns its seqs' ids; 0 is one of them."""
+
+    def test_preprocess_takes_the_caller_s_id(self):
+        proc = _make_processor()
+        for seq_id in (0, 7):
+            seq = proc.preprocess("hello", SamplingParams(n=1), seq_id=seq_id)
+            assert seq.id == seq_id and proc.requests[seq_id] is seq
+        assert next(Sequence.counter) == 0  # no id was drawn
+
+    def test_fanout_takes_one_caller_id_per_sibling(self):
+        proc = _make_processor()
+        sp = SamplingParams(n=2, temperature=0.8)
+        seqs = proc.preprocess_fanout("hello", sp, seq_ids=[0, 5])
+        assert [s.id for s in seqs] == [0, 5]
+        with pytest.raises(ValueError, match="seq_ids length 1 does not match n=2"):
+            proc.preprocess_fanout("hello", sp, seq_ids=[9])
+
+
 class TestStopTokenSequences:
     """Stops given as ids (gRPC's Generate) reach the seq through `preprocess`."""
 
