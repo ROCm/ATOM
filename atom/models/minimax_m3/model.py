@@ -32,6 +32,7 @@ from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
+    gemma_rms_norm_mxfp8_quant,
 )
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -158,6 +159,12 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
+
+
+def _linear_consumes_mxfp8(linear: nn.Module) -> bool:
+    """Whether a linear takes native MXFP8 input (E4M3 + row-major group-32
+    E8M0, what its own `quantize_fp8` would make)."""
+    return linear.native_a8_group_rows is not None and not linear.runs_bf16
 
 
 def _minimax_m3_cos_sin_cache(
@@ -358,7 +365,21 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def takes_shared_mxfp8_input(self) -> bool:
+        """Whether `forward` can take the shared expert's MXFP8 input from the
+        caller: a separate shared MLP whose gate_up is a native MXFP8 linear."""
+        return self.shared_experts is not None and _linear_consumes_mxfp8(
+            self.shared_experts.gate_up_proj
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_x: torch.Tensor | None = None,
+        shared_x_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`shared_x`, `shared_x_scale`: the shared expert's MXFP8 input, the
+        quant of `hidden_states` its gate_up would make itself."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -370,7 +391,12 @@ class MiniMaxM3MoE(nn.Module):
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
-        if self.shared_experts is not None:
+        if shared_x is not None:
+            routed_output = routed_output + self.shared_experts(
+                shared_x.view(-1, orig_shape[-1]),
+                x_scale=shared_x_scale.view(hidden_states.shape[0], -1),
+            )
+        elif self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
         return routed_output.view(orig_shape)
@@ -688,6 +714,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
+        # TP 1 with ATOM_M3_TP1_NORM_MXFP8: a native MXFP8 consumer's input comes
+        # out of the norm, quantized in the same aiter launch (the dense MLP's
+        # gate_up, or the MoE's shared expert while the routed experts take the
+        # bf16 row).
+        tp1 = (
+            envs.ATOM_M3_TP1_NORM_MXFP8 and get_tensor_model_parallel_world_size() == 1
+        )
+        input_norm_mxfp8 = tp1 and _linear_consumes_mxfp8(self.self_attn.qkv_proj)
+        post_attention_norm_mxfp8 = tp1 and (
+            self.block_sparse_moe.takes_shared_mxfp8_input()
+            if self.is_moe_layer
+            else _linear_consumes_mxfp8(self.mlp.gate_up_proj)
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -696,6 +735,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.input_layernorm
                 )
+            )
+        elif input_norm_mxfp8:
+            hidden_states, hidden_states_scale, residual = gemma_rms_norm_mxfp8_quant(
+                hidden_states, residual, self.input_layernorm
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
@@ -719,6 +762,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.post_attention_layernorm
                 )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif post_attention_norm_mxfp8 and self.is_moe_layer:
+            shared_x, shared_x_scale, hidden_states, residual = (
+                gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    emit_bf16=True,
+                )
+            )
+            hidden_states = ffn(
+                hidden_states, shared_x=shared_x, shared_x_scale=shared_x_scale
+            )
+        elif post_attention_norm_mxfp8:
+            hidden_states, hidden_states_scale, residual = gemma_rms_norm_mxfp8_quant(
+                hidden_states, residual, self.post_attention_layernorm
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
         else:

@@ -1083,6 +1083,48 @@ def fused_allreduce_gemma_rms_norm_quant(
     return out_fp8, scale_out, residual_out
 
 
+def gemma_rms_norm_mxfp8_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+    emit_bf16: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """MiniMax-M3 helper at TP 1: residual add + Gemma RMSNorm + the group-32
+    MXFP8 quant (E4M3 + E8M0, `quantize_fp8`'s rule) of the normed row in one
+    aiter launch (E8M0 group quant, ROCm/aiter#8017). Returns (E4M3, E8M0
+    scales, residual); `emit_bf16` also returns the normed row before the
+    residual."""
+    shape = hidden_states.shape
+    x = hidden_states.view(-1, shape[-1])
+    out_fp8 = torch.empty(x.shape, dtype=aiter.dtypes.fp8, device=x.device)
+    scale_out = torch.empty(
+        (x.shape[0], shape[-1] // 32), dtype=torch.float8_e8m0fnu, device=x.device
+    )
+    residual_out = torch.empty_like(x)
+    normed = torch.empty_like(x) if emit_bf16 else None
+    fused_qk_rmsnorm_group_quant(
+        out_fp8,
+        scale_out,
+        x,
+        norm.weight.data,
+        norm.variance_epsilon,
+        q_out_unquantized=normed,
+        q_res_out=residual_out,
+        q_residual=residual.view(-1, shape[-1]),
+        group_size=32,
+        gemma_norm=True,
+    )
+    out_fp8 = out_fp8.view(shape)
+    scale_out = scale_out.view(*shape[:-1], shape[-1] // 32)
+    residual_out = residual_out.view(shape)
+    if emit_bf16:
+        return out_fp8, scale_out, normed.view(shape), residual_out
+    return out_fp8, scale_out, residual_out
+
+
 # ---------------------------------------------------------------------------
 # Fused Q/K RMSNorm Triton kernel
 # ---------------------------------------------------------------------------
