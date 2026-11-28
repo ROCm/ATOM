@@ -1456,6 +1456,24 @@ class LinearBase(nn.Module):
                     self.weight_scale.data = shuffle_mxfp8_bpreshuffle_scale(
                         self.weight_scale.data
                     )
+            if getattr(self, "_qkv_chain", False):
+                from atom.model_ops.minimax_m3 import qkv_chain
+
+                if getattr(self.weight, "is_shuffled", False):
+                    self._qkv_chain_scale = qkv_chain.chain_weight_scale(
+                        self.weight_scale.data
+                    )
+                    qkv_chain.warm(self.weight, self._qkv_chain_scale)
+                    qkv_chain.note_layer(True)
+                else:
+                    # the chain's GEMM reads the (16, 16)-preshuffled weight layout only
+                    logger.warning(
+                        "%s: ATOM_M3_QKV_CHAIN needs a preshuffled MXFP8 weight "
+                        "(ATOM_GROUP32_WEIGHT_PRESHUFFLE); chain off for this layer",
+                        self.prefix,
+                    )
+                    self._qkv_chain = False
+                    qkv_chain.note_layer(False)
             return
         if self.weight.numel() == 0:
             return
@@ -1717,6 +1735,21 @@ class LinearBase(nn.Module):
         if self.runs_bf16:
             assert x_scale is None, "the BF16 fallback takes unquantized input"
             y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+        elif (
+            getattr(self, "_qkv_chain_scale", None) is not None
+            and x_scale is None
+            and self.bias is None
+        ):
+            # ATOM_M3_QKV_CHAIN: decode rows the chain takes only quantize here (see minimax_m3/qkv_chain.py)
+            from atom.model_ops.minimax_m3 import qkv_chain
+
+            y = qkv_chain.qkv_front(
+                x,
+                self.weight,
+                self.weight_scale,
+                self._qkv_chain_scale,
+                bool(getattr(self.weight, "is_shuffled", False)),
+            )
         elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
