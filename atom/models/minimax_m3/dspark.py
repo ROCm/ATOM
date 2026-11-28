@@ -54,13 +54,28 @@ The draft ships no embedding or LM head; both are the target's.
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+import triton
+import triton.language as tl
 from aiter import QuantType, dtypes
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.rotary_embedding import get_rope
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import QuantizationConfig
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.kv_transfer.disaggregation import kv_config_has_producer
+from atom.model_ops.blockscale import native_quant_linear
+from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
+from atom.model_ops.dspark_markov_stage1 import (
+    BLOCK_K,
+    BLOCK_V,
+    markov_launch_geometry,
+    markov_logits_tile_of,
+)
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -69,6 +84,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     sparse_pa_per_row,
     to_page16_shuffle,
 )
+from atom.model_ops.tile_argmax import argmax_lowest_id
 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
     triton_fused_norm_rope_cache,
 )
@@ -81,7 +97,16 @@ from atom.models.dspark_draft import (
     draft_quant_config,
     linear_out,
 )
+from atom.models.minimax_m3.draft_fused import gemma_rmsnorm_mxfp8
 from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.models.minimax_m3.packed_argmax import (
+    EMPTY,
+    EMPTY_K,
+    pack_max_id,
+    ranks_best,
+    unpack_id,
+)
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -149,6 +174,200 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+
+
+# Request counts, table widths and ids vary per step: no per-value variants
+# (Triton would otherwise specialize on ==1 and divisibility by 16 and compile
+# a new one mid-serving or mid-capture).
+@triton.jit(do_not_specialize=["bt_stride", "vocab_max", "scheduled_bs", "W"])
+def _block_meta_kernel(
+    anchor_ptr,  # [running_bs] int64, each row's anchor position; STAGE: written
+    bt_ptr,  # [running_bs, W] int32 page-128 ids, row stride bt_stride
+    bt_stride,
+    alloc_ptr,  # [running_bs] int32, pages each row holds (pad rows: read as 1)
+    next_ids_ptr,  # STAGE: [scheduled_bs] each row's verified anchor token
+    positions_ptr,  # STAGE: the target step's positions
+    rows_ptr,  # STAGE: [scheduled_bs] each anchor's row in them
+    ids_out_ptr,  # STAGE: [running_bs] the block's anchor ids (0 on pad rows)
+    vocab_max,
+    pos_ptr,  # [running_bs, T] int64 out: the block's positions
+    slot_ptr,  # [running_bs, T] int64 out: its KV slots, -1 dropped
+    ctx_ptr,  # [running_bs] int32 out: anchor + 1 + T (PAD_CTX on pad rows)
+    rows_bt_ptr,  # [running_bs * T, PW] int32 out: each row's page-16 window table
+    rows_len_ptr,  # [running_bs * T] int32 out: each row's key count from its table start
+    scheduled_bs,
+    W,
+    T: tl.constexpr,
+    TP: tl.constexpr,
+    ENTRY: tl.constexpr,
+    WINDOW: tl.constexpr,
+    PW: tl.constexpr,
+    PWP: tl.constexpr,
+    PAD_CTX: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    """One request row of the block's metadata, everything the generic torch
+    path (``DSparkProposer._build_paged_block_metadata`` + ``prepare_paged_block``)
+    builds in ~30 launches: positions, slots (dropped past the table, past the
+    allocation and on pad rows), the context length, and each block row's
+    page-16 table from the page holding its window's first key, with its key
+    count. The tables hold only the ``PW`` pages a window can span rather than
+    the whole context's; the per-row decode reads a row's table up to its key
+    count, so the read is the same. ``STAGE``: also stages the row's anchor id
+    and position (``_stage_anchors_kernel``) before using them."""
+    i = tl.program_id(0)
+    real = i < scheduled_bs
+    if STAGE:
+        token = tl.load(next_ids_ptr + i, mask=real, other=0)
+        tl.store(
+            ids_out_ptr + i, tl.minimum(tl.maximum(token, 0), vocab_max).to(tl.int32)
+        )
+        row = tl.load(rows_ptr + i, mask=real, other=0)
+        anchor = tl.load(positions_ptr + row, mask=real, other=0).to(tl.int64)
+        tl.store(anchor_ptr + i, anchor)
+    else:
+        anchor = tl.load(anchor_ptr + i)
+    alloc_tok = (
+        tl.where(real, tl.maximum(tl.load(alloc_ptr + i), 1), 1).to(tl.int64) * ENTRY
+    )
+    j = tl.arange(0, TP)
+    jm = j < T
+    pos = anchor + 1 + j
+    tl.store(pos_ptr + i * T + j, pos, mask=jm)
+    page = pos // ENTRY
+    in_table = page < W
+    bt_row = bt_ptr + i.to(tl.int64) * bt_stride
+    pg = tl.load(bt_row + tl.minimum(page, W - 1), mask=jm, other=0).to(tl.int64)
+    slot = pg * ENTRY + pos % ENTRY
+    slot = tl.where(in_table & real & (pos < alloc_tok), slot, -1)
+    tl.store(slot_ptr + i * T + j, slot, mask=jm)
+    ctx = tl.where(real, anchor + 1 + T, PAD_CTX)
+    tl.store(ctx_ptr + i, ctx.to(tl.int32))
+    ctx_eff = tl.minimum(ctx, alloc_tok)
+    start16 = tl.maximum(pos - (WINDOW - 1), 0) // 16
+    start16 = tl.where(real, start16, 0)
+    tl.store(rows_len_ptr + i * T + j, (ctx_eff - start16 * 16).to(tl.int32), mask=jm)
+    e = tl.arange(0, PWP)
+    p16 = start16[:, None] + e[None, :]
+    p128 = p16 // 8
+    em = jm[:, None] & (e[None, :] < PW)
+    pgs = tl.load(bt_row + p128, mask=em & (p128 < W), other=0)
+    entry = tl.where(real, pgs * 8 + (p16 % 8), e[None, :] % 8)
+    out = (i * T + j)[:, None].to(tl.int64) * PW + e[None, :]
+    tl.store(rows_bt_ptr + out, entry.to(tl.int32), mask=em)
+
+
+@triton.jit(do_not_specialize=["vocab_start", "vocab_end", "noise_id"])
+def _block_embed_kernel(
+    anchor_ptr,  # [B] anchor ids
+    weight_ptr,  # [V / tp, D] this rank's rows of the table
+    out_ptr,  # [B * T, D]
+    vocab_start,
+    vocab_end,
+    noise_id,
+    stride_w,
+    D,
+    T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    r = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    tok = tl.where(r % T == 0, tl.load(anchor_ptr + r // T), noise_id)
+    in_range = (tok >= vocab_start) & (tok < vocab_end)
+    emb = tl.load(
+        weight_ptr + (tok - vocab_start).to(tl.int64) * stride_w + cols,
+        mask=in_range & (cols < D),
+        other=0.0,
+    )
+    tl.store(out_ptr + r.to(tl.int64) * D + cols, emb, mask=cols < D)
+
+
+@triton.jit
+def _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W: tl.constexpr):
+    """The id of the largest packed value over the W ranks' rows ``[W, B]``."""
+    return unpack_id(ranks_best(gathered_ptr, offs_row, row_mask, num_rows, W, 1))
+
+
+@triton.jit
+def _markov_step_atomic(
+    base_ptr,  # this position's base logits, this rank's vocab shard, rows strided
+    prev_ids_ptr,  # FIRST: [B] the anchors
+    gathered_ptr,  # not FIRST: [W, B] int64, every rank's packed best of the previous position
+    prev_packed_ptr,  # not FIRST: [B] int64, this rank's packed best of the previous position (reset here)
+    out_prev_ptr,  # not FIRST: the previous position's column of the [B, T] ids
+    w1_ptr,
+    w2_ptr,
+    packed_ptr,  # [B] int64: this position's best on this rank, atomic_max (reset by the next launch)
+    num_rows,
+    vocab_size,
+    rank,
+    stride_base_row,
+    stride_prev,
+    stride_out,
+    stride_w1_vocab,
+    stride_w2_vocab,
+    vocab_offset,
+    FIRST: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One block position of the sharded greedy Markov block in one launch: the
+    previous position's cross-rank winner (tile 0 also writes it into the
+    previous column and resets this rank's previous packed best), the bias
+    GEMV of `markov_logits_tile_of`, and each tile's (max, lowest id) folded
+    into the row's packed best by ``atomic_max``: the reduction launch of
+    `dspark_markov_argmax` without the launch. The same values and tie rule,
+    so the same ids."""
+    tile = tl.program_id(0)
+    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    row_mask = offs_row < num_rows
+    v_mask = offs_v < vocab_size
+    if FIRST:
+        prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    else:
+        prev = _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W)
+        if tile == 0:
+            tl.store(out_prev_ptr + offs_row * stride_out, prev, mask=row_mask)
+            tl.store(
+                prev_packed_ptr + offs_row,
+                tl.full([BLOCK_ROW], EMPTY_K, tl.int64),
+                mask=row_mask,
+            )
+    vals = markov_logits_tile_of(
+        prev, base_ptr, w1_ptr, w2_ptr, base_ptr, tile, offs_row, offs_v, row_mask,
+        v_mask, rank, stride_base_row, stride_w1_vocab, 0, stride_w2_vocab,
+        vocab_offset, BLOCK_ROW, BLOCK_V, BLOCK_K, False,
+    )  # fmt: skip
+    tile_max, tile_idx = argmax_lowest_id(
+        vals, offs_v[None, :], v_mask[None, :], 2147483647
+    )
+    hit = tile_idx != 2147483647
+    packed = pack_max_id(tile_max, tile_idx + vocab_offset)
+    tl.atomic_max(packed_ptr + offs_row, packed, mask=row_mask & hit, sem="relaxed")
+
+
+@triton.jit
+def _markov_last_atomic(
+    gathered_ptr,
+    packed_ptr,
+    out_ptr,
+    num_rows,
+    stride_out,
+    W: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """The last position's cross-rank winner into its column; resets this rank's
+    packed best for the next block."""
+    offs_row = tl.program_id(0) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    row_mask = offs_row < num_rows
+    best_id = _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W)
+    tl.store(out_ptr + offs_row * stride_out, best_id, mask=row_mask)
+    tl.store(
+        packed_ptr + offs_row, tl.full([BLOCK_ROW], EMPTY_K, tl.int64), mask=row_mask
+    )
 
 
 class M3DSparkAttention(nn.Module):
@@ -277,13 +496,18 @@ class M3DSparkAttention(nn.Module):
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+    ):
         """The block pass: non-causal attention over ``[context | block]``.
 
         Write the block's K/V at the block slots the proposer masked to the
         request's allocated pages -- an unallocated column reads as page 0, a
         page another request owns (under prefix caching, a shared prefix) --
-        then decode per row.
+        then decode per row. ``x_scale``: ``hidden_states`` is already MXFP8.
         """
         if self.num_kv_heads != 1:
             # Before any K/V is written: only a P/D producer, which never
@@ -292,7 +516,7 @@ class M3DSparkAttention(nn.Module):
                 f"The block pass decodes one KV head per rank; this rank holds "
                 f"{self.num_kv_heads} of {self.total_num_kv_heads}"
             )
-        qkv = linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states, x_scale=x_scale))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
@@ -341,6 +565,19 @@ class M3DSparkAttention(nn.Module):
         return out.view(rows, -1)
 
 
+def _is_native_mxfp8(lin) -> bool:
+    """``lin`` runs the native MXFP8 1x32 path on a quantized input (not a
+    weight dequantized to bf16, not another weight format)."""
+    weight = getattr(lin, "weight", None)
+    return (
+        getattr(lin, "native_a8_group_rows", None) == 1
+        and not getattr(lin, "runs_bf16", False)
+        and weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and getattr(lin, "weight_scale", None) is not None
+    )
+
+
 class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
     """One draft layer: pre-norm attention + pre-norm dense SwiGLU-OAI MLP."""
 
@@ -372,6 +609,32 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    def forward(self, positions, hidden_states, residual=None):
+        # Both norms feed a native MXFP8 linear (qkv_proj, gate_up_proj): write
+        # its quantized input directly instead of bf16 + a quantize pass.
+        # Checked per call: a linear's mode can change as the weights load.
+        if not all(
+            _is_native_mxfp8(lin)
+            for lin in (self.self_attn.qkv_proj, self.mlp.gate_up_proj)
+        ):
+            return super().forward(positions, hidden_states, residual)
+        norm = self.input_layernorm
+        if residual is None:
+            residual = hidden_states
+            xq, xs, _ = gemma_rmsnorm_mxfp8(
+                hidden_states, norm.weight, norm.variance_epsilon
+            )
+        else:
+            xq, xs, residual = gemma_rmsnorm_mxfp8(
+                hidden_states, norm.weight, norm.variance_epsilon, residual
+            )
+        hidden_states = self.self_attn(positions, xq, x_scale=xs)
+        norm = self.post_attention_layernorm
+        xq, xs, residual = gemma_rmsnorm_mxfp8(
+            hidden_states, norm.weight, norm.variance_epsilon, residual
+        )
+        return self.mlp(xq, x_scale=xs), residual
 
 
 class MiniMaxM3DSpark(DSparkDraftModel):
@@ -448,6 +711,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             if getattr(config, "enable_confidence_head", False)
             else None
         )
+        # Only a confidence-scheduled verify reads the head (the proposer drops
+        # it otherwise), so the block skips its GEMM.
+        self.emit_confidence = self.confidence_head is not None and bool(
+            atom_config.dspark.confidence_schedule
+        )
 
         # Bound by share_with_target(); the checkpoint ships neither.
         self.embed_tokens = None
@@ -457,6 +725,83 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
+        # `_context_kv_weight`, built on first use (after the weights load)
+        self._ctx_kv = None
+        # `_markov_atomic`'s per-position packed bests, allocated with the
+        # block rows
+        self._mk_packed = None
+
+    def _context_kv_weight(self):
+        """The K/V rows of every context layer's qkv_proj as one MXFP8 weight
+        ``[layers * 2 * kv, hidden]`` (and its E8M0 scales): one GEMM gives
+        every layer's context K/V, the q rows each layer's projection would
+        compute and drop are not read. The bytes are the layers' own, copied
+        (``make_row_view`` slices whole 16-row shuffle tiles). None where a
+        layer's projection is not native MXFP8 1x32. The copy is made once,
+        after the weights load; weights are not updated in place afterwards."""
+        if self._ctx_kv is None:
+            if torch.cuda.is_current_stream_capturing():
+                # built only eagerly: a recording would put it in its private pool
+                return None
+            attns = [layer.self_attn for layer in self.context_layers]
+            projs = [a.qkv_proj for a in attns]
+            a0 = attns[0]
+            if not all(_is_native_mxfp8(p) for p in projs) or any(
+                p.bias is not None or getattr(p, "is_output_padded", False)
+                for p in projs
+            ):
+                self._ctx_kv = ()
+            else:
+                try:
+                    views = [p.make_row_view(a0.q_size, 2 * a0.kv_size) for p in projs]
+                except ValueError:  # offsets not tile-aligned at this TP size
+                    self._ctx_kv = ()
+                else:
+                    self._ctx_kv = (
+                        torch.cat([v.weight.data for v in views], dim=0),
+                        torch.cat([v.weight_scale.data for v in views], dim=0),
+                        bool(getattr(views[0].weight, "is_shuffled", False)),
+                    )
+        return self._ctx_kv or None
+
+    def write_context_kv(
+        self, taps, positions, slot_mapping=None, pcp_num_tokens=None
+    ) -> None:
+        """The context K/V of every layer from one GEMM over one quantized
+        ``hidden_norm(fc(taps))`` (see ``_context_kv_weight``)."""
+        kv_weight = None
+        if (
+            pcp_num_tokens is None
+            and not get_forward_context().context.is_dummy_run
+            and self.layers[0].self_attn.kv.bound
+        ):
+            kv_weight = self._context_kv_weight()
+        if kv_weight is None:
+            return super().write_context_kv(
+                taps, positions, slot_mapping, pcp_num_tokens
+            )
+        weight, scale, shuffled = kv_weight
+        norm = self.hidden_norm
+        xq, xs, _ = gemma_rmsnorm_mxfp8(
+            linear_out(self.fc(self.concat_taps(taps))),
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        kv = native_quant_linear(
+            xq,
+            weight,
+            scale,
+            x_scale=xs,
+            weight_group_rows=1,
+            weight_preshuffled=shuffled,
+        )
+        for i, layer in enumerate(self.context_layers):
+            attn = layer.self_attn
+            k = kv[:, (2 * i) * attn.kv_size : (2 * i + 1) * attn.kv_size]
+            v = kv[:, (2 * i + 1) * attn.kv_size : (2 * i + 2) * attn.kv_size]
+            attn._norm_rope_write(
+                k, k, v, 0, positions, slot_mapping, attn._bound_cache()
+            )
 
     # ---- drafting entry points (called by the proposer) --------------------
 
@@ -481,6 +826,12 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._alloc_markov_packed(T, device)
+
+    def _alloc_markov_packed(self, num_draft: int, device) -> None:
+        self._mk_packed = torch.full(
+            (num_draft, self.max_num_seqs), EMPTY, dtype=torch.int64, device=device
+        )
 
     def prepare_paged_block(
         self,
@@ -542,7 +893,181 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
+    def embed_block(self, input_ids, num_draft):
+        """The base block embedding, each row's id chosen in the lookup kernel
+        (the anchor at column 0, MASK past it); the same masked lookup and
+        all-reduce as the target's ``VocabParallelEmbedding``."""
+        embed = self.embed_tokens
+        if not hasattr(embed, "vocab_start_idx"):
+            return super().embed_block(input_ids, num_draft)
+        weight = embed.weight
+        assert weight.stride(1) == 1
+        rows, dim = input_ids.shape[0] * num_draft, weight.shape[1]
+        out = torch.empty(rows, dim, dtype=weight.dtype, device=weight.device)
+        block_d = 1024
+        _block_embed_kernel[(rows, triton.cdiv(dim, block_d))](
+            input_ids, weight, out, embed.vocab_start_idx,
+            embed.vocab_start_idx + weight.shape[0], self.noise_token_id,
+            weight.stride(0), dim, T=num_draft, BLOCK_D=block_d,
+        )  # fmt: skip
+        if embed.tp_size > 1:
+            out = get_tp_group().all_reduce(out, ca_fp8_quant=False)
+        return out
+
+    def fused_block_metadata_ok(self) -> bool:
+        """Whether `build_block_metadata` serves this draft: a sliding window
+        bounds the pages a block row reads."""
+        return self.sliding_window > 0
+
+    def build_block_metadata(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page-128 ids
+        anchor_positions: torch.Tensor,  # [running_bs] int64
+        block_positions: torch.Tensor,  # [running_bs, T] int64 out
+        slots: torch.Tensor,  # [running_bs, T] int64 out
+        ctx_lens: torch.Tensor,  # [running_bs] int32 out
+        allocated_pages,  # [>= scheduled_bs] host, or a device int32 tensor
+        scheduled_bs: int,
+        entry_tokens: int,
+        pad_ctx_len: int,
+        stage=None,  # (next_token_ids, positions, rows, ids_out): stage the anchors too
+    ) -> None:
+        """The block's metadata in one launch (`_block_meta_kernel`): what the
+        proposer's generic path and `prepare_paged_block` build, with compact
+        window tables. Buffers are allocated at ``max_num_seqs`` on the first
+        call (the warmup, ahead of any capture) and only sliced after.
+        ``allocated_pages`` as a device tensor (published with the step's
+        inputs) skips the host-to-device copy; ``stage`` writes the anchor ids
+        and positions in the same launch."""
+        running_bs, T = block_positions.shape
+        W = block_tables.shape[1]
+        pw = triton.cdiv(self.sliding_window + T + 16, 16) + 1
+        pw = triton.cdiv(pw, 8) * 8
+        if getattr(self, "_meta_key", None) != (T, pw):
+            max_bs, device = self.max_num_seqs, block_tables.device
+            self._meta_key = (T, pw)
+            self._meta_cap = None
+            self._meta_rows_bt = torch.zeros(
+                max_bs * T, pw, dtype=torch.int32, device=device
+            )
+            self._meta_rows_len = torch.zeros(
+                max_bs * T, dtype=torch.int32, device=device
+            )
+        if isinstance(allocated_pages, torch.Tensor):
+            alloc = allocated_pages
+        else:
+            if self._meta_cap is None:
+                self._meta_cap = AllocationCap(self.max_num_seqs, block_tables.device)
+            alloc = self._meta_cap.upload(allocated_pages, scheduled_bs, running_bs)
+        rows = running_bs * T
+        assert rows <= self._meta_rows_bt.shape[0], (running_bs, T)
+        rows_bt = self._meta_rows_bt[:rows]
+        rows_len = self._meta_rows_len[:rows]
+        if stage is None:
+            next_ids = positions = anchor_rows = ids_out = anchor_positions
+        else:
+            next_ids, positions, anchor_rows, ids_out = stage
+        _block_meta_kernel[(running_bs,)](
+            anchor_positions, block_tables, block_tables.stride(0), alloc,
+            next_ids, positions, anchor_rows, ids_out, int(self.vocab_size) - 1,
+            block_positions, slots, ctx_lens, rows_bt, rows_len,
+            scheduled_bs, W,
+            T=T, TP=triton.next_power_of_2(T), ENTRY=entry_tokens,
+            WINDOW=self.sliding_window, PW=pw, PWP=triton.next_power_of_2(pw),
+            PAD_CTX=pad_ctx_len, STAGE=stage is not None,
+            num_warps=4,  # [T, PW] tiles of one request row; more warps only idle
+        )  # fmt: skip
+        attn_metadata.dspark_bt16_rows = rows_bt
+        attn_metadata.dspark_ctx_rows = rows_len
+
+    def _sharded_markov_sample(self) -> bool:
+        """Whether the block is sampled off this rank's vocab shard: the ranks
+        exchange each position's ``(max, id)`` instead of all-gathering the
+        ``[B * T, V]`` logits, and each reads a quarter of ``W2`` per position
+        (see ``DeepseekV41DSpark._sharded_markov_sample``). Not with the
+        confidence head on, which reads each position's ``W1[prev]`` row: that
+        block keeps the all-gathered path."""
+        head, markov = self.lm_head, self.markov_head
+        return (
+            head is not None
+            and not self.emit_confidence
+            and head.tp_size > 1
+            and head.bias is None
+            # `_head_and_sample_sharded` multiplies the raw shard, so the head
+            # must be the plain TP-sharded one: an even, unpadded split of the
+            # vocab and no sequence-parallel logits path.
+            and not sp_is_enabled()
+            and head.num_embeddings % head.tp_size == 0
+            and head.weight.shape[0] == head.num_embeddings // head.tp_size
+            and markov.fused_sample
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
+        )
+
+    def _head_and_sample_sharded(self, hidden, anchor_ids, num_draft):
+        """``head_and_sample`` with the LM head left sharded; the same ids as
+        the whole-vocab op."""
+        bs = anchor_ids.shape[0]
+        head, markov = self.lm_head, self.markov_head
+        base_logits = tgemm.mm(hidden, head.weight).view(bs, num_draft, -1)
+        tp_group = get_tp_group()
+        w1, w2 = markov.markov_w1.weight, markov.markov_w2.weight
+        out_ids = anchor_ids.new_empty(bs, num_draft)
+        self._markov_atomic(base_logits, anchor_ids, w1, w2, out_ids, head, tp_group)
+        return out_ids, None
+
+    def _markov_atomic(self, base_logits, anchor_ids, w1, w2, out_ids, head, tp_group):
+        """The sharded greedy Markov block, one launch and one all-gather per
+        position (`_markov_step_atomic`) and one closing launch. Each position's
+        packed best lives in a persistent ``[T, max_num_seqs]`` int64 buffer,
+        at its reset value between blocks (each is reset by the launch after the
+        all-gather that read it), so no launch clears it."""
+        bs, num_draft, v_local = base_logits.shape
+        world = tp_group.world_size
+        rank = w2.shape[1]
+        geometry = markov_launch_geometry(bs, v_local)
+        # Sized with the block buffers ahead of graph capture; never regrown
+        # here, a captured graph holds its address. A forward that runs before
+        # the block buffers exist (the profile pass) sizes it on first use.
+        if self._mk_packed is None:
+            self._alloc_markov_packed(num_draft, base_logits.device)
+        assert num_draft <= self._mk_packed.shape[0]
+        assert bs <= self._mk_packed.shape[1]
+        gathered = None
+        for k in range(num_draft):
+            base_k = base_logits[:, k]
+            packed = self._mk_packed[k, :bs]
+            prev_packed = self._mk_packed[max(k - 1, 0), :bs]
+            _markov_step_atomic[(geometry.v_tiles, geometry.row_tiles)](
+                base_k, anchor_ids, packed if gathered is None else gathered,
+                prev_packed, out_ids[:, max(k - 1, 0)], w1, w2, packed,
+                bs, v_local, rank, base_k.stride(0), anchor_ids.stride(0),
+                out_ids.stride(0), w1.stride(0), w2.stride(0), head.vocab_start_idx,
+                FIRST=k == 0, W=world, BLOCK_ROW=geometry.block_row,
+                BLOCK_V=BLOCK_V, BLOCK_K=BLOCK_K, num_warps=geometry.num_warps,
+                num_stages=2,
+            )  # fmt: skip
+            gathered = (
+                tp_group.all_gather(
+                    packed.view(torch.float32).view(bs, 2),
+                    dim=0,
+                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                )
+                .view(torch.int64)
+                .view(-1)
+            )
+        block_row = min(1024, triton.next_power_of_2(bs))
+        _markov_last_atomic[(triton.cdiv(bs, block_row),)](
+            gathered, self._mk_packed[num_draft - 1, :bs], out_ids[:, num_draft - 1],
+            bs, out_ids.stride(0), W=world, BLOCK_ROW=block_row, num_warps=1,
+        )  # fmt: skip
+
     def head_and_sample(self, hidden, anchor_ids, num_draft):
+        if self._sharded_markov_sample():
+            return self._head_and_sample_sharded(hidden, anchor_ids, num_draft)
         bs = anchor_ids.shape[0]
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
@@ -556,7 +1081,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
                 )
             )
         confidence = None
-        if self.confidence_head is not None:
+        if self.emit_confidence:
             confidence = self.confidence_head(
                 hidden.view(bs, num_draft, -1), torch.stack(markov_embeds, dim=1)
             )
