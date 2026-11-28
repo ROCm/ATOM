@@ -205,6 +205,20 @@ def test_unindex_during_copy_waits_for_the_queued_writer():
     assert pool.num_free == 20
 
 
+def test_released_units_are_dirty_until_kv_or_a_store_takes_them():
+    """`take_dirty` names the units whose image bytes a KV owner would read."""
+    pool, store = make_store(num_units=3)
+    _, op = ready(store, 101)
+    store.unindex(101)
+    first, *rest = op.unit_ids
+    assert pool.take_dirty(first)
+    assert not pool.take_dirty(first), "reported once"
+
+    again = store.begin_store(202, src_slot=0)
+    assert again is not None and set(again.unit_ids) == set(op.unit_ids)
+    assert not any(pool.take_dirty(unit) for unit in rest), "a store took them back"
+
+
 def test_protected_hit_is_excluded_from_admission_reclaim():
     pool, store = make_store(num_units=6)
     ready(store, 101)

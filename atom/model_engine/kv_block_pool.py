@@ -165,6 +165,12 @@ class KVBlockPool(ABC):
         self, unit_ids: Iterable[int], old_owner: Hashable, new_owner: Hashable
     ) -> None: ...
 
+    def take_dirty(self, block_id: int) -> bool:
+        """Whether `block_id` still holds a released raw unit's bytes, which a
+        caller taking it for KV has to clear; forgets it if so. A pool that
+        keeps no raw units has none."""
+        return False
+
     # ------------------------------ resizing ------------------------------- #
     @abstractmethod
     def extend(self, count: int) -> int:

@@ -121,6 +121,8 @@ class BlockPool(KVBlockPool):
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
+        # Released raw units, still holding their bytes (`take_dirty`).
+        self._dirty_units: set[int] = set()
         # Reusable content this pool destroyed, split by what destroyed it.
         # Both are evictions in the sense that a later prefix hit is now
         # impossible, and they read the same in a hit rate, but they want
@@ -414,6 +416,8 @@ class BlockPool(KVBlockPool):
             block_id = self.pop()
             self.allocate(block_id)
             self._raw_unit_owner[block_id] = (owner, piece_index)
+            # Raw bytes again; whatever is left in it is nobody's KV.
+            self._dirty_units.discard(block_id)
             unit_ids.append(block_id)
         return unit_ids
 
@@ -433,6 +437,22 @@ class BlockPool(KVBlockPool):
         for block_id in ids:
             del self._raw_unit_owner[block_id]
             self.free(block_id)
+        self._dirty_units.update(ids)
+
+    def take_dirty(self, block_id: int) -> bool:
+        """Whether `block_id` still holds a raw unit's bytes; forgets it if so.
+
+        A released unit keeps the image it held, and the free list hands it
+        out as an ordinary KV block. Attention reads a fresh block's unwritten
+        rows under a zero weight, and an image read as KV need not be finite:
+        fp32 or int8 state bytes include NaN and Inf bit patterns, and
+        `0 * NaN` is NaN. A caller taking a block for KV clears it when this
+        says so (`StateMaintenanceOps.cleared_units`).
+        """
+        if block_id in self._dirty_units:
+            self._dirty_units.discard(block_id)
+            return True
+        return False
 
     def rekey_units(
         self,

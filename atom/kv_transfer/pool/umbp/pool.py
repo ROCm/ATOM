@@ -1134,6 +1134,9 @@ class UmbpBlockPool(KVBlockPool):
     ) -> None:
         self.private.rekey_units(unit_ids, old_owner, new_owner)
 
+    def take_dirty(self, block_id: int) -> bool:
+        return not self._is_umbp(block_id) and self.private.take_dirty(block_id)
+
     # ------------------------------ resizing ------------------------------- #
     def extend(self, count: int) -> int:
         return 0

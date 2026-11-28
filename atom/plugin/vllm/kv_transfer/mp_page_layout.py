@@ -72,6 +72,9 @@ _NON_PAGE_ROLES: frozenset[str] = frozenset(
         # Layer-local flush scratch and cached ISA; neither is a PAGE image.
         "replay_flush_arrivals",
         "replay_flush_wait",
+        # LeapQuant's scales and compensators, beside the int8 recurrent state.
+        "leapquant_scale",
+        "leapquant_comp",
         # Not a plane but a verdict on the ones above: True marks this whole
         # entry as per-request recurrent state, addressed by request slot. It
         # is checked rather than merely skipped -- see `build_mp_transfer_tensors`.

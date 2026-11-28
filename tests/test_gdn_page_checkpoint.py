@@ -67,7 +67,7 @@ def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
     )
 
 
-def _transfer(monkeypatch, **kwargs):
+def _builder(monkeypatch, **kwargs):
     params = {
         "layers": 45,
         "shape_k": (3, 1536),
@@ -78,22 +78,35 @@ def _transfer(monkeypatch, **kwargs):
         "num_spec": 0,
         "replayssm": False,
         "midstep": False,
+        "leapquant": False,
     }
     params.update(kwargs)
     builder_cls = _builder_cls()
+    from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes
+
     monkeypatch.setattr(
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=params["tp"]),
     )
     monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if params["midstep"] else "0")
+    # The pool's dtypes: LeapQuant stores the ssm plane as its int8 residual.
+    dtype_pool_v = torch.int8 if params["leapquant"] else params["dtype_v"]
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
-        replayssm=params["replayssm"],
-        _conv_state_len=lambda: params["shape_k"][0],
+        leapquant=params["leapquant"],
+        leapquant_rank=4,
+        replayssm=params["replayssm"] or params["leapquant"],
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
+        _pool_state_dtypes=lambda: (params["dtype_k"], dtype_pool_v),
+        _leapquant_buffer_shapes=lambda: (
+            leapquant_buffer_shapes(*params["shape_v"], 4)
+            if params["leapquant"]
+            else None
+        ),
+        _conv_state_len=lambda: params["shape_k"][0],
     )
     for name in (
         "_decode_keep",
@@ -101,7 +114,11 @@ def _transfer(monkeypatch, **kwargs):
         "_checkpoint_plane_shapes",
     ):
         setattr(builder, name, getattr(builder_cls, name).__get__(builder))
-    return builder_cls.state_transfer(builder)
+    return builder
+
+
+def _transfer(monkeypatch, **kwargs):
+    return _builder_cls().state_transfer(_builder(monkeypatch, **kwargs))
 
 
 def _layout(monkeypatch, **kwargs):
@@ -156,10 +173,12 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
         ),
         state_transfer=lambda: transfer,
         _state_shape_for_runner=lambda: ((3, 16), (2, 4, 4)),
-        _state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
+        _pool_state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
         num_state_layers=lambda: 2,
         _replayssm_bytes_per_slot=lambda: 0,
+        _leapquant_bytes_per_slot=lambda: 0,
         slots_per_req=lambda: 1,
+        state_transfer_slots=lambda: 0,
     )
     builder._checkpoint_interval = _builder_cls()._checkpoint_interval.__get__(builder)
     spec = _builder_cls().state_spec(builder)
@@ -200,13 +219,45 @@ class TestTheLayoutId:
         assert _layout(monkeypatch) != _layout(monkeypatch, dtype_v=torch.float32)
         assert _layout(monkeypatch) != _layout(monkeypatch, layers=44)
 
+    def test_leapquant_names_its_planes_and_its_int8_state(self, monkeypatch):
+        layout = _layout(monkeypatch, leapquant=True)
+        assert layout != _layout(monkeypatch)
+        assert f":ssm={(8, 128, 128)},{torch.int8}" in layout
+        assert (
+            ":order=conv-all-layers,ssm-all-layers,scale-all-layers,"
+            "comp-all-layers:leapquant=r4"
+        ) in layout
+
+
+class TestAReplaySlotKeepsNothingItCannotGive:
+    """Between two decode steps a ReplaySSM slot is its checkpoint plus the
+    records since. A PAGE copy builds the step's image from that
+    (`KEEP_SNAPSHOT`); LeapQuant's scale and compensator planes have no such
+    builder, and a fork hands over the slot itself, so both keep nothing at a
+    decode boundary. A prefill leaves no records."""
+
+    @pytest.mark.parametrize("midstep", [False, True])
+    def test_leapquant_keeps_none_at_a_decode_boundary(self, monkeypatch, midstep):
+        transfer = _transfer(monkeypatch, leapquant=True, midstep=midstep)
+        assert transfer.readable_midstep is midstep
+        assert transfer.decode_keep == "none"
+
+    def test_a_fork_keeps_none_under_replay(self, monkeypatch):
+        _builder_cls()
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+
+        fork = GDNStateMixin.state_transfer
+        assert fork(_builder(monkeypatch)).decode_keep == "settled"
+        assert fork(_builder(monkeypatch, replayssm=True)).decode_keep == "none"
+        assert fork(_builder(monkeypatch, leapquant=True)).decode_keep == "none"
+
 
 def _fork_transfer(monkeypatch, *, midstep):
     _builder_cls()
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
     monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if midstep else "0")
-    builder = SimpleNamespace(_conv_state_len=lambda: 3)
+    builder = SimpleNamespace(_conv_state_len=lambda: 3, replayssm=False)
     return GDNStateMixin.state_transfer(builder)
 
 
@@ -373,6 +424,53 @@ class TestMhaRegionsMatchThePublishedPages:
                 (view.data_ptr(), view.numel() * view.element_size()) for view in views
             ]
             assert list(zip(ptrs.tolist(), sizes.tolist(), strict=True)) == want
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    def test_clearing_zeroes_whole_units_and_nothing_else(self):
+        """A unit going back to KV is zeroed over every region, past
+        `image_bytes` too, and no other block is touched."""
+        pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+        from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+
+        pool = MhaKvPool(
+            layers=3,
+            block_size=16,
+            num_kv_heads=1,
+            head_dim=256,
+            kv_dtype=torch.bfloat16,
+        )
+        pool.allocate(6, "cuda")
+        for _, tensor in pool.region_tensors():
+            tensor.view(torch.uint8).fill_(0xFF)  # NaN, read as bf16
+        regions = layer_major_page_unit_regions([pool])
+        builder = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                config=SimpleNamespace(
+                    max_num_batched_tokens=32, kv_cache_block_size=16, max_num_seqs=1
+                )
+            ),
+            _page_unit_bases=lambda ids: layer_major_page_unit_bases(regions, ids),
+            _page_unit_stream_sizes=lambda n: layer_major_page_unit_stream_sizes(
+                regions, n
+            ),
+            _checkpoint_descriptor_device=lambda: torch.device("cuda"),
+        )
+        for name in (
+            "clear_page_units",
+            "_page_unit_clear_plan",
+            "_page_unit_clear_staging",
+        ):
+            method = getattr(AttentionMetadataBuilder, name)
+            setattr(builder, name, method.__get__(builder))
+        builder._page_unit_clear_turn = 0
+
+        # Four units a launch here, so five take both staging slots.
+        builder.clear_page_units([5, 0, 3, 1, 4])
+        torch.cuda.synchronize()
+        for _, tensor in pool.region_tensors():
+            rows = tensor.view(torch.uint8).view(tensor.shape[0], -1)
+            assert not rows[[0, 1, 3, 4, 5]].any()
+            assert (rows[2] == 0xFF).all(), "a unit nobody named was touched"
 
     def test_a_unit_past_the_pool_is_refused(self):
         pool = _pool(kv_dtype=torch.bfloat16, layers=1, block_size=16)

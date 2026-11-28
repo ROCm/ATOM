@@ -63,6 +63,8 @@ def builder(num_slots: int = 4, allocate: bool = True):
         num_state_layers=lambda: N_LAYERS,
         _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
         _state_dtypes=lambda: (DT_K, DT_V),
+        # LeapQuant would store the temporal plane as int8.
+        leapquant=False,
     )
     # The methods under test call each other through `self`. Bind the real
     # ones, so what runs is the shipped code and only the model/runner reads
@@ -72,6 +74,8 @@ def builder(num_slots: int = 4, allocate: bool = True):
         "_checkpoint_num_slots",
         "_checkpoint_layer_ranges",
         "_checkpoint_segment_sizes",
+        "_pool_state_dtypes",
+        "_leapquant_buffer_shapes",
     ):
         setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
     return stub
@@ -238,6 +242,7 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
     )
     stub = object.__new__(K3._KimiMLAGDNCommon)
     stub.model_runner = runner
+    stub.leapquant = False
     stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
     stub._state_dtypes = lambda: (DT_K, DT_V)
     stub._index_cache_layout = lambda: ((3, 7), (3, 7))
@@ -286,19 +291,37 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
     ENTRY = 4
     LOGICAL_BS = 8
     N_UNITS = 24  # generous: the image must not need all of them
+    LQ_RANK = 2
 
-    def build(self):
+    def build(self, monkeypatch=None, leapquant=False):
         from atom.model_ops.attentions.pool_layout.paged_state_copy import (
             plan_segmented_copy,
         )
+        from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes
 
         k = torch.zeros((self.N_LAYERS, self.SLOTS) + SHAPE_K, dtype=DT_K)
-        v = torch.zeros((self.N_LAYERS, self.SLOTS) + SHAPE_V, dtype=DT_V)
+        # LeapQuant stores the ssm plane as its int8 residual, with fp32
+        # scales and fp16 compensators beside it.
+        v = torch.zeros(
+            (self.N_LAYERS, self.SLOTS) + SHAPE_V,
+            dtype=torch.int8 if leapquant else DT_V,
+        )
+        planes = [k, v]
+        if leapquant:
+            monkeypatch.setattr(
+                "atom.model_ops.attentions.gdn_attn.get_tp_group",
+                lambda: SimpleNamespace(world_size=1),
+            )
+            s_scale, s_comp = leapquant_buffer_shapes(*SHAPE_V, self.LQ_RANK)
+            planes += [
+                torch.zeros((self.N_LAYERS, self.SLOTS) + s_scale),
+                torch.zeros((self.N_LAYERS, self.SLOTS) + s_comp, dtype=torch.float16),
+            ]
         # Every slot a distinct byte, so a stray write into a bystander is
         # visible rather than merely possible.
-        for s in range(self.SLOTS):
-            k[:, s].view(torch.uint8).fill_(0x10 + s)
-            v[:, s].view(torch.uint8).fill_(0x40 + s)
+        for p, plane in enumerate(planes):
+            for s in range(self.SLOTS):
+                plane[:, s].view(torch.uint8).fill_(0x10 * (p + 1) + s)
 
         region = self.LOGICAL_BS * self.ENTRY
         # Shaped like the real `kv_cache`: (rows, physical_blocks,
@@ -319,6 +342,15 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             state_runtime=runtime,
             has_mla_indexer=False,
         )
+        if leapquant:
+            runner.leapquant_scale, runner.leapquant_comp = planes[2:]
+            runner.config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    linear_num_value_heads=SHAPE_V[0],
+                    linear_key_head_dim=SHAPE_V[1],
+                    linear_value_head_dim=SHAPE_V[2],
+                )
+            )
         stub = SimpleNamespace(
             model_runner=runner,
             num_state_layers=lambda: self.N_LAYERS,
@@ -328,6 +360,8 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
             _state_dtypes=lambda: (DT_K, DT_V),
             _page_unit_region_cache=None,
+            leapquant=leapquant,
+            leapquant_rank=self.LQ_RANK,
         )
         for name in (
             "_checkpoint_plane_shapes",
@@ -336,6 +370,8 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
+            "_leapquant_buffer_shapes",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         for name in (
@@ -379,6 +415,30 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         self.round_trip(stub, plan_fn, units, src=1, dst=3)
         assert torch.equal(k[:, 3], k[:, 1])
         assert torch.equal(v[:, 3], v[:, 1])
+
+    def test_a_leapquant_image_carries_its_scales_and_compensators(self, monkeypatch):
+        """The int8 plane is no state without the two beside it, so the image
+        holds all four planes, every one arrives, and nothing else moves. The
+        offload tier's `state_entry_views` names the same bytes in the same
+        order, or an image packed by one reads back wrong through the other."""
+        stub, k, v, plan_fn = self.build(monkeypatch, leapquant=True)
+        planes = [k, v, stub.model_runner.leapquant_scale]
+        planes.append(stub.model_runner.leapquant_comp)
+        image = stub.checkpoint_image_bytes()
+        assert image == self.N_LAYERS * sum(p[0, 0].nbytes for p in planes)
+        units = list(range(-(-image // (self.ROWS * self.LOGICAL_BS * self.ENTRY))))
+        before = [p.clone() for p in planes]
+
+        self.round_trip(stub, plan_fn, units, src=1, dst=3)
+        for got, was in zip(planes, before):
+            assert torch.equal(got[:, 3], was[:, 1])
+            assert torch.equal(got[:, :3], was[:, :3])
+
+        views = Mixin.state_entry_views(stub, 3)
+        assert [x.data_ptr() for x in views] == [
+            p[layer, 3].data_ptr() for p in planes for layer in range(self.N_LAYERS)
+        ]
+        assert sum(x.nbytes for x in views) == image
 
     def test_no_bystander_slot_is_touched(self):
         """The failure mode K3 has and V4 does not: slots are strided by
@@ -591,6 +651,7 @@ class TestAnImageSpansBothPoolsIntact:
         stub.num_state_layers = lambda: N_LAYERS
         stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
         stub._state_dtypes = lambda: (DT_K, DT_V)
+        stub.leapquant = False
         for name in (
             "_checkpoint_plane_shapes",
             "_checkpoint_num_slots",
@@ -598,6 +659,8 @@ class TestAnImageSpansBothPoolsIntact:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
+            "_leapquant_buffer_shapes",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         return stub, k, v, pool, index_cache, plan_segmented_copy

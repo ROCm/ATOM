@@ -75,6 +75,17 @@ def test_private_blocks_come_first(l1):
     assert pool.is_used(block_id) and pool.num_used == 4
 
 
+def test_a_released_raw_unit_is_dirty_through_the_split(l1):
+    """PAGE units live in the private part, so a block one of them released
+    is reported dirty there, once; a UMBP block never is."""
+    pool = make_split(l1, "a", 3, 2)
+    units = pool.reserve_units(2, owner="image")
+    pool.release_units(units, owner="image")
+    assert all(pool.take_dirty(u) for u in units)
+    assert not any(pool.take_dirty(u) for u in units), "reported once"
+    assert not pool.take_dirty(3)
+
+
 def test_cold_private_content_is_demoted_not_dropped(l1):
     evicted = []
     pool = make_split(l1, "a", 2, 2, evicted)

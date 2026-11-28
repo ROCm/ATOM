@@ -613,6 +613,10 @@ class BlockManager:
         # forward's start for the conv window, or the forward started off the
         # block grid. Each is a checkpoint the cutting ladder would have kept.
         self.midstep_positions_unreadable: int = 0
+        # Fresh KV blocks that were checkpoint units. Drained with the batch
+        # that allocated them, every allocation of a pass being made before
+        # its drain, so the clear lands ahead of the first forward to write.
+        self._units_to_clear: list[int] = []
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
@@ -643,11 +647,13 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        cleared, self._units_to_clear = tuple(self._units_to_clear), []
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
             block_copies=self.kv.take_block_copies(),
+            cleared_units=cleared,
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -722,6 +728,8 @@ class BlockManager:
             raise AssertionError("No PAGE unit available for a fresh KV block")
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
+        if self.kv.take_dirty(block_id):
+            self._units_to_clear.append(block_id)
         return block_id
 
     def disown_claimed_prefix(self, seq: Sequence, keep_blocks: int = 0) -> bool:

@@ -210,10 +210,11 @@ def test_the_state_spec_adds_the_transfer_slots():
     stub = types.SimpleNamespace(
         model_runner=types.SimpleNamespace(config=config),
         _state_shape_for_runner=lambda: ((2, 3), (4, 5)),
-        _state_dtypes=lambda: (torch.bfloat16, torch.float32),
+        _pool_state_dtypes=lambda: (torch.bfloat16, torch.float32),
         state_transfer=lambda: types.SimpleNamespace(decode_keep=None),
         num_state_layers=lambda: 2,
         _replayssm_bytes_per_slot=lambda: 0,
+        _leapquant_bytes_per_slot=lambda: 0,
         slots_per_req=lambda: 1,
         state_transfer_slots=lambda: 8,
     )

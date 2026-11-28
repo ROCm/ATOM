@@ -122,6 +122,7 @@ def write_state_checkpoints(
     chunk_size: int,
     conv_state_len: int,
     h_rows: torch.Tensor | None = None,
+    copy_ssm: bool = True,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -158,6 +159,10 @@ def write_state_checkpoints(
     Kimi KDA instead supplies head re-runs' final states with explicit rows.
     Without ``h_rows`` the row is the chunk boundary,
     ``chunk_offsets[row] + off // chunk``.
+
+    ``copy_ssm=False`` writes the conv half alone, for a pool whose state is
+    not a plain copy of ``h`` (LeapQuant's int8 one); the caller owes the SSM
+    half (`leapquant_write_checkpoints`) in the same step.
     """
     n = rows.numel()
     if n == 0:
@@ -167,7 +172,7 @@ def write_state_checkpoints(
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = (hkv + BLOCK - 1) // BLOCK
+    nblk_ssm = (hkv + BLOCK - 1) // BLOCK if copy_ssm else 0
     grid = (n, nblk_ssm + (d + BLOCK - 1) // BLOCK)
     _copy_checkpoints_kernel[grid](
         h,

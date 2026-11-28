@@ -92,6 +92,11 @@ class KVCacheTensor:
     # Flush scratch is local to this layer's pool, not transferred with state.
     replay_flush_arrivals: torch.Tensor = None
     replay_flush_wait: str | None = None
+    # LeapQuant side buffers next to the int8 state in ``v_cache``: per-head
+    # scales ``b [V]`` + smoothing ``c [K]``, and the fp16 compensator tokens.
+    # None unless ``ATOM_ENABLE_LEAPQUANT``.
+    leapquant_scale: torch.Tensor = None
+    leapquant_comp: torch.Tensor = None
     # True when the tensors above are a hybrid's PER-REQUEST state (GDN/KDA
     # recurrent state) rather than paged KV. Only the GDN and KDA linear-attn
     # forwards set it (`gdn_attn.py`, `kimi_mla_gdn_attn.py`, and the rtpllm/
