@@ -1706,6 +1706,9 @@ class EPLBManager:
         # SGLang avoids this by issuing migration P2P on a separate (default) group;
         # we mirror that with an EP-membership subgroup used only for migration.
         self._migration_group: Any | None = None
+        # True once a collective has brought up the migration group's device
+        # communicator (see `_ensure_migration_comm`).
+        self._migration_comm_ready: bool = False
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -1822,6 +1825,9 @@ class EPLBManager:
             # valid). Isolating migration off the EP communicator prevents its
             # isend/irecv from cross-matching in-flight forward ops on that group.
             # new_group is collective over the default group; every rank calls it.
+            # It brings up no device communicator (the default group is made
+            # without device_id); the first collective does, see
+            # `_ensure_migration_comm`.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
             self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
             # If the DP group is exactly the migration group, the DP sync's
@@ -1871,11 +1877,36 @@ class EPLBManager:
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
         # PyTorch requires all ranks to participate when batch_isend_irecv is
-        # the first collective on an NCCL process group. Initialize the dedicated
-        # migration group with an all-rank barrier because fill_redundant issues
-        # asymmetric P2P operations involving only a subset of EP ranks.
-        torch.distributed.barrier(group=self._migration_group)
+        # the first collective on an NCCL process group, and fill_redundant
+        # issues asymmetric P2P, so with redundant slots the communicator comes
+        # up here. Without them nothing needs it before the first rebalance:
+        # bringing it up now creates RCCL streams before CUDA graph capture,
+        # which shifts the HW queues HIP gives the captured graphs' branches
+        # and slows decode replay (-19% P90 interactivity on DSv4.1 DEP8).
+        if num_redundant > 0:
+            self._ensure_migration_comm()
         self.fill_redundant()
+
+    def _ensure_migration_comm(self) -> Any:
+        """The migration group, its communicator brought up by an all-rank
+        barrier on first use. Every caller is reached by all EP ranks at the
+        same point, before any asymmetric P2P on the group."""
+        if not self._migration_comm_ready:
+            torch.distributed.barrier(group=self._migration_group)
+            self._migration_comm_ready = True
+        return self._migration_group
+
+    def _release_migration_comm(self) -> None:
+        """Rebalancing has stopped for good: drop the migration communicator so
+        a frozen server holds what one without EPLB holds."""
+        if not self._migration_comm_ready or self._migration_group is None:
+            return
+        group, self._migration_group = self._migration_group, None
+        self._migration_comm_ready = False
+        try:
+            torch.distributed.destroy_process_group(group)
+        except Exception as exc:  # noqa: BLE001 - only the memory stays held
+            logger.warning("EPLB migration group not destroyed: %r", exc)
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -2117,12 +2148,16 @@ class EPLBManager:
             has_prefill = dp_any_has_prefill
         else:
             # OR the local has-prefill flag over exactly the migration collective
-            # (the group the rebalance actually runs on).
+            # (the group the rebalance actually runs on). This runs from the
+            # first forward on, so here the communicator still comes up before
+            # graph capture.
             flag = torch.tensor(
                 [1 if local_has_prefill else 0], device="cuda", dtype=torch.int32
             )
             torch.distributed.all_reduce(
-                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self._ensure_migration_comm(),
             )
             has_prefill = bool(flag.item())
 
@@ -2133,6 +2168,13 @@ class EPLBManager:
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
+            return
+        if self._rebalancing_stopped:
+            # The placement is frozen and the migration communicator released.
+            logger.warning(
+                "EPLB offline rebalance ignored (reason=%s): rebalancing stopped",
+                reason,
+            )
             return
         logger.info("EPLB offline rebalance triggered: reason=%s", reason)
         # Update balancedness state even on the force path for observability.
@@ -2167,6 +2209,7 @@ class EPLBManager:
 
     def _stop_rebalancing(self) -> None:
         self._rebalancing_stopped = True
+        self._release_migration_comm()
         logger.info(
             "EPLB stopped after %d rebalances (ATOM_EPLB_MAX_REBALANCES=%d); "
             "the current expert placement is kept from now on",
@@ -2264,6 +2307,9 @@ class EPLBManager:
 
         self._log_rebalance_metrics(rc=_rc, logical_load=logical_load, logcnt=logcnt)
 
+        # Every rank derives the same plan from the same reduced load and runs
+        # this loop, so all of them reach the first barrier together.
+        migration_group = self._ensure_migration_comm()
         for start in range(0, len(layer_ids), chunk_size):
             chunk = layer_ids[start : start + chunk_size]
             yield
@@ -2280,7 +2326,7 @@ class EPLBManager:
                     new_meta=new_meta,
                     expert_weights_of_layer=self._expert_weights_of_layer,
                     temp_buffers=temp_buffers,
-                    ep_group=self._migration_group,
+                    ep_group=migration_group,
                     nnodes=self._nnodes,
                     rank=self._ep_rank,
                     live_meta=self.live_metadata,
