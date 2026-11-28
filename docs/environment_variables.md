@@ -334,7 +334,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
-| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | Gemma-norm layers that hand their q/k norm to the attention (the MiniMax-M3 dense layers always, without the fusion above; Qwen3-Next and Qwen3.5 with it on) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. Above this count on the gfx1250 family, with the pre-shuffled (ASM) KV cache layout these separate kernels need, the q/k norm + RoPE is one aiter `fused_qknorm_idxrqknorm` launch where the op takes the layer (`fused_qknorm_idxrqknorm_supports`, asked once per layer at its first long prefill; the MiniMax-M3 dense layers, not head_dim 256). **Needs aiter with #8011**; upgrade ATOM and aiter together. |
 
 ### Llama-style
 

@@ -143,8 +143,8 @@ def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
 
 def _cos_sin(attn, layer_id: int) -> torch.Tensor:
     """The [max_pos, rotary_dim] bf16 cos|sin table the attention module registered
-    on its rotary embedding (``_minimax_m3_cos_sin_cache``)."""
-    t = getattr(attn.rotary_emb, "_minimax_m3_cos_sin_cache", None)
+    on its rotary embedding (``_cos_sin_cache``, see ``get_cos_sin_cache``)."""
+    t = getattr(attn.rotary_emb, "_cos_sin_cache", None)
     _need(
         t is not None
         and t.dtype == torch.bfloat16
