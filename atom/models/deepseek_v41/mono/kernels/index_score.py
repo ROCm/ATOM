@@ -265,8 +265,9 @@ def stage_ilist(
     tid = c["tid"]
     a = c["args"]
     k = ip.KINDS[kind]
-    raw, cols, split = share
-    col0 = 0 if split is None else _row_share(c, t)[0]
+    raw, cols, split = share[:3]
+    # a share's first column: carried (``_sel_rows``), else the plan's
+    col0 = share[3] if len(share) > 3 else (0 if split is None else _row_share(c, t)[0])
     # a split row's columns are always scored (its bound is past SPLIT_FROM)
     any_scored = ip.scored(raw) if split is None else (split != 0) | ip.scored(cols)
     slots = ip.list_slots(kind, level, bound_max, seg)
@@ -698,6 +699,15 @@ PROD_SEL0 = 48
 # column (32 segments: 6 rows' first level within the grid beside the blk tree;
 # at 400K columns, 49 segments, it ran slower than the compacted columns)
 PROD_FULL_MAX = 32 * ip.SEG
+# a candidate producer's split rows' merges (``_run_merge``): past its blk
+# tree's lists (CTAs 0 ..) and the attention score's (from ``score0``), before
+# the late wq_b's (``attn_pre.WQB_LAYER0``): their CTAs end with the merge
+PROD_MERGE0 = 66
+# a split build's selection takes ``_sel_rows`` (a candidate producer's wide
+# rows split over the TP ranks) up to this many rows; a wider build keeps the
+# compacted candidates (its 24-row layer_post held more than its SGPRs: 36 B
+# of scratch)
+SEL_ROWS_MAX = 12
 
 
 @traced
@@ -709,6 +719,7 @@ def run_indexer(c, s, bid, bound_max):
     max_chunks = ip.chunks(bound_max)
     c["anchor_bound"] = bound_max  # ``_anchor``'s layout
     t0, n = _own_rows(c, s)
+    split_sel = c["index_split"] and n <= SEL_ROWS_MAX
     # the FP4 scorer reads its rows' bounds itself: the trees' are loaded past
     # it, none held through its walk
     if const_expr(c["index_fp4"]):
@@ -725,15 +736,28 @@ def run_indexer(c, s, bid, bound_max):
         # candidates afresh (``index_plan.compacts``); ICRDY says its blocks
         # are out either way
         ((blk, bseg),) = ip.trees("blk", bound_max)
+        # a split build's selection never ranks compacted columns (``_sel_rows``)
+        compact = False if split_sel else _wide(c, t0, n)
         _run_tree(
             c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg,
-            compact=_wide(c, t0, n),
+            compact=compact,
         )  # fmt: skip
     # the selection's trees (``index_plan.trees``): the columns', a REINDEX
     # row's -- a candidate producer's too, over its candidates
     (full, seg), (reindex, rseg) = ip.trees("sel", bound_max)
     if a["ilift"] != 0:
         _run_tree(c, t0, n, bid, "sel", _whole(c, t0, n), reindex, max_chunks, rseg)
+    elif const_expr(split_sel):
+        # one tree for a FULL layer's rows and a candidate producer's
+        # (``_sel_rows``): every row as a share, split or whole; a producer's
+        # from PROD_SEL0 (past its blk tree's first level), beside that tree
+        rows = _sel_rows(c, t0, n)
+        prod = a["iprod"] != 0
+        _run_tree(
+            c, t0, n, bid, "sel", rows, full, max_chunks, seg,
+            sel(prod, Int32(PROD_SEL0), Int32(0)), False,
+        )  # fmt: skip
+        _run_merge(c, t0, n, bid, rows, sel(prod, Int32(PROD_MERGE0), Int32(0)))
     elif a["iprod"] != 0:
         bounds = _bounds(c, t0, n)
         if _wide(c, t0, n):
@@ -799,6 +823,43 @@ def _share_of(word):
     return None, ip.word_cols(word), ip.word_split(word)
 
 
+def _sel_rows(c, t0, n):
+    """A split build's selection rows (``_whole``'s form, a (``share_word``,
+    first column) a row): a FULL layer's from the step's plan (``_shares``); a
+    candidate producer's from its bounds, a row past PROD_FULL_MAX split over
+    the TP ranks by ``index_plan.row_shares``' arithmetic on its own bound
+    (its shares partition its columns in rank order, each scored whole: the
+    producer's walk takes every column for the blk tree), the others whole --
+    where its full-column tree would outgrow the grid beside the blk tree, the
+    split tree and the ranks' merge (``stage_imerge``) instead of that tree's
+    compacted candidates: the same ids in the same order (a winner is in its
+    share's top-512; rank order is column order; ties to the lower column)."""
+    prod = c["args"]["iprod"] != 0
+    tp, rank = c["d"].tp, c["rank"]
+    rows = []
+    for t in range(n):
+        share = _row_share(c, t0 + t)
+        first, word = share[0], share[1]
+        # a candidate producer's own plan row is whole (``index_plan.splits``:
+        # its ratio 1 never splits): its columns are its bound, ``ibound``'s
+        # (both the step's visible rows at its ratio), a scalar load already
+        # made, not a vector one ahead of the tree (a FULL row's tree too)
+        b = ip.word_cols(word)
+        split = b > PROD_FULL_MAX
+        q = ip.share_len(b, tp)
+        p_first = sel(split, rank * q, Int32(0))
+        p_cols = sel(split, ip.imin(ip.imax(b - p_first, 0), q), b)
+        p_word = ip.share_word(p_cols, sel(split, Int32(1), Int32(0)))
+        rows.append((sel(prod, p_word, word), sel(prod, p_first, first)))
+    return _sel_of, rows
+
+
+def _sel_of(row):
+    """A ``_sel_rows`` row's share: no bound, its first column carried."""
+    word, first = row
+    return None, ip.word_cols(word), ip.word_split(word), first
+
+
 def _whole_of(bound):
     return bound, bound, None
 
@@ -845,20 +906,33 @@ def _run_tree(
         enter_stage(f"k2a.i{kind}{level}")
         for task in range(first_task(bid, first), ip.flat_total(counts), BLOCKS):
             t, j = ip.flat_task(counts, task)
-            share = decode(pick(words, t))
+            share = decode(_pick_row(words, t))
             stage_ilist(
                 c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg,
                 gathers_ok, compact,
             )  # fmt: skip
 
 
+def _pick_row(words, t):
+    """Row t of a tree's rows (a word, or a tuple of words: picked each)."""
+    if isinstance(words[0], tuple):
+        return tuple(pick([w[k] for w in words], t) for k in range(len(words[0])))
+    return pick(words, t)
+
+
 @traced
-def _run_merge(c, t0, n, bid):
-    """The merges of the step's split rows (``stage_imerge``), a row a CTA from
-    CTA 0 -- the CTAs whose selection lists end first."""
+def _run_merge(c, t0, n, bid, rows=None, first=0):
+    """The merges of the step's split rows (``stage_imerge``; ``rows``:
+    ``_sel_rows``', None: the plan's), a row a CTA from CTA ``first``: 0 for a
+    FULL layer -- the CTAs whose selection lists end first --, PROD_MERGE0 for
+    a candidate producer."""
     enter_stage("k2a.imerge")
-    for t in range(first_task(bid, 0), n, BLOCKS):
-        if ip.word_split(_row_share(c, t0 + t)[1]) != 0:
+    for t in range(first_task(bid, first), n, BLOCKS):
+        if const_expr(rows is None):
+            split = ip.word_split(_row_share(c, t0 + t)[1])
+        else:
+            split = rows[0](_pick_row(rows[1], t))[2]
+        if split != 0:
             stage_imerge(c, t0 + t)
 
 

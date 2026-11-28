@@ -1088,6 +1088,14 @@ class V41MonoDecodeRunner:
             if self.index_fp4
             else {}
         )
+        # ``index_score._sel_rows`` reads a candidate producer's bound off its
+        # own plan row: whole only at a ratio that never splits (the FP4 path's
+        # target; the draft model has no topology)
+        if self.index_fp4:
+            assert not any(
+                spec.produces_candidates and ip.splits(self.tp, spec.ratio)
+                for spec in getattr(self.model, "topology", ())
+            ), "V4.1 mono: a candidate producer's ratio splits its plan rows"
         self.bounds = {}
         self.candidate_table = None
         # the indexer's query, its scales and the scaled head weights: e4m3 and
