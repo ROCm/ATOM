@@ -4,6 +4,8 @@
 """The `umbp_pool` connector provides the KV pool; the engine asks connectors
 for it before falling back to its own (atom/kv_transfer/pool)."""
 
+import ctypes
+import sys
 import types
 
 import pytest
@@ -96,6 +98,74 @@ class TestRegistry:
     def test_other_connectors_share_no_pool(self):
         cfg = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
         assert KVConnectorFactory.pool_sharing(config_with(cfg)) is None
+
+
+class TestDeviceOffset:
+    """Two engines on one UMBP server, each seeing only its own devices."""
+
+    BLOCKS = 4
+
+    class Server:
+        """What the pool memory tells the server when it hands its buffer over."""
+
+        def __init__(self):
+            self.devices = {}
+
+        def attach(self, pool_id, group, device, nbytes, **handle):
+            self.devices[pool_id] = device
+
+        def bind_layout(self, pool_id, num_slots, regions):
+            pass
+
+    @pytest.fixture(autouse=True)
+    def host_handles(self, monkeypatch):
+        """No HIP here: an address stands in for the allocation's handle."""
+        from atom.mono import runtime
+
+        stub = types.SimpleNamespace(
+            get_allocation_base=lambda address: address,
+            get_ipc_handle=lambda address: address.to_bytes(8, "little"),
+        )
+        monkeypatch.setattr(runtime, "hip_ipc", stub, raising=False)
+        monkeypatch.setitem(sys.modules, "atom.mono.runtime.hip_ipc", stub)
+
+    def adopt(self, server, pool_id, device, **extra):
+        settings = UmbpPoolSettings.from_transfer_config(transfer(**extra))
+        memory = umbp_pool.UmbpPoolMemory(
+            server, pool_id, "g", 1.0, device_offset=settings.device_offset
+        )
+        raw = (ctypes.c_uint8 * (self.BLOCKS * 16))()
+        buf = types.SimpleNamespace(
+            data_ptr=lambda: ctypes.addressof(raw),
+            numel=lambda: len(raw),
+            device=types.SimpleNamespace(index=device),
+        )
+        region = types.SimpleNamespace(
+            reverse_indexed=False, base_addr=ctypes.addressof(raw), unit_bytes=16
+        )
+        memory.bind_layout(buf, [region], self.BLOCKS)
+
+    def test_an_engine_on_its_own_devices_names_the_servers(self):
+        server = self.Server()
+        # Both engines call their second device cuda:1; the server sees eight.
+        self.adopt(server, "a:dp1", 1)
+        self.adopt(server, "b:dp1", 1, device_offset=4)
+        assert server.devices == {"a:dp1": 1, "b:dp1": 5}
+
+    def test_the_offset_is_none_by_default_and_never_negative(self):
+        assert UmbpPoolSettings.from_transfer_config(transfer()).device_offset == 0
+        with pytest.raises(ValueError, match="device_offset"):
+            UmbpPoolSettings.from_transfer_config(transfer(device_offset=-1))
+
+    def test_the_runners_memory_carries_the_setting(self, monkeypatch):
+        monkeypatch.setattr(umbp_pool, "_connect", lambda settings: (None, None))
+        monkeypatch.setattr(umbp_pool, "share_group_for", lambda *args: "g")
+        config = config_with(transfer(device_offset=4))
+        config.parallel_config = types.SimpleNamespace(data_parallel_rank=1)
+        memory = umbp_pool.make_umbp_pool_memory(
+            config, UmbpPoolSettings.from_transfer_config(config.kv_transfer_config)
+        )
+        assert (memory.pool_id, memory.device_offset) == ("atom:dp1:tp0", 4)
 
 
 class TestProvidesThePool:

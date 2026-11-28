@@ -1204,6 +1204,34 @@ class Scheduler:
         # seq id -> when `has_forward_work` first saw it blocked on a tier lookup
         # (ATOM_DP_IDLE_WHEN_BLOCKED). Bounded by the waiting queue.
         self._forward_blocked_since: dict[int, float] = {}
+        # Copies from other ranks' pools start on any tick
+        # (`_early_copy_shared_prefixes`), and whether the group holds its
+        # prefill for a rank whose waiting requests are all mid-copy.
+        self._early_pool_copy = envs.ATOM_POOL_EARLY_COPY
+        # How long a pass with nothing to run anywhere in the group waits for
+        # this rank's copies in flight (`_await_arriving_copies`); 0 = never.
+        self._pool_copy_wait_s = max(0, envs.ATOM_POOL_COPY_WAIT_MS) / 1000.0
+        # A copy this rank waited for missed that bound; cleared once the rank
+        # is no longer waiting on copies alone.
+        self._copy_wait_missed = False
+        # How long one pass waits, in all, for the copies its waiting requests
+        # are held back for (`_land_arriving_copies`); 0 = never, a copy is
+        # indexed at the top of the next pass.
+        self._pool_inpass_wait_s = max(0, envs.ATOM_POOL_COPY_INPASS_WAIT_MS) / 1e3
+        # When this pass's wait budget ends; None until the pass first waits.
+        self._inpass_deadline: float | None = None
+        # Requests whose copy in flight has had its wait: a copy that outlasts
+        # one pass's budget is left to the passes after it, as without the wait.
+        self._inpass_waited: set[int] = set()
+        self._pool_copy_holds_prefill = envs.ATOM_POOL_COPY_HOLDS_PREFILL
+        # The delayer's pending tokens count a waiting request past its prefix
+        # hit in this rank's pool (`_waiting_new_token_count`).
+        self._pool_probed_pending = envs.ATOM_POOL_PROBED_PENDING
+        # Set by `_can_admit_head_prefill`: it found nothing to admit, and only
+        # because the requests it reached are mid-copy.
+        self._prefill_arriving = False
+        # Consecutive ticks this rank reported that to the delayer.
+        self._arriving_ticks = 0
         # (seq id, prompt tokens reused) of requests `share_cache` routing placed
         # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
         self.dp_reuse_reports: list[tuple] = []
@@ -1784,6 +1812,7 @@ class Scheduler:
         entries) and check `can_allocate` + token-budget, mirroring the
         same checks the admission while-loop runs below.
         """
+        self._prefill_arriving = False
         if self._partial_prefill_count > 0:
             return True
         if not self.waiting:
@@ -1795,6 +1824,8 @@ class Scheduler:
         # request, which then ran alone after a vacuous FIRE.
         examined = 0
         lookup_skips = self._prefix_bypass_limit()
+        copies = self._early_pool_copy and self.block_manager.copies_shared_prefixes
+        mid_copy = False
         for seq in self.waiting:
             if examined >= 4:
                 break
@@ -1820,6 +1851,9 @@ class Scheduler:
                 lookup_skips -= 1
                 if lookup_skips < 0:
                     break
+                # With early copies the rank is not blocked either: what
+                # waits lands on its own, and the group holds for it.
+                mid_copy = mid_copy or copies
                 continue
             if self._head_waits_on_tier_lookup(seq):
                 # Phase 2 skips it until its lookup answers (`prefix_waiters`),
@@ -1845,6 +1879,7 @@ class Scheduler:
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks.
             return self.block_manager.can_allocate_memoized(seq) >= 0
+        self._prefill_arriving = mid_copy
         return False
 
     def _prefix_bypass_limit(self) -> int:
@@ -1958,11 +1993,24 @@ class Scheduler:
         `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
+
+        With a pool the ranks share (`_pool_probed_pending`) that bound is
+        replaced by the admission probe's hit: there every cross-rank hit is an
+        HBM hit of a request not admitted yet, so the upper bound would count
+        each waiting request at its whole prompt and report a full budget on
+        every rank with anything waiting.
         """
         cap = self.max_num_batched_tokens
+        bm = self.block_manager
+        probed = self._pool_probed_pending and bm.copies_shared_prefixes
         total = 0
         for seq in self._waiting_prefills():
-            num_new_tokens = self.pending_prefill_tokens(seq)
+            if probed:
+                if bm.shared_prefix_in_flight(seq):
+                    continue  # parked by Phase 2 until its copy lands
+                num_new_tokens = self._probed_pending_prefill_tokens(seq)
+            else:
+                num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
@@ -1972,6 +2020,20 @@ class Scheduler:
             if total >= cap:
                 return cap
         return total
+
+    def _probed_pending_prefill_tokens(self, seq: Sequence) -> int:
+        """`pending_prefill_tokens` of a waiting request, with one not admitted
+        yet counted past its prefix hit in this rank's pool: the admission
+        probe, memoised across ticks. A request the pool cannot take now keeps
+        the upper bound."""
+        pending = self.pending_prefill_tokens(seq)
+        if seq.block_table:
+            return pending
+        bm = self.block_manager
+        hit_blocks = bm.can_allocate_memoized(seq)
+        if hit_blocks <= 0:
+            return pending
+        return max(0, pending - hit_blocks * bm.hash_block_size)
 
     def _partial_prefill_remaining_tokens(self) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
@@ -2711,7 +2773,16 @@ class Scheduler:
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
         self._early_load_tier_prefixes()
+        # The same for prefixes another rank's pool holds: the copy starts now,
+        # not at the FIRE that would otherwise be spent starting it.
+        self._early_copy_shared_prefixes()
+        # And lands, within a few milliseconds: before the delayer's probe, so
+        # the request it is for counts as the prefill work it now is.
+        self._land_arriving_copies()
 
+        # Whether this rank told the delayer, this tick, that all it has
+        # waiting is mid-copy (`_await_arriving_copies`).
+        mid_copy_only = False
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
@@ -2721,6 +2792,7 @@ class Scheduler:
                 0, len(self.running) - self._partial_prefill_count
             )
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
+            prefill_arriving = False
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
             ):
@@ -2735,7 +2807,23 @@ class Scheduler:
             elif self._local_prefill_coalescing:
                 prefillable, pending_tokens = self._local_prefill_pending_work(limits)
             else:
-                prefillable = limits.tokens > 0 and self._can_admit_head_prefill()
+                # The probe runs only with tokens to admit, and it is what sets
+                # `_prefill_arriving`: without it the flag is a previous tick's.
+                has_budget = limits.tokens > 0
+                prefillable = has_budget and self._can_admit_head_prefill()
+                mid_copy_only = has_budget and self._prefill_arriving
+                prefill_arriving = (
+                    has_budget
+                    and self._pool_copy_holds_prefill
+                    and self._prefill_arriving
+                )
+                # A copy lands within a step or two. One that does not is not
+                # worth the group's wait: the rank is blocked, as before.
+                self._arriving_ticks = (
+                    self._arriving_ticks + 1 if prefill_arriving else 0
+                )
+                if self._arriving_ticks > self._ARRIVING_MAX_TICKS:
+                    prefill_arriving = False
                 pending_tokens = min(
                     self._waiting_new_token_count()
                     + self._partial_prefill_remaining_tokens(),
@@ -2778,6 +2866,7 @@ class Scheduler:
                 ),
                 # prefill_admit_policy adaptive: what a FIRE could add to the
                 # decode batch -- partials plus waiting heads up to free slots
+                prefill_arriving=prefill_arriving,
                 admittable_requests=self._partial_prefill_count
                 + min(
                     len(self.waiting),
@@ -2797,6 +2886,10 @@ class Scheduler:
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
+
+        # After the decision, which says what the rest of the group runs this
+        # pass, and before Phase 2, which admits what the wait brought in.
+        self._await_arriving_copies(decision, mid_copy_only)
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:
@@ -2921,7 +3014,9 @@ class Scheduler:
 
             # Its prefix is still being copied in from another rank's pool:
             # admitting it now would recompute what is about to land.
-            if self.block_manager.shared_prefix_pending(seq):
+            if self.block_manager.shared_prefix_pending(
+                seq
+            ) and not self._land_copy_in_pass(seq):
                 prefix_waiters.append(seq)
                 continue
 
@@ -4857,6 +4952,172 @@ class Scheduler:
         for req_id, _h, _group in loads:
             self.block_manager.abandon_state_load(req_id)
             self.failed_recving_kv_req_ids.append(req_id)
+
+    # How many copies from other ranks' pools one tick may start (each asks the
+    # pool's server what it holds and for destination blocks).
+    _EARLY_COPY_PER_TICK = 8
+    # How many ticks in a row the group holds its prefill for this rank's
+    # copies in flight.
+    _ARRIVING_MAX_TICKS = 8
+
+    def _early_copy_shared_prefixes(self) -> int:
+        """Start copying in the prefixes other ranks' pools hold for waiting
+        requests, on any tick (HOLD or FIRE). Returns how many copies started.
+
+        Without this a copy starts when Phase 2 or the prefillable probe first
+        reaches the request. The probe is skipped during decode protection, so
+        a request that arrived in that window starts its copy on the FIRE tick:
+        the rank is counted prefillable, Phase 2 then parks every such request
+        (`shared_prefix_pending`), and the rank runs a dummy prefill beside its
+        peers and prefills a whole delayer cycle later, although the copy takes
+        about a decode step.
+
+        Nothing else moves earlier: the request keeps its place in `waiting`,
+        is not prefillable while its copy is in flight
+        (`_can_admit_head_prefill`), and prefills when a FIRE admits it. Local
+        to this rank: no collective, no step type changes.
+        """
+        bm = self.block_manager
+        if (
+            not self._early_pool_copy
+            or not self.waiting
+            or not bm.copies_shared_prefixes
+        ):
+            return 0
+        started = 0
+        for seq in itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN):
+            if seq.status != SequenceStatus.WAITING:
+                continue
+            if bm.start_shared_prefix_copy(seq):
+                started += 1
+                if started >= self._EARLY_COPY_PER_TICK:
+                    break
+        return started
+
+    def _land_arriving_copies(self) -> int:
+        """Wait, within this pass's budget, for the copies its waiting requests
+        are held back for, and index what landed. Returns how many are over.
+
+        A copy from another pool is started at the top of a pass
+        (`_early_copy_shared_prefixes`) and takes milliseconds, but its blocks
+        become hits only when a pass indexes them (`poll_fetches`), and the
+        next one to do so is the pass after this one's step: hundreds of
+        milliseconds in which the request waits for nothing. Waiting here for
+        the copy costs every rank's step that many milliseconds, bounded by
+        `ATOM_POOL_COPY_INPASS_WAIT_MS` for the whole pass, and puts the
+        request into this pass's batch.
+
+        Nothing but the timing changes. A request is still held back while
+        its copy is in flight (`shared_prefix_pending`), still hits only what
+        `poll_fetches` indexed, and a copy that fails is still a miss. One
+        that outlasts the budget is left exactly where it was: in flight,
+        indexed by whichever later pass finds it done, and not waited for
+        again, so a stalled copy costs one budget and not one a pass.
+        """
+        self._inpass_deadline = None
+        if self._pool_inpass_wait_s <= 0:
+            return 0
+        bm = self.block_manager
+        waited = self._inpass_waited
+        if waited:
+            # Landed, failed or gone since: only copies still in flight count.
+            in_flight = bm.kv.fetch_pending
+            self._inpass_waited = waited = {i for i in waited if in_flight(i)}
+        if not self.waiting or not bm.copies_shared_prefixes:
+            return 0
+        return self._wait_in_pass(
+            [
+                seq
+                for seq in itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN)
+                if seq.status == SequenceStatus.WAITING
+                and seq.id not in waited
+                and bm.shared_prefix_in_flight(seq)
+            ]
+        )
+
+    def _land_copy_in_pass(self, seq: Sequence) -> bool:
+        """For a request Phase 2 is about to hold back for its copy: whether
+        the copy is over within what is left of this pass's budget, landed and
+        indexed or failed. One started by Phase 2 itself (past what the top of
+        the pass starts) gets its wait here; one that already had it is only
+        looked at."""
+        if self._pool_inpass_wait_s <= 0:
+            return False
+        self._wait_in_pass([seq])
+        return not self.block_manager.shared_prefix_in_flight(seq)
+
+    def _wait_in_pass(self, seqs: list[Sequence]) -> int:
+        """Give each of `seqs`' copies its one wait, all against the pass's
+        one deadline, and index those that are over. Returns how many are."""
+        if not seqs:
+            return 0
+        kv = self.block_manager.kv
+        if self._inpass_deadline is None:
+            self._inpass_deadline = time.monotonic() + self._pool_inpass_wait_s
+        over = 0
+        for seq in seqs:
+            # Past the deadline, or for a copy that had its wait, a look only.
+            left = (
+                0.0
+                if seq.id in self._inpass_waited
+                else self._inpass_deadline - time.monotonic()
+            )
+            self._inpass_waited.add(seq.id)
+            over += kv.wait_fetch(seq.id, left)
+        if over:
+            # Within the pass: what landed is a hit for the walks that follow.
+            kv.poll_fetches(new_pass=False)
+        return over
+
+    def _await_arriving_copies(
+        self, decision: PrefillDecision, mid_copy_only: bool
+    ) -> bool:
+        """Wait, briefly, for the copies this rank's waiting requests are held
+        back for, on a pass where nothing else would run. True when it waited.
+
+        A copy from another rank's pool lands in milliseconds, but only the
+        next pass sees it (`poll_fetches`), and this one is about to end in a
+        step. Where some rank has work that step is its forward and costs
+        nothing extra. Where none has -- no rank with prefill to admit, no
+        request decoding anywhere in the group, and here only requests
+        mid-copy (`mid_copy_only`, what `_can_admit_head_prefill` found this
+        tick) -- it is a dummy step on every rank, run for nothing but to
+        reach the next pass, and the request waits it out. So this rank waits
+        for its copies instead, bounded (`ATOM_POOL_COPY_WAIT_MS`), indexes
+        what landed and lets Phase 2 admit it in this pass. Its peers reach
+        the step's collectives that much later, with nothing of their own
+        delayed.
+
+        A copy that misses the bound is left to the passes after it, as
+        before, and is not waited for again: a stalled copy costs one bound,
+        not one a pass. Without a delayer nothing here runs: there is no dummy
+        step to avoid, and the pass after an empty one comes at once.
+        """
+        if not mid_copy_only:
+            self._copy_wait_missed = False
+            return False
+        if not (
+            self._pool_copy_wait_s > 0
+            and not self._copy_wait_missed
+            and decision.allow
+            and decision.prefillable_ranks == 0
+            and decision.running_decodes == 0
+            and not self.running
+        ):
+            return False
+        bm = self.block_manager
+        deadline = time.monotonic() + self._pool_copy_wait_s
+        for seq in itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN):
+            if seq.status != SequenceStatus.WAITING:
+                continue
+            if not bm.shared_prefix_in_flight(seq):
+                continue
+            if not bm.kv.wait_fetch(seq.id, deadline - time.monotonic()):
+                self._copy_wait_missed = True
+                break
+        # What landed becomes a hit for this pass's walks.
+        bm.kv.poll_fetches(new_pass=False)
+        return True
 
     # How deep into `waiting` the early tier load looks, and how many requests it
     # may admit in one tick (each runs an HBM probe and an allocation).

@@ -134,6 +134,9 @@ class UmbpL1Pool(KVBlockPool):
 
     shares_content = True
     async_fetch = True
+    # With `fetch` off too: that stops this pool copying in, not the others
+    # copying out of it.
+    read_by_other_pools = True
 
     def __init__(
         self,
@@ -185,6 +188,12 @@ class UmbpL1Pool(KVBlockPool):
         # owner -> (future, block ids, hashes, tokens_of, start) of a copy
         # into held blocks (`fetch_async`).
         self._fetches: dict = {}
+        # Scheduling passes so far (`poll_fetches(new_pass=True)`), which a
+        # copy is stamped with when it starts: how many passes later it was
+        # indexed is what the hand-off cost, the copy itself being milliseconds.
+        self._pass = 0
+        self.fetches_indexed = 0
+        self.fetches_indexed_same_pass = 0
         self._executor = None
         # Bumped by `clear_index`: a copy started before a clear (a weight
         # update, a cache reset) must not be indexed after it.
@@ -492,6 +501,7 @@ class UmbpL1Pool(KVBlockPool):
             return True
         if not hashes:
             return False
+        asked = time.perf_counter()
         keys = [_key(h) for h in hashes]
         *_, available = self._client.fetch(self.pool_id, keys, probe_only=True)
         room = self.num_free - len(self._stash) - len(self._granted)
@@ -514,22 +524,39 @@ class UmbpL1Pool(KVBlockPool):
             ids,
             list(hashes[:n]),
             tokens_of,
-            time.perf_counter(),
+            (submitted := time.perf_counter()),
             self._clear_generation,
+            self._pass,
+            # What the caller's thread spent before the copy was on its way:
+            # asking what other pools hold and for the blocks to copy into.
+            submitted - asked,
         )
         return True
 
     def fetch_pending(self, owner: Hashable) -> bool:
         return owner in self._fetches
 
-    def poll_fetches(self) -> None:
+    def wait_fetch(self, owner: Hashable, timeout_s: float) -> bool:
+        entry = self._fetches.get(owner)
+        if entry is None:
+            return True
+        future = entry[0]
+        if not future.done() and timeout_s > 0:
+            from concurrent.futures import wait
+
+            wait((future,), timeout=timeout_s)
+        return future.done()
+
+    def poll_fetches(self, new_pass: bool = True) -> None:
         """Index what finished copies brought in; release the rest."""
+        if new_pass:
+            self._pass += 1
         if not self._fetches:
             return
         done = [o for o, entry in self._fetches.items() if entry[0].done()]
         for owner in done:
-            future, ids, hashes, tokens_of, started, generation = self._fetches.pop(
-                owner
+            future, ids, hashes, tokens_of, started, generation, issued, asking = (
+                self._fetches.pop(owner)
             )
             try:
                 slots, _, copied, copied_bytes, *_ = future.result()
@@ -554,15 +581,33 @@ class UmbpL1Pool(KVBlockPool):
             self.blocks_fetched += copied
             self.bytes_fetched += copied_bytes
             self.fetch_seconds += elapsed
+            # 0: the pass that started the copy also indexed it (it waited).
+            # 1: the next pass's top did, a step later. More: the copy was
+            # still running at a pass top in between.
+            passes_later = self._pass - issued
+            self.fetches_indexed += 1
+            self.fetches_indexed_same_pass += passes_later == 0
+            when = (
+                "same pass"
+                if passes_later == 0
+                else (
+                    "1 pass later"
+                    if passes_later == 1
+                    else f"{passes_later} passes later"
+                )
+            )
             if copied:
                 logger.info(
                     "UMBP pool %s: fetched %d of %d blocks from peer pools in the "
-                    "background (%.1f MiB, %.1f ms until indexed)",
+                    "background (%.1f MiB, %.1f ms until indexed), %s, "
+                    "%.1f ms to ask",
                     self.pool_id,
                     copied,
                     len(ids),
                     copied_bytes / (1 << 20),
                     elapsed * 1e3,
+                    when,
+                    asking * 1e3,
                 )
 
     def _fetch_executor(self):
@@ -595,11 +640,20 @@ class UmbpPoolMemory(KVPoolMemory):
     counted_by_torch = True
     shares_blocks = True
 
-    def __init__(self, client, pool_id: str, group: str, ratio: float):
+    def __init__(
+        self,
+        client,
+        pool_id: str,
+        group: str,
+        ratio: float,
+        device_offset: int = 0,
+    ):
         self._client = client
         self.pool_id = pool_id
         self.group = group
         self.ratio = ratio
+        # Where this process's first device stands among the UMBP server's.
+        self.device_offset = device_offset
         self._device = None
         # Where UMBP's part was adopted from; None until `bind_layout`.
         self._mapped_base: int | None = None
@@ -718,7 +772,7 @@ class UmbpPoolMemory(KVPoolMemory):
             )
         allocation = hip_ipc.get_allocation_base(base)
         handle = hip_ipc.get_ipc_handle(allocation)
-        device = buf.device.index if buf.device.index is not None else 0
+        device = (buf.device.index or 0) + self.device_offset
         self._client.attach(
             self.pool_id,
             self.group,
@@ -773,7 +827,13 @@ def make_umbp_pool_memory(
     _, client = _connect(settings)
     pool_id = pool_id_for(config, settings, rank)
     group = share_group_for(config, settings)
-    return UmbpPoolMemory(client, pool_id, group, settings.share_ratio)
+    return UmbpPoolMemory(
+        client,
+        pool_id,
+        group,
+        settings.share_ratio,
+        device_offset=settings.device_offset,
+    )
 
 
 def split_point(num_blocks: int, ratio: float) -> int:
@@ -857,6 +917,12 @@ class UmbpBlockPool(KVBlockPool):
     @property
     def async_fetch(self) -> bool:
         return self.umbp.async_fetch
+
+    @property
+    def read_by_other_pools(self) -> bool:
+        # Asked of the pool, not of a block: a private block is this rank's
+        # alone, but a prefix hit can run on into UMBP's part.
+        return self.umbp.read_by_other_pools
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -955,7 +1021,15 @@ class UmbpBlockPool(KVBlockPool):
         return get
 
     def count_used(self, block_ids: list[int], n: int) -> int:
-        return sum(1 for block_id in block_ids[:n] if self.is_used(block_id))
+        # Asked on every admission probe, for a whole prefix hit: each part
+        # counts its own ids as a set, not block by block through `is_used`.
+        offset = self.offset
+        if not offset:
+            return self.umbp.count_used(block_ids, n)
+        head = block_ids[:n]
+        return self.private.count_used(
+            [b for b in head if b < offset], n
+        ) + self.umbp.count_used([b - offset for b in head if b >= offset], n)
 
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         if self._is_umbp(block_id):
@@ -1153,8 +1227,11 @@ class UmbpBlockPool(KVBlockPool):
     def fetch_pending(self, owner: Hashable) -> bool:
         return self.umbp.fetch_pending(owner)
 
-    def poll_fetches(self) -> None:
-        self.umbp.poll_fetches()
+    def wait_fetch(self, owner: Hashable, timeout_s: float) -> bool:
+        return self.umbp.wait_fetch(owner, timeout_s)
+
+    def poll_fetches(self, new_pass: bool = True) -> None:
+        self.umbp.poll_fetches(new_pass)
 
     def flush(self) -> None:
         self.umbp.flush()

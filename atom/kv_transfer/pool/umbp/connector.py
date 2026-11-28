@@ -11,10 +11,11 @@ which block a request gets and what is evicted). Both are the same at every
 share ratio: a ratio of 1 only leaves the private part empty. Every per-step
 transfer hook is a no-op.
 
-Enabled through `kv_transfer_config` (`settings.py`), on its own: DeepSeek-V4.1,
-the one model whose pool it can provide, refuses it under `multi`
+Enabled through `kv_transfer_config` (`settings.py`), on its own or under
+`multi` beside the Mooncake P/D leg, which is the one composite DeepSeek-V4.1,
+the one model whose pool it can provide, admits
 (`models/deepseek_v41/config.py`). `multi` forwards the pool hooks to the one
-sub-connector that provides a pool, for a model that composes them later.
+sub-connector that provides a pool.
 """
 
 from __future__ import annotations

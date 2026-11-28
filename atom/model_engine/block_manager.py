@@ -308,11 +308,20 @@ class BlockManager:
             reserve_null_block=state_runtime.checkpoint_spec is not None,
             kv_connector=kv_connector,
         )
+        # The connector's word on a request whose prompt a P/D receive writes
+        # whole (`KVConnectorSchedulerBase.receive_rewrites_prefix`); None
+        # without a connector, or with one that receives nothing.
+        self._receive_rewrites_prefix = getattr(
+            kv_connector, "receive_rewrites_prefix", None
+        )
         # Sequences whose prompt chain a content-sharing pool was already asked
         # for (`_fetch_shared_prefix`), by the seed it was asked under.
         self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
             WeakKeyDictionary()
         )
+        # Whether asking marks what this rank already holds of the prefix as
+        # just used, so the room made for the copy is not taken from it.
+        self._refresh_local_prefix = envs.ATOM_POOL_REFRESH_LOCAL_PREFIX
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -1469,8 +1478,35 @@ class BlockManager:
         )
         return self._no_joint(reason)
 
+    def _lands_whole_in_shared_pool(self, seq: Sequence) -> bool:
+        """Whether `seq`'s prompt KV arrives whole from a P/D producer, into a
+        pool other pools read.
+
+        Such a request takes no prefix hit and starts no copy from other
+        pools. The receive writes every block of its table, by RDMA, which no
+        stream orders: a claimed hit would be published blocks rewritten while
+        another pool copies them out (the pool's rule is that a block is read
+        from outside once its writes have landed, and stays as it is while
+        indexed), and a prefix copied in would be overwritten on arrival. With
+        no hit its blocks are fresh ones, published when the receive has
+        landed (`register_received_prefix`). The answer holds until the
+        connector is told of the allocation, so every probe of one admission
+        agrees with its `allocate`; from then on the request holds its blocks,
+        which is what `_fetch_shared_prefix` goes by.
+        """
+        asks = self._receive_rewrites_prefix
+        return bool(
+            asks is not None
+            and getattr(self.kv, "read_by_other_pools", False)
+            and asks(seq)
+        )
+
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        if self._lands_whole_in_shared_pool(seq):
+            return _PrefixWalk(
+                seq.num_tokens, seq.cache_seed, self.kv.index_version, [], []
+            )
         if self.kv.shares_content and self.enable_prefix_caching:
             self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
@@ -1502,6 +1538,16 @@ class BlockManager:
         """
         if self._shared_prefix_asked.get(seq) == seq.cache_seed:
             return
+        if seq.block_table or self._lands_whole_in_shared_pool(seq):
+            # A request to be received whole, before its allocation and after:
+            # parked for the receive it holds its blocks, and admission asks
+            # about a copy on every pass it waits through, when the connector
+            # no longer names it (`_lands_whole_in_shared_pool`). A copy then
+            # would put a second copy of the prefix beside the blocks being
+            # received and hold the request back for it. Not recorded as
+            # asked: preempted after its receive, the request prefills here
+            # and asks then.
+            return
         self._shared_prefix_asked[seq] = seq.cache_seed
         n = self._n_hash_blocks(seq) - 1
         if n <= 0:
@@ -1513,15 +1559,34 @@ class BlockManager:
         local = 0
         while local < n and get(chain[local]) is not None:
             local += 1
+        if local and self._refresh_local_prefix and self.copies_shared_prefixes:
+            # The copy below needs room, and so do the copies of other waiting
+            # requests: what this rank already holds of the prefix is the
+            # oldest copy of it here, so it would be the first to go, and the
+            # walk would then miss at block 0 with the rest just copied in.
+            self._refresh_cached_blocks([get(h) for h in chain[:local]])
         if local == n:
             return
-        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+
+        def tokens_of(i: int):
+            return self._hash_block_tokens(seq, local + i)
+
         if self.kv.async_fetch:
             # Copied in the background; the scheduler holds the sequence back
             # while it is in flight (`shared_prefix_pending`).
             self.kv.fetch_async(seq.id, chain[local:], tokens_of)
             return
         self.kv.fetch(chain[local:], tokens_of)
+
+    def _refresh_cached_blocks(self, block_ids: list[int]) -> None:
+        """Tell the pool these cached blocks were just used: a hold and a
+        release each, which makes them its most recently released blocks and,
+        in a pool that keeps the newest copies of shared content, the copy to
+        keep."""
+        self.kv.claim_many(block_ids)
+        free = self.kv.free
+        for block_id in block_ids:
+            free(block_id)
 
     def shared_prefix_pending(self, seq: Sequence) -> bool:
         """Whether `seq` should wait for its prefix to arrive from other pools.
@@ -1536,6 +1601,31 @@ class BlockManager:
         ):
             return False
         self._fetch_shared_prefix(seq)
+        return self.kv.fetch_pending(seq.id)
+
+    @property
+    def copies_shared_prefixes(self) -> bool:
+        """Whether prefixes other pools hold are copied in in the background."""
+        return bool(
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and getattr(self.kv, "async_fetch", False)
+        )
+
+    def start_shared_prefix_copy(self, seq: Sequence) -> bool:
+        """Ask for `seq`'s prefix now unless it was asked for already
+        (`_fetch_shared_prefix`). True when this call asked. Only with
+        `copies_shared_prefixes`."""
+        if self._shared_prefix_asked.get(seq) == seq.cache_seed:
+            return False
+        self._fetch_shared_prefix(seq)
+        # A request that asks for nothing (`_lands_whole_in_shared_pool`) is
+        # not counted against the caller's copies per tick.
+        return self._shared_prefix_asked.get(seq) == seq.cache_seed
+
+    def shared_prefix_in_flight(self, seq: Sequence) -> bool:
+        """Whether a copy of `seq`'s prefix is in flight. A probe: it starts
+        none (`shared_prefix_pending` does). Only with `copies_shared_prefixes`."""
         return self.kv.fetch_pending(seq.id)
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:

@@ -182,6 +182,17 @@ class KVConnectorSchedulerBase(ABC):
         """First destination block for this PD load; None for other loads."""
         return None
 
+    def receive_rewrites_prefix(self, seq: Any) -> bool:
+        """Whether `seq` waits for a P/D receive that writes its whole block
+        table, the blocks of a prefix this engine already holds included.
+
+        Asked before allocation. `BlockManager` then gives the request no
+        prefix hit in a pool other pools read (`KVBlockPool.
+        read_by_other_pools`): the receive would rewrite published blocks under
+        a reader no stream of this process orders it against.
+        """
+        return False
+
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """Check if *seq* needs remote KV prefill.

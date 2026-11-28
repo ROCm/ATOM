@@ -246,10 +246,12 @@ class _EwFit:
 
 class PrefillDecision(NamedTuple):
     """One lockstep decision, alike on every rank: whether prefill may be
-    admitted this tick, and how many ranks of the group have prefill to admit."""
+    admitted this tick, how many ranks of the group have prefill to admit, and
+    how many requests the group is decoding."""
 
     allow: bool
     prefillable_ranks: int
+    running_decodes: int = 0
 
 
 class PrefillDelayer:
@@ -561,6 +563,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        prefill_arriving: bool = False,
         *,
         prefill_budget: int,
     ) -> PrefillDecision:
@@ -614,6 +617,11 @@ class PrefillDelayer:
                 after reserving decode work. Mixed scheduling leaves a 1/8 token
                 floor when decode pages fit, or zero under page pressure.
                 Required even when this rank has no prefillable work.
+            prefill_arriving: this rank has no admittable prefill only because
+                what waits is about to become admittable on its own (its prefix
+                is being copied in from another rank's pool, about a decode
+                step). Neither blocked nor unreachable: the group holds for it,
+                within the same bounds as any hold.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -622,7 +630,12 @@ class PrefillDelayer:
         # Waiting work this rank cannot admit (no KV for its head, or the
         # head's remote KV still loading): its own decode completions or the
         # load change that, not its peers waiting, so holding cannot align it.
-        blocked = not prefillable and (waiting_requests > 0 or has_partial)
+        prefill_arriving = prefill_arriving and not prefillable and not has_partial
+        blocked = (
+            not prefillable
+            and not prefill_arriving
+            and (waiting_requests > 0 or has_partial)
+        )
         # A rank with neither aligns once a decode completes and its slot takes
         # the next request. If that cannot happen before the TTFT bound
         # releases this hold anyway, waiting for it only delays its peers.
@@ -631,6 +644,7 @@ class PrefillDelayer:
         unreachable = (
             not prefillable
             and not blocked
+            and not prefill_arriving
             and (
                 next_completion_steps is None
                 or next_completion_steps > self.ttft_max_ticks - self._hold_ticks
@@ -723,7 +737,9 @@ class PrefillDelayer:
             float(c) for c in reduced[_FIXED_SLOTS : self._gate_at]
         ]
         return PrefillDecision(
-            allow=self._decide(reduced, step_s), prefillable_ranks=int(reduced[0])
+            allow=self._decide(reduced, step_s),
+            prefillable_ranks=int(reduced[0]),
+            running_decodes=int(reduced[2]),
         )
 
     def _decide(self, reduced: list[int], step_s: float) -> bool:
