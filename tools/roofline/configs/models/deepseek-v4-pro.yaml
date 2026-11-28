@@ -1,0 +1,46 @@
+# DeepSeek-V4-Pro — layer taxonomy and the marker vocabulary that goes with it.
+#
+# Named for the ATOM benchmark catalog's `prefix` (.github/benchmark/models.json),
+# so `--model deepseek-v4-pro` is the same string the benchmark uses. Quantisation
+# variants get their own file, as the catalog lists them separately -- see
+# `extends` in glm-5-2-mxfp4.yaml for how a variant avoids repeating structure.
+#
+# What lives here: STRUCTURE. What does not: `stages` (presentation grouping,
+# shared across models in module_map.yaml) and dtypes (resolved per run from the
+# HF config plus server flags -- a precision is a property of the checkpoint, not
+# of the architecture).
+
+model: deepseek-v4-pro
+architecture: DeepseekV4ForCausalLM
+description: >
+  61 layers: 3 leading hash layers, then HCA and CSA alternating. CSA carries a
+  Lightning Indexer and compresses KV 4:1; HCA compresses 128:1 and has no
+  indexer. Residual is widened by mHC (hc_mult=4).
+
+# How a layer is recognised. The engine knows three rule kinds and nothing about
+# these names:
+#   contains  a layer carrying a marker whose path contains this substring
+#   leading   the first N layers, N read from this model-config key
+#   default   everything else
+families:
+  - name: hash
+    detect: {leading: num_hash_layers}
+  - name: csa
+    detect: {contains: "attn.indexer."}
+  - name: hca
+    detect: {default: true}
+
+# Canonical taxonomy, checked by --methodology. Deriving families from marker
+# content follows the model instead of tracking it, but it can drift silently when
+# a build renames a module -- and a sparse-attention formula on a dense family is
+# a category error, not a rounding error. This turns that into a hard failure.
+methodology:
+  hash: 3
+  hca: 29
+  csa: 29
+
+# Which marker map in formulas.py this model's operators come from. Marker PATHS
+# are per-model even though @mark_trace lives in atom/model_ops: the name comes
+# from the caller's prefix=, so `attn.wo_b` is this model's word for an output
+# projection and another model will call it something else.
+marker_map: DSV4_MAP
