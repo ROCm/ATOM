@@ -56,8 +56,8 @@ def compile_kernels(kernels) -> list:
 
 def trace(launcher, abi) -> Record:
     """``launcher``'s hand-offs, traced compile-only (no launch, no GPU needed
-    with ``ARCH`` set). FlyDSL traces a build before it looks it up, so a
-    build in its disk cache is traced too."""
+    with ``FLYDSL_GPU_ARCH`` set). FlyDSL traces a build before it looks it up,
+    so a build in its disk cache is traced too."""
     with recording() as rec:
         compile_kernels([(launcher, abi)])
     if not rec.stages:

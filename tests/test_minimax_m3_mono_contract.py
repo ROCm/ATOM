@@ -32,6 +32,7 @@ WIDE_TOKENS = 8  # the expert-grouped MoE
 def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
+        patch.setenv("FLYDSL_GPU_ARCH", "gfx950")
         fused = contract.build_layer(TOKENS, INDEX_HEADS, fused_shared=True)
         fused_wide = contract.build_layer(WIDE_TOKENS, 1, fused_shared=True)
         return {

@@ -5,7 +5,7 @@
 
 Each kernel's mailbox regions (``scratch_layout`` of its module, the peer
 regions) with the stages that put them; tracing a build (compile-only, no
-launch, no GPU needed with ``ARCH`` set) records its accesses
+launch, no GPU needed with ``FLYDSL_GPU_ARCH`` set) records its accesses
 (``atom.mono.plan.trace``) and ``atom.mono.plan.check`` holds them to the table.
 FlyDSL traces a build before it looks it up, so a build in its disk cache is
 traced too.

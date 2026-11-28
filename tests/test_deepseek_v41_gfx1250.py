@@ -615,12 +615,13 @@ def test_lds_regions():
 
 
 def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
-    """Four ranks' target kernels traced at once on four threads, compile-only (``ARCH``: no GPU): every trace counts
-    its poll timeouts through its own kernel's counter, and no IR value of one trace reaches another (a module-level
-    counter pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
+    """Four ranks' target kernels traced at once on four threads, compile-only (``FLYDSL_GPU_ARCH``: no GPU): every
+    trace counts its poll timeouts through its own kernel's counter, and no IR value of one trace reaches another (a
+    module-level counter pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
+    monkeypatch.setenv("FLYDSL_GPU_ARCH", "gfx1250")
     from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
     from atom.models.deepseek_v41.mono.gfx1250.kernels import step
     from atom.mono.runtime.compile import compile_only
