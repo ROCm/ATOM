@@ -2343,7 +2343,7 @@ def test_first_attention_layer_num_follows_the_kv_binding():
     assert mla.first_attention_layer_num == 17
 
 
-# The non-MLA drafts' TP. MiniMax-M3.1's draft needs one KV head per rank.
+# The non-MLA drafts' TP: one KV head per rank for MiniMax-M3.1's draft.
 _DRAFT_TP = 4
 
 
@@ -2868,25 +2868,9 @@ def test_window_rows_start_each_row_at_its_own_window(window):
         assert tables[row].tolist() == list(range(first, first + P))
 
 
-@pytest.mark.parametrize("tp", [1, 2])
-def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
-    """The MiniMax-M3.1 draft decodes its block per row with one KV head per
-    rank; with 4 KV heads it refuses TP < 4 at construction rather than
-    failing on the first drafted block."""
-    import atom.models.minimax_m3.dspark as m3_dspark
-
-    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
-    config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
-    atom_config = types.SimpleNamespace(kv_transfer_config={})
-    with pytest.raises(ValueError, match="needs TP >= 4"):
-        m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=0)
-
-
-def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
-    monkeypatch,
-):
-    """A TP1 P/D producer builds the draft with all 4 KV heads; its block pass,
-    which decodes one head per rank, refuses before writing anything."""
+def test_minimax_m31_dspark_holds_every_kv_head_at_tp1(monkeypatch):
+    """At TP1 the draft is built with all 4 KV heads (its block tables:
+    `test_dspark_draft.py`)."""
     import atom.models.minimax_m3.dspark as m3_dspark
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -2901,13 +2885,9 @@ def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
         max_position_embeddings=4096,
         rope_theta=5e6,
     )
-    atom_config = types.SimpleNamespace(
-        kv_transfer_config={"kv_role": "kv_producer"}, kv_cache_dtype="fp8"
-    )
+    atom_config = types.SimpleNamespace(kv_cache_dtype="fp8")
     attn = m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
     assert attn.num_kv_heads == 4
-    with pytest.raises(RuntimeError, match="one KV head per rank"):
-        attn(torch.zeros(2, dtype=torch.long), torch.zeros(2, 6144))
 
 
 def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):

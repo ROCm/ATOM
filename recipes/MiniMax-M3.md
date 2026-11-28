@@ -476,7 +476,9 @@ How ATOM runs it:
   token (the per-row decode the target's sparse layers use), through page tables built outside
   the graph in pre-allocated buffers. The block pass therefore has fixed shapes and is
   CUDA-graph captured for every batch size up to `--max-num-seqs`. The per-row decode takes one
-  KV head per rank, so DSpark needs TP ≥ 4 (the draft has 4 KV heads) and refuses smaller TP.
+  KV head a row; a rank that holds several decodes each block position as a row per KV head. DSpark
+  runs at TP1 (all 4 of the draft's KV heads on the rank, e.g. under DP + EP) or TP ≥ 4, and
+  refuses TP2 and TP3.
 
 ## PD Disaggregation
 
