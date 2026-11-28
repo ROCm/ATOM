@@ -12,7 +12,7 @@ if __name__ == "__main__":
 
     initialize_metrics()
 
-from atom.utils import envs, set_ulimit
+from atom.utils import envs, raise_memlock_limit, set_ulimit
 
 if envs.USE_ATOMESH_ENTRYPOINTS:
     from atom.entrypoints.atomesh.server import main
@@ -24,4 +24,6 @@ if __name__ == "__main__":
     # subprocesses it spawns) start, so high connection concurrency does not
     # exhaust file descriptors. Inherited by spawned children.
     set_ulimit()
+    # RDMA KV registration on the spawned workers needs locked memory.
+    raise_memlock_limit()
     main()

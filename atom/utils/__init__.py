@@ -91,6 +91,29 @@ def set_ulimit(target_soft_limit: int = 65535) -> None:
         )
 
 
+def raise_memlock_limit() -> None:
+    """Raise the RLIMIT_MEMLOCK soft limit to the hard limit. RDMA drivers charge a
+    GPU ``ibv_reg_mr`` against it before their peer-memory fallback."""
+    try:
+        import resource
+    except ImportError:  # POSIX-only.
+        return
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft == hard:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+        logger.info("Raised RLIMIT_MEMLOCK soft limit %d -> %d", soft, hard)
+    except (ValueError, OSError) as e:
+        logger.warning(
+            "Failed to raise RLIMIT_MEMLOCK soft limit %d to the hard limit %d: %s",
+            soft,
+            hard,
+            e,
+        )
+
+
 @contextlib.contextmanager
 def set_device_control_env_var(config: "Config", local_dp_rank: int):
     """Publish this engine's GPU slice under the RLHF device-map variable.
