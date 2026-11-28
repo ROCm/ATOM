@@ -222,6 +222,8 @@ class M3DSparkAttention(nn.Module):
             rope_scaling=None,
         )
         self.kv = KVCacheBinding(layer_num, page_tokens=ASM_PAGE_SIZE)
+        # 0: every block row attends the whole context (see `_window_rows`).
+        self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
 
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
@@ -337,6 +339,16 @@ class M3DSparkAttention(nn.Module):
             output=out,
             k_scale=ks16,
             v_scale=vs16,
+            # Every layer of the pass reads the same rows and lengths: one plan
+            # refresh per pass (the target's decode layers do the same).
+            plan_step_owner=md,
+            # A row reads at most the window, the page-16 start rounding and
+            # the block: the splits follow that instead of the legacy cap.
+            max_context_length=(
+                self.sliding_window + ASM_PAGE_SIZE + int(md.max_seqlen_q)
+                if self.sliding_window
+                else None
+            ),
         )
         return out.view(rows, -1)
 
