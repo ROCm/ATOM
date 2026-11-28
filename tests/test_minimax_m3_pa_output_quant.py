@@ -3,7 +3,8 @@
 
 """MiniMax-M3 sparse PA writing o_proj's per-token FP8 input (aiter #7401's
 ``pa_decode(quantized_output=, output_scale=, ...)``): the gate, the op, the
-routing and, on gfx1250, the bytes against BF16 PA + the standalone quant."""
+routing and, on gfx1250, the bytes against BF16 PA + the standalone quant. Also
+the plan cap of the BF16 sparse prefill."""
 
 from types import SimpleNamespace
 
@@ -209,6 +210,57 @@ def test_the_fp8_sparse_pa_hands_flydsl_the_fp8_output_alone(monkeypatch, m):
     assert seen["quantized_output"].data_ptr() == fp8.data_ptr()
     assert seen["output_scale"] is scale and seen["key_scale"].shape == (8, 1, 16, 1)
     assert seen["store_output"] is False and seen["quantized_pad_rows"] == 3
+
+
+@pytest.mark.parametrize(
+    "gfx, min_prefix_len, rows, default_cap",
+    [
+        ("gfx1250", 4096, 64, True),  # every row's prefix covers the window
+        ("gfx1250", 4095, 64, False),  # a row still on its causal ramp
+        ("gfx950", 4096, 64, False),
+        ("gfx1250", 4096, 512, False),  # rows reach the default plan's budget
+    ],
+)
+def test_saturated_cached_sparse_prefill_plans_at_the_default_cap(
+    monkeypatch, m, gfx, min_prefix_len, rows, default_cap
+):
+    """Sparse prefill keeps the static split cap unless, on gfx1250, every row's
+    prefix covers the selected window (256 page-16 columns = 4096 keys here) and
+    the rows fit aiter's default plan budget (512 here)."""
+    import aiter.ops.flydsl.pa_decode as fly
+    import aiter.ops.triton.gluon.pa_decode_gluon as gluon
+
+    ba, sparse_attn = m.base_attention, m.sparse_attn
+    caps, budget_shapes = [], []
+    monkeypatch.setattr(gluon, "get_recommended_splits", lambda n, h: 8)
+    monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *a: False)
+    monkeypatch.setattr(sparse_attn, "get_gfx_runtime", lambda: gfx)
+    monkeypatch.setattr(
+        fly,
+        "pa_decode_default_workgroup_budget",
+        lambda device, **kw: budget_shapes.append(kw) or 512,
+    )
+    monkeypatch.setattr(
+        ba, "run_pa_decode", lambda **kw: caps.append(kw["plan_partition_cap"])
+    )
+
+    def meta(*shape):
+        return torch.empty(shape, device="meta")
+
+    sparse_attn.minimax_m3_sparse_attn_prefill_asm(
+        q=meta(rows, 16, 128), k_cache=meta(8, 1, 8, 16, 16),
+        v_cache=meta(8, 1, 1, 128, 16), topk_idx=None, block_table=None,
+        query_req_id=None, query_abs_pos=None, qo_indptr=meta(rows + 1),
+        num_kv_heads=1, sm_scale=1.0, output=meta(rows, 16, 128),
+        sparse_bt=meta(rows, 256), sparse_ctx=meta(rows),
+        min_prefix_len=min_prefix_len,
+    )  # fmt: skip
+    assert caps == [None if default_cap else 8]
+    # asked for this PA's shape: head 128, page 16, 16 query heads a KV head
+    assert all(
+        (kw["head_dim"], kw["block_size"], kw["query_group_size"]) == (128, 16, 16)
+        for kw in budget_shapes
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

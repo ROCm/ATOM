@@ -808,6 +808,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             block_page_stride=BLOCK_PAGE_STRIDE,
             plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
             plan_cache_owner=prefill_md,
+            min_prefix_len=prefill_md.min_prefix_len,
         )
 
     def _run_sparse_attention(

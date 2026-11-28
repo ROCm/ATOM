@@ -980,6 +980,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_prefills=bs,
                 num_prefill_tokens=batch.scheduled_tokens,
                 num_idx_heads=self._num_idx_heads,
+                min_prefix_len=(
+                    int(batch.cached_lens[:bs].min())
+                    if attn_metadata.has_cached and bs
+                    else 0
+                ),
                 index_scorer=self._index_scorers.get(""),
                 nvfp4_kv=self.model_runner.config.kv_cache_dtype == "nvfp4",
             )

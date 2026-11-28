@@ -1885,6 +1885,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     sparse_ctx=sparse_ctx,
                     plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
                     plan_cache_owner=prefill_md,
+                    min_prefix_len=prefill_md.min_prefix_len,
                 )
         output = output.view(*q.shape)
         self._index_q = None

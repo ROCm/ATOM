@@ -1224,7 +1224,7 @@ class TestExplicitPlan:
         assert plan.refreshed == 1, "capture must record exactly one refresh"
 
     def test_dense_runtime_plan_takes_the_aiter_ceiling(self, monkeypatch):
-        """Same ceiling as the capture-owned plans; sparse keeps its cap."""
+        """Same ceiling as the capture-owned plans; a caller's cap is kept."""
         ba, built = self._setup(monkeypatch)
         assert self._call(ba, cap=None).max_partitions == 256
         assert built[-1].get("max_partitions") is None, built[-1]
@@ -1290,23 +1290,17 @@ class TestExplicitPlan:
         assert calls, f"{relpath} no longer calls {func}; test moved"
         return calls
 
-    def test_static_cap_callers_pass_their_split_count(self):
-        """Who keeps a static plan ceiling is a choice, not an invariant.
-
-        Sparse keeps it because each row's selected context is a bounded topk
-        window; the vLLM bridge keeps it until it is measured at aiter's
-        default. A later measurement may change either; this pins the current
-        choice so a change is deliberate. (The SGLang bridge computes in bf16,
-        which FlyDSL rejects, so it never plans.)
+    def test_vllm_bridge_keeps_its_static_split_cap(self):
+        """The vLLM bridge keeps the static plan ceiling until it is measured at
+        aiter's default; this pins the choice so a change is deliberate. (The
+        SGLang bridge computes in bf16, which FlyDSL rejects, so it never plans.)
         """
-        for relpath in (
-            "model_ops/minimax_m3/sparse_attn.py",
-            "plugin/vllm/attention/layer_mha.py",
+        for kw in self._call_kwargs(
+            "plugin/vllm/attention/layer_mha.py", "run_pa_decode"
         ):
-            for kw in self._call_kwargs(relpath, "run_pa_decode"):
-                assert getattr(kw.get("plan_partition_cap"), "id", None) == (
-                    "max_context_partition_num"
-                ), f"{relpath}: plan cap is not the static split count"
+            assert getattr(kw.get("plan_partition_cap"), "id", None) == (
+                "max_context_partition_num"
+            ), "vLLM bridge: plan cap is not the static split count"
 
     def test_callers_leave_gluon_scratch_to_aiter(self):
         """No caller keeps its own copy of the kernel's scratch shapes."""

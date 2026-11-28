@@ -444,6 +444,7 @@ class MinimaxM3SparsePrefillMetadata:
     block_table: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    min_prefix_len: int = 0
 
 
 @dataclass
@@ -658,6 +659,21 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
                 prefill_start : prefill_stop + 1
             ].to(torch.int32)
             prefill_query_start = prefill_query_start - prefill_token_start
+            prefill_query_start_cpu = common_attn_metadata.query_start_loc_cpu[
+                prefill_start : prefill_stop + 1
+            ]
+            prefill_query_lens_cpu = (
+                prefill_query_start_cpu[1:] - prefill_query_start_cpu[:-1]
+            )
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
+            prefix_lens_cpu = [
+                seq_len - query_len
+                for seq_len, query_len in zip(
+                    seq_lens_cpu[prefill_start:prefill_stop].tolist(),
+                    prefill_query_lens_cpu.tolist(),
+                )
+            ]
             context_lens = common_attn_metadata.compute_num_computed_tokens()[
                 prefill_start:prefill_stop
             ]
@@ -672,6 +688,7 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
                 block_table=block_table[prefill_start:prefill_stop],
                 max_query_len=prefill_max_query_len,
                 max_seq_len=prefill_max_seq_len,
+                min_prefix_len=min(prefix_lens_cpu, default=0),
             )
 
         decode_metadata: MinimaxM3SparseDecodeMetadata | None = None

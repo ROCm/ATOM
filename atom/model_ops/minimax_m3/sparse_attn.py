@@ -20,6 +20,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
@@ -76,6 +77,7 @@ class MiniMaxM3SparsePrefillMetadata:
     """``(row_req_id, row_kv_lens)`` of every prefill row, int32: what the NVFP4 sparse
     PA takes per row. Built once with the step's metadata and read by every sparse layer;
     None unless the KV cache is NVFP4 (``make_sparse_prefill_metadata(nvfp4_kv=True)``)."""
+    min_prefix_len: int = 0
 
 
 @dataclass
@@ -120,6 +122,7 @@ def make_sparse_prefill_metadata(
     num_prefills: int,
     num_prefill_tokens: int,
     num_idx_heads: int,
+    min_prefix_len: int = 0,
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_scorer: IndexScoreBuffers | None = None,
     nvfp4_kv: bool = False,
@@ -145,6 +148,7 @@ def make_sparse_prefill_metadata(
             if nvfp4_kv
             else None
         ),
+        min_prefix_len=min_prefix_len,
     )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -1435,6 +1439,21 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+def _default_plan_budget(q, k_cache) -> int:
+    """The workgroup budget of aiter's default plan for this PA shape (imported on
+    call: only gfx1250 asks, and FlyDSL is optional elsewhere)."""
+    from aiter.ops.flydsl.pa_decode import pa_decode_default_workgroup_budget
+
+    return pa_decode_default_workgroup_budget(
+        q.device,
+        kv_dtype=k_cache.dtype,
+        head_dim=q.shape[-1],
+        block_size=k_cache.shape[3],
+        query_length=1,
+        query_group_size=q.shape[1],
+    )
+
+
 @torch.no_grad()
 def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1449,6 +1468,7 @@ def sparse_pa_per_row(
     v_scale: torch.Tensor | None,
     plan_step_owner=None,
     plan_cache_owner=None,
+    dynamic_partition_plan: bool = False,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and PA decode else.
 
@@ -1495,6 +1515,12 @@ def sparse_pa_per_row(
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
+    use_dynamic_partition_plan = (
+        get_gfx_runtime() == "gfx1250"
+        and dynamic_partition_plan
+        and sparse_bt.shape[-1] * ASM_PAGE_SIZE > context_partition_size
+        and num_seqs < _default_plan_budget(q_view, k_cache_view)
+    )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
@@ -1526,8 +1552,13 @@ def sparse_pa_per_row(
         ps=True,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
-        # Bounded topk window per row: keep the static split cap.
-        plan_partition_cap=max_context_partition_num,
+        # Once every row's prefix covers the selected window, the selected
+        # lengths are flat instead of the cold prefill's causal ramp: the GPU
+        # planner spends its default capacity there. The decision reads only
+        # host values (the minimum prefix, the window), never a device length.
+        plan_partition_cap=(
+            None if use_dynamic_partition_plan else max_context_partition_num
+        ),
     )
 
 
@@ -1661,6 +1692,7 @@ def minimax_m3_sparse_attn_prefill_asm(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     plan_step_owner=None,
     plan_cache_owner=None,
+    min_prefix_len: int = 0,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1724,4 +1756,8 @@ def minimax_m3_sparse_attn_prefill_asm(
         v_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
+        # Once every row starts beyond a full selected window, its sparse
+        # context is flat instead of the cold prefill's causal ramp. Both the
+        # minimum prefix and selected capacity are host-known.
+        dynamic_partition_plan=(min_prefix_len >= sparse_bt.shape[-1] * ASM_PAGE_SIZE),
     )

@@ -626,6 +626,9 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
 
     if is_prefill:
         extend_lens = _extend_lens(forward_batch, positions, bs)
+        # None when SGLang hands the extend lengths in on the device only
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu or []
+        min_prefix_len = min(prefix_lens_cpu[:bs], default=0)
         cu_q = torch.empty(bs + 1, dtype=torch.int32, device=positions.device)
         cu_q[0] = 0
         torch.cumsum(extend_lens, dim=0, out=cu_q[1:])
@@ -655,6 +658,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             num_prefills=bs,
             num_prefill_tokens=total_tokens,
             num_idx_heads=num_idx_heads,
+            min_prefix_len=min_prefix_len,
         )
         sparse_md.prefill.qo_indptr = torch.arange(
             total_tokens + 1,
