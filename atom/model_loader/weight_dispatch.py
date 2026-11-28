@@ -99,6 +99,8 @@ class WeightDispatcher:
         # drafter block in two separate passes.
         self._is_fused_expert = False
         self._fused_expert_params_mapping: Sequence[tuple] = ()
+        # Parameter id -> name, built on the first `weight_loader_fanout`.
+        self._param_names: dict[int, str] | None = None
 
     def dispatch(self, orig_ckpt_name: str, name: str, tensor: torch.Tensor) -> None:
         if not self._dispatch_packed(orig_ckpt_name, name, tensor):
@@ -320,3 +322,11 @@ class WeightDispatcher:
 
     def _record(self, param_name: str) -> None:
         self.loaded_weights_record.add(self.prefix + param_name)
+        # Parameters that `param_name`'s weight_loader writes as well: loaded,
+        # though no checkpoint tensor names them.
+        param = self.params_dict.get(param_name)
+        fanout = getattr(param, "weight_loader_fanout", ())
+        if fanout and self._param_names is None:
+            self._param_names = {id(p): n for n, p in self.params_dict.items()}
+        for p in fanout:
+            self.loaded_weights_record.add(self.prefix + self._param_names[id(p)])
