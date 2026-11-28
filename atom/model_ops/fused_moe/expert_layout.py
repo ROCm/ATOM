@@ -202,6 +202,34 @@ def physical_expert_id(
     return expert_id
 
 
+def block_quantized_intermediate_size(
+    logical_size: int, block_n: int, block_k: int, tp_size: int
+) -> int:
+    """Physical width for a TP shard with intact or replicated scale blocks.
+
+    Equal sub-block shards may share a square weight block's scale. Group32
+    weights have (N, K) blocks of (1, 32); their multi-rank TP shards still require
+    K alignment. Padding the target kernel layout does not relax that contract.
+    """
+    if (
+        block_n == block_k
+        and 0 < logical_size < block_n
+        and block_n % logical_size == 0
+    ):
+        return block_n
+    if logical_size % block_n != 0:
+        raise ValueError(
+            f"The output_size of gate's and up's weight = {logical_size} "
+            f"is not divisible by weight quantization block_n = {block_n}."
+        )
+    if tp_size > 1 and logical_size % block_k != 0:
+        raise ValueError(
+            f"The input_size of down's weight = {logical_size} "
+            f"is not divisible by weight quantization block_k = {block_k}."
+        )
+    return logical_size
+
+
 def expert_shard_dim(shard_id: str, is_transposed: bool = False) -> int:
     """Dimension of a single expert slot that `shard_id` is sharded along."""
     dim = _SHARD_ID_TO_SHARDED_DIM[shard_id]

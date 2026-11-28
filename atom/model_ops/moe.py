@@ -53,6 +53,7 @@ from atom.model_ops.fused_moe.config import (
 from atom.model_ops.fused_moe.expert_layout import (
     MoEExpertLayout,
     SharedExpertMode,
+    block_quantized_intermediate_size,
     count_local_base_experts,
     determine_expert_map,
     expert_region,
@@ -121,6 +122,15 @@ from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
 from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 
 logger = logging.getLogger("atom")
+
+
+def _fp8_weight_block_shape(quant_type: QuantType) -> tuple[int, int]:
+    """Weight (N, K) blocks, distinct from the activation quantization group."""
+    if quant_type == QuantType.per_1x128:
+        return 128, 128
+    if quant_type == QuantType.per_1x32:
+        return 1, 32
+    raise ValueError(f"Not a block FP8 quantization type: {quant_type}")
 
 
 class MoEActivationQuant(Enum):
@@ -2907,12 +2917,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
 
         # Block sizes for block quantization
         if self.block_quant:
-            if self.quant_type == QuantType.per_1x128:
-                self.block_n = 128
-                self.block_k = 128
-            elif self.quant_type == QuantType.per_1x32:
-                self.block_n = 1
-                self.block_k = 32
+            self.block_n, self.block_k = _fp8_weight_block_shape(self.quant_type)
 
     def create_weights(
         self,
@@ -2929,31 +2934,26 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         layer.hidden_size = hidden_size
         layer.intermediate_size_per_partition = intermediate_size_per_partition
 
-        # Check block alignment for block quantization
-        if self.block_quant:
-            tp_size = get_tp_group().world_size
-            if intermediate_size_per_partition % self.block_n != 0:
-                raise ValueError(
-                    f"intermediate_size_per_partition={intermediate_size_per_partition} "
-                    f"must be divisible by block_n={self.block_n}"
-                )
-            if tp_size > 1 and intermediate_size_per_partition % self.block_k != 0:
-                raise ValueError(
-                    f"intermediate_size_per_partition={intermediate_size_per_partition} "
-                    f"must be divisible by block_k={self.block_k}"
-                )
-
-        # WEIGHTS
         logical_intermediate = intermediate_size_per_partition
-        if self.per_channel:
-            intermediate_size_per_partition = padded_partition_size(
+        intermediate_size_for_weight = logical_intermediate
+        if self.block_quant:
+            intermediate_size_for_weight = block_quantized_intermediate_size(
+                intermediate_size_per_partition,
+                self.block_n,
+                self.block_k,
+                get_tp_group().world_size,
+            )
+
+        elif self.per_channel:
+            intermediate_size_for_weight = padded_partition_size(
                 logical_intermediate, self.pad_align
             )
 
+        # WEIGHTS
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                2 * intermediate_size_for_weight,
                 hidden_size,
                 dtype=params_dtype,
             )
@@ -2965,14 +2965,14 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition,
+                intermediate_size_for_weight,
                 dtype=params_dtype,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        if intermediate_size_per_partition != logical_intermediate:
+        if intermediate_size_for_weight != logical_intermediate:
             # Byte initialization also works for FP8 storage. Loaders copy
             # logical TP slices into each physical gate/up half and W2's K
             # prefix, leaving the padding zero.
@@ -2986,19 +2986,19 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = atom_parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    2 * intermediate_size_for_weight,
                     1,  # Important: dimension is 1, not omitted
                     dtype=torch.float32,
                 )
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-            if intermediate_size_per_partition != logical_intermediate:
+            if intermediate_size_for_weight != logical_intermediate:
                 w13_weight_scale.data[
-                    :, logical_intermediate:intermediate_size_per_partition
+                    :, logical_intermediate:intermediate_size_for_weight
                 ].zero_()
                 w13_weight_scale.data[
-                    :, intermediate_size_per_partition + logical_intermediate :
+                    :, intermediate_size_for_weight + logical_intermediate :
                 ].zero_()
 
             w2_weight_scale = atom_parameter(
@@ -3025,7 +3025,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                     num_experts,
                     2
                     * (
-                        (intermediate_size_per_partition + self.block_n - 1)
+                        (intermediate_size_for_weight + self.block_n - 1)
                         // self.block_n
                     ),
                     (hidden_size + self.block_k - 1) // self.block_k,
@@ -3038,8 +3038,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 torch.ones(
                     num_experts,
                     (hidden_size + self.block_n - 1) // self.block_n,
-                    (intermediate_size_per_partition + self.block_k - 1)
-                    // self.block_k,
+                    (intermediate_size_for_weight + self.block_k - 1) // self.block_k,
                     dtype=torch.float32,
                 )
             )
@@ -3325,30 +3324,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         stream_online_quant = getattr(layer, "_stream_online_quant", False)
 
         if self.block_quant:
-            if self.quant_type == QuantType.per_1x128:
-                block_n = 128
-                block_k = 128
-            elif self.quant_type == QuantType.per_1x32:
-                block_n = 1
-                block_k = 32
-            tp_size = get_tp_group().world_size
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
+            block_n, block_k = _fp8_weight_block_shape(self.quant_type)
+            intermediate_size_for_weight = block_quantized_intermediate_size(
+                intermediate_size_per_partition,
+                block_n,
+                block_k,
+                get_tp_group().world_size,
+            )
+            if stream_online_quant:
+                intermediate_size_for_weight = intermediate_size_per_partition
             if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
@@ -3379,7 +3363,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight", w13_weight)
         # Only target buffers contain padding bytes.
-        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
+        if not stream_online_quant and (
+            self.quant_type == QuantType.per_1x32
+            or intermediate_size_for_weight != intermediate_size_per_partition
+        ):
             w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -3393,7 +3380,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
+        if not stream_online_quant and (
+            self.quant_type == QuantType.per_1x32
+            or intermediate_size_for_weight != intermediate_size_per_partition
+        ):
             w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -3625,12 +3615,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # V4-Flash-Base on gfx942 hits this: routed experts are FP8 e4m3
             # per_1x128 + UE8M0 block-scale.
             if self.block_quant:
-                if self.quant_type == QuantType.per_1x128:
-                    block_shape = [128, 128]
-                elif self.quant_type == QuantType.per_1x32:
-                    block_shape = [1, 32]
-                else:
-                    block_shape = None
+                block_shape = list(_fp8_weight_block_shape(self.quant_type))
             else:
                 block_shape = None
             return fp8_w8a8_moe_quant_config(
@@ -5224,13 +5209,28 @@ class FusedMoE(torch.nn.Module):
                 )
                 return True
             if quant_method in (QuantType.per_1x128, QuantType.per_1x32):
+                load_full = getattr(param, "load_full_w2", False)
+                if quant_method == QuantType.per_1x128 and not load_full:
+                    block_n, block_k = _fp8_weight_block_shape(quant_method)
+                    # Gate/up shard N; down shards K. Multi-rank group32 TP still
+                    # requires K alignment, outside this square-block path.
+                    shard_block = block_k if shard_id == "w2" else block_n
+                    if self.intermediate_size_per_partition < shard_block:
+                        # A scale block spans several equal TP shards.
+                        scale_index = (
+                            self.tp_rank
+                            * self.intermediate_size_per_partition
+                            // shard_block
+                        )
+                        loaded_weight = loaded_weight.narrow(shard_dim, scale_index, 1)
+                        load_full = True
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
-                    load_full=getattr(param, "load_full_w2", False),
+                    load_full=load_full,
                 )
                 return True
             return False
