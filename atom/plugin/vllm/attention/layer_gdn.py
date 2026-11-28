@@ -6,65 +6,36 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from vllm.forward_context import get_forward_context
-from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-# Two prefill kernel options, selected per-instance via use_vk_layout:
-#
-#   * vk (default for the plugin path): ATOM-vendored verbatim port of
-#     vllm.model_executor.layers.fla.ops.chunk. Writes ssm_state as
-#     `[N, H, V, K]` per slot — matches the layout vLLM allocates via
-#     MambaStateShapeCalculator.gated_delta_net_state_shape and the layout
-#     that this file's decode kernels (fused_sigmoid_gating_delta_rule_update,
-#     flydsl_gdr_decode) read. Bit-exact agreement with vLLM upstream
-#     verified by tests/test_chunk_gated_delta_rule_vk.py.
-#
-#   * kv: ATOM's original chunk_gated_delta_rule in chunk.py. Writes
-#     ssm_state as `[N, H, K, V]` per slot. Used by the non-plugin
-#     ATOM-native GDN backend, which pairs it with its kv-layout decode
-#     kernel `fused_recurrent_gated_delta_rule`. NOT compatible with the
-#     plugin path's decode kernels — included here as a developer-only
-#     escape hatch (e.g. for A/B layout experiments). Selecting it on the
-#     plugin path will corrupt the prefill→decode ssm_state round-trip.
+# Prefill always uses chunk_gated_delta_rule_vk with VK state layout
+# [N, H, V, K], matching the vLLM allocator and this layer's decode kernels.
 from atom.model_ops.fla_ops.chunk_vk import chunk_gated_delta_rule_vk
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
-
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
 
-from torch import nn
-
 USE_FLYDSL_GDR = envs.ATOM_USE_FLYDSL_GDR
-try:
+if USE_FLYDSL_GDR:
     from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-except ImportError:
-    USE_FLYDSL_GDR = False
-    print(
-        "Failed to import flydsl_gdr_decode. Please make sure you have the latest version of aiter installed."
-    )
 
 
 class ChunkGatedDeltaRule(nn.Module):
-    """Prefill kernel wrapper.
+    """Prefill wrapper for chunk_gated_delta_rule_vk (VK state layout)."""
 
-    The choice between vk- and kv-layout chunk kernels is resolved at
-    construction time so .forward stays branch-free. See the module-level
-    import comment for the layout semantics and the constraint that the
-    plugin path's decode kernels are vk-only.
-    """
-
-    def __init__(self, use_vk_layout: bool = True) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.use_vk_layout = use_vk_layout
         self._fla_chunk_gated_delta_rule = chunk_gated_delta_rule_vk
 
     def forward(
@@ -79,21 +50,7 @@ class ChunkGatedDeltaRule(nn.Module):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         o: torch.Tensor | None = None,
-        num_decodes: int = 0,
-        num_decode_tokens: int = 0,
     ):
-        # `num_decodes` / `num_decode_tokens`: GDN mixed-batch hint that
-        # `cu_seqlens` is the ORIGINAL non-spec cumulative sequence lengths
-        # with a leading decode-only prefix of `num_decodes` sequences /
-        # `num_decode_tokens` tokens to skip. Passing them all the way
-        # down lets the chunk_vk prologue (`prepare_chunk_indices`,
-        # `prepare_chunk_offsets`, `prepare_rebased_cu_seqlens`) reuse
-        # its `@tensor_cache` entries across forward calls — the cache
-        # key is keyed on `cu_seqlens` identity, not content, so handing
-        # in the cache-stable metadata tensor avoids the D2H syncs that
-        # `.tolist()` inside the prologue would otherwise trigger.
-        # num_decodes hints are only supported by aiter opt_vk; ATOM blockdim64_vk
-        # does not accept them yet.
         return self._fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -201,20 +158,8 @@ class GatedDeltaNet(nn.Module):
         conv1d,
         activation,
         layer_num: int = 0,
-        use_vk_layout: bool = True,
         **kwargs,
     ):
-        """
-        Args:
-            use_vk_layout: When True (default), prefill writes ssm_state in
-                vLLM's `[V, K]`-per-head layout — required for this file's
-                decode kernels (fused_sigmoid_gating_delta_rule_update,
-                flydsl_gdr_decode) to read it correctly. The vLLM ssm_state
-                allocator (MambaStateShapeCalculator.gated_delta_net_state_shape)
-                also uses this layout. Set False ONLY for developer
-                experiments — the plugin path's decode kernels are vk-only,
-                so kv prefill would corrupt the prefill→decode round-trip.
-        """
         super().__init__()
         self.layer_num = layer_num
 
@@ -230,8 +175,7 @@ class GatedDeltaNet(nn.Module):
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.use_vk_layout = use_vk_layout
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(use_vk_layout=use_vk_layout)
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -290,23 +234,14 @@ class GatedDeltaNet(nn.Module):
         only when the prefill output can be written straight into the
         caller's `core_attn_out` slice without an intermediate copy.
 
-        `query_start_loc` is the ORIGINAL non-spec cumulative sequence
-        lengths (cache-stable across forward calls). `num_decodes` and
-        `num_decode_tokens` tell the chunk-vk prologue to skip the
-        leading decode-only prefix; the prologue does the rebase
-        internally under `@tensor_cache`, avoiding a per-call D2H sync.
+        `query_start_loc` includes the non-spec decode prefix. Rebase it by
+        `num_decodes` sequences and `num_decode_tokens` tokens before prefill.
         """
         initial_state = ssm_state[non_spec_state_indices].contiguous()
         initial_state[~has_initial_state, ...] = 0
         cu_seqlens = query_start_loc
         if num_decodes > 0:
-            # blockdim64_vk expects cu_seqlens length == initial_state + 1.
-            # opt_vk rebased internally via num_decodes; replicate that here.
             cu_seqlens = query_start_loc[num_decodes:] - num_decode_tokens
-        # Use ATOM's verified blockdim64_vk prefill kernel. aiter's
-        # chunk_gated_delta_rule_opt_vk corrupts the prefill→decode ssm_state
-        # round-trip with fused_sigmoid_gating_delta_rule_update on block-FP8
-        # Qwen3.5 (0526 plugin OK with blockdim64_vk, latest BAD with opt_vk).
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule_vk(
             q=q,
             k=k,
@@ -338,9 +273,8 @@ class GatedDeltaNet(nn.Module):
         Uses the fused sigmoid-gating + delta-rule kernel which reads/
         writes ssm_state inplace via the slot table.
 
-        When `ATOM_USE_FLYDSL_GDR` is set and aiter is importable, takes
-        the flydsl decode fast-path instead. `o` is required when the
-        flydsl path is selected (it has no `output_final_state` return).
+        When `ATOM_USE_FLYDSL_GDR=1`, takes the FlyDSL decode fast-path from AITER.
+        `o` is required for this path (there is no `output_final_state` return).
         """
         if USE_FLYDSL_GDR:
             assert o is not None, "flydsl_gdr_decode requires a pre-allocated o"
