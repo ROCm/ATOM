@@ -2081,6 +2081,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
+    dp_attention: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2108,6 +2109,13 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
+    if dp_attention:
+        # `tp_size` is still -tp here: CoreManager folds it into DP later, and each
+        # rank then runs attention at TP 1 with every index head and no replica.
+        return (
+            "--enable-dp-attention (attention runs at TP 1: each rank scores all "
+            "index heads over its own requests, so no index K is replicated)"
+        )
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -3296,6 +3304,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
+                dp_attention=self.enable_dp_attention,
             )
             if indexer_cp_off is not None:
                 logger.warning(

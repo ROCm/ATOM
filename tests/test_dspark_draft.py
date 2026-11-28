@@ -93,6 +93,44 @@ def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     assert md.dspark_ctx_rows.tolist() == [128] * T + [8] * T + [1 + T] * T
 
 
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("window", [0, 64])
+def test_minimax_m31_dspark_rows_per_kv_head(host_staging, window, heads):
+    """A rank holding H KV heads (2 at -tp 2, 4 at attention TP1) gets one
+    table row per (block row, KV head): the one-head row's pages KV-head
+    encoded (page * H + head), its length repeated -- what
+    `sparse_pa_per_row` reads over its collapsed cache view."""
+    import torch
+
+    m3_dspark = pytest.importorskip(
+        "atom.models.minimax_m3.dspark",
+        reason="the MiniMax-M3.1 draft imports aiter at module load",
+        exc_type=ImportError,
+    )
+
+    def run(heads):
+        draft = m3_dspark.MiniMaxM3DSpark.__new__(m3_dspark.MiniMaxM3DSpark)
+        draft.max_num_seqs, draft._bt16 = 4, None
+        draft.sliding_window = window
+        draft.kv_heads_per_rank = heads
+        pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
+        slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]])
+        ctx = torch.tensor([129, 8, 4], dtype=torch.int32)
+        block_tables = torch.tensor([[3, 0], [4, 5], [0, 0]], dtype=torch.int32)
+        md = types.SimpleNamespace()
+        draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2, 128)
+        return md.dspark_bt16_rows.clone(), md.dspark_ctx_rows.clone()
+
+    tables, lens = run(1)
+    kv_tables, kv_lens = run(heads)
+    rows, P = tables.shape
+    H = heads
+    assert kv_tables.shape == (rows * H, P) and kv_lens.shape == (rows * H,)
+    head_ids = torch.arange(H, dtype=torch.int32).view(1, H, 1)
+    assert torch.equal(kv_tables.view(rows, H, P), tables.unsqueeze(1) * H + head_ids)
+    assert kv_lens.tolist() == [n for n in lens.tolist() for _ in range(H)]
+
+
 # ---- the base draft's defaults --------------------------------------------
 
 
