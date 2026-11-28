@@ -375,6 +375,9 @@ class RemoteCoreManager:
     """Stands in for ``CoreManager`` in a worker: requests go to the hub, and
     the hub's outputs reach the same per-request callbacks."""
 
+    # The hub dispatches, so a worker never learns its requests' DP ranks.
+    reports_dp_rank = False
+
     def __init__(self, info: dict):
         self.index = info["index"]
         self.max_pool_tokens = info.get("max_pool_tokens")

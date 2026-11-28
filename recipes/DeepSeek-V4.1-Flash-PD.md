@@ -119,7 +119,7 @@ ingress in front of the router). PR states are as of 2026-11-27.
 | PR | What it does | State | Side | As measured (tree `de7d8ec1c`) | How to configure now | Points that used it | Notes |
 |---|---|---|---|---|---|---|---|
 | [#3772](https://github.com/ROCm/ATOM/pull/3772) | Store load wait: the first forward waits for a Mooncake Store load that is already in flight, instead of recomputing the prefix | open | P | Old fixed-wait version: `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20`. Its default was 0 (off), so the variable was set explicitly. | Not on main yet. On the current PR head: `ATOM_OFFLOAD_LOAD_EVENT_WAIT`, on by default (`0` turns it off), so set nothing. The PR head removes `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS`, so drop that variable. | all (c1-c768) | The wait is now event-driven: the load-completion doorbell wakes it, and the measured forward time bounds it. There is no fixed timeout. It does nothing without a Store tier. Measured at 1P1D c256: TTFT mean -20.2%, throughput +0.55%. |
-| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates pages and pulls KV while P is still computing | open | P | `ATOM_PD_EARLY_HANDOFF=1`. Its default was 0, so the variable was set explicitly. | Not on main yet. On the current PR head it is on by default (`1`). Set `ATOM_PD_EARLY_HANDOFF=0` explicitly wherever it should be off. | all (c1-c768) | **Known issue:** if a P step stalls for more than 60 s, early requests can leak a state slot. Once a rank has leaked `--max-num-seqs` slots, it admits no more requests, permanently. Use `0` at c1024 and above until the fix lands; the fix is in progress. Load visibility is correct only with one P instance. With several P instances behind one router, the router's view of P load is wrong. |
+| [#3773](https://github.com/ROCm/ATOM/pull/3773) | Early handoff: P answers the router at DP dispatch, so D allocates pages and pulls KV while P is still computing | open | P | `ATOM_PD_EARLY_HANDOFF=1`. Its default was 0, so the variable was set explicitly. | Not on main yet. On the current PR head it is on by default (`1`). Set `ATOM_PD_EARLY_HANDOFF=0` explicitly wherever it should be off. | all (c1-c768) | The ladder ran an older revision of this PR, with one P instance at every point. That revision had two problems. First, if a P step stalled for more than 60 s, an early request could leak a state slot, and a rank that had leaked `--max-num-seqs` slots admitted no more requests; runs at c1024 and above therefore used `0`, and they are not part of this ladder. Second, P's early answer ended the router's load charge for P, so with several P instances the router did not see the prefills still running on each P. The current PR head fixes both: (1) the leak fix is in the PR: the scheduler aborts a retired early source, and the worker releases its blocks and state slot; (2) the router keeps P's load guard, prefill tokens included, until P reports the prefill's end (line 2 of its answer), so the choice between several P instances sees each P's in-flight prefills. Early handoff is also negotiated per (P, D) pair, and a pair that cannot do it keeps the legacy relay. These fixes have CPU and router tests; the current head has not been run at c1024 and above, or with several P instances, in this recipe. |
 | [#3777](https://github.com/ROCm/ATOM/pull/3777) | Idle when blocked: a DP rank whose only work is blocked (Store lookup or load, KV send) idles instead of forcing dummy forwards | merged 2026-11-27 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1`. The pre-merge default was 0, so the variable was set explicitly. | Set nothing. On main, leaving it unset turns it on for a P/D prefill (`kv_producer`) and off elsewhere. An explicit `0` or `1` applies to any role. | all (c1-c768) | Needs `ATOM_ENABLE_PREFILL_DELAYER=0`, because the prefill delayer turns this setting off. |
 | [#3854](https://github.com/ROCm/ATOM/pull/3854) | Base64 prompt ids: the prompt token ids are sent as base64-packed uint32, which cuts D's ingest cost | merged 2026-11-26 | P, D, ingress | `ATOM_PROMPT_IDS_B64=1` on P and D (pre-merge default 0; merged into the tree by hand with two conflicts). Ingress: `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | P and D: set nothing, since `ATOM_PROMPT_IDS_B64` is on (`1`) by default on main. Ingress: keep `ATOM_FRONT_IDS_B64=1 ATOM_FRONT_SPLICE_BODY=1`. | all (c1-c768) | The two `ATOM_FRONT_*` variables belong to the external ingress, not to ATOM. Without them the ingress sends JSON ids, which still work. |
 | [#3873](https://github.com/ROCm/ATOM/pull/3873) | Late KV params on D: D accepts the chat request first and P's `kv_transfer_params` afterwards, on `/v1/pd/late_kv/chat/completions` | merged 2026-11-26 | D | Not in the tree and not used. | `ATOM_PD_LATE_KV=1` on D. The default is `0`, under which the route answers 404. | none | Use together with #3874. |
@@ -169,8 +169,10 @@ they were not part of the measured points.
   P-rank x D-rank rail takes 35-60 s to set up, while P's lookup times out at
   60 s (`PREFILL_LOOKUP_TIMEOUT`). Before timing, drive enough traffic that
   every P rank has transferred to every D rank.
-- **Early handoff.** Set `ATOM_PD_EARLY_HANDOFF=0` at c1024 and above (see
-  #3773 above).
+- **Early handoff.** The measured revision of #3773 was run only up to c768;
+  c1024 and above used `ATOM_PD_EARLY_HANDOFF=0` because of a state-slot leak
+  that the current PR head fixes (see #3773 above). On the current PR head it
+  is on by default; `0` on P turns it off.
 
 ### Software stack (identical on P and D, every point)
 
@@ -2476,7 +2478,7 @@ The two-node 1P1D AgentX ladder (c1-c768, P DEP4 + D TP8 Mono or D DEP8,
 | 5 | Store | Mooncake Store on the same host as P/D (optional) | About -2%, within noise. A remote Store works the same way. |
 | 6 | D | `--moe-backend mega` (E19 = E14a + items 6 and 7) | ITL fell from 6.37 to 5.88 ms on Host A, and throughput rose to 7,572 tok/s. |
 | 7 | P | `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS=20` (needs ATOM #3772) | The first forward waits up to 20 ms for a Store load already in flight, instead of recomputing the prefix. |
-| 8 | P | `ATOM_PD_EARLY_HANDOFF=1` (needs ATOM #3773) | P answers the router as soon as it has dispatched the request, so D allocates and pulls KV while P computes. Time from P finish to first token fell from 0.309 to 0.136 s. **Use only with a single P instance** (see [Caveats](#caveats)). |
+| 8 | P | `ATOM_PD_EARLY_HANDOFF=1` (needs ATOM #3773) | P answers the router as soon as it has dispatched the request, so D allocates and pulls KV while P computes. Time from P finish to first token fell from 0.309 to 0.136 s. Measured with a single P instance. On the current PR head the router keeps P charged until P's prefill ends, so several P instances are balanced by their in-flight prefills (covered by router tests, not measured here; see [Caveats](#caveats)). |
 | 9 | P | `ATOM_DP_IDLE_WHEN_BLOCKED=1` (ATOM #3777, merged; on by default on a P/D prefill on main) | A DP rank whose only work is waiting on a Store lookup or load, or on a KV send, no longer forces the group into dummy forwards. Outside the arrival burst, P queueing fell from about 0.22 s to 0.083 s. Ignored while the prefill delayer is on. |
 | 10 | D | `--cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]'` | D runs batch 15-20 per rank at C256. The old 16→24 step padded those batches. In a same-host A/B, a step at batch 17 was 2.67 ms faster and at batch 19 2.49 ms faster. Batches 16 and 24 changed by ±0.15 ms. Startup time and cudagraph memory (1.53 GB) were unchanged. |
 
@@ -2538,9 +2540,10 @@ for their current defaults):
    `ATOM_OFFLOAD_PRESTART_LOAD_WAIT_MS` as measured. The current PR head
    replaces it with `ATOM_OFFLOAD_LOAD_EVENT_WAIT` (on by default).
 4. **ATOM [#3773](https://github.com/ROCm/ATOM/pull/3773)** (open):
-   `ATOM_PD_EARLY_HANDOFF`. It applies only when P uses single-node DP and
-   the router uses the legacy relay. The current PR head turns it on by
-   default.
+   `ATOM_PD_EARLY_HANDOFF`. On the current PR head it is on by default and
+   negotiated per (P, D) pair: P offers it only with single-node DP and
+   without router-chunked mode, the router asks for it only when D can take
+   the chunked receive, and every other pair keeps the legacy relay.
 5. **ATOM [#3777](https://github.com/ROCm/ATOM/pull/3777)** (merged):
    `ATOM_DP_IDLE_WHEN_BLOCKED`, which includes the `BLOCKED_IDLE_SLEEP_S`
    GIL yield. On main it is on by default on a P/D prefill.
@@ -2753,11 +2756,15 @@ in the D command above.
   --cudagraph-capture-sizes '[1,2,4,6,8,10,12,14,16,18,20,22,24,28,32,36,40,44,48,64,96,128]' \
 ```
 
-`ATOM_PD_EARLY_HANDOFF` is for **one P instance only**. P answers the router
-once it has dispatched the request, so the router's in-flight count for P
-stays near zero. With several P instances, atomesh's least-loaded choice
-between them then no longer sees each P's queue depth. Leave it unset when
-more than one P serves a router.
+`ATOM_PD_EARLY_HANDOFF` was measured with one P instance. In the measured
+revision, P's answer at dispatch also ended the router's load charge for P,
+so with several P instances atomesh's least-loaded choice no longer saw each
+P's queue depth. The current PR head keeps P's load, prefill tokens
+included, until P reports the prefill's end (line 2 of its answer), so the
+choice between several P instances sees the prefills still running. Router
+tests cover this; no multi-P run has been made with this recipe. On the
+current head it is on by default; set `ATOM_PD_EARLY_HANDOFF=0` on P to turn
+it off.
 
 ### 4. Router and encoding ingress
 
@@ -2925,9 +2932,11 @@ What the tables show:
   without items 6-9, because the burst about 300 s into the window queues
   every request behind a 4-GPU P. Items 6-10 improve the mean, P50, P90 and
   the non-burst tail, but not this.
-- **Early handoff (8) is for a single P instance.** With several P instances
-  behind one router, the router stops seeing P load; see
-  [Best configuration](#best-configuration). Under a burst, D also reserves
+- **Early handoff (8) was measured with a single P instance.** In the measured
+  revision, the router stopped seeing P load once P answered early, so
+  several P instances were not balanced; the current PR head keeps P charged
+  until its prefill ends, see [Best configuration](#best-configuration).
+  Under a burst, D also reserves
   pages for requests still queued on P. In the A/B, D's mean waiting
   requests rose from 1.1 to 7.5, with no preemption and no errors.
 - **The full stack was measured once, on Host B only.** A same-host E19 run

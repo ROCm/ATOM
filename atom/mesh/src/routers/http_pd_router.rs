@@ -30,7 +30,7 @@ use crate::{
     core::{
         placement::{
             backend::{
-                atom::{AtomAdapter, AtomPrefillInfo},
+                atom::{offers_early_handoff, AtomAdapter, AtomChunkedReceive, AtomPrefillInfo},
                 sglang::SglangAdapter,
                 vllm::{VllmAdapter, VllmPrefillInfo},
                 BackendAdapter, PairCtx,
@@ -276,6 +276,17 @@ impl WorkerResponse {
         result
     }
 
+    /// Read the body line by line (an early-handoff prefill's NDJSON answer).
+    fn into_lines(self) -> NdjsonLines {
+        let Self { inner, outcome } = self;
+        NdjsonLines {
+            stream: inner.bytes_stream().boxed(),
+            buf: Vec::new(),
+            scanned: 0,
+            outcome,
+        }
+    }
+
     fn bytes_stream(
         self,
     ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send {
@@ -303,6 +314,111 @@ impl WorkerResponse {
             },
         )
     }
+}
+
+/// Set by an ATOM prefill that answered before its prefill ended (early
+/// handoff): its body is NDJSON, the handoff on line 1 and
+/// `{"atom_pd_prefill_done": {"ok": bool, "finish_reason": ...}}` on line 2.
+const ATOM_EARLY_HANDOFF_HEADER: &str = "x-atom-pd-early-handoff";
+
+/// A worker response body read line by line. Lines have no size limit: an
+/// early handoff's first line can carry a long prompt's token ids.
+struct NdjsonLines {
+    stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    buf: Vec<u8>,
+    /// Bytes of `buf` already searched for a newline.
+    scanned: usize,
+    outcome: WorkerOutcome,
+}
+
+impl NdjsonLines {
+    /// The next line without its '\n'; an unterminated tail is the last line.
+    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, reqwest::Error> {
+        loop {
+            if let Some(pos) = memchr::memchr(b'\n', &self.buf[self.scanned..]) {
+                let end = self.scanned + pos;
+                let rest = self.buf.split_off(end + 1);
+                let mut line = std::mem::replace(&mut self.buf, rest);
+                line.pop();
+                self.scanned = 0;
+                return Ok(Some(line));
+            }
+            self.scanned = self.buf.len();
+            match self.stream.next().await {
+                Some(chunk) => self.buf.extend_from_slice(&chunk?),
+                None if self.buf.is_empty() => return Ok(None),
+                None => {
+                    self.scanned = 0;
+                    return Ok(Some(std::mem::take(&mut self.buf)));
+                }
+            }
+        }
+    }
+
+    /// The next line that is not blank.
+    async fn next_json_line(&mut self) -> Result<Option<Vec<u8>>, reqwest::Error> {
+        loop {
+            match self.next_line().await? {
+                Some(line) if line.trim_ascii().is_empty() => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Wait for the prefill's end: Ok once P reports `ok: true` (and its body
+    /// ends), Err if it reports a failure or its body ends or fails first.
+    async fn prefill_done(mut self) -> Result<(), String> {
+        loop {
+            let line = match self.next_json_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    self.outcome.finish(false);
+                    return Err("prefill ended without atom_pd_prefill_done".to_string());
+                }
+                Err(e) => {
+                    self.outcome.finish(false);
+                    return Err(format!("prefill stream failed: {e}"));
+                }
+            };
+            let done = serde_json::from_slice::<Value>(&line)
+                .ok()
+                .and_then(|mut v| v.get_mut("atom_pd_prefill_done").map(Value::take));
+            let Some(done) = done else {
+                debug!(
+                    "ignoring an early-handoff prefill line without atom_pd_prefill_done: {}",
+                    String::from_utf8_lossy(&line[..line.len().min(256)])
+                );
+                continue;
+            };
+            if done.get("ok").and_then(Value::as_bool) != Some(true) {
+                self.outcome.finish(false);
+                return Err(format!(
+                    "prefill failed after its early handoff: finish_reason={}",
+                    done.get("finish_reason").unwrap_or(&Value::Null)
+                ));
+            }
+            // P ends its body right after the terminal line. A body that fails
+            // here is a failed prefill too: the caller answers 502 for it.
+            while let Some(chunk) = self.stream.next().await {
+                if let Err(e) = chunk {
+                    self.outcome.finish(false);
+                    return Err(format!(
+                        "prefill stream failed after atom_pd_prefill_done: {e}"
+                    ));
+                }
+            }
+            self.outcome.finish(true);
+            return Ok(());
+        }
+    }
+}
+
+/// The rest of an early-handoff prefill after its line 1: the wait for line 2
+/// (the prefill's end) and P's load guard, held until that end. Dropping it
+/// hangs up on P, which aborts the prefill.
+struct PrefillEnd {
+    done: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+    guard: WorkerLoadGuard,
 }
 
 /// Cancel prefill on dispatch errors; successful streams can detach its drain.
@@ -446,9 +562,10 @@ impl PDRouter {
                 Arc::new(VllmAdapter::new(info))
             }
             BackendType::Atom => {
-                let info =
-                    Arc::new(Self::fetch_atom_prefill_info(&worker_registry, &client).await?);
-                let a = Arc::new(AtomAdapter::new(info));
+                let mut info = Self::fetch_atom_prefill_info(&worker_registry, &client).await?;
+                info.decode_receive =
+                    Self::fetch_atom_decode_receive(&worker_registry, &client).await;
+                let a = Arc::new(AtomAdapter::new(Arc::new(info)));
                 atom_adapter = Some(a.clone());
                 a
             }
@@ -731,6 +848,7 @@ impl PDRouter {
 
         let mut tp_sizes = HashMap::new();
         let mut chunked_transfer = HashMap::new();
+        let mut early_handoff = HashSet::new();
         let mut queried_base_urls = HashSet::new();
         for worker in &prefill_workers {
             let worker_url = worker.url().to_string();
@@ -738,6 +856,9 @@ impl PDRouter {
             if !queried_base_urls.insert(base_url.clone()) {
                 if let Some(tp) = tp_sizes.get(&base_url).copied() {
                     tp_sizes.insert(worker_url.clone(), tp);
+                }
+                if early_handoff.contains(&base_url) {
+                    early_handoff.insert(worker_url.clone());
                 }
                 if let Some(meta) = chunked_transfer.get(&base_url).cloned() {
                     chunked_transfer.insert(worker_url, meta);
@@ -772,10 +893,18 @@ impl PDRouter {
                     base_url, kv_role
                 ));
             }
-            info!("ATOM prefill {} tp_size={}", base_url, tp);
+            let offers_early = offers_early_handoff(&data);
+            info!(
+                "ATOM prefill {} tp_size={} early_handoff={}",
+                base_url, tp, offers_early
+            );
             if let Some(meta) = data.get("chunked_transfer").filter(|v| v.is_object()) {
                 chunked_transfer.insert(base_url.clone(), meta.clone());
                 chunked_transfer.insert(worker_url.clone(), meta.clone());
+            }
+            if offers_early {
+                early_handoff.insert(base_url.clone());
+                early_handoff.insert(worker_url.clone());
             }
             tp_sizes.insert(base_url, tp);
             tp_sizes.insert(worker_url, tp);
@@ -783,7 +912,77 @@ impl PDRouter {
         Ok(AtomPrefillInfo {
             tp_sizes,
             chunked_transfer,
+            early_handoff,
+            ..Default::default()
         })
+    }
+
+    /// Query each ATOM decode's `chunked_receive`. Never fatal: a decode
+    /// that cannot be queried, or does not answer one, keeps the legacy relay.
+    async fn fetch_atom_decode_receive(
+        worker_registry: &WorkerRegistry,
+        client: &Client,
+    ) -> HashMap<String, AtomChunkedReceive> {
+        let mut receive = HashMap::new();
+        let mut queried = HashMap::<String, Option<AtomChunkedReceive>>::new();
+        for worker in worker_registry.get_decode_workers() {
+            let worker_url = worker.url().to_string();
+            let base_url = worker.base_url().trim_end_matches('/').to_string();
+            let found = match queried.get(&base_url) {
+                Some(found) => found.clone(),
+                None => {
+                    let found = Self::query_atom_decode_receive(client, &base_url).await;
+                    queried.insert(base_url.clone(), found.clone());
+                    found
+                }
+            };
+            if let Some(found) = found {
+                receive.insert(base_url, found.clone());
+                receive.insert(worker_url, found);
+            }
+        }
+        receive
+    }
+
+    async fn query_atom_decode_receive(
+        client: &Client,
+        base_url: &str,
+    ) -> Option<AtomChunkedReceive> {
+        let info_url = format!("{}/kv_transfer_info", base_url);
+        let data: Value = match client
+            .get(&info_url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("ATOM decode {info_url}: unparsable response ({e}); early handoff off for it");
+                    return None;
+                }
+            },
+            Err(e) => {
+                warn!("ATOM decode {info_url} failed ({e}); early handoff off for it");
+                return None;
+            }
+        };
+        let found = AtomChunkedReceive::from_kv_transfer_info(&data);
+        match &found {
+            Some(r) => info!(
+                "ATOM decode {} chunked_receive accepts={} tp_size={} reason={}",
+                base_url,
+                r.accepts,
+                r.tp_size,
+                data["chunked_receive"]["reason"]
+            ),
+            None => warn!(
+                "ATOM decode {} has no usable v1 chunked_receive (kv_role={}); early handoff off for it",
+                base_url, data["kv_role"]
+            ),
+        }
+        found
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -1190,7 +1389,7 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let kv_params = match self
+        let (kv_params, prefill_end) = match self
             .atom_prefill_kv(
                 prefill_post,
                 &prefill,
@@ -1201,7 +1400,7 @@ impl PDRouter {
             )
             .await
         {
-            Ok(kv) => kv,
+            Ok(answer) => answer,
             Err(response) => return response,
         };
 
@@ -1230,7 +1429,23 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = self.send_worker(decode_post, decode.clone(), headers).await;
+        let decode_send = self.send_worker(decode_post, decode.clone(), headers);
+        let decode_result = match prefill_end {
+            None => decode_send.await,
+            // A P still prefilling ends with D's request if D did not answer
+            // with success (the unused end is dropped here).
+            Some(end) => match Self::send_decode_during_early_prefill(
+                decode_send,
+                end,
+                prefill.url(),
+                &correlation_for_log,
+            )
+            .await
+            {
+                Ok((result, _)) => result,
+                Err(response) => return response,
+            },
+        };
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1258,6 +1473,10 @@ impl PDRouter {
     /// answered, and the params are enriched for `ctx` with P's prompt-id echo
     /// carried over. Every failure is logged with `request_id`. Shared by the
     /// serial relay and the concurrent (late-kv) dispatch.
+    ///
+    /// An NDJSON early handoff (P answered at DP dispatch and is still
+    /// prefilling) also returns its `PrefillEnd`: P's load stays reserved
+    /// until P reports the prefill's end on line 2.
     async fn atom_prefill_kv(
         &self,
         prefill_post: reqwest::RequestBuilder,
@@ -1266,7 +1485,7 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         ctx: &PairCtx,
         request_id: &str,
-    ) -> Result<Value, Response> {
+    ) -> Result<(Value, Option<PrefillEnd>), Response> {
         let prefill_resp = self
             .send_worker(prefill_post, prefill.clone(), headers)
             .await
@@ -1305,21 +1524,56 @@ impl PDRouter {
             ));
         }
 
-        let prefill_body: Value = prefill_resp.json().await.map_err(|e| {
-            error!(
-                "ATOM prefill {} request_id={} response parse failed: {}",
-                prefill.url(),
-                request_id,
-                e
-            );
-            error::bad_gateway(
-                "prefill_parse_error",
-                format!("Prefill response parse error: {}", e),
-            )
-        })?;
-
-        // P has completed its work; D's output stream must not keep P loaded.
-        drop(prefill_guard);
+        let (prefill_body, prefill_end) = if Self::is_ndjson_early_handoff(prefill_resp.headers()) {
+            let mut lines = prefill_resp.into_lines();
+            let parsed = match lines.next_json_line().await {
+                Ok(Some(line)) => serde_json::from_slice::<Value>(&line).map_err(|e| e.to_string()),
+                Ok(None) => Err("prefill ended before its handoff".to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            match parsed {
+                Ok(body) => {
+                    let end = PrefillEnd {
+                        done: Box::pin(lines.prefill_done()),
+                        guard: prefill_guard,
+                    };
+                    (body, Some(end))
+                }
+                Err(e) => {
+                    // A malformed line 1, or a body that ended or failed before
+                    // the handoff, is P's failure (as on every `prefill_done`
+                    // path), not a cancellation: dropping the 200 response
+                    // unfinished would record nothing in P's circuit breaker.
+                    lines.outcome.finish(false);
+                    error!(
+                        "ATOM prefill {} request_id={} early handoff parse failed: {}",
+                        prefill.url(),
+                        request_id,
+                        e
+                    );
+                    return Err(error::bad_gateway(
+                        "prefill_parse_error",
+                        format!("Prefill response parse error: {}", e),
+                    ));
+                }
+            }
+        } else {
+            let prefill_body: Value = prefill_resp.json().await.map_err(|e| {
+                error!(
+                    "ATOM prefill {} request_id={} response parse failed: {}",
+                    prefill.url(),
+                    request_id,
+                    e
+                );
+                error::bad_gateway(
+                    "prefill_parse_error",
+                    format!("Prefill response parse error: {}", e),
+                )
+            })?;
+            // P has completed its work; D's output stream must not keep P loaded.
+            drop(prefill_guard);
+            (prefill_body, None)
+        };
 
         // ATOM's prefill answers without a handoff as `"kv_transfer_params": null`.
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
@@ -1361,7 +1615,7 @@ impl PDRouter {
             "ATOM PD request_id={} carried {} prompt token ids to decode",
             request_id, carried_ids
         );
-        Ok(kv_params)
+        Ok((kv_params, prefill_end))
     }
 
     /// Relay mode with D dispatched concurrently (`--atom-pd-concurrent`).
@@ -1454,8 +1708,11 @@ impl PDRouter {
         let decode_policy = self.dispatch(&decode, headers);
 
         let flow_request_id = request_id.clone();
+        let prefill_url = prefill.url().to_string();
         let mut prefill_flow = Box::pin(async move {
-            let line = match self
+            // An early-handoff P answers at DP dispatch, so line 2 reaches D
+            // while P still prefills; its `PrefillEnd` comes back with it.
+            let answer = match self
                 .atom_prefill_kv(
                     prefill_post,
                     &prefill,
@@ -1466,12 +1723,14 @@ impl PDRouter {
                 )
                 .await
             {
-                Ok(kv) => late_kv_line(kv).map_err(Self::handle_serialization_error),
+                Ok((kv, end)) => late_kv_line(kv)
+                    .map(|line| (line, end))
+                    .map_err(Self::handle_serialization_error),
                 Err(response) => Err(response),
             };
             // D may already have answered (an error) and closed its body.
-            match &line {
-                Ok(line) => {
+            match &answer {
+                Ok((line, _)) => {
                     let _ = tx.try_send(Ok(line.clone()));
                 }
                 // Abort D's body instead of ending it: D sees a disconnect
@@ -1480,18 +1739,31 @@ impl PDRouter {
                     let _ = tx.try_send(Err(std::io::Error::other("prefill failed")));
                 }
             }
-            line
+            answer
         });
         let decode_send = Self::send(late_post, decode.clone(), decode_policy.clone());
         let mut decode_send = std::pin::pin!(decode_send);
 
         // A P failure ends the request at once; D's body is aborted above.
-        let (kv_line, decode_result) = tokio::select! {
+        // An early-handoff P's end is raced against D's answer, as in the
+        // serial relay; it stays pending only if D did not answer with success.
+        let (kv_line, prefill_end, decode_result) = tokio::select! {
             p = &mut prefill_flow => match p {
                 Err(response) => return response,
-                Ok(line) => (Some(line), decode_send.await),
+                Ok((line, None)) => (Some(line), None, decode_send.await),
+                Ok((line, Some(end))) => match Self::send_decode_during_early_prefill(
+                    decode_send.as_mut(),
+                    end,
+                    &prefill_url,
+                    &request_id,
+                )
+                .await
+                {
+                    Ok((result, end)) => (Some(line), end, result),
+                    Err(response) => return response,
+                },
             },
-            d = &mut decode_send => (None, d),
+            d = &mut decode_send => (None, None, d),
         };
         let res = match decode_result {
             Ok(r) => r,
@@ -1512,8 +1784,9 @@ impl PDRouter {
         if res.status() != StatusCode::NOT_FOUND {
             // Only the fallback needs line 1 and line 2. If D answered before
             // P (an error, as D waits for line 2), cancel P: dropping its flow
-            // releases P's load without counting a failure.
-            drop((head, kv_line, prefill_flow));
+            // (or an early-handoff P's pending end) releases P's load without
+            // counting a failure.
+            drop((head, kv_line, prefill_flow, prefill_end));
             events::RequestReceivedEvent {}.emit();
             return self
                 .finish_atom_decode_response(res, context, decode, decode_guard)
@@ -1529,10 +1802,10 @@ impl PDRouter {
                 ATOM_LATE_KV_PATH
             );
         }
-        let kv_line = match kv_line {
-            Some(line) => line,
+        let (kv_line, prefill_end) = match kv_line {
+            Some(line) => (line, prefill_end),
             None => match prefill_flow.await {
-                Ok(line) => line,
+                Ok(answer) => answer,
                 // Dropping the 404 completes D's dispatch as a cancellation.
                 Err(response) => return response,
             },
@@ -1549,7 +1822,24 @@ impl PDRouter {
             .headers(decode_headers)
             .header(CONTENT_TYPE, "application/json")
             .body(body);
-        let res = match Self::send(relay_post, decode.clone(), decode_policy).await {
+        let relay_send = Self::send(relay_post, decode.clone(), decode_policy);
+        let relay_result = match prefill_end {
+            None => relay_send.await,
+            Some(end) => {
+                match Self::send_decode_during_early_prefill(
+                    relay_send,
+                    end,
+                    &prefill_url,
+                    &request_id,
+                )
+                .await
+                {
+                    Ok((result, _)) => result,
+                    Err(response) => return response,
+                }
+            }
+        };
+        let res = match relay_result {
             Ok(r) => r,
             Err(e) => {
                 error!(
@@ -1567,6 +1857,75 @@ impl PDRouter {
         events::RequestReceivedEvent {}.emit();
         self.finish_atom_decode_response(res, context, decode, decode_guard)
             .await
+    }
+
+    fn is_ndjson_early_handoff(headers: &HeaderMap) -> bool {
+        headers
+            .get(ATOM_EARLY_HANDOFF_HEADER)
+            .is_some_and(|v| v.as_bytes() == b"1")
+    }
+
+    /// Send D while an early-handoff P is still prefilling. P's load guard is
+    /// released at P's line 2 (the prefill's end). Before D's headers, a P
+    /// failure answers 502 `prefill_error` and drops D's request. After D's
+    /// headers, a success leaves P's end to a detached watcher that releases
+    /// the guard and logs a failure (D then fails on its own). If D did not
+    /// answer with success, P's still-pending end is handed back: the caller
+    /// drops it (P aborts its prefill) or, on the late-kv 404 fallback, keeps
+    /// it for the relay's resend.
+    async fn send_decode_during_early_prefill(
+        decode_send: impl std::future::Future<Output = Result<WorkerResponse, reqwest::Error>>,
+        end: PrefillEnd,
+        prefill_url: &str,
+        correlation: &str,
+    ) -> Result<(Result<WorkerResponse, reqwest::Error>, Option<PrefillEnd>), Response> {
+        tokio::pin!(decode_send);
+        let PrefillEnd { done, guard } = end;
+        let mut prefill_end = Some(done);
+        let mut guard = Some(guard);
+        let decode_result = loop {
+            tokio::select! {
+                done = async { prefill_end.as_mut().unwrap().await }, if prefill_end.is_some() => {
+                    // P's prefill ended: release its load now, not at D's answer.
+                    prefill_end = None;
+                    guard = None;
+                    if let Err(e) = done {
+                        error!(
+                            "ATOM prefill {} request_id={} {} before decode answered",
+                            prefill_url, correlation, e
+                        );
+                        return Err(error::bad_gateway("prefill_error", e));
+                    }
+                }
+                result = &mut decode_send => break result,
+            }
+        };
+        // P already ended (its load was released above).
+        let (Some(prefill_end), Some(guard)) = (prefill_end, guard) else {
+            return Ok((decode_result, None));
+        };
+        let decode_ok = decode_result
+            .as_ref()
+            .is_ok_and(|res| res.status().is_success());
+        if !decode_ok {
+            let end = PrefillEnd {
+                done: prefill_end,
+                guard,
+            };
+            return Ok((decode_result, Some(end)));
+        }
+        let prefill_url = prefill_url.to_string();
+        let correlation = correlation.to_string();
+        tokio::spawn(crate::observability::route_trace::carry(async move {
+            if let Err(e) = prefill_end.await {
+                warn!(
+                    "ATOM prefill {} request_id={} {} after decode answered",
+                    prefill_url, correlation, e
+                );
+            }
+            drop(guard);
+        }));
+        Ok((decode_result, None))
     }
 
     async fn dispatch_atom_chunked_internal(
@@ -3380,6 +3739,301 @@ mod tests {
         assert_eq!(sent["prompt_token_ids"], json!([4, 5]));
         assert_eq!(sent["kv_transfer_params"]["remote_dp_rank"], 3);
         assert_eq!(sent["kv_transfer_params"]["transfer_id"], "xfer-1");
+    }
+
+    /// An early-handoff P mock: answers NDJSON at once with the handoff on
+    /// line 1, and reports the prefill's end (`ok`) on line 2 after `done_ms`.
+    async fn early_prefill_mock(state: Shared, done_ms: u64, ok: bool) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let state = state.clone();
+                async move {
+                    state.lock().unwrap().prefill_bodies.push(body);
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+                    let handoff = json!({"kv_transfer_params": {
+                        "do_remote_prefill": true, "do_remote_decode": false,
+                        "chunked_transfer": true, "transfer_id": "xfer-1", "dp_rank": 3}});
+                    let _ = tx.try_send(Ok(bytes::Bytes::from(format!("{handoff}\n"))));
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(done_ms)).await;
+                        state.lock().unwrap().prefill_replied = Some(Instant::now());
+                        let done = json!({"atom_pd_prefill_done": {"ok": ok}});
+                        let _ = tx.send(Ok(bytes::Bytes::from(format!("{done}\n")))).await;
+                    });
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/x-ndjson")
+                        .header(ATOM_EARLY_HANDOFF_HEADER, "1")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn late_kv_with_early_handoff_holds_prefill_load_until_line_two() {
+        let state: Shared = Default::default();
+        let p = early_prefill_mock(state.clone(), 400, true).await;
+        let d = decode_mock(state.clone(), LateRoute::Serve).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                          "prompt_token_ids": [1, 2]});
+        let r = run_atom_pd(&router, &p, &d, body, LateKvRun::default()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.out);
+        // D got P's line 1 as its kv line and answered while P still prefills.
+        let kv = &r.out["late"]["kv_transfer_params"];
+        assert_eq!(kv["transfer_id"], "xfer-1");
+        assert_eq!(kv["remote_dp_rank"], 3);
+        assert_eq!(kv["chunked_transfer"], true);
+        assert!(state.lock().unwrap().prefill_replied.is_none());
+        // P stays charged until its line 2.
+        assert_eq!(r.prefill.load(), 1);
+        assert_eq!(r.decode.load(), 0);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(state.lock().unwrap().prefill_replied.is_some());
+        r.assert_released();
+        assert_eq!(r.prefill.circuit_breaker().total_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn late_kv_fallback_keeps_an_early_prefill_running() {
+        let state: Shared = Default::default();
+        let p = early_prefill_mock(state.clone(), 400, true).await;
+        let d = decode_mock(state.clone(), LateRoute::Missing).await;
+        let router = atom_test_router(&p, true);
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                          "prompt_token_ids": [4, 5]});
+        let r = run_atom_pd(&router, &p, &d, body, LateKvRun::default()).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.out);
+        {
+            let st = state.lock().unwrap();
+            // D's 404 did not hang up on P: the relay resent with P's handoff.
+            assert_eq!(st.plain_hits, 1);
+            let sent = &st.plain_bodies[0]["kv_transfer_params"];
+            assert_eq!(sent["transfer_id"], "xfer-1");
+            assert_eq!(sent["remote_dp_rank"], 3);
+            assert!(st.prefill_replied.is_none());
+        }
+        assert_eq!(r.prefill.load(), 1);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        r.assert_released();
+        assert_eq!(r.prefill.circuit_breaker().total_failures(), 0);
+        assert_eq!(r.decode.circuit_breaker().total_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn early_handoff_line_one_failure_is_recorded_as_a_prefill_failure() {
+        // P answers 200 with the early-handoff header, then line 1 is malformed,
+        // the body ends before any line, or the body fails: a 502, and one
+        // failure (not a cancellation) in P's circuit breaker.
+        for case in ["malformed", "eof", "cut"] {
+            let p = serve(axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+                    match case {
+                        "malformed" => {
+                            let _ = tx.try_send(Ok(bytes::Bytes::from_static(b"not json\n")));
+                        }
+                        "cut" => {
+                            let _ = tx.try_send(Err(std::io::Error::other("cut")));
+                        }
+                        _ => {}
+                    }
+                    drop(tx);
+                    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/x-ndjson")
+                        .header(ATOM_EARLY_HANDOFF_HEADER, "1")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            ))
+            .await;
+            let router = atom_test_router(&p, false);
+            let prefill = early_test_worker(
+                &p,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            let decode = early_test_worker("http://decode.invalid", WorkerType::Decode);
+            let ctx = router
+                .adapter
+                .prepare_pair(prefill.as_ref(), decode.as_ref())
+                .unwrap();
+            let post = router
+                .client
+                .post(format!("{p}/v1/chat/completions"))
+                .json(&json!({}));
+            let guard = WorkerLoadGuard::new(prefill.clone(), None);
+            let result = router
+                .atom_prefill_kv(post, &prefill, guard, None, &ctx, "req-1")
+                .await;
+            let response = match result {
+                Ok(_) => panic!("{case}: a broken line 1 must fail the prefill"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            assert_eq!(prefill.circuit_breaker().total_failures(), 1, "{case}");
+            assert_eq!(prefill.circuit_breaker().total_successes(), 0, "{case}");
+            assert_eq!(prefill.load(), 0, "{case}");
+        }
+    }
+
+    /// An early-handoff P whose body reports `ok` on line 2 after `done_ms`,
+    /// then (`cut`) fails instead of ending cleanly.
+    async fn early_prefill_body_mock(done_ms: u64, cut: bool) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                let _ = tx.try_send(Ok(bytes::Bytes::from_static(b"{\"handoff\":1}\n")));
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(done_ms)).await;
+                    let done = json!({"atom_pd_prefill_done": {"ok": true}});
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("{done}\n")))).await;
+                    if cut {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let _ = tx.send(Err(std::io::Error::other("cut"))).await;
+                    }
+                });
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/x-ndjson")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        ))
+        .await
+    }
+
+    /// A D that sends its headers only after `delay_ms`.
+    async fn slow_decode_mock(delay_ms: u64) -> String {
+        serve(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                axum::Json(json!({"decoded": true}))
+            }),
+        ))
+        .await
+    }
+
+    fn early_test_worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .build(),
+        )
+    }
+
+    /// Posts to the early-handoff P mock and reads its line 1: what is left
+    /// is the wait for line 2 and P's load guard.
+    async fn early_prefill_end(p_url: &str, prefill: &Arc<dyn Worker>) -> PrefillEnd {
+        let policy: Arc<dyn crate::policies::LoadBalancingPolicy> =
+            Arc::new(CompletionPolicy::default());
+        let request = Client::new()
+            .post(format!("{p_url}/v1/chat/completions"))
+            .json(&json!({}));
+        let guard = WorkerLoadGuard::new(prefill.clone(), None);
+        let response = PDRouter::send(request, prefill.clone(), policy)
+            .await
+            .unwrap();
+        let mut lines = response.into_lines();
+        assert!(lines.next_json_line().await.unwrap().is_some());
+        PrefillEnd {
+            done: Box::pin(lines.prefill_done()),
+            guard,
+        }
+    }
+
+    fn slow_decode_send(
+        d_url: &str,
+        decode: &Arc<dyn Worker>,
+    ) -> impl std::future::Future<Output = Result<WorkerResponse, reqwest::Error>> {
+        let policy: Arc<dyn crate::policies::LoadBalancingPolicy> =
+            Arc::new(CompletionPolicy::default());
+        let request = Client::new()
+            .post(format!("{d_url}/v1/chat/completions"))
+            .json(&json!({}));
+        PDRouter::send(request, decode.clone(), policy)
+    }
+
+    #[tokio::test]
+    async fn early_prefill_body_failing_after_its_done_line_is_a_prefill_error() {
+        // P reports ok, then its body fails, all before D's headers: that is
+        // a failed prefill (502 prefill_error), not a success to wait D out.
+        let p_url = early_prefill_body_mock(30, true).await;
+        let d_url = slow_decode_mock(1500).await;
+        let prefill = early_test_worker(
+            &p_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = early_test_worker(&d_url, WorkerType::Decode);
+        let end = early_prefill_end(&p_url, &prefill).await;
+        let started = Instant::now();
+        let result = PDRouter::send_decode_during_early_prefill(
+            slow_decode_send(&d_url, &decode),
+            end,
+            &p_url,
+            "rid",
+        )
+        .await;
+        let Err(response) = result else {
+            panic!("a P body that fails after its done line must answer 502");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("prefill_error"));
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn early_prefill_success_releases_its_load_before_decode_answers() {
+        // P completes successfully long before D's headers: P's load guard
+        // goes at P's end, not at D's answer.
+        let p_url = early_prefill_body_mock(30, false).await;
+        let d_url = slow_decode_mock(600).await;
+        let prefill = early_test_worker(
+            &p_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = early_test_worker(&d_url, WorkerType::Decode);
+        let end = early_prefill_end(&p_url, &prefill).await;
+        assert_eq!(prefill.load(), 1);
+        let (result, load_while_d_runs) = tokio::join!(
+            PDRouter::send_decode_during_early_prefill(
+                slow_decode_send(&d_url, &decode),
+                end,
+                &p_url,
+                "rid",
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                prefill.load()
+            }
+        );
+        assert_eq!(load_while_d_runs, 0, "P stayed charged until D answered");
+        let Ok((Ok(response), None)) = result else {
+            panic!("D's answer must come back with P's end already consumed");
+        };
+        assert!(response.status().is_success());
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
     }
 
     #[tokio::test]

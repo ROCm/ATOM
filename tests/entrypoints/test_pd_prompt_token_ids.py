@@ -395,12 +395,17 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
         kv_cache_block_size=64,
         decode_context_parallel_size=2,
     )
+    # Router-chunked discovery alone; early handoff (on by default) has its
+    # own coverage in tests/test_pd_early_handoff.py.
+    monkeypatch.setenv("ATOM_PD_EARLY_HANDOFF", "0")
+    monkeypatch.setattr(api_server, "_early_handoff_endpoint_cache", [])
     monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=config))
     monkeypatch.setattr("atom.utils.network.get_ip", lambda: "127.0.0.1")
     info = asyncio.run(api_server.kv_transfer_info())
     assert info["kv_role"] == "kv_producer"
     assert info["handshake_port"] == 6401
     assert ("chunked_transfer" in info) is enabled
+    assert "early_handoff" not in info
     if enabled:
         assert info["chunked_transfer"] == {
             "remote_host": "127.0.0.1",

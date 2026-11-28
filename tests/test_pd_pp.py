@@ -373,6 +373,7 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched._pending_chunked_admissions = {}
     sched._chunked_waiting = {}
     sched._chunked_ready = set()
+    sched._speculative = False
     return sched
 
 

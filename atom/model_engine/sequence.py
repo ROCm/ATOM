@@ -275,6 +275,15 @@ class Sequence:
     counter = count()
     # True only for a decode leg whose prefill kept the media, set in __init__.
     media_on_prefill_instance = False
+    # ATOM_PD_EARLY_HANDOFF: the DP rank `CoreManager` dispatched the request
+    # to, set on the front end's copy after its add frame is pickled. A class
+    # default, so an unset rank adds nothing to the pickled state.
+    pd_routed_dp_rank: int | None = None
+    # ATOM_PD_EARLY_HANDOFF: the parameters an early request takes instead
+    # when its rank's prefill queue is too long to answer early, set by the
+    # API server and popped by `CoreManager._settle_early_handoff` before the
+    # add frame is pickled.
+    pd_legacy_kv_transfer_params: dict | None = None
 
     def __init__(
         self,
