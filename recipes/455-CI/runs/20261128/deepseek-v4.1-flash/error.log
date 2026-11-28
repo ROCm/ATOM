@@ -1,0 +1,91 @@
+[atom 04:52:46] Engine Core Mgr: add rank3: 1 req / 717 tok | in-flight reqs=[14, 14, 14, 15] queued_prefill_tokens=[11161, 11062, 11062, 11410]
+[atom 04:52:46] Engine Core Mgr: add rank1: 1 req / 725 tok | in-flight reqs=[14, 15, 14, 15] queued_prefill_tokens=[11161, 11787, 11062, 11410]
+[atom 04:52:46] Engine Core Mgr: add rank2: 1 req / 742 tok | in-flight reqs=[14, 15, 15, 15] queued_prefill_tokens=[11161, 11787, 11804, 11410]
+[atom 04:52:46] Engine Core Mgr: add rank0: 1 req / 766 tok | in-flight reqs=[15, 15, 15, 15] queued_prefill_tokens=[11927, 11787, 11804, 11410]
+[atom 04:52:46] Engine Core Mgr: add rank3: 1 req / 730 tok | in-flight reqs=[15, 15, 15, 16] queued_prefill_tokens=[11927, 11787, 11804, 12140]
+[atom 04:52:46] Engine Core Mgr: add rank1: 1 req / 711 tok | in-flight reqs=[15, 16, 15, 16] queued_prefill_tokens=[11927, 12498, 11804, 12140]
+[atom 04:52:46] Engine Core Mgr: add rank2: 1 req / 730 tok | in-flight reqs=[15, 16, 16, 16] queued_prefill_tokens=[11927, 12498, 12534, 12140]
+[atom 04:52:46] Engine Core Mgr: add rank0: 1 req / 750 tok | in-flight reqs=[16, 16, 16, 16] queued_prefill_tokens=[12677, 12498, 12534, 12140]
+[atom 04:52:46] Engine Core Mgr: add rank3: 1 req / 786 tok | in-flight reqs=[16, 16, 16, 17] queued_prefill_tokens=[12677, 12498, 12534, 12926]
+Process ModelRunner0/1:
+Process ModelRunner0/1:
+Traceback (most recent call last):
+Process ModelRunner0/1:
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/app/ATOM/atom/model_engine/async_proc.py", line 230, in __init__
+    self.busy_loop()
+  File "/app/ATOM/atom/model_engine/async_proc.py", line 334, in busy_loop
+    out = func(*call_args)
+          ^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 1521, in dummy_execution
+    return self.forward(
+           ^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 856, in wrapped
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/eplb.py", line 2482, in wrapper
+    return fn(self, batch, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 4148, in forward
+    self.run_lm_head(batch, hidden_states, all_greedy),
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 3746, in run_lm_head
+    return LmHeadOutput(None, self.compute_logits(hidden_states))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 3719, in compute_logits
+    return self.model.compute_logits(hidden_states)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v41/runtime.py", line 440, in compute_logits
+    return self.head.get_logits(self.norm(hidden))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 3805, in get_logits
+    return super().forward(x)
+           ^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/embed_head.py", line 291, in forward
+    return self.gather_logits(self.local_logits(x))
+                              ^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/embed_head.py", line 343, in local_logits
+    return tgemm.mm(x, self.weight, self.bias, out=out)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/tuned_gemm.py", line 941, in mm
+    return gemm_a16w16(
+           ^^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 346, in wrapper_custom
+    getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_ops.py", line 1350, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 377, in outer_wrapper
+    wrapper(*args, **kwargs)
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 259, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/tuned_gemm.py", line 419, in gemm_a16w16
+    return _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/plugin/__init__.py", line 730, in routed
+    return _dispatch(operation, canonicalize, native, args, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/plugin/__init__.py", line 763, in _dispatch
+    return native(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/tuned_gemm.py", line 542, in _gemm_a16w16
+    result = solfunc(
+             ^^^^^^^^
+  File "/app/aiter/aiter/tuned_gemm.py", line 791, in flydsl_gemm
+    result = flydsl_gemm_kernels.flydsl_hgemm(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/gemm_kernels.py", line 326, in flydsl_hgemm
+    return gemm_a16w16_tdm(
+           ^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/gemm_a16w16_tdm.py", line 70, in gemm_a16w16_tdm
+    validate_gemm_gfx1250_config(
+  File "/app/aiter/aiter/ops/flydsl/kernels/gemm_a16w16_tdm_gfx1250.py", line 98, in validate_gemm_gfx1250_config
+    raise ValueError(
+ValueError: dimensions, tiles, stages, wave counts and WMMA sizes must be positive integers
