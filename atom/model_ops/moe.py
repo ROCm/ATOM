@@ -21,6 +21,16 @@ from aiter.ops.shuffle import (
     moe_shuffle_weight,
 )
 from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+
+try:  # aiter with the gfx1250 fused router GEMM + top-k
+    from aiter.ops.flydsl.moe_front_gfx1250 import (
+        flydsl_moe_router_topk as _flydsl_moe_router_topk,
+    )
+    from aiter.ops.flydsl.moe_front_gfx1250 import router_split_k as _router_split_k
+    from aiter.tuned_gemm import tgemm  # the router GEMM where the fused one is not
+except ImportError:  # pragma: no cover - older aiter: the gate stays separate
+    _flydsl_moe_router_topk = None
+    _router_split_k = None
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -2251,6 +2261,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scheduled_tokens_gpu: torch.Tensor | None = None,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2396,6 +2407,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 _moe_result = _moe_result + self._apply_shared_experts_dense(
                     layer, x, activation
                 )
+            fill_mxfp8_copy(x, mxfp8_copy_out)
             return _moe_result
 
         # The step select_experts routed Top-(K+1) HERD candidates for: the same
@@ -2539,6 +2551,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         scheduled_tokens_gpu,
                     )
                 )
+                fill_mxfp8_copy(x, mxfp8_copy_out)
                 return triton_kernel_fused_experts(
                     None,  # output_tensor: the GUGU path allocates its own
                     x,
@@ -2583,6 +2596,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # writes the output in the model dtype, not x's.
                 a1_scale = x_scale
                 moe_extra_args["dtype"] = self.moe.in_dtype
+            if mxfp8_copy_out is not None:
+                # aiter folds the copy into the routed A1 quant where it can.
+                moe_extra_args["mxfp8_copy_out"] = mxfp8_copy_out
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -2602,6 +2618,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
+        fill_mxfp8_copy(x, mxfp8_copy_out)
         # Only the mori v2 modular kernel takes a shared output
         # (FusedMoE.combine_accepts_shared); the other kernels are not passed one.
         shared_kwargs = (
@@ -3707,6 +3724,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
 
+def fill_mxfp8_copy(
+    hidden_states: torch.Tensor,
+    mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None,
+) -> None:
+    """Write `mxfp8_copy_out` with the shared expert's own input quant, where
+    the experts' quant did not take it (a path other than aiter's fused_moe,
+    or rows the experts never see as they are here)."""
+    if mxfp8_copy_out is None:
+        return
+    from atom.model_ops.blockscale import quantize_fp8
+
+    payload, scale = quantize_fp8(hidden_states)
+    mxfp8_copy_out[0].copy_(payload)
+    mxfp8_copy_out[1].copy_(scale)
+
+
 def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -3730,6 +3763,116 @@ moe_forward_op = direct_register_custom_op(
     op_func=moe_forward,
     mutates_args=["hidden_states"],
     fake_impl=moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _mxfp8_copy_buffers(hidden_states: torch.Tensor):
+    """`quantize_fp8`'s outputs for these rows: E4M3 values and one E8M0
+    exponent per 32."""
+    from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+
+    rows, k = hidden_states.shape
+    return (
+        torch.empty((rows, k), dtype=FP8_DTYPE, device=hidden_states.device),
+        torch.empty(
+            (rows, k // 32), dtype=torch.float8_e8m0fnu, device=hidden_states.device
+        ),
+    )
+
+
+def moe_forward_mxfp8_copy(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`moe_forward` that also returns `hidden_states` quantized as the
+    shared expert's `quantize_fp8` would, written by the routed quant."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    copy = _mxfp8_copy_buffers(hidden_states)
+    out = self.forward_impl(hidden_states, router_logits, mxfp8_copy_out=copy)
+    # The scale leaves as bytes: this op mutates hidden_states, and Inductor
+    # does not decompose an auto_functionalized_v2 that returns E8M0
+    # ("auto_functionalized_v2 was not removed"). The caller views it back.
+    return out, copy[0], copy[1].view(torch.uint8)
+
+
+def moe_forward_mxfp8_copy_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    payload, scale = _mxfp8_copy_buffers(hidden_states)
+    return torch.empty_like(hidden_states), payload, scale.view(torch.uint8)
+
+
+moe_forward_mxfp8_copy_op = direct_register_custom_op(
+    op_name="moe_forward_mxfp8_copy",
+    op_func=moe_forward_mxfp8_copy,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_mxfp8_copy_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def moe_forward_fused_router(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """`moe_forward` with the router GEMM folded in (`forward_fused_router`)."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.forward_impl_fused_router(hidden_states, gate_weight)
+
+
+def moe_forward_fused_router_fake(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_fused_router",
+    op_func=moe_forward_fused_router,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_fused_router_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def moe_forward_fused_router_mxfp8_copy(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`moe_forward_mxfp8_copy` with the router GEMM folded in."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    copy = _mxfp8_copy_buffers(hidden_states)
+    out = self.forward_impl_fused_router(
+        hidden_states, gate_weight, mxfp8_copy_out=copy
+    )
+    return out, copy[0], copy[1].view(torch.uint8)
+
+
+def moe_forward_fused_router_mxfp8_copy_fake(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    payload, scale = _mxfp8_copy_buffers(hidden_states)
+    return torch.empty_like(hidden_states), payload, scale.view(torch.uint8)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_fused_router_mxfp8_copy",
+    op_func=moe_forward_fused_router_mxfp8_copy,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_fused_router_mxfp8_copy_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -5720,6 +5863,117 @@ class FusedMoE(torch.nn.Module):
 
         return isinstance(self.quant_method.fused_experts, MoriV2ModularKernel)
 
+    def supports_fused_router(self, gate_weight: torch.Tensor) -> bool:
+        """Whether `forward_fused_router` may replace `gate` + `forward` here:
+        an unquantized [E, K] bf16 router feeding a plain biased-sigmoid top-k
+        (aiter `topk_gating`, no group, custom or fused-shared routing, no fake
+        EPLB) and the local MXFP4 experts (DP 1, no SP mega MoE, TP-only).
+        The kernel's own shape gate (`router_split_k`) is asked per call."""
+        if _flydsl_moe_router_topk is None:
+            return False
+        method = self.quant_method
+        return (
+            isinstance(method, Mxfp4MoEMethod)
+            and gate_weight.dtype == torch.bfloat16
+            and gate_weight.dim() == 2
+            and gate_weight.shape[0] == 128
+            and gate_weight.is_contiguous()
+            and self.scoring_func == "sigmoid"
+            and not self.use_grouped_topk
+            and self.custom_routing_function is None
+            and self.num_fused_shared_experts == 0
+            and self.shared_expert_scoring_func is None
+            and self.balance_router_logits is None
+            and self.top_k <= 4
+            and (
+                self.e_score_correction_bias is None
+                or (
+                    self.e_score_correction_bias.dtype == torch.float32
+                    and self.e_score_correction_bias.numel() == 128
+                )
+            )
+            and self.dp_size == 1
+        )
+
+    def forward_fused_router(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """`forward(hidden_states, tgemm.mm(hidden_states, gate_weight))`, the
+        router GEMM and the top-k in one aiter launch where it reproduces them
+        (`supports_fused_router`); same output bytes."""
+        return torch.ops.aiter.moe_forward_fused_router(
+            hidden_states, gate_weight, self.layer_name
+        )
+
+    def forward_fused_router_with_mxfp8_copy(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`forward_with_mxfp8_copy` with the router of `forward_fused_router`."""
+        out, payload, scale = torch.ops.aiter.moe_forward_fused_router_mxfp8_copy(
+            hidden_states, gate_weight, self.layer_name
+        )
+        return out, payload, scale.view(torch.float8_e8m0fnu)
+
+    def forward_impl_fused_router(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Route with aiter's fused router GEMM + top-k when it takes this row
+        count (the tuned router GEMM is the FlyDSL kernel it reproduces), else
+        with the GEMM and `select_experts` as `forward` would."""
+        rows, k = hidden_states.shape
+        split_k = None
+        if (
+            rows > 0
+            and self.sp_mega_moe is None
+            and get_dp_group().world_size == 1
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.stride(1) == 1
+            and hidden_states.stride(0) % 8 == 0
+            and gate_weight.dtype == torch.bfloat16
+            and gate_weight.is_contiguous()
+            and tuple(gate_weight.shape) == (128, k)
+        ):
+            split_k = _router_split_k(
+                rows, gate_weight.shape[0], k, str(torch.bfloat16), str(torch.bfloat16)
+            )
+        if split_k is None:
+            router_logits = tgemm.mm(
+                hidden_states, gate_weight, None, otype=dtypes.bf16
+            )
+            return self.forward_impl(
+                hidden_states, router_logits, mxfp8_copy_out=mxfp8_copy_out
+            )
+        routing = _flydsl_moe_router_topk(
+            hidden_states,
+            gate_weight,
+            self.e_score_correction_bias,
+            self.top_k,
+            split_k,
+            need_renorm=self.renormalize,
+            routed_scaling_factor=1.0,
+            num_valid_rows=pass_scheduled_tokens_gpu(rows),
+        )
+        return self.forward_impl(
+            hidden_states, None, mxfp8_copy_out=mxfp8_copy_out, routing=routing
+        )
+
+    def forward_with_mxfp8_copy(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`forward`, plus `hidden_states` as `quantize_fp8` would give them
+        (E4M3, E8M0 per 32) for a shared expert run beside this layer. The
+        routed quant writes them in its own pass where aiter's fused_moe takes
+        the copy; any other path quantizes them separately."""
+        out, payload, scale = moe_forward_mxfp8_copy_op(
+            hidden_states,
+            self._routing_logits(hidden_states, router_logits),
+            self.layer_name,
+        )
+        return out, payload, scale.view(torch.float8_e8m0fnu)
+
     def forward_maybe_comm_fused(
         self,
         hidden_states: torch.Tensor,
@@ -5784,6 +6038,7 @@ class FusedMoE(torch.nn.Module):
         gathered: bool = False,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
@@ -5803,6 +6058,9 @@ class FusedMoE(torch.nn.Module):
         # SP marks its dummy and captured passes split too.
         split = merge and context.pcp_split and (pcp or sp_is_enabled())
         if split:
+            # The experts see the PCP group's rows, not these.
+            fill_mxfp8_copy(hidden_states, mxfp8_copy_out)
+            mxfp8_copy_out = None
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,
                 hidden_states,
@@ -5821,6 +6079,9 @@ class FusedMoE(torch.nn.Module):
 
             hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
+        copy_kwargs = (
+            {} if mxfp8_copy_out is None else {"mxfp8_copy_out": mxfp8_copy_out}
+        )
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
@@ -5852,6 +6113,7 @@ class FusedMoE(torch.nn.Module):
                 else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
             **shared_kwargs,
+            **copy_kwargs,
         )
         if split:
             output = tbo_on_comm(pcp_reduce_scatter, output)
@@ -5955,20 +6217,32 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: torch.Tensor | None,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        mxfp8_copy_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        routing: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
-        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`."""
+        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`.
+        `mxfp8_copy_out`: also write `hidden_states` as `quantize_fp8` would
+        (see `forward_with_mxfp8_copy`). `routing`: the `(topk_weights,
+        topk_ids)` `select_experts` would return, already computed (the fused
+        router, `forward_impl_fused_router`); `router_logits` is then unused."""
         assert self.quant_method is not None
+        assert routing is None or (
+            self.sp_mega_moe is None and get_dp_group().world_size == 1
+        ), "precomputed routing takes the local (DP 1, no SP mega) path only"
 
         # Decided here, at run time: the row count is symbolic while compiling.
         if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
             hidden_states.shape[0]
         ):
+            fill_mxfp8_copy(hidden_states, mxfp8_copy_out)
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
+            # The experts run on the gathered rows.
+            fill_mxfp8_copy(hidden_states, mxfp8_copy_out)
             return self.forward_impl_graph(
                 hidden_states,
                 router_logits,
@@ -5979,12 +6253,17 @@ class FusedMoE(torch.nn.Module):
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
-        )
+        if routing is not None:
+            topk_weights, topk_ids = routing
+        else:
+            topk_weights, topk_ids = self.quant_method.select_experts(
+                self, hidden_states, router_logits
+            )
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
+            fill_mxfp8_copy(hidden_states, mxfp8_copy_out)
+            mxfp8_copy_out = None
             hidden_states, topk_weights, topk_ids = (
                 repeat_rows(t, dp_repeat)
                 for t in (hidden_states, topk_weights, topk_ids)
@@ -5999,6 +6278,7 @@ class FusedMoE(torch.nn.Module):
             gathered=dp_repeat > 1,
             shared_add=shared_add,
             shared_ready=shared_ready,
+            mxfp8_copy_out=mxfp8_copy_out,
         )
 
         if dp_repeat > 1:
