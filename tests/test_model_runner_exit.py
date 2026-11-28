@@ -41,3 +41,24 @@ def test_a_failed_megamoe_close_still_releases_everything(monkeypatch):
     assert calls == ["sp_close", "close_mega_transports", "destroy", "empty"]
     assert runner.req_graph is None
     assert not hasattr(runner, "kv_cache") and not hasattr(runner, "model")
+
+
+def test_exit_stops_the_tbo_workers_before_releasing_the_model(monkeypatch):
+    """The TBO wrapper's micro-batch workers are joined at exit, not left
+    parked on a wrapper the runner no longer holds."""
+    calls = []
+    monkeypatch.setattr(mr, "get_kvconnector", lambda: None)
+    monkeypatch.setattr(mr, "destroy_dist_env", lambda: calls.append("destroy"))
+    monkeypatch.setattr(mr.torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    runner = SimpleNamespace(
+        still_running=True,
+        vision_embeddings=SimpleNamespace(clear=lambda: None),
+        structured_compile_executor=None,
+        req_graph=object(),
+        model=SimpleNamespace(stop_tbo_workers=lambda: calls.append("stop_tbo")),
+    )
+
+    mr.ModelRunner.exit(runner)
+
+    assert calls == ["destroy", "stop_tbo", "empty"]
+    assert not hasattr(runner, "model")
