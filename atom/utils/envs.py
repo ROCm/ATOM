@@ -204,6 +204,10 @@ def _dp_sync_interval_env() -> int | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # KDA W4 decode / five-token verify; read before import and graph capture.
+    "ATOM_KDA_CONV1D_FASTPATH": lambda: _flag_env("ATOM_KDA_CONV1D_FASTPATH", "1"),
+    # Experimental gfx1250 Gluon decode and TDM verification paths.
+    "ATOM_KDA_CONV1D_GLUON": lambda: _flag_env("ATOM_KDA_CONV1D_GLUON", "0"),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},

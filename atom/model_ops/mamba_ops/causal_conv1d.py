@@ -5,13 +5,58 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
 
+from atom.utils import envs
+
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+# Opt out before importing ATOM or capturing CUDA graphs.
+_KDA_CONV1D_FASTPATH_ENABLED = envs.ATOM_KDA_CONV1D_FASTPATH
+_KDA_CONV1D_GLUON_ENABLED = envs.ATOM_KDA_CONV1D_GLUON
+
 PAD_SLOT_ID = -1
+
+
+@cache
+def _get_kda_conv1d_gluon_kernel(device: torch.device, speculative: bool):
+    """Resolve an optional CDNA5 kernel once per device/mode, after opt-in."""
+    arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    if arch.split(":")[0] != "gfx1250":
+        return None
+    try:
+        from triton.experimental.gluon.language.amd.cdna5 import buffer
+    except ImportError:
+        return None
+    if not all(
+        hasattr(buffer, name) for name in ("make_buffer_descriptor", "load", "store")
+    ):
+        return None
+    if speculative:
+        try:
+            from triton.experimental.gluon.language.amd.cdna5 import tdm
+        except ImportError:
+            return None
+        if not all(
+            hasattr(tdm, name)
+            for name in (
+                "make_tensor_descriptor",
+                "update_tensor_descriptor",
+                "async_load",
+                "async_wait",
+            )
+        ):
+            return None
+        from .kda_conv1d_gluon import kda_conv1d_gluon_tdm_kernel
+
+        return kda_conv1d_gluon_tdm_kernel
+    from .kda_conv1d_gluon_decode import kda_conv1d_gluon_decode_kernel
+
+    return kda_conv1d_gluon_decode_kernel
 
 
 @triton.jit
@@ -1415,13 +1460,101 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
+    # Keep the generic kernel and its original compiler defaults for all other
+    # layouts/modes. This check inspects metadata only: no GPU synchronization.
+    _update_kernel = _causal_conv1d_update_kernel
+    _update_block_n = 256
+    _update_options = {}
+    _fast_decode = (
+        query_start_loc is None
+        and num_accepted_tokens is None
+        and x.ndim == 3
+        and seqlen == 1
+        and stride_x_seq >= dim
+    )
+    _fast_spec = (
+        query_start_loc is not None
+        and num_accepted_tokens is not None
+        and x.ndim == 2
+        and max_query_len == 5
+        and seqlen == 5
+        and stride_x_token >= dim
+        and query_start_loc.dtype == torch.int32
+        and query_start_loc.ndim == 1
+        and query_start_loc.numel() >= batch + 1
+        and query_start_loc.stride(0) == 1
+        and query_start_loc.device == x.device
+        and num_accepted_tokens.dtype == torch.int32
+        and num_accepted_tokens.ndim == 1
+        and num_accepted_tokens.numel() >= batch
+        and num_accepted_tokens.stride(0) == 1
+        and num_accepted_tokens.device == x.device
+    )
+    if (
+        _KDA_CONV1D_FASTPATH_ENABLED
+        and (_fast_decode or _fast_spec)
+        and dim == 4608
+        and k_dim_size == 1536
+        and v_dim_size == 1536
+        and width == 4
+        and weight.shape == (4608, 4)
+        and original_x_dtype == torch.bfloat16
+        and x.dtype == torch.bfloat16
+        and conv_state.dtype == torch.bfloat16
+        and query.dtype == key.dtype == value.dtype == torch.bfloat16
+        and weight.dtype == torch.float32
+        and x.is_cuda
+        and conv_state.device == weight.device == x.device
+        and bias is None
+        and activation in ("silu", "swish")
+        and block_idx_last_scheduled_token is None
+        and initial_state_idx is None
+        and stride_x_dim == 1
+        and stride_w_dim == 4
+        and stride_w_width == 1
+        and stride_istate_dim == 1
+        and stride_istate_token == dim
+        and stride_istate_seq == conv_state.shape[2] * dim
+        and conv_state.shape[1] == dim
+        and conv_state.shape[2] >= state_len
+        and conv_state_indices is not None
+        and conv_state_indices_in is not None
+        and conv_state_indices.dtype == torch.int32
+        and conv_state_indices_in.dtype == torch.int32
+        and conv_state_indices.ndim == conv_state_indices_in.ndim == 1
+        and conv_state_indices.numel() == conv_state_indices_in.numel() == batch
+        and conv_state_indices.device == conv_state_indices_in.device == x.device
+        and stride_state_indices > 0
+        and stride_q_seq == stride_k_seq == stride_v_seq == 1536
+        and stride_q_dim == stride_k_dim == stride_v_dim == 1
+        and stride_q_token == stride_k_token == stride_v_token == 1
+    ):
+        from .kda_conv1d_optimized import kda_conv1d_reuse_kernel
+
+        _update_kernel = kda_conv1d_reuse_kernel
+        if _fast_spec:
+            _update_block_n = 256
+            _update_options = {"num_warps": 4, "T_MODE": 2, "enable_fp_fusion": False}
+        else:
+            _update_block_n = 256
+            _update_options = {"num_warps": 4, "T_MODE": 0, "enable_fp_fusion": False}
+        if _KDA_CONV1D_GLUON_ENABLED and (
+            (_fast_spec and batch == 128)
+            or (_fast_decode and batch in (32, 128, 256, 512))
+        ):
+            _gluon_kernel = _get_kda_conv1d_gluon_kernel(x.device, _fast_spec)
+            if _gluon_kernel is not None:
+                _update_kernel = _gluon_kernel
+                _update_block_n = 256 if _fast_spec else 512
+                _update_options = {"num_warps": 4, "enable_fp_fusion": False}
+
     def grid(META):
         return (
             batch,
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    _causal_conv1d_update_kernel[grid](
+    _update_kernel[grid](
         # Pointers to matrices
         x,
         weight,
@@ -1478,7 +1611,8 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=_update_block_n,
+        **_update_options,
     )
     query = query.squeeze(-1)
     key = key.squeeze(-1)
