@@ -4,6 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
+from inspect import signature
 from typing import ClassVar, Protocol
 
 import torch
@@ -665,6 +666,37 @@ try:
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_GATHER_AVAILABLE = False
 
+# Optional gfx1250 BF16 split-cat epilogue. Import and signature checks keep
+# older aiter wheels on the existing kv_b_proj -> split -> torch.cat path.
+_FLYDSL_KV_SPLIT_CAT_KWARGS = frozenset({"k_out", "v_out", "k_rope", "split_sizes"})
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime as _get_gfx_runtime
+    from aiter.ops.flydsl import flydsl_hgemm as _flydsl_hgemm
+
+    _FLYDSL_KV_SPLIT_CAT_AVAILABLE = _FLYDSL_KV_SPLIT_CAT_KWARGS.issubset(
+        signature(_flydsl_hgemm).parameters
+    )
+except Exception:  # noqa: BLE001 -- optional API; absence selects the fallback
+    _get_gfx_runtime = None
+    _flydsl_hgemm = None
+    _FLYDSL_KV_SPLIT_CAT_AVAILABLE = False
+
+# The config validated by aiter's DeepSeek-R1 split-cat bitwise/perf suite.
+# Keep it explicit here: this direct call must not fall through to an untuned
+# generic FlyDSL default while replacing Linear's normal tuned dispatch.
+_DEEPSEEK_R1_KV_SPLIT_CAT_CONFIG = {
+    "block_m": 128,
+    "block_n": 256,
+    "block_k": 64,
+    "stages": 2,
+    "split_k": 1,
+    "m_waves": 2,
+    "n_waves": 4,
+    "k_waves": 1,
+    "group_m": 0,
+    "policy": "ft",
+}
+
 # Optional FP8 prefill backend, gated by ATOM_USE_FLYDSL_FP8_PREFILL_ATTN.
 try:
     from aiter.ops.flydsl import (
@@ -826,6 +858,9 @@ class MLAAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        self.use_flydsl_bf16_prefill_kv_split_cat = bool(
+            envs.ATOM_USE_FLYDSL_BF16_PREFILL_KV_SPLIT_CAT
+        )
         self._flydsl_fp8_mha_ok: bool | None = None
         # Set by a model whose prefill token graph records up to the attention
         # core (`records_prefill_split`).
@@ -1368,6 +1403,115 @@ class MLAAttention(nn.Module):
                 head_dim,
                 self.v_head_dim,
             )
+
+    def _try_flydsl_bf16_prefill_kv_split_cat(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_rope: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Write plain DeepSeek-R1 BF16 prefill K/V in their final layouts.
+
+        This direct FlyDSL call is deliberately narrower than ``kv_b_proj``:
+        only its unquantized BF16 Linear contract, the gfx1250/DeepSeek-R1
+        geometry validated by aiter, and uncached non-CP BF16 attention are
+        eligible. Every other case returns None before allocating output, so
+        the caller retains ``kv_b_proj -> split -> _prepare_prefill_k``.
+
+        A launch failure is not retried: the kernel may already have modified
+        the output buffers, so falling back after launch would be unsafe.
+        """
+        if (
+            not getattr(self, "use_flydsl_bf16_prefill_kv_split_cat", False)
+            or not _FLYDSL_KV_SPLIT_CAT_AVAILABLE
+            or _flydsl_hgemm is None
+            or _get_gfx_runtime is None
+            or getattr(self, "_flydsl_fp8_mha_ok", None) is not False
+            or getattr(self, "dtype", None) != torch.bfloat16
+            or getattr(self, "rope_is_zero_pad", False)
+            or getattr(self, "is_sparse_mla", False)
+            or getattr(self, "dcp_world_size", 1) != 1
+            or getattr(self, "kv_lora_rank", None) != 512
+            or getattr(self, "num_heads", None) != 128
+            or getattr(self, "qk_nope_head_dim", None) != 128
+            or getattr(self, "qk_rope_head_dim", None) != 64
+            or getattr(self, "qk_head_dim", None) != 192
+            or getattr(self, "v_head_dim", None) != 128
+        ):
+            return None
+        try:
+            if _get_gfx_runtime() != "gfx1250" or get_pcp_world_size() != 1:
+                return None
+        except Exception:  # noqa: BLE001 -- inability to prove support falls back
+            return None
+
+        projector = getattr(self, "kv_b_proj", None)
+        weight = getattr(projector, "weight", None)
+        quant_type = getattr(projector, "quant_type", None)
+        if (
+            not isinstance(q, torch.Tensor)
+            or not isinstance(kv_c_normed, torch.Tensor)
+            or not isinstance(k_rope, torch.Tensor)
+            or not isinstance(weight, torch.Tensor)
+            or getattr(quant_type, "value", None) != QuantType.No.value
+            or getattr(projector, "params_dtype", None) != torch.bfloat16
+            or getattr(projector, "bias", None) is not None
+            or getattr(projector, "is_output_padded", False)
+            or getattr(projector, "reduce_results", False)
+            or getattr(weight, "is_shuffled", False)
+        ):
+            return None
+
+        m = kv_c_normed.shape[0] if kv_c_normed.dim() == 2 else -1
+        if (
+            m <= 0
+            or tuple(kv_c_normed.shape) != (m, 512)
+            or tuple(weight.shape) != (128 * 256, 512)
+            or tuple(q.shape) != (m, 128, 192)
+            or tuple(k_rope.shape) != (m, 1, 64)
+            or any(
+                tensor.dtype != torch.bfloat16
+                for tensor in (q, kv_c_normed, weight, k_rope)
+            )
+            or any(
+                tensor.device != kv_c_normed.device for tensor in (q, weight, k_rope)
+            )
+            or kv_c_normed.stride(1) != 1
+            or kv_c_normed.stride(0) < 512
+            or weight.stride(1) != 1
+            or weight.stride(0) < 512
+            or k_rope.stride(-1) != 1
+            or k_rope.stride(0) < 64
+        ):
+            return None
+
+        k_out = torch.empty(
+            (m, 128, 192), dtype=torch.bfloat16, device=kv_c_normed.device
+        )
+        v_out = torch.empty(
+            (m, 128, 128), dtype=torch.bfloat16, device=kv_c_normed.device
+        )
+        result = _flydsl_hgemm(
+            kv_c_normed,
+            weight,
+            bias=projector.bias,
+            out_dtype=torch.bfloat16,
+            k_out=k_out,
+            v_out=v_out,
+            k_rope=k_rope,
+            split_sizes=(128, 128),
+            **_DEEPSEEK_R1_KV_SPLIT_CAT_CONFIG,
+        )
+        if (
+            not isinstance(result, tuple)
+            or len(result) != 2
+            or result[0] is not k_out
+            or result[1] is not v_out
+        ):
+            raise RuntimeError(
+                "aiter FlyDSL split-cat did not return ATOM's K/V output buffers"
+            )
+        return k_out, v_out
 
     def _prepare_prefill_k(self, k_nope, k_rope):
         """Keep K split for FP8 quantization; materialize it for BF16 attention."""
@@ -2628,7 +2772,12 @@ class MLAAttention(nn.Module):
             k_rope = k_rope.unsqueeze(1)
 
         quant_k_rope = None
-        if use_triton_gemm():
+        fused_bf16_kv = MLAAttention._try_flydsl_bf16_prefill_kv_split_cat(
+            self, q, kv_c_normed, k_rope
+        )
+        if fused_bf16_kv is not None:
+            k, v = fused_bf16_kv
+        elif use_triton_gemm():
             weight = self.kv_b_proj.weight
             weight_scale = self.kv_b_proj.weight_scale
             if (

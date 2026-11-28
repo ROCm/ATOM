@@ -546,6 +546,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # DeepSeek-R1 plain BF16 prefill: let gfx1250 FlyDSL write kv_b_proj
+    # directly as final K=[NoPE, RoPE] and V. Shape/API guards in attention_mla
+    # make this a no-op on other models, quantized projections and old aiter.
+    "ATOM_USE_FLYDSL_BF16_PREFILL_KV_SPLIT_CAT": lambda: (
+        os.getenv("ATOM_USE_FLYDSL_BF16_PREFILL_KV_SPLIT_CAT", "1") == "1"
+    ),
     # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
     # where supported. Unsupported attention inputs raise. Added 2026-09-10.
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
