@@ -30,6 +30,24 @@ from typing import Any
 logger = logging.getLogger("atom")
 
 
+def _dp_sync_backend_env() -> str:
+    value = os.getenv("ATOM_DP_SYNC_BACKEND", "gloo").lower()
+    if value not in ("gloo", "rccl"):
+        raise ValueError("ATOM_DP_SYNC_BACKEND must be 'gloo' or 'rccl'")
+    return value
+
+
+def _dp_sync_verify_env() -> int:
+    raw = os.getenv("ATOM_DP_SYNC_VERIFY", "0")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("ATOM_DP_SYNC_VERIFY must be a nonnegative int64") from error
+    if not 0 <= value <= (1 << 63) - 1:
+        raise ValueError("ATOM_DP_SYNC_VERIFY must be a nonnegative int64")
+    return value
+
+
 def _positive_float_env(name: str, default: str) -> float:
     raw_value = os.getenv(name, default)
     try:
@@ -1232,6 +1250,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
         os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
     ),
+    # Backend of the per-step packed DP metadata all_gather (ForwardMode.decide):
+    # "gloo" (CPU group) or "rccl" (the DP device group; RCCL selects the
+    # transport for the machine topology). Set identically on every DP rank.
+    "ATOM_DP_SYNC_BACKEND": _dp_sync_backend_env,
+    # Debug: every N device-backend syncs also run the gloo all_gather and raise
+    # on any mismatch (0 = off). Set identically on every DP rank.
+    "ATOM_DP_SYNC_VERIFY": _dp_sync_verify_env,
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts

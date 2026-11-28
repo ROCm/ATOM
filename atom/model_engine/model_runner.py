@@ -1250,6 +1250,10 @@ class ModelRunner:
     def _setup_device_and_distributed(self, rank: int, config: Config):
         self.device = init_model_env(config, rank)
 
+        from atom.utils.tbo.ubatching import initialize_dp_metadata_sync
+
+        initialize_dp_metadata_sync(get_dp_group())
+
     def _get_cumsum_and_arange(
         self,
         num_tokens: np.ndarray,
