@@ -246,6 +246,33 @@ def test_input_capture_uses_stream_mean_and_respects_offset_and_draft(monkeypatc
     assert torch.equal(captured, saved)
 
 
+def test_input_capture_writes_the_buffer_rows_through_arm_aux_capture(monkeypatch):
+    """`arm_aux_capture` hands the V4.1 tap its `writes_into` destination: the
+    tensor the tap returns is the capture buffer's own rows, so the hook copies
+    nothing. Dropping the flag on the way in brings the copy back with equal
+    values; this checks where the rows live, not only what they hold."""
+    proposer, target, _ = capture_fixture(monkeypatch)
+    returned = []
+    tap = DeepseekV41DSpark._target_layer_input
+
+    def recording_tap(inputs, block, out_for=None):
+        returned.append(tap(inputs, block, out_for=out_for))
+        return returned[-1]
+
+    monkeypatch.setattr(
+        DeepseekV41DSpark, "_target_layer_input", staticmethod(recording_tap)
+    )
+    proposer.arm_aux_capture(target)
+    residual = torch.arange(1 * 3 * 4 * 8).reshape(1, 3, 4, 8).float()
+    pre = torch.zeros(1, 3, 4)
+    pre[..., 0] = 1
+    target.layers[0](SinglePassHCState(residual, pre))
+    captured = proposer.aux_for(torch.empty(9, 8))[0]
+    assert len(returned) == 1
+    assert returned[0].data_ptr() == captured[2].data_ptr()
+    assert torch.equal(captured[2:5], residual.mean(-2).squeeze(0))
+
+
 def test_output_capture_remains_default(monkeypatch):
     proposer, target, _ = capture_fixture(monkeypatch)
     proposer._aux_capture_spec = lambda: AuxCaptureSpec(

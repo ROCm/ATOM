@@ -3,6 +3,7 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """Single-Pass mHC math; incoming pre-mix belongs to the previous sublayer."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -309,11 +310,12 @@ class SinglePassHCState:
             self.combination,
         )
 
-    def _reduce_owed(self, pre_mix=None):
+    def _reduce_owed(self, pre_mix=None, out=None):
         """An owed post and the stream reduction after it as one
         `aiter.mhc_post_reduce` (the ``pre_mix`` weighted sum, or with
-        ``pre_mix=None`` the mean), shaped like one stream. None unless a post
-        is owed and `post_reduce_supported` holds; the caller then settles and
+        ``pre_mix=None`` the mean), shaped like one stream, written into
+        ``out`` if given (see `post_reduce_streams`). None unless a post is
+        owed and `post_reduce_supported` holds; the caller then settles and
         reduces in two steps."""
         if self.pending is None or not post_reduce_supported(
             self.pending, self.residual
@@ -321,7 +323,12 @@ class SinglePassHCState:
             return None
         *outer, _, hidden = self.residual.shape
         return post_reduce_streams(
-            self.pending, self.residual, self.post_mix, self.combination, pre_mix
+            self.pending,
+            self.residual,
+            self.post_mix,
+            self.combination,
+            pre_mix,
+            out=out,
         ).view(*outer, hidden)
 
     def collapse(self):
@@ -351,16 +358,26 @@ class SinglePassHCState:
             self.pre_mix.view(-1, hc_mult),
         ).view(*outer, hidden)
 
-    def stream_mean(self):
+    def stream_mean(self, out=None):
         """The mean over the streams, settling an owed post: what a DSpark
         draft reads at a target layer's input (V4.1's taps and the vLLM
         plugin's aux hidden states). An owed post and the mean run as one
         aiter launch where `post_reduce_supported` holds, without writing the
-        settled residual; elsewhere `settle()` and torch's mean."""
-        fused = self._reduce_owed()
+        settled residual; elsewhere `settle()` and torch's mean.
+
+        ``out``: a contiguous ``[tokens, H]`` destination (a capture buffer's
+        rows) that receives the mean on either path; the result is then a view
+        of it. Any other ``out`` raises."""
+        fused = self._reduce_owed(out=out)
         if fused is not None:
             return fused
-        return self.settle().residual.mean(dim=-2)
+        mean = self.settle().residual.mean(dim=-2)
+        if out is None:
+            return mean
+        *outer, _, hidden = self.residual.shape
+        _check_out(out, math.prod(outer), self.residual)
+        out.copy_(mean.view(out.shape))
+        return out.view(*outer, hidden)
 
 
 def predict_mixes(
@@ -440,17 +457,43 @@ def post_reduce_supported(pending, residual) -> bool:
     )
 
 
-def post_reduce_streams(pending, residual, post_mix, combination, pre_mix=None):
+def _check_out(out, rows, residual):
+    """``out=`` is honoured or refused, never dropped for a new tensor: a
+    destination that silently stopped being written would bring back the copy
+    it exists to save."""
+    hidden = residual.shape[-1]
+    if not (
+        out.shape == (rows, hidden)
+        and out.dtype == residual.dtype
+        and out.device == residual.device
+        and out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be a contiguous [{rows}, {hidden}] {residual.dtype} tensor "
+            f"on {residual.device}; got {list(out.shape)} {out.dtype} on "
+            f"{out.device} (contiguous={out.is_contiguous()})"
+        )
+
+
+def post_reduce_streams(
+    pending, residual, post_mix, combination, pre_mix=None, out=None
+):
     """`settle()` and then `collapse_streams` -- or, with ``pre_mix=None``,
     the mean over the streams -- as one `aiter.mhc_post_reduce`, which never
     writes the settled residual. aiter computes each stream with `mhc_post`'s
     own body and reduces it as those two do (FP32, streams in order, products
     and sums rounded apart), so the result is the two-kernel path's to the
-    bit. Callers check `post_reduce_supported` first."""
+    bit. Callers check `post_reduce_supported` first.
+
+    ``out``: the contiguous ``[tokens, H]`` destination to write (e.g. a
+    capture buffer's rows), returned as the result; anything else raises."""
     hc_mult, hidden = residual.shape[-2], residual.shape[-1]
     flat = residual.view(-1, hc_mult, hidden)
     rows = flat.shape[0]
-    out = torch.empty(rows, hidden, dtype=residual.dtype, device=residual.device)
+    if out is None:
+        out = torch.empty(rows, hidden, dtype=residual.dtype, device=residual.device)
+    else:
+        _check_out(out, rows, residual)
     mhc_post_reduce(
         out,
         pending.view(rows, hidden),
