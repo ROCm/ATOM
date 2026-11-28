@@ -2719,6 +2719,64 @@ def _append_shared_torch(topk_weights, topk_ids, num_shared, base, weight):
     )
 
 
+@dataclass(frozen=True)
+class EplbRouteTables:
+    """What the route kernels read for a layer EPLB places: fixed-address
+    views into the live metadata (a rebalance commits them in place), so
+    cudagraph-safe."""
+
+    dispatch: torch.Tensor  # [num_logical] this rank's local physical, or -1
+    l2p: torch.Tensor  # [num_logical, num_replicas] replicas (-1 padded)
+    cnt: torch.Tensor  # [num_logical] replica count
+    load: torch.Tensor | None  # [num_physical] pass load counts, None: no record
+    num_logical: int
+    id_delta: int
+    num_physical: int
+    num_replicas: int
+
+
+def eplb_route_tables(layer: Any, device: torch.device) -> EplbRouteTables | None:
+    """The tables `layer`'s routes are placed and recorded with, or None where
+    EPLB does not own the layer (no remap, no record)."""
+    meta = get_live_expert_location_metadata()
+    layer_id = getattr(layer, "layer_id", None)
+    if not _eplb_owns_layer(meta, layer_id):
+        return None
+    dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
+    # Full replica table + counts feed the forced-remote token-spread path
+    # (dispatch[e] == -1 -> pick a replica per token).
+    l2p = meta.logical_to_physical_map[layer_id]
+    cnt = meta.logical_replica_count[layer_id]
+    if dispatch.device != device:
+        dispatch = dispatch.to(device)
+    if l2p.device != device:
+        l2p = l2p.to(device)
+    if cnt.device != device:
+        cnt = cnt.to(device)
+    num_logical = int(dispatch.numel())
+    num_physical = int(meta.num_physical_experts)
+    # Record buffer (== _cur_pass_count[layer_id]); None disables it.
+    # eplb_enable is static (server lifetime), so RECORD is a compile-time
+    # constexpr -> cudagraph capture fixes it, no per-step host branch.
+    load = None
+    atom_cfg = get_current_atom_config()
+    if bool(getattr(atom_cfg, "eplb_enable", False)):
+        monitor = get_expert_load_monitor(
+            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
+        )
+        load = monitor.pass_count_buffer(layer_id, num_physical)
+    return EplbRouteTables(
+        dispatch=dispatch,
+        l2p=l2p,
+        cnt=cnt,
+        load=load,
+        num_logical=num_logical,
+        id_delta=num_physical - num_logical,
+        num_physical=num_physical,
+        num_replicas=int(l2p.shape[-1]),
+    )
+
+
 def _eplb_route(
     layer: Any,
     topk_weights: torch.Tensor | None,
@@ -2753,39 +2811,18 @@ def _eplb_route(
     if numel == 0:
         return out_w, out_ids
 
+    tables = eplb_route_tables(layer, topk_ids.device) if owned else None
     dispatch = l2p = cnt = load_buf = None
     num_logical = id_delta = num_physical = num_replicas = 0
-    if owned:
-        # Per-rank dispatch table (int32, [num_logical]); a fixed-address view
-        # into the meta tensor (rebalance writes it in place via copy_), so
-        # cudagraph-safe.
-        dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id]
-        if dispatch.device != topk_ids.device:
-            dispatch = dispatch.to(topk_ids.device)
-        num_logical = int(dispatch.numel())
-        num_physical = int(meta.num_physical_experts)
-        id_delta = num_physical - num_logical
-        # Full replica table + counts feed the forced-remote token-spread path
-        # (dispatch[e] == -1 -> pick a replica per token). Fixed-address meta
-        # views committed in place by update() (like `dispatch`).
-        l2p = meta.logical_to_physical_map[layer_id]
-        cnt = meta.logical_replica_count[layer_id]
-        if l2p.device != topk_ids.device:
-            l2p = l2p.to(topk_ids.device)
-        if cnt.device != topk_ids.device:
-            cnt = cnt.to(topk_ids.device)
-        num_replicas = int(l2p.shape[-1])
-
-        # Resolve record buffer (== _cur_pass_count[layer_id]); None disables
-        # it. eplb_enable is static (server lifetime), so RECORD is a
-        # compile-time constexpr -> cudagraph capture fixes it, no per-step
-        # host branch.
-        atom_cfg = get_current_atom_config()
-        if bool(getattr(atom_cfg, "eplb_enable", False)):
-            monitor = get_expert_load_monitor(
-                enabled=True, window_size=atom_cfg.eplb_config.load_window_size
-            )
-            load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+    if tables is not None:
+        dispatch, l2p, cnt, load_buf = (
+            tables.dispatch,
+            tables.l2p,
+            tables.cnt,
+            tables.load,
+        )
+        num_logical, id_delta = tables.num_logical, tables.id_delta
+        num_physical, num_replicas = tables.num_physical, tables.num_replicas
     record = load_buf is not None
 
     def grid(meta_kw):
