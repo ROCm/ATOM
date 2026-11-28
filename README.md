@@ -290,3 +290,5 @@ This project was adapted from [nano-vllm](https://github.com/GeeeekExplorer/nano
 ## Support & Reporting Issues
 
 We welcome issues and contributions! Please use the GitHub Issues page to report bugs or request features: https://github.com/ROCm/ATOM/issues
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute, [CONTACTS.md](CONTACTS.md) for who to contact for a pull request, and [REVIEWERS.md](REVIEWERS.md) to help review.
