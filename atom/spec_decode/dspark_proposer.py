@@ -83,6 +83,36 @@ class DSparkProposer(Drafter):
         if self._with_draft:
             self._init_draft_block_buffers()
 
+    def _pinned_draft_bs(self, running_bs: int) -> int:
+        """``ATOM_DSPARK_BLOCK_BS_LADDER``: the batch a step's block runs at, the
+        smallest ladder entry >= ``running_bs`` (``running_bs`` itself when the
+        flag is off, lossless sampling is armed, or nothing on the ladder is
+        large enough). Pinning the batch to a few sizes lets the block's
+        recorded graphs and compiled kernels be reused across steps whose live
+        batch differs. A prefill step's draft is pinned too: the block pass
+        clears ``is_prefill`` and publishes its own ``[running_bs, T]`` shape
+        before it runs. A function of the group-agreed ``running_bs`` alone, so
+        every rank picks the same."""
+        ladder = getattr(self, "_bs_ladder", None)
+        if ladder is None:
+            raw = envs.ATOM_DSPARK_BLOCK_BS_LADDER.strip()
+            ladder = (
+                sorted({int(x) for x in raw.split(",") if x.strip()}) if raw else []
+            )
+            ladder = [b for b in ladder if b <= self.config.max_num_seqs]
+            self._bs_ladder = ladder
+            if ladder:
+                logger.info(
+                    "ATOM_DSPARK_BLOCK_BS_LADDER: DSpark block batch pinned to %s",
+                    ladder,
+                )
+        if not ladder or self.lossless is not None:
+            return running_bs
+        for b in ladder:
+            if b >= running_bs:
+                return b
+        return running_bs
+
     def _arm_lossless_draft(self) -> DSparkLossless | None:
         """Allocates only; the runner binds the draft model (`bind_target`)
         before any warmup or capture, since ``block``'s sampler branches on
@@ -829,6 +859,11 @@ class DSparkProposer(Drafter):
         # doing is its own business, so a rank that skipped this would leave
         # the others waiting in the exchange.
         running_bs = context.running_bs
+        pinned_bs = self._pinned_draft_bs(running_bs)
+        if pinned_bs != running_bs:
+            # The block runs at the ladder's batch; the rows past the target's
+            # are pad rows like any widened batch.
+            context.running_bs = running_bs = pinned_bs
         # The target's own padding does not reach here: its pad rows end at the
         # graph boundary, and the anchors come from the sampler, which runs
         # after the graph over real rows only. So the block pads its own inputs.

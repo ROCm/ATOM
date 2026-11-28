@@ -855,6 +855,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # Comma-separated batch sizes a DSpark draft block is pinned to: a step's
+    # block runs at the smallest entry >= its live batch (empty: the live
+    # batch). Not used with lossless sampling.
+    "ATOM_DSPARK_BLOCK_BS_LADDER": lambda: os.getenv("ATOM_DSPARK_BLOCK_BS_LADDER", ""),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
