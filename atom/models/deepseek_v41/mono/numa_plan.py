@@ -25,6 +25,9 @@ DUAL_REGIONS = (
     "as", "xo", "xos", "x8b", "x8bs",
     "logit", "route", "x8rdy", "xrdy", "mid", "mids", "dy", "sdo",
     "x8f", "nb", "iqdone",
+    # the layer kernel's window rows as tagged pairs
+    # (``layer.window_rows_tagged``): last, so every other region keeps its place
+    "kvt",
 )  # fmt: skip
 
 

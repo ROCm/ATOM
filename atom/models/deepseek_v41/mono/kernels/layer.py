@@ -18,6 +18,10 @@ tag, each written to memory no XCD caches (the scratch, and the runner's
            not from the pool, whose lines another XCD's L2 may hold from an
            earlier step
     QP     ``q`` itself as tagged pairs (wq_b -> the scores: one hop, no load after)
+    KVT    in place of KRDY and ``kvrow`` where ``window_rows_tagged``: a token's
+           window row as tagged pairs, a data word each, its group's E8M0 code
+           in the tag's high half, polled by the scores and the merge
+           themselves (no drain, no flag, no load after)
     IQDONE an index layer's (token, head) query, scale and head weight written
            (``index_query``'s quantization -> K2a's scorer: ``iq`` / ``iq_scale``
            / ``iw``, the runner's uncached buffers)
@@ -65,8 +69,9 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     run_attn_pre,
     shard_seam,
 )
+from atom.models.deepseek_v41.mono.kernels.code_warm import warm_code
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, Dims
+from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, KV_DIM, Dims
 from atom.models.deepseek_v41.mono.kernels.index_query import IQ_GROUPS, iq_in_place
 from atom.models.deepseek_v41.mono.kernels.layer_post import (
     LayerPostBuild,
@@ -75,6 +80,7 @@ from atom.models.deepseek_v41.mono.kernels.layer_post import (
     publish_x_tok_par,
     seam_dot_norm,
 )
+from atom.models.deepseek_v41.mono.kernels.mailbox import fresh_s32, fresh_s64
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -83,11 +89,18 @@ from atom.models.deepseek_v41.mono.kernels.moe import (
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import route_shape
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc
+from atom.mono.device.ops import (
+    CM_DEV,
+    kernel_symbol,
+    launcher,
+    rsrc,
+    traced,
+    uniform,
+)
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.plan.build_key import key_tuple
-from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import pair_layout
 from atom.mono.runtime.abi import KernelAbi
 
@@ -98,6 +111,49 @@ TL_STAGES = k1.TL_STAGES + k2.TL_STAGES
 TL_POINTS = 1 + len(TL_STAGES)
 # K1's hand-over flags (module docstring), in its scratch past K2's regions
 FLAGS = ("sdone", "gdone", "krdy", "qp", "iqdone")
+# the window row as tagged pairs (KVT, past the flags): kv_norm puts a
+# row's data words, its group's E8M0 code in each tag's high half
+# (``Mailbox.put_coded``), and the score's idle waves and the merge poll the
+# words themselves -- no ``kvrow`` copy, no publish drain, no KRDY. TP8, an FP8
+# pool, no indexer / compressor / token parallel / DSpark block, at most
+# KVT_MAX_TOKENS rows (the score's poll a lane: two quads a pair of rows); any
+# other build keeps KRDY
+KVT_MAX_TOKENS = 8
+
+
+def window_rows_tagged(key) -> bool:
+    """Whether ``key`` (a ``LayerBuild``) hands the window rows over by KVT."""
+    pre, post = key.pre, key.post
+    return (
+        pre.tp == 8
+        and pre.kv_fp8
+        and not pre.feeds_index
+        and not pre.tok_par
+        and not key.compress_ratio
+        and pre.tokens <= KVT_MAX_TOKENS
+        and post.attn_sel
+        and not post.block_rows
+    )
+
+
+# A layer's code meets its I-cache misses in an L2 a whole layer of weights has
+# streamed through since its last launch: an index layer's (296 .. 308 KB at
+# s6, once a step) and, as measured, an ordinary layer's (~100 KB, launched
+# every layer) too. At entry one wave of each of the last 8 CTAs (one an XCD)
+# reads it into its XCD's L2 (``warm_code``, from its pc up to CODE_WARM_SPAN
+# bytes, clamped at the code's end) and waits for it there: those CTAs hold no
+# slice, gate (block) or seam norm task, their first wait the normed rows'
+# (wqkv_a, a compressor's projection). Every layer build; 0: off
+CODE_WARM_SPAN = 320 * 1024
+CODE_WARM_CTA0 = BLOCKS - 8
+CODE_WARM_WAVE = WAVES - 1
+
+
+@traced
+def warm_layer_code(on, tid, bid):
+    if const_expr(on):  # noqa: SIM102
+        if (bid >= CODE_WARM_CTA0) & (uniform(tid // 64) == CODE_WARM_WAVE):
+            warm_code(tid % 64, CODE_WARM_SPAN)
 
 
 @dataclass(frozen=True)
@@ -181,6 +237,9 @@ def scratch_layouts(key: LayerBuild) -> tuple[dict, dict]:
     iq_flags = IQ_GROUPS if iq_in_place(s, key.post.index_fp4) else 1
     sizes = (k1.SLICES, s, s, s * heads * k1.HEAD_DIM // 2, s * ip.HEADS * iq_flags)
     pairs = dict(zip(FLAGS, sizes, strict=True))
+    if window_rows_tagged(key):
+        # KVT: a step row's data words, a pair each
+        pairs["kvt"] = s * (KV_DIM // 4)
     if key.compress is not None:
         # CRDY a step row (the one completing a compressed entry), then the
         # compressor's own hand-offs (``compress.scratch_layout``'s regions)
@@ -256,6 +315,11 @@ def build_layer(key: LayerBuild):
     if comp is not None:
         members["cp"] = compress_smem(comp)
     Parts = lds_union("LayerLds", members)
+    warm = CODE_WARM_SPAN > 0
+    if warm:
+        # the seam norm's CTAs end before WQKV0 or at NORM0 + its rows
+        norm_rows = s // pre.tp if pre.tok_par else s
+        assert max(k1.NORM0 + norm_rows, k1.WQKV0) <= CODE_WARM_CTA0
 
     @fx.struct
     class Stamps:
@@ -311,12 +375,20 @@ def build_layer(key: LayerBuild):
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
+        warm_layer_code(warm, tid, bid)
+        # the scratch regions' base a value of its own (``mailbox.fresh_s64``), not
+        # a part of the merged kernarg load a compressing build reloads whole
+        scratch = fresh_s64(scratch)
+        # the kernarg tail's other late-read scalars too: no merged 8- / 4-dword
+        # kernarg tuple held across the kernel
+        sym, peers, numa_word = fresh_s64(sym), fresh_s64(peers), fresh_s64(numa_word)
+        rank, layer = fresh_s32(rank), fresh_s32(layer)
+        post_layer, moe_layer = fresh_s32(post_layer), fresh_s32(moe_layer)
         alloc = fx.SharedAllocator()
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
         lds = {n: getattr(smem, n).peek() for n in members}
-        bases = peer_bases(peers, rs.dims.ranks)
-        args_1 = attn_pre_args(
+        k1_args = lambda: attn_pre_args(
             k1_res_in, k1_pend, k1_post_in, k1_comb_in, k1_pre_in, k1_hc_fn,
             k1_hc_scale, k1_hc_base, k1_attn_w, k1_wqkv, k1_wqkv_s, k1_qn_w, k1_kvn_w,
             k1_wqb, k1_wqb_s, k1_cos, k1_sin, k1_pos, k1_ring, k1_ring_scale,
@@ -324,6 +396,21 @@ def build_layer(key: LayerBuild):
             k1_normed, k1_qr_out, k1_qrs_out, k1_aux, k1_iq_w, k1_iq_ws, k1_iw_w,
             k1_iq_out, k1_iqs_out, k1_iw_out, ibound,
         )  # fmt: skip
+
+        # the seam A slice unit's first loads before any peer table's
+        # (their readfirstlanes waited on them, the slice's loads after:
+        # a cold round trip in series on every slice's path). At TP8 only (no
+        # gain measured at TP4, whose kernel sits near the VGPR cap). Only where
+        # it prefetches are K1's args made ahead of the tables: every other
+        # build traces as before
+        entry_pre, args_1 = None, None
+        prefetch = pre.shard and pre.slice_x8 and pre.fold and pre.tp == 8
+        if const_expr(prefetch):
+            args_1 = k1_args()
+            entry_pre = k1.slice_entry_prefetch(args_1, s, pre.tp, bid, rank)
+        bases = peer_bases(peers, rs.dims.ranks)
+        if const_expr(not prefetch):
+            args_1 = k1_args()
         args_1["kvrow"] = kvrow
         args_a = attn_post_args(
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
@@ -362,6 +449,10 @@ def build_layer(key: LayerBuild):
         ca["k1_poll"] = mb_1.poll
         for flag in FLAGS:
             ca[flag] = c1[flag]
+        kvt_rows = window_rows_tagged(key)
+        c1["kvt_rows"] = co1["kvt_rows"] = ca["kvt_rows"] = kvt_rows
+        if const_expr(kvt_rows):
+            ca["kvt"], ca["k1_poll_need"] = c1["kvt"], mb_1.poll_need
         if const_expr(comp is not None):
             # the attention reads this launch's new entries from ``kvrow``
             # past their CRDY (``attention._selected_row`` / ``await_selection``)
@@ -415,7 +506,7 @@ def build_layer(key: LayerBuild):
         run_attn_pre(
             c1, co1, pre, tls, 0, lds["k1_iw"].nbl.ptr, gates=False,
             after_norm=None if comp is None else lambda: compress_stage(cp.project, cc),
-            q_apart=key.q_apart,
+            q_apart=key.q_apart, entry_pre=entry_pre,
         )  # fmt: skip
         if const_expr(comp is not None):
             compress_stage(cp.plan_rows, cc)

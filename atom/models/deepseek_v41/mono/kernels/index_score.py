@@ -48,6 +48,7 @@ from flydsl.expr.typing import Int32, T
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.index_query import await_queries
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4, sload4
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.kernels.topk import (
     radix_select,
@@ -68,7 +69,7 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.device.select import key_bits, order_key
-from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.device.sync import POLL_MAX, publish
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.trace import enter_stage
@@ -252,11 +253,15 @@ def stage_iscore(c, lead, span, span_max, ch0, width, max_chunks):
 
 
 @traced
-def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
+def stage_ilist(
+    c, t, j, share, kind, level, bound_max, max_chunks, seg, gathers_ok=True,
+    compact=None,
+):  # fmt: skip
     """List j of ``level`` for token t (``share``: its (column bound, columns
     on this rank, split), ``_shares``; a split build's FULL rows carry no
     bound) of a tree of ``seg`` segments; see the module. Only the lists
-    ``index_plan.list_count`` gives a token run."""
+    ``index_plan.list_count`` gives a token run. ``compact`` (the blk tree,
+    traced): whether its rows are compacted (``run_indexer``)."""
     tid = c["tid"]
     a = c["args"]
     k = ip.KINDS[kind]
@@ -269,6 +274,10 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
     # a candidate producer's row of TOPK_BLOCKS blocks or more: its selection
     # ranks its candidate blocks' rows, compacted to the row's front (``_compact``)
     gathers = False if raw is None else (a["iprod"] != 0) & ip.compacts(raw)
+    if const_expr(not gathers_ok):
+        gathers = False
+    if const_expr(compact is not None and gathers is not False):
+        gathers = gathers & compact
     if j < ip.list_count(bound, level, k, seg):
         n = ip.list_inputs(bound, level, j, k, seg)
         final = ip.is_final(bound, level, k, seg)
@@ -283,8 +292,9 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
                 if const_expr(raw is not None):
                     # a compacted row's columns: its candidates' flag instead
                     count = sel(gathers, 0, count)
-                    if gathers & (tid == 0):
-                        c["poll"]([(_icrdy(c), t, 1)])
+                    if const_expr(gathers is not False):  # noqa: SIM102
+                        if gathers & (tid == 0):
+                            c["poll"]([(_icrdy(c), t, 1)])
             else:
                 first, count = ip.block_chunks(raw, j)
             if tid < count:
@@ -327,6 +337,8 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
         # are done), lifted to their rows one a thread after the routine
         slot = c["sel_lds"]["hist"]
 
+        # this list's k-th of the step before (``topk.radix_select``)
+        anchor = _anchor(c, t, kind, seg, level, j)
         if const_expr(kind == "sel"):
             # a list above: written by place here (none at the top level)
             listed = (
@@ -336,13 +348,13 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
             )
             _select_sel(
                 c, t, j, n, per, load, got, level, seg, slots, to_final, listed,
-                col0, split,
+                col0, split, anchor,
             )  # fmt: skip
             if to_final:
                 _final_rows(c, t, slot, split, gathers)
         else:
             idents = _select_blk(
-                c, t, j, n, per, load, got, level, seg, slots, to_final, kind
+                c, t, j, n, per, load, got, level, seg, slots, to_final, kind, anchor
             )
             if final & gathers:
                 _compact(c, t, idents)
@@ -357,7 +369,7 @@ def stage_ilist(c, t, j, share, kind, level, bound_max, max_chunks, seg):
 @traced
 def _select_sel(
     c, t, j, n, per, load, got, level, seg, slots, to_final, listed, col0=0,
-    split=None,
+    split=None, anchor=None,
 ):  # fmt: skip
     """The top-512 of a selection list's ``n`` values (``topk.radix_select``:
     keys in registers, a pass whose digit is taken whole ends the search, the
@@ -366,7 +378,7 @@ def _select_sel(
     pairs to every rank's merge instead (``_put_answer``) --, another's into
     its region ``listed`` (region, put?). A merge's columns go by place
     through ``keys`` (its inputs' own); level 0's are its segment's past the
-    share's first column ``col0``."""
+    share's first column ``col0``. ``anchor``: the list's (``_anchor``)."""
     tid = c["tid"]
     k = ip.TOPK
     keys, slot, rlds = c["sel_lds"]["keys"], c["sel_lds"]["hist"], c["sel_lds"]["hi"]
@@ -379,7 +391,7 @@ def _select_sel(
     if const_expr(level > 0):
         for d in range_constexpr(per):
             fx.ptr_store(got[d][1], keys + (base + d))
-    n_out = radix_select(rlds, tid, us, base, n, k)
+    n_out = radix_select(rlds, tid, us, base, n, k, anchor)
     for p in range_constexpr((k + THREADS - 1) // THREADS):
         place = tid + THREADS * p
         if place < k:
@@ -409,7 +421,9 @@ def _select_sel(
 
 
 @traced
-def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
+def _select_blk(
+    c, t, j, n, per, load, got, level, seg, slots, to_final, kind, anchor=None
+):
     """The candidate blocks' list: the top-2048 of its ``n`` block maxima
     (``topk.radix_select``, as ``_select_sel``), a place a thread out to
     ``icout`` (a final list) or the level's region. A merge's blocks go by
@@ -428,7 +442,7 @@ def _select_blk(c, t, j, n, per, load, got, level, seg, slots, to_final, kind):
     if const_expr(level > 0):
         for d in range_constexpr(per):
             fx.ptr_store(got[d][1], keys + (base + d))
-    n_out = radix_select(rlds, tid, us, base, n, k)
+    n_out = radix_select(rlds, tid, us, base, n, k, anchor)
     for p in range_constexpr(k // THREADS):
         place = tid + THREADS * p
         u, idx = radix_slot(rlds, place, n_out, k)
@@ -472,6 +486,19 @@ def _compact(c, t, idents):
         place = tid + THREADS * p
         for h in range_constexpr(2):
             st_dev(pair[h], a["ilog"], base + place * TILE + 4 * h)
+
+
+def _anchor(c, t, kind, seg, level, j=0):
+    """List j of ``level`` of token t's ``kind`` / ``seg`` tree's anchor
+    (kind "merge": its split row's merge), (pointer, word): the anchors in
+    front of the layer's ``isel`` (``index_plan.anchor_base``, laid out for the
+    build's bound, ``run_indexer``); None with ``index_plan.ANCHOR`` off."""
+    if const_expr(not ip.ANCHOR):
+        return None
+    bound_max = c["anchor_bound"]
+    row = ip.anchor_row_words(bound_max)
+    ptr = c["args"]["isel"] - fx.Int64(ip.anchor_bytes(bound_max))
+    return ptr, t * row + ip.anchor_base(bound_max, kind, seg, level) + j
 
 
 def _icrdy(c):
@@ -664,6 +691,15 @@ def _own_rows(c, s):
     return 0, s
 
 
+# a candidate producer's selection tasks' first CTA when they take every column:
+# past its blk tree's first-level lists (6 rows x 7 segments at 400K columns)
+PROD_SEL0 = 48
+# a candidate producer's widest row up to which its selection takes every
+# column (32 segments: 6 rows' first level within the grid beside the blk tree;
+# at 400K columns, 49 segments, it ran slower than the compacted columns)
+PROD_FULL_MAX = 32 * ip.SEG
+
+
 @traced
 def run_indexer(c, s, bid, bound_max):
     """Every indexer stage of a selecting layer, the tasks of each laid out from
@@ -671,6 +707,7 @@ def run_indexer(c, s, bid, bound_max):
     before this launch: plain loads."""
     a = c["args"]
     max_chunks = ip.chunks(bound_max)
+    c["anchor_bound"] = bound_max  # ``_anchor``'s layout
     t0, n = _own_rows(c, s)
     # the FP4 scorer reads its rows' bounds itself: the trees' are loaded past
     # it, none held through its walk
@@ -681,18 +718,42 @@ def run_indexer(c, s, bid, bound_max):
     # a candidate producer's blocks first: its long rows' selection ranks
     # only their rows (``index_plan.compacts``), a CTA's tasks in this order
     if a["iprod"] != 0:
+        # its long rows compacted (``_compact``) only where its selection then
+        # ranks the compacted columns (``_wide``). Beside the full-column tree
+        # a compaction would rewrite the columns that tree's level 0 is still
+        # reading, and nothing would read it: a REINDEX layer scores its
+        # candidates afresh (``index_plan.compacts``); ICRDY says its blocks
+        # are out either way
         ((blk, bseg),) = ip.trees("blk", bound_max)
-        _run_tree(c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg)
+        _run_tree(
+            c, t0, n, bid, "blk", _whole(c, t0, n), blk, max_chunks, bseg,
+            compact=_wide(c, t0, n),
+        )  # fmt: skip
     # the selection's trees (``index_plan.trees``): the columns', a REINDEX
     # row's -- a candidate producer's too, over its candidates
     (full, seg), (reindex, rseg) = ip.trees("sel", bound_max)
     if a["ilift"] != 0:
         _run_tree(c, t0, n, bid, "sel", _whole(c, t0, n), reindex, max_chunks, rseg)
     elif a["iprod"] != 0:
-        # its candidates' columns (``index_plan.candidate_bound``), apart from
-        # a REINDEX row's tree: that one computes none
-        cols = [ip.candidate_bound(b) for b in _bounds(c, t0, n)]
-        _run_tree(c, t0, n, bid, "sel", (_whole_of, cols), reindex, max_chunks, rseg)
+        bounds = _bounds(c, t0, n)
+        if _wide(c, t0, n):
+            # past PROD_FULL_MAX columns the full tree's first level outgrows
+            # the grid: its candidates' columns (``index_plan.candidate_bound``)
+            # after the blk tree's compaction, apart from a REINDEX row's tree
+            cols = [ip.candidate_bound(b) for b in bounds]
+            _run_tree(
+                c, t0, n, bid, "sel", (_whole_of, cols), reindex, max_chunks, rseg
+            )
+        else:
+            # every column, a FULL row's tree, on CTAs from PROD_SEL0 (past the
+            # blk tree's first level): the attention waits on this selection
+            # alone, so it runs beside the blk tree and compaction, which only
+            # the later REINDEX layers read (``index_plan.compacts``: the same
+            # answer)
+            _run_tree(
+                c, t0, n, bid, "sel", _whole(c, t0, n), full, max_chunks, seg,
+                PROD_SEL0, False,
+            )  # fmt: skip
     else:
         _run_tree(c, t0, n, bid, "sel", _shares(c, t0, n), full, max_chunks, seg)
         if const_expr(c["index_split"]):
@@ -701,6 +762,17 @@ def run_indexer(c, s, bid, bound_max):
 
 def _bounds(c, t0, n):
     return [ld_i32(c["args"]["ibound"], t0 + t) for t in range(n)]
+
+
+def _wide(c, t0, n):
+    """Is a candidate producer's widest row past PROD_FULL_MAX? Its
+    selection then ranks its rows' candidate columns, compacted by its blk
+    tree, else every column beside that tree (``run_indexer``)."""
+    bounds = _bounds(c, t0, n)
+    widest = bounds[0]
+    for b in bounds[1:]:
+        widest = fx.max(widest, b)
+    return widest > PROD_FULL_MAX
 
 
 def _whole(c, t0, n):
@@ -759,7 +831,10 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
 
 
 @traced
-def _run_tree(c, t0, n, bid, kind, rows, bound_max, max_chunks, seg):
+def _run_tree(
+    c, t0, n, bid, kind, rows, bound_max, max_chunks, seg, first=0, gathers_ok=True,
+    compact=None,
+):  # fmt: skip
     k = ip.KINDS[kind]
     decode, words = rows
     for level in range_constexpr(ip.top_level(kind, bound_max, seg) + 1):
@@ -768,10 +843,13 @@ def _run_tree(c, t0, n, bid, kind, rows, bound_max, max_chunks, seg):
             for w in words
         ]
         enter_stage(f"k2a.i{kind}{level}")
-        for task in range(first_task(bid, 0), ip.flat_total(counts), BLOCKS):
+        for task in range(first_task(bid, first), ip.flat_total(counts), BLOCKS):
             t, j = ip.flat_task(counts, task)
             share = decode(pick(words, t))
-            stage_ilist(c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg)
+            stage_ilist(
+                c, t0 + t, j, share, kind, level, bound_max, max_chunks, seg,
+                gathers_ok, compact,
+            )  # fmt: skip
 
 
 @traced
@@ -817,6 +895,9 @@ def stage_imerge(c, t):
     def load(q, i):
         return [got[4 * q + e][0] for e in range(4)]
 
-    _select_sel(c, t, 0, fx.Int32(n), per, load, got, 1, ip.SEG, 0, True, None)
+    _select_sel(
+        c, t, 0, fx.Int32(n), per, load, got, 1, ip.SEG, 0, True, None, 0, None,
+        _anchor(c, t, "merge", 0, 0),
+    )  # fmt: skip
     _final_rows_of(c, t, c["sel_lds"]["hist"])
     _publish_all(c, "irdy", t)

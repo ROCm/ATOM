@@ -18,9 +18,13 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
+from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.mono.device.ops import (
+    ballot,
     block_excl_scan,
     fresh,
+    ld_i32,
+    st_dev,
     traced,
     uniform,
     wave_incl_scan,
@@ -162,15 +166,27 @@ BINS = 256
 COPIES = 8  # pass 0's histograms: lane l adds into copy l % COPIES
 H0_STRIDE = BINS + 4  # the copies 4 words apart in bank
 PASSES = 4
+# The anchored pass (``radix_select``'s ``anchor``, ``index_plan.ANCHOR``): a
+# key's top 16 bits (passes 0 and 1's digits together) placed in a window of
+# WINDOW values around the anchor's -- bin 1 + (top - lo16), 255 above it, a
+# key below it uncounted. Its k-th in a window bin stands for passes 0 and 1.
+WINDOW = BINS - 2
+# passes 2 and 3 issue a key's add only where some lane of the wave counts (a
+# scalar branch on the ballot): past the top 16 bits few keys still count
+RADIX_SPARSE = True
 
 
 def _layout(k: int) -> dict[str, int]:
     """Word offsets of ``radix_select``'s LDS for top ``k``."""
     hist = COPIES * H0_STRIDE  # passes 1 ..: a histogram each
-    cnt = hist + (PASSES - 1) * BINS  # the waves' prefix-sum totals
+    win = hist + (PASSES - 1) * BINS  # the anchored pass's (``ip.ANCHOR``)
+    cnt = win + (BINS if ip.ANCHOR else 0)  # the waves' prefix-sum totals
     slots = cnt + WAVES  # a winner a slot: (place, key)
     junk = slots + 2 * k  # a word a lane: the uncounted keys' adds
-    return {"hist": hist, "cnt": cnt, "slots": slots, "junk": junk, "words": junk + 64}
+    return {
+        "hist": hist, "win": win, "cnt": cnt, "slots": slots, "junk": junk,
+        "words": junk + 64,
+    }  # fmt: skip
 
 
 def select_words(k: int) -> int:
@@ -183,11 +199,14 @@ def _lds4(ptr, off):
     return [v[e] for e in range(4)]
 
 
-def _count(lds, hoff, keys, base, n, lane, prefix, mask, shift, copies, junk):
+def _count(
+    lds, hoff, keys, base, n, lane, prefix, mask, shift, copies, junk, sparse=False
+):
     """Count the keys at places base .. below n matching ``prefix`` under the
     static ``mask`` by their digit at ``shift`` (``copies`` > 1: lane l's
     copy), then the barrier. A key that does not count adds to its lane's junk
-    word: no branch a key, no two lanes on one word."""
+    word: no branch a key, no two lanes on one word. ``sparse``: a key's add
+    only where some lane of the wave counts (``_add_any``)."""
     if const_expr(copies > 1):
         hoff = hoff + (lane % copies) * H0_STRIDE
     for e in range_constexpr(len(keys)):
@@ -196,8 +215,43 @@ def _count(lds, hoff, keys, base, n, lane, prefix, mask, shift, copies, junk):
         if const_expr(mask != 0):
             m = m & ((u & Int32(_signed(mask))) == prefix)
         at = m.select(hoff + ((u >> shift) & 255), junk + lane)
+        if const_expr(sparse):
+            _add_any(m, lds + at)
+        else:
+            fx.llvm.atomic_add(lds + at, Int32(1), syncscope="workgroup")
+    gpu.barrier()
+
+
+@traced
+def _add_any(m, at):
+    """Every lane's add at ``at`` (a junk word where ``m`` fails), issued only
+    when some lane's ``m`` holds: the ballot is wave-uniform, so a scalar
+    branch skips the instruction (an exec mask alone still issues it)."""
+    if ballot(m) != fx.Int64(0):
+        fx.llvm.atomic_add(at, Int32(1), syncscope="workgroup")
+
+
+def _count_window(lds, woff, keys, base, n, lane, lo16, junk):
+    """The anchored pass: count the keys at places base .. below n by their
+    top 16 bits' place in the window from ``lo16`` -- bin 1 + (top - lo16)
+    within it, bin 255 above it; a key below it adds to its lane's junk word
+    --, then the barrier. Monotone in the key: a bin above holds only greater
+    keys."""
+    for e in range_constexpr(len(keys)):
+        u = fresh(keys[e])
+        q = ((u >> 16) & 0xFFFF) - lo16
+        m = ((base + e) < n) & (q >= 0)
+        at = m.select(woff + fx.min(q + 1, Int32(BINS - 1)), junk + lane)
         fx.llvm.atomic_add(lds + at, Int32(1), syncscope="workgroup")
     gpu.barrier()
+
+
+def _window_lo(word):
+    """The window's lowest top-16 value around an anchor word (an order key:
+    any word, a window that misses only costs the passes): its top 16 bits
+    centred, the window kept inside 16 bits."""
+    a16 = (word >> 16) & 0xFFFF
+    return fx.min(fx.max(a16 - (WINDOW // 2), Int32(0)), Int32(0xFFFF - (WINDOW - 1)))
 
 
 def _signed(m: int) -> int:
@@ -245,30 +299,60 @@ def _cta_prefix(v, lane, wave, cnt):
 
 
 @traced
-def radix_select(lds, tid, keys, base, n, k):
+def radix_select(lds, tid, keys, base, n, k, anchor=None):
     """The best min(k, n) of the CTA's order keys (thread ``tid``'s ``keys``
     at places ``base`` .., below ``n``; places in thread order, so ties go to
     the lower place) into LDS slots 0 .. n_out in place order; returns
     ``n_out`` (uniform). Every thread calls it; ``lds``: ``select_words(k)``
-    words. Ends with a barrier (slots readable, ``radix_slot``)."""
+    words. Ends with a barrier (slots readable, ``radix_slot``).
+
+    ``anchor`` (``index_plan.ANCHOR``; (pointer, word)): this list's k-th key
+    of the step before. The anchored pass (``_count_window``) first: a k-th
+    in a window bin gives the top 16 bits of the k-th and the count still to
+    take there -- what passes 0 and 1 give --, so only passes 2 and 3 run;
+    else the four passes, as without it. Either way the same k-th key and
+    count, so the same slots. The k-th's word for the next step after."""
     lay = _layout(k)
     tid = fresh(tid)
     lane = tid % 64
     wave = uniform(tid // 64)
+    if const_expr(anchor is not None):
+        # out before the zeroing's barrier; waited on with the keys
+        aword = ld_i32(anchor[0], anchor[1])
     for i in range_constexpr(-(-lay["cnt"] // THREADS)):
         if tid + i * THREADS < lay["cnt"]:
             fx.ptr_store(Int32(0), lds + (tid + i * THREADS))
     gpu.barrier()
     prefix, remain, live = Int32(0), Int32(k), Int32(1)
+    # 1: the anchored pass stands for passes 0 and 1
+    took = Int32(0)
+    if const_expr(anchor is not None):
+        lo16 = _window_lo(uniform(aword))
+        # n <= k takes every key: no k-th to find (the passes find none)
+        if uniform((fx.Int32(n) > k).select(Int32(1), Int32(0))) != 0:
+            _count_window(lds, lay["win"], keys, base, n, lane, lo16, lay["junk"])
+            gw = _digit(lds + lay["win"], lane, 1, remain)
+            dw = (gw >> 16) & 255
+            took = ((((gw >> 25) & 1) != 0) & (dw >= 1) & (dw <= WINDOW)).select(
+                Int32(1), Int32(0)
+            )
+            hit = took != 0
+            prefix = hit.select(((lo16 + dw - 1) & 0xFFFF) << 16, prefix)
+            remain = hit.select(gw & 0xFFFF, remain)
+            live = hit.select(((gw >> 24) & 1) ^ 1, live)
     mask = 0
     for p in range_constexpr(PASSES):
         shift = 24 - 8 * p
         copies = COPIES if p == 0 else 1
         hoff = 0 if p == 0 else lay["hist"] + BINS * (p - 1)
-        if live != 0:
+        run = live != 0
+        if const_expr(anchor is not None and p < 2):
+            run = run & (took == 0)
+        if run:
             _count(
-                lds, hoff, keys, base, n, lane, prefix, mask, shift, copies, lay["junk"]
-            )
+                lds, hoff, keys, base, n, lane, prefix, mask, shift, copies,
+                lay["junk"], RADIX_SPARSE and p >= 2,
+            )  # fmt: skip
             got = _digit(lds + hoff, lane, copies, remain)
             prefix = prefix | (((got >> 16) & 255) << shift)
             remain = (((got >> 25) & 1) != 0).select(got & 0xFFFF, remain)
@@ -299,6 +383,11 @@ def radix_select(lds, tid, keys, base, n, k):
         ab = ab + gt.select(Int32(1), Int32(0))
         tb = tb + tie.select(Int32(1), Int32(0))
     gpu.barrier()
+    if const_expr(anchor is not None):  # noqa: SIM102
+        # the k-th's key (a pass that took its digit whole leaves the bits
+        # below it 0): the next step's anchor; none while every key is taken
+        if (tid == 0) & (fx.Int32(n) > k):
+            st_dev(prefix, anchor[0], anchor[1])
     return (total & 0xFFFF) + fx.min((total >> 16) & 0xFFFF, remain)
 
 

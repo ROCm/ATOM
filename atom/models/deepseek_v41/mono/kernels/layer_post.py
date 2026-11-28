@@ -53,6 +53,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import shard_seam
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -71,7 +72,7 @@ from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import preg, publish
+from atom.mono.device.sync import publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.abi import KernelAbi

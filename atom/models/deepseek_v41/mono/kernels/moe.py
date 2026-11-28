@@ -54,6 +54,7 @@ Stages, with TP4's task counts:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
@@ -91,6 +92,7 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     SHARED_INTER,
     UG_PART,
 )
+from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.moe_shape import (
     SORT_NETS,
     MoeBuild,
@@ -100,6 +102,7 @@ from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
+from atom.models.deepseek_v41.mono.kernels.wave_max import wave_max_key
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device import queue, route
 from atom.mono.device.mx import (
@@ -113,7 +116,6 @@ from atom.mono.device.mx import (
     rcp_pow2,
     scale_index,
 )
-from atom.mono.device.numa import region_addrs
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -134,6 +136,7 @@ from atom.mono.device.ops import (
     launcher,
     ld_f32,
     lds_bytes,
+    permlane_swap,
     popcount,
     readlane,
     row_sum,
@@ -145,7 +148,7 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.select import KEY_LEAST, f32_key
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Quad, preg, publish
+from atom.mono.device.sync import Quad, publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, LDS_BYTES, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout
@@ -430,7 +433,9 @@ def router_x_normed(c, part, g0, per, tiles):
     for u, col in zip(us, cols):
         tok = fx.min(plus(g0, u // ROUTER_UNITS), s - 1)
         specs.append((dn["lin"], Quad((tok * HIDDEN + col) // 4), 2))
-    got = dn["poll"](specs)
+    # a retry re-loads only a lane's stale specs: past the first pass the
+    # 48 router CTAs' 2.2 MB a pass shrinks to the pairs still outstanding
+    got = dn["poll"](specs, stale_only=True)
     per_tok = len(lssq_specs(dn["lssq"], 0, lane))
     for k in range_constexpr(waves_tokens):
         r = lin_rstd(lane, got[k * per_tok : (k + 1) * per_tok])
@@ -527,45 +532,43 @@ def stage_route(c, t):
     gpu.barrier()
     if wave == 0:
         ept = experts // 64
-        # integer order keys: an integer max takes its DPP operand in
-        # the one instruction, the f32 maximum needs a DPP move before it
+        # a lane's keys sorted with their experts only: each winner's
+        # unbiased score is read back from LDS by its expert at the end
         vals = [f32_key(fx.ptr_load(red + (lane + 64 * i))) for i in range(ept)]
-        orig = [fx.ptr_load(red + (experts + lane + 64 * i)) for i in range(ept)]
         idxs = [fx.Int32(lane + 64 * i) for i in range(ept)]
         for p, q in c["rs"].sort_net:
             sw = vals[p] < vals[q]
             vals[p], vals[q] = sw.select(vals[q], vals[p]), sw.select(vals[p], vals[q])
-            orig[p], orig[q] = sw.select(orig[q], orig[p]), sw.select(orig[p], orig[q])
             idxs[p], idxs[q] = sw.select(idxs[q], idxs[p]), sw.select(idxs[p], idxs[q])
-        # round k's winner (expert, unbiased score) read off the winning lane
-        # (the lowest lane holding the wave's max), which then pops its head:
-        # a round reads every lane's head only.
+        # round k's winner read off the winning lane (the lowest lane holding
+        # the wave's max), which then pops its head: a round reads every
+        # lane's head only.
         # A lane whose list runs out (ept < topk: the draft's 2 a lane, top 3)
         # takes KEY_LEAST, below every score's key: 64 ept >= topk, so a live
         # entry wins every round
         assert 64 * ept >= topk
-        ids, ws = [], []
+        ids = []
         for k in range_constexpr(topk):
-            best = butterfly(vals[0], (32, 16, 8, 4, 2, 1), fx.max)
+            best = wave_max_key(vals[0])
             win = fx.Int32(fmath.cttz(ballot(vals[0] == best)))
             ids.append(readlane(idxs[0], win))
-            ws.append(readlane(orig[0], win))
             popped = lane == win
             # only the entries a later round can still reach
             reach = min(ept, topk - k)
             for j in range_constexpr(reach - 1):
                 vals[j] = popped.select(vals[j + 1], vals[j])
                 idxs[j] = popped.select(idxs[j + 1], idxs[j])
-                orig[j] = popped.select(orig[j + 1], orig[j])
             if const_expr(reach == ept):
                 vals[ept - 1] = popped.select(fx.Int32(KEY_LEAST), vals[ept - 1])
+        my_id = ids[0]
+        for k in range_constexpr(1, topk):
+            my_id = (lane == k).select(ids[k], my_id)
+        # lane k's winner's unbiased score (``route_scores``' LDS, NaN as 0),
+        # the k winners' summed in top-k order
+        my_w = fx.Float32(fx.ptr_load(red + (experts + my_id)))
         total = fx.Float32(0.0)
         for k in range_constexpr(topk):
-            total = total + ws[k]
-        my_id, my_w = ids[0], ws[0]
-        for k in range_constexpr(1, topk):
-            mine = lane == k
-            my_id, my_w = mine.select(ids[k], my_id), mine.select(ws[k], my_w)
+            total = total + readlane(my_w, k)
         scale = fx.Float32(SCALE) / fx.max(total, fx.Float32(1e-20))
         if lane < topk:
             # token t of the routed rows is the step's row ``route_t0`` + t
@@ -578,8 +581,167 @@ def stage_route(c, t):
     gpu.barrier()
 
 
-@traced
+# a step's picks at most for ``load_route_wave``: one a lane of wave 0
+WAVE_ROUTE_PICKS = 64
+
+
+def wave_route(rs) -> bool:
+    """Whether ``load_route`` builds the table on wave 0 (``load_route_wave``):
+    every pick a lane of one wave, under TP (no expert parallel)."""
+    return rs.ep == 1 and rs.picks <= WAVE_ROUTE_PICKS
+
+
 def load_route(c, tab):
+    """The route table in LDS ``tab`` (``RouteShape``): ``load_route_wave`` for
+    a step's picks a lane of one wave, else ``load_route_bitmaps``. Both lay
+    out the same words the kernel reads."""
+    if const_expr(wave_route(c["rs"])):
+        load_route_wave(c, tab)
+    else:
+        load_route_bitmaps(c, tab)
+
+
+def _dpp(x, ctrl):
+    """DPP ``ctrl`` of x (every row and bank; a lane reading outside its row
+    takes 0: no lane here uses such a value)."""
+    return fx.Int32(update_dpp_i32(fx.Int32(0), x, ctrl, 0xF, 0xF, True))
+
+
+def _swap_min_max(x, off):
+    """(min, max) of x and lane ``lane ^ off``'s x, off 16 or 32: a
+    v_permlane*_swap gives a lane its own value and its partner's."""
+    a, b = permlane_swap(off, x, x)
+    return fx.min(a, b), fx.max(a, b)
+
+
+def _wave_sort(x, lane, size):
+    """The wave's i32 keys sorted ascending in lane order within each run of
+    ``size`` (32 or 64) lanes: a bitonic network in its flip form, every
+    compare ascending (a block's first step compares lane i with i ^ (k - 1),
+    the lower lane keeping the min, then the half-cleaners i ^ j). Partners by
+    DPP within a row (quad perms, row mirrors, row shifts) and the permlane
+    swaps across rows: no LDS, no barrier."""
+    k = 2
+    while k <= size:
+        low = (lane & (k // 2)) == 0
+        if k == 2:
+            p = _dpp(x, 0xB1)  # lane ^ 1
+        elif k == 4:
+            p = _dpp(x, 0x1B)  # quad mirror: lane ^ 3
+        elif k == 8:
+            p = _dpp(x, 0x141)  # half-row mirror: lane ^ 7
+        else:
+            p = _dpp(x, 0x140)  # row mirror: lane ^ 15
+            if k >= 32:
+                a, b = permlane_swap(16, p, p)
+                p = ((lane & 16) != 0).select(a, b)  # lane ^ 31
+            if k == 64:
+                a, b = permlane_swap(32, p, p)
+                p = ((lane & 32) != 0).select(a, b)  # lane ^ 63
+        x = low.select(fx.min(x, p), fx.max(x, p))
+        j = k // 4
+        while j >= 1:
+            low = (lane & j) == 0
+            if j >= 16:
+                mn, mx = _swap_min_max(x, j)
+            elif j >= 4:
+                # the lower lane's partner j above it (row_shl), the upper's
+                # j below (row_shr)
+                mn = fx.min(x, _dpp(x, 0x100 + j))
+                mx = fx.max(x, _dpp(x, 0x110 + j))
+            else:
+                p = _dpp(x, 0xB1 if j == 1 else 0x4E)  # lane ^ 1, lane ^ 2
+                mn, mx = fx.min(x, p), fx.max(x, p)
+            x = low.select(mn, mx)
+            j //= 2
+        k *= 2
+    return x
+
+
+@traced
+def load_route_wave(c, tab):
+    """``load_route_bitmaps``' table for a step's picks a lane of wave 0
+    (``wave_route``), with one barrier: wave 0 polls the picks' ids, a pick a
+    lane, wave 1 their weights (every route word in one batch, as there), and
+    wave 0 alone lays out the rest from its lanes.
+
+    The picks' keys (expert, pick) sorted ascending (``_wave_sort``) are the
+    pick order, a slot's picks by token ascending as the bitmaps' ranks give
+    them (a token picks an expert once): lane r holds the pick at position r.
+    A slot starts where the expert changes; its slot is the starts below it
+    (a ballot), and U, the slots' first positions and, past one token tile,
+    their pick tiles follow from the starts' ballots. Each expert of U gets its
+    slot (``RouteShape.expert_slot0``); the other experts' entries, and the
+    token bitmaps, are read by ``load_route_bitmaps`` alone, and not written."""
+    s, wave = c["S"], c["wave"]
+    # tid and lane afresh: the lane masks and addresses built on them stay
+    # here, not hoisted out of the ug loop into registers held across stages
+    tid = fresh(c["tid"])
+    lane = tid & 63
+    rs = c["rs"]
+    topk = rs.topk
+    n = s * topk
+    assert wave_route(rs) and 2 * WAVE_ROUTE_PICKS <= THREADS
+    # thread tid's route word: wave 0 lane p pick p's id, wave 1 lane p its
+    # weight (a lane past the picks the last pick's); past wave 1 the last
+    # word, re-read and not stored (``load_route_bitmaps``' poll's)
+    pk = fx.min(lane, n - 1)
+    word = pk // topk * (2 * topk) + pk % topk
+    word = (tid < 64).select(word, (tid < 128).select(word + topk, fx.Int32(2 * n - 1)))
+    copy_at = c["bid"] % ROUTE_COPIES * (2 * n)
+    got = c["poll"]([(c["route_src"], copy_at + word, 1)])
+    if (tid < 128) & (lane < n):
+        fx.ptr_store(got[0][0], tab + word)
+    if wave == 0:
+        mine = lane < n
+        # (expert, pick) keys, past the picks above every key
+        key = mine.select(got[0][0] * 64 + lane, fx.Int32(rs.experts * 64))
+        key = _wave_sort(key, lane, 32 if n <= 32 else 64)
+        e, pick = key >> 6, key & 63
+        # the previous position's expert (DPP wave_shr:1; lane 0 takes none)
+        e_prev = _dpp(key, 0x138) >> 6
+        start = mine & ((lane == 0) | (e != e_prev))
+        starts = ballot(start)
+        n_u = popcount(starts)
+        below = lanes_below(starts, lane)
+        slot = start.select(below, below - 1)
+        if mine:
+            fx.ptr_store(pick, tab + (rs.order0 + lane))
+            fx.ptr_store(slot, tab + (2 * rs.picks + 1 + rs.max_u + pick))
+        if start:
+            fx.ptr_store(e, tab + (2 * n + 1 + slot))
+            fx.ptr_store(lane, tab + (rs.first0 + slot))
+            fx.ptr_store(slot, tab + (rs.expert_slot0 + e))
+        if lane == 0:
+            fx.ptr_store(n_u, tab + 2 * n)
+            # the picks of U: every pick under TP
+            fx.ptr_store(fx.Int32(n), tab + (rs.first0 + n_u))
+        if const_expr(rs.multi):
+            # a slot's picks run to its last position: the next start's below,
+            # or the last pick
+            last = (starts >> 1) | (fx.Int64(1) << (n - 1))
+            count = fx.Int32(fmath.cttz(last >> fx.Int64(lane))) + 1
+            tiles = mplan.pick_tiles(count)
+            # the slots' pick tiles below each start: a slot's 1 + its tiles
+            # past each further TILE picks
+            tf = below
+            total = n_u
+            for t in range_constexpr(1, rs.slot_tiles):
+                more = ballot(start & (tiles > t))
+                tf = tf + lanes_below(more, lane)
+                total = total + popcount(more)
+            if start:
+                fx.ptr_store(tf, tab + (rs.tile_first0 + slot))
+                for j in range_constexpr(rs.slot_tiles):
+                    if j < tiles:
+                        fx.ptr_store(slot, tab + (rs.tile_slot0 + tf + j))
+            if lane == 0:
+                fx.ptr_store(total, tab + (rs.tile_first0 + n_u))
+    gpu.barrier()
+
+
+@traced
+def load_route_bitmaps(c, tab):
     """Every token's (ids, weights) into LDS ``tab``, then the union U of the ids
     (ascending): tab[2 S topk ..] = |U|, the experts of U, each (t, k)'s slot in
     U, each expert's slot, the picks in slot order (a slot's ascending) and each
@@ -1624,8 +1786,6 @@ def shared_down_units(rs) -> int:
 # a routed unit's weight tiles a wave holds (a 16-row task's K steps each): at
 # TP4 four tasks (512 rows); a wider K takes fewer tasks
 DOWN_Y_WAVE_TILES = 20
-# its tasks whose weights are issued before the MID poll
-DOWN_Y_PRE_TASKS = 1
 
 
 def down_y_wave_tasks(d) -> int:
@@ -1642,13 +1802,15 @@ def down_y_unit_blocks(d) -> int:
 
 
 @traced
-def run_down_y(c, tasks):
+def run_down_y(c, tasks, unit):
     """Down by queue units (``RouteShape.down_y``): every unit from the
     launch's queue (DNQ) -- each slot's (slot, hidden block) units
     (``down_y_unit``) and the shared expert's (``shared_down_unit``), in
-    ``down_y_next``'s order -- by the CTAs as they reach down, so a CTA whose
-    ug ended last finds the queue empty; then the combine of this CTA's
-    ``tasks`` (``down_y_combine``)."""
+    ``down_y_run``'s order -- by the CTAs as they reach down, so a CTA whose
+    ug ended last finds the queue empty, from ``unit`` (this CTA's first take,
+    ``take_down_rank_unit``); then the combine of this CTA's ``tasks``
+    (``down_y_combine``). A unit's next is taken after it: one taken ahead let
+    the first CTAs to arrive claim two units each and the last none (+6%)."""
     blocks = down_y_unit_blocks(c["d"])
     rs, tab = c["rs"], c["tab"]
     # a slot's units, or past one token tile a pick tile's
@@ -1657,43 +1819,46 @@ def run_down_y(c, tasks):
     shared = shared_down_units(rs)
     total = routed + shared
     sl = c["wsl"] + c["wave"] * down_wsl_words(c["d"])
-    unit = fx.Int32(-1)
+    unit = fx.Int32(unit)
     while unit < total:
-        unit = down_y_next(c, unit, sl, routed, shared)
+        down_y_run(c, unit, sl, routed, shared)
+        unit = take_down_unit(c)
     for pas in range_constexpr(0, len(tasks) * c["S"] * (ROWS // 2), THREADS):
         down_y_combine(c, tasks, plus(pas, c["tid"]))
     gpu.barrier()
 
 
 @traced
-def down_y_next(c, unit, sl, routed, shared):
-    """Unit ``unit`` of ``run_down_y`` (-1: none yet), then the queue's next:
-    with wide shared units (``shared_down_wide``) the shared expert's
-    ``shared`` first (from the CTAs that reach down first, while the slots'
-    MID is still being written), then the slots' ``routed``; else the slots'
-    first."""
+def down_y_run(c, unit, sl, routed, shared):
+    """Unit ``unit`` of ``run_down_y``: with wide shared units
+    (``shared_down_wide``) the shared expert's ``shared`` first (from the CTAs
+    that reach down first, while the slots' MID is still being written), then
+    the slots' ``routed``; else the slots' first."""
     if const_expr(shared_down_wide(c["rs"])):
-        if (unit >= 0) & (unit < shared):
+        if unit < shared:
             shared_down_unit(c, unit)
         if unit >= shared:
             down_y_unit(c, unit - shared, sl)
     else:
-        if (unit >= 0) & (unit < routed):
+        if unit < routed:
             down_y_unit(c, unit, sl)
         if unit >= routed:
             shared_down_unit(c, unit - routed)
-    return take_down_unit(c)
 
 
 @traced
 def down_y_unit(c, unit, sl):
     """Down unit ``unit`` (slot ``unit // down_y_unit_blocks`` of U, a hidden
     block): a wave its ``down_y_wave_tasks`` adjacent 16-row tasks -- the
-    scale blocks and the first DOWN_Y_PRE_TASKS tasks' weights
-    issued, the slot's MID rows polled into LDS (``load_mid_rows``: tagged, no
-    flag), then the other tasks' weights, so the poll waits behind few loads --
-    the chains over K, each pick's contribution bf16(v w) to DY as tagged
-    pairs (``down_store_y``)."""
+    slot's MID rows polled into LDS (``load_mid_rows``: tagged, no flag), the
+    poll's first pass issued before the scale blocks and every task's
+    weights and checked after them -- the chains over K, then each pick's
+    contribution bf16(v w) to DY as tagged pairs (``down_store_y``).
+
+    vmcnt counts loads and stores in issue order: a poll issued behind the
+    weights waits for them, and a weight wait issued behind a task's DY stores
+    waits for their acks (G306 / G307 / G312: -16 us/step with all three
+    orders of this and ``shared_down_unit``, none alone)."""
     tab, d, a, rs = c["tab"], c["d"], c["args"], c["rs"]
     n_tasks, blocks = down_y_wave_tasks(d), down_y_unit_blocks(d)
     task0 = (unit % blocks * WAVES + c["wave"]) * n_tasks
@@ -1710,37 +1875,40 @@ def down_y_unit(c, unit, sl):
     e = local_expert(c, rs.union_expert(tab, c["S"], u))
     nst = d.inter // 128
     block_words = down_scale_words(d)
-    svs = [
-        scale_block_loads(c, a["w2_s"], e * HIDDEN + (task0 + 2 * b) * 16, d.down_scale_cols)
-        for b in range(n_tasks // 2)
-    ]  # fmt: skip
     tasks = [task0 + j for j in range(n_tasks)]
 
     def weights(t):
         return fp4_tile_weights(c, a["w2"], e, HIDDEN, d.inter, t, 0, nst, d.inter_real)
 
-    avs = [weights(t) for t in tasks[:DOWN_Y_PRE_TASKS]]
-    load_mid_rows(c, first, count)
-    avs += [weights(t) for t in tasks[DOWN_Y_PRE_TASKS:]]
+    def issue():
+        return [
+            scale_block_loads(c, a["w2_s"], e * HIDDEN + (task0 + 2 * b) * 16, d.down_scale_cols)
+            for b in range(n_tasks // 2)
+        ], [weights(t) for t in tasks]  # fmt: skip
+
+    svs, avs = load_mid_rows(c, first, count, between=issue)
     for b in range_constexpr(len(svs)):
         scale_block_store(c, svs[b], sl + b * block_words)
     mids = mid_lds_operands(c, count, nst)
+    # every task's chains before any DY store
+    accss = [
+        down_chains(c, tasks[j], sl + j // 2 * block_words, mids, avs[j], down_zero())
+        for j in range(n_tasks)
+    ]  # fmt: skip
     for j in range_constexpr(n_tasks):
-        accs = down_chains(
-            c, tasks[j], sl + j // 2 * block_words, mids, avs[j], down_zero()
-        )
-        down_store_y(c, accs, tasks[j], first, count)
+        down_store_y(c, accss[j], tasks[j], first, count)
     gpu.barrier()
 
 
 @traced
-def load_mid_rows(c, first, count):
+def load_mid_rows(c, first, count, between=None):
     """The MID rows of a slot's picks first .. first + count into LDS rows 0 ..
     of ``dml`` / ``dmsl`` at the ``lds_row`` stride: what ug writes polled
     (tagged pairs) -- a row's words of the real width (two a spec) and its
     real groups' codes (``mid_code_index`` puts a padding group's among them)
     -- and the padding to ``inter`` (ug writes none) zeroed: a zero weight does
-    not mask a NaN byte."""
+    not mask a NaN byte. ``between``: loads issued after the poll's first pass
+    and before its check (``Mailbox.poll``), their values returned."""
     d, tid = c["d"], c["tid"]
     words, real_words = d.mid_words, d.inter_real // 4
     groups, steps = d.inter // 32, d.inter // 128
@@ -1766,7 +1934,10 @@ def load_mid_rows(c, first, count):
         stores.append(
             (c["dmsl"] + (r * lds_row(groups) + p), (tid + THREADS * i < TILE * groups) & (r < count), real)
         )  # fmt: skip
-    got = c["poll"](specs, batch=len(specs))
+    if const_expr(between is not None):
+        got, extra = c["poll"](specs, batch=len(specs), between=between)
+    else:
+        got = c["poll"](specs, batch=len(specs))
     for (at, live, real), v in zip(stores, got):
         if real is None:
             put_lds_live(at, fx.Vector.from_elements(v, fx.Int32), live)
@@ -1779,6 +1950,8 @@ def load_mid_rows(c, first, count):
         at = c["dml"] + (e // pad * lds_row(words) + real_words + e % pad)
         put_lds_live(at, fx.Int32(0), tid + THREADS * i < TILE * pad)
     gpu.barrier()
+    if const_expr(between is not None):
+        return extra
 
 
 def mid_lds_operands(c, count, nst):
@@ -1831,13 +2004,17 @@ def shared_down_unit(c, k):
     bf16 -> SDO [task][token][16 rows] as tagged pairs, the intermediate loaded
     once for them. Every task's weights in flight first; wide units
     (``shared_down_wide``) SHARED_DOWN_AHEAD tasks' at a time, the next issued
-    before this one's MFMAs."""
+    before this one's MFMAs. A task's SDO word is held and stored at the
+    unit's end: a later task's weight wait would else wait for its store's
+    ack (vmcnt counts in issue order; ``down_y_unit``)."""
     s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
     per = shared_down_tasks(c["rs"])
     tasks = [k * per + j for j in range(per)]
     tiles = token_tiles(s)
     ahead = min(per, SHARED_DOWN_AHEAD) if shared_down_wide(c["rs"]) else per
     shops = [shared_down_loads(c, tasks[j]) for j in range(ahead)]
+    rp, tl = tid % (ROWS // 2), tid // (ROWS // 2)
+    held = []
     for t0, nn in tiles:
         load_smid_tile(c, t0, nn, d.sh_inter // 32)
         for j in range_constexpr(len(tasks)):
@@ -1845,12 +2022,17 @@ def shared_down_unit(c, k):
                 shops.append(shared_down_loads(c, tasks[j + ahead]))
             gemv_fp8_mfmas(c, d.sh_inter, c["sxl"], c["sxsl"], red, shops[j], rows=nn)
             gpu.barrier()
+            word = fx.Int32(0)
             if tid < ROWS * nn // 2:
-                rp, tl = tid % (ROWS // 2), tid // (ROWS // 2)
                 vs = [bf16_round(acc_sum(red, 2 * rp + h, tl)) for h in range(2)]
-                at = (tasks[j] * s + plus(t0, tl)) * ROWS + 2 * rp
-                c["put_bf"](c["sdo"], at, vs)
+                word = bf16_pair(vs[0], vs[1]).bitcast(fx.Int32)
+            held.append((j, t0, nn, word))
             gpu.barrier()
+    for j, t0, nn, word in held:
+        if tid < ROWS * nn // 2:
+            # pair (element ``(task s + t) ROWS + 2 rp``) // 2
+            at = (tasks[j] * s + plus(t0, tl)) * (ROWS // 2) + rp
+            c["put_words"](c["sdo"], at, [word])
 
 
 @traced
@@ -2033,6 +2215,29 @@ def take_down_rank(c):
     CTAs take the extra tiles. A tile's result is the same whichever CTA
     computes it."""
     return take_launch_queue(c, "dq")
+
+
+@traced
+def take_down_rank_unit(c):
+    """``take_down_rank`` and the first ``take_down_unit`` (``run_down_y``) in
+    one round trip: thread 0's two atomics back to back, both handed over in
+    one LDS word (rank | unit << 16). Their words' addresses go through an
+    opaque move: on a uniform address LLVM's atomic optimizer reads each
+    result back at once, two round trips in series."""
+    slot = c["tab"] + c["rs"].queue0
+    gpu.barrier()
+    if c["tid"] == 0:
+        base = c["args"]["queue_words"] + fx.Int64(fresh(fx.Int32(0)))
+        rank = fx.Int32(
+            queue.take(queue.word(base + fx.Int64(QUEUES.index("dq") * QUEUE_REGION)))
+        )
+        unit = fx.Int32(
+            queue.take(queue.word(base + fx.Int64(QUEUES.index("dnq") * QUEUE_REGION)))
+        )
+        fx.ptr_store((rank & fx.Int32(0xFFFF)) | (unit << fx.Int32(16)), slot)
+    gpu.barrier()
+    v = fx.Int32(fx.ptr_load(slot))
+    return v & fx.Int32(0xFFFF), v >> fx.Int32(16)
 
 
 def down_weights(c, tasks, rnd, slots, nu, st0=0, nst=None):
@@ -2588,14 +2793,17 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     # one too: the CTAs whose ug ended first (by bid, those ending last held
     # two tiles and ended the stage)
     down_task = first_task(bid, DOWN0)
-    rank = take_down_rank(c)
+    if const_expr(c["rs"].down_y):
+        rank, unit0 = take_down_rank_unit(c)
+    else:
+        rank = take_down_rank(c)
     has_second = rank < DOWN_TASKS - BLOCKS
     by_unit = down_by_unit(c["rs"])
     if const_expr(c["rs"].down_y):
         # the combine's second task: live for the first arrivals only
         cy = dict(c)
         cy["second_live"] = has_second
-        run_down_y(cy, [down_task, has_second.select(BLOCKS + rank, down_task)])
+        run_down_y(cy, [down_task, has_second.select(BLOCKS + rank, down_task)], unit0)
     elif const_expr(by_unit):
         # the down stamp at the units' end: the combine is timed in the reduce
         second = has_second.select(BLOCKS + rank, down_task)
