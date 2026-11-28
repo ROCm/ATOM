@@ -230,6 +230,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
     # MiniMax PP/TP1 -> TP landing, independent of incremental chunk transfer.
     "ATOM_PD_MINIMAX_LANDING": lambda: _flag_env("ATOM_PD_MINIMAX_LANDING", "0"),
+    # P->D sends of a MiniMax page-staging Mooncake producer from a process of
+    # their own per stage (`send_process.py`); 0 keeps them in the stage process.
+    "ATOM_PD_SEND_PROCESS": lambda: _flag_env("ATOM_PD_SEND_PROCESS", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
     # failure; a Mooncake prefill keeps a landing slot whose write failed out

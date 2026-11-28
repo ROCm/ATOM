@@ -4,11 +4,16 @@
 """The P->D send process (``ATOM_PD_SEND_PROCESS``), on CPU.
 
 `create` builds its connector from a stage's state, and each transfer case runs
-it beside the in-process producer and compares bytes, READYs and write-dones.
+it beside the in-process producer and compares bytes, READYs and write-dones;
+T6 starts and serves one as well. Lifecycle cases spawn stand-ins.
 """
 
 import ctypes
+import importlib.machinery
 import multiprocessing
+import os
+import signal
+import socket
 import sys
 import threading
 import time
@@ -16,22 +21,30 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import msgpack
+import msgspec
+import pd_send_children as children
+import psutil
 import pytest
+import test_pd_chunked_transfer as protocol
 import torch
+import zmq
 from test_mha_landing import (  # noqa: F401 - host_gather, host_streams: autouse
     LAST,
     SINGLE,
     STAGES,
     Harness,
+    byte_view,
     host_gather,
     host_streams,
     mc,
 )
 
 from atom.kv_transfer.disaggregation.mooncake import send_process as sp
+from atom.kv_transfer.disaggregation.staging_config import staging_reserve_bytes
 from atom.mono.runtime import hip_ipc
 
 SRC, DST = [3, 1, 2], [2, 0, 3]
+SPAWN = multiprocessing.get_context("spawn")  # what atom.utils.get_mp_context returns
 
 
 @pytest.fixture(autouse=True)
@@ -41,9 +54,20 @@ def harness_connector_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, mc.__name__, mc)
     monkeypatch.setattr(package, "mooncake_connector", mc, raising=False)
+    monkeypatch.delenv("ATOM_PD_SEND_PROCESS", raising=False)
 
 
-def minimax_config():
+@pytest.fixture
+def spawnable(monkeypatch):
+    # A spawned child re-runs a script __main__ (the aiter-stub runner) unless
+    # it looks like a package's.
+    main = sys.modules["__main__"]
+    if getattr(main, "__spec__", None) is None:
+        spec = importlib.machinery.ModuleSpec("pytest.__main__", None)
+        monkeypatch.setattr(main, "__spec__", spec, raising=False)
+
+
+def minimax_config(chunked=False, role="kv_producer"):
     return SimpleNamespace(
         hf_config=SimpleNamespace(model_type="minimax_m3", num_hidden_layers=2),
         tensor_parallel_size=1,
@@ -54,14 +78,15 @@ def minimax_config():
         dcp_config=SimpleNamespace(interleave_size=1),
         kv_transfer_config={
             "kv_connector": "mooncake",
-            "kv_role": "kv_producer",
+            "kv_role": role,
             "protocol": "rdma",
             "ib_device": "ionic_0",
+            "enable_chunked_transfer": chunked,
         },
     )
 
 
-def stage_connector(monkeypatch):
+def stage_connector(monkeypatch, *, send_process, rails=""):
     """A MiniMax page-staging producer stage, as `__init__` builds it."""
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(mc, "get_tp_group", lambda: group)
@@ -69,18 +94,30 @@ def stage_connector(monkeypatch):
     monkeypatch.setattr(mc, "get_ip", lambda: "192.0.2.2")
     monkeypatch.setattr(mc, "get_open_port", lambda: 17000)
     monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
-    monkeypatch.setattr(mc, "_ib_device_exists", lambda device: True)
+    monkeypatch.setattr(mc.mooncake_hca, "ib_device_exists", lambda device: True)
     monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
     monkeypatch.setattr(mc.zmq, "Context", MagicMock())
-    engine = MagicMock()
-    engine.initialize.return_value = 0
-    engine.get_rpc_port.return_value = 17001
-    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    engines = []
+
+    def engine():
+        engines.append(MagicMock())
+        engines[-1].initialize.return_value = 0
+        engines[-1].get_rpc_port.return_value = 17001
+        return engines[-1]
+
+    monkeypatch.setattr(mc, "TransferEngine", engine, raising=False)
     monkeypatch.setenv("ATOM_PD_MINIMAX_LANDING", "1")
-    monkeypatch.setenv("ATOM_MOONCAKE_MATCHED_RAILS", "")
+    monkeypatch.setenv("ATOM_PD_SEND_PROCESS", "1" if send_process else "0")
+    monkeypatch.setenv("ATOM_MOONCAKE_MATCHED_RAILS", rails)
     monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
-    return mc.MooncakeConnector(minimax_config())
+    return mc.MooncakeConnector(minimax_config()), engines
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 # What register_kv_caches sets on a stage; taken from the harness's pages.
@@ -92,15 +129,20 @@ REGISTERED = (
 
 
 def created_state(h, monkeypatch):
-    """The state the send process takes from a stage `__init__` built over the
-    harness's pages; a key the stage lacks raises."""
+    """The state `start` takes from a stage `__init__` built over the harness's
+    pages; a key the stage lacks raises."""
     executor, context = mc.ThreadPoolExecutor, mc.zmq.Context
-    stage = stage_connector(monkeypatch)
+    stage, _ = stage_connector(monkeypatch, send_process=True)
     monkeypatch.setattr(mc, "ThreadPoolExecutor", executor)
     monkeypatch.setattr(mc.zmq, "Context", context)
     for key in REGISTERED:
         setattr(stage, key, getattr(h.c, key))
-    return {key: getattr(stage, key) for key in sp.STATE_KEYS}
+    stage._side_channel_port = free_port()
+    specs = []
+    monkeypatch.setattr(sp, "export_views", lambda views: (b"", []))
+    monkeypatch.setattr(sp, "StageLink", specs.append)
+    sp.start(stage, dict(enumerate(h.src_views)))
+    return specs[0].state
 
 
 # What `serve` sets, and the harness's sockets and streams, taken from its stage.
@@ -378,6 +420,26 @@ def test_a_single_stage_marks_done_once_every_consumer_rank_is_served(
         assert h.c.done_sending == {"xfer-a"}
 
 
+def link_to(child, monkeypatch, label="pd-send-pp0"):
+    monkeypatch.setattr(sp, "child_main", child)
+    return sp.StageLink(SimpleNamespace(label=label))
+
+
+def test_the_stage_reports_a_done_once_and_stops_its_send_process(
+    spawnable, monkeypatch
+):
+    stage = protocol.producer()[0]
+    stage._send_process = link_to(children.bound_then_done, monkeypatch)
+    deadline = time.monotonic() + 30
+    finished = set()
+    while not finished and time.monotonic() < deadline:
+        finished = stage.get_finished().finished_sending
+    assert finished == {"xfer-a"}
+    assert not stage.get_finished().finished_sending
+    stage.close()
+    assert stage._send_process.proc.exitcode == 0
+
+
 # ---- T4: the pool's views across the process boundary ----
 
 
@@ -494,3 +556,256 @@ def test_serve_registers_staging_only_and_warms_each_cut_before_listening(
     tps = [t for t in (2, 4, 8) if 4 % t == 0 or t % 4 == 0]
     assert len(gathers) == len(cut) * len(tps) * 4
     assert set(gathers) == {(True, True), (False, True), (True, False), (False, False)}
+
+
+# ---- T5: lifecycle ----
+
+
+@pytest.mark.parametrize(
+    "child, message",
+    [
+        (children.bound_then_exit, "pd-send-pp0 exited"),
+        (children.bound_then_fatal, "pd-send-pp0 failed: write listener exited"),
+    ],
+)
+def test_the_stage_raises_once_its_send_process_dies_or_fails(
+    child, message, spawnable, monkeypatch
+):
+    stage = protocol.producer()[0]
+    stage._send_process = link_to(child, monkeypatch)
+    deadline = time.monotonic() + 30
+    try:
+        with pytest.raises(RuntimeError, match=message):
+            while time.monotonic() < deadline:
+                stage.get_finished()
+                time.sleep(0.05)
+    finally:
+        stage._send_process.proc.kill()
+
+
+def test_no_bound_fails_registration_and_kills_the_child(spawnable, monkeypatch):
+    monkeypatch.setattr(sp, "BOUND_TIMEOUT_S", 0.5)
+    procs, process = [], SPAWN.Process
+    monkeypatch.setattr(
+        SPAWN, "Process", lambda *a, **k: procs.append(process(*a, **k)) or procs[-1]
+    )
+    with pytest.raises(RuntimeError, match="did not bind within 0.5s"):
+        link_to(children.silent, monkeypatch)
+    assert len(procs) == 1 and not procs[0].is_alive()
+
+
+def test_a_send_process_that_cannot_start_fails_registration(spawnable):
+    # The real child_main: on a host without a GPU it fails at set_device.
+    spec = sp.SendProcessSpec({"_cuda_device": 0, "pp_rank": 2}, b"", [], "pd-send-pp2")
+    with pytest.raises(RuntimeError, match="pd-send-pp2 failed to start"):
+        sp.StageLink(spec)
+
+
+def test_ready_is_relayed_only_after_its_forward_completed(spawnable, monkeypatch):
+    link = link_to(children.echo, monkeypatch)
+    completed = threading.Event()
+    forward = SimpleNamespace(synchronize=lambda: completed.wait(30))
+    link.saved({"a": 1})
+    link.ready(forward, ["a"])
+    link.saved({"b": 2})
+    assert link._from_child.recv() == ("echo", (sp.SAVED, {"a": 1}))
+    assert not link._from_child.poll(0.3)  # READY waits for the forward
+    completed.set()
+    assert link._from_child.recv() == ("echo", (sp.READY, ["a"]))
+    assert link._from_child.recv() == ("echo", (sp.SAVED, {"b": 2}))
+    link.close()
+    assert link._from_child.recv() == ("echo", (sp.STOP, None))
+    assert link.proc.exitcode == 0
+
+
+def test_the_send_process_dies_with_its_stage(spawnable, monkeypatch, tmp_path):
+    marker = tmp_path / "child-pid"
+    monkeypatch.setenv(children.MARKER, str(marker))
+    spec = sp.SendProcessSpec({"_cuda_device": 0, "pp_rank": 1}, b"", [], "pd-send-pp1")
+    stage = SPAWN.Process(target=children.stage_with_blocked_child, args=(spec,))
+    stage.start()
+    try:
+        deadline = time.monotonic() + 300  # two cold imports on a loaded host
+        while not (marker.exists() and marker.read_text()):
+            assert time.monotonic() < deadline, "the send process never started"
+            time.sleep(0.05)
+        child = psutil.Process(int(marker.read_text()))
+        assert child.ppid() == stage.pid
+        os.kill(stage.pid, signal.SIGKILL)  # no close() and no atexit: PDEATHSIG
+        stage.join(10)
+        deadline = time.monotonic() + 10
+        while not gone(child):
+            if time.monotonic() > deadline:
+                child.kill()
+                pytest.fail("the send process outlived its stage")
+            time.sleep(0.05)
+    finally:
+        if stage.is_alive():
+            stage.kill()
+
+
+def gone(process):
+    try:
+        return process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+# ---- the gate and the stage's hooks ----
+
+
+def test_the_flag_is_off_unless_set_and_refused_where_it_cannot_serve(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_MINIMAX_LANDING", "1")
+    assert not sp.send_process_enabled(minimax_config())
+    base = mc.MooncakeConnector.kv_budget_reserve_bytes(minimax_config())
+    assert base == staging_reserve_bytes(minimax_config()) > 0
+    monkeypatch.setenv("ATOM_PD_SEND_PROCESS", "1")
+    assert sp.send_process_enabled(minimax_config())
+    reserve = mc.MooncakeConnector.kv_budget_reserve_bytes(minimax_config())
+    assert reserve == base + sp.SEND_PROCESS_RESERVE_BYTES
+    assert not sp.send_process_enabled(minimax_config(role="kv_consumer"))
+    with pytest.raises(RuntimeError, match="without chunked transfer only"):
+        sp.send_process_enabled(minimax_config(chunked=True))
+    monkeypatch.setenv("ATOM_PD_MINIMAX_LANDING", "0")
+    with pytest.raises(RuntimeError, match="MiniMax page-staging"):
+        sp.send_process_enabled(minimax_config())
+
+
+def test_a_send_process_stage_starts_no_engine_and_no_send_workers(monkeypatch):
+    stage, engines = stage_connector(monkeypatch, send_process=False)
+    assert len(engines) == 1 and stage._send_executor is not None
+    assert not stage._send_process_mode
+    stage, engines = stage_connector(monkeypatch, send_process=True)
+    assert stage._send_process_mode and not engines
+    assert stage.transfer_engine is None and stage._send_executor is None
+    with pytest.raises(RuntimeError, match="no matched rails"):
+        stage_connector(monkeypatch, send_process=True, rails="ionic_0,ionic_1")
+
+
+def test_the_stage_hands_ready_saved_and_close_to_its_link(monkeypatch):
+    stage = protocol.producer()[0]
+    stage._completed_prefills = {}
+    link = stage._send_process = MagicMock()
+    event, stream = MagicMock(), object()
+    monkeypatch.setattr(mc.torch.cuda, "Event", lambda blocking: blocking and event)
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", lambda device: stream)
+    stage.record_kv_cache_ready([5, 6])
+    stage.record_kv_cache_ready([])
+    event.record.assert_called_once_with(stream)
+    link.ready.assert_called_once_with(event, [5, 6])
+    meta = protocol.ConnectorMetadata()
+    meta.add_new_req_to_save(9, [4, 5], {"transfer_id": "xfer-b"})
+    stage.start_load_kv(meta)
+    link.saved.assert_called_once_with(
+        {9: {"block_ids": [4, 5], "swa_block_ids": [], "slot_index": -1}}
+    )
+    assert 9 not in stage._completed_prefills
+    stage.close()
+    link.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("extra", [None, "slot", "window", "index", "host"])
+def test_registration_sends_staged_pages_only(extra, monkeypatch):
+    stage = protocol.producer()[0]
+    started = []
+    monkeypatch.setattr(sp, "start", lambda c, views: started.append(views) or "link")
+    view = SimpleNamespace(
+        is_cuda=extra != "host", dtype=torch.uint8, is_contiguous=lambda: True
+    )
+    tt = SimpleNamespace(
+        block_tensor_views=[view, view],
+        block_regions=["r0", "r1"],
+        swa_block_regions=["w"] if extra == "window" else [],
+        index_staging_region="i" if extra == "index" else None,
+    )
+    stage._has_slot_regions = extra == "slot"
+    if extra is None:
+        stage._start_send_process(tt)
+        assert stage._send_process == "link" and list(started[0]) == [0, 1]
+    else:
+        with pytest.raises(RuntimeError, match="staged PAGE regions only"):
+            stage._start_send_process(tt)
+
+
+# ---- T6: a send process as start, create and serve build it ----
+
+FIRST = STAGES[1]  # stage 0 of PP4, which the decode ranks release to
+
+
+def test_a_created_send_process_sends_and_releases_over_its_listener(monkeypatch):
+    h = Harness(FIRST, 1)
+    state = created_state(h, monkeypatch)
+    sources, sent = [], []
+
+    def write(target, srcs, dsts, sizes):
+        sent.append(len(srcs))
+        for src, dst, n in zip(srcs, dsts, sizes):
+            byte_view([h.recv.pool, *h.dst_views], dst, n).copy_(
+                byte_view(sources, src, n)
+            )
+        return 0
+
+    engine = MagicMock()
+    engine.initialize.return_value = engine.batch_register_memory.return_value = 0
+    engine.get_rpc_port.return_value = 17002
+    engine.batch_transfer_sync_write.side_effect = write
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc.torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(sp, "_completed_event", lambda device: h.event)
+    released, write_dones, to_decode = [], [], h.c._send_on_socket
+    c = sp._connector_class().create(
+        state, dict(enumerate(h.src_views)), released.append
+    )
+    c._send_worker_stream = lambda: h.stream  # the GPU's streams, on CPU
+
+    def notify(addr, parts, repeat=1):
+        if parts[0] == mc.MSG_WRITE_DONE:
+            write_dones.append(msgpack.loads(parts[-1]))
+        else:
+            to_decode(addr, parts)
+
+    c._send_on_socket = notify
+    h.c._landing_credits = c._landing_credits  # where the decode returns credits
+    c.serve()  # its listener has no stop: a daemon thread, it ends with pytest
+    sources.append(c._kv_staging)  # the only memory its engine registered
+    reader, writer = multiprocessing.Pipe(duplex=False)
+    prefill = {"block_ids": list(SRC), "swa_block_ids": [], "slot_index": -1}
+    for message in (
+        (sp.SAVED, {"xfer-a": prefill}),
+        (sp.READY, ["xfer-a"]),
+        (sp.STOP, None),
+    ):
+        writer.send(message)
+    sp._follow_stage(c, reader)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, h.partition)))
+    release = msgpack.dumps({"transfer_id": "xfer-a", "consumer_tp_size": 4})
+    context = zmq.Context()
+    decode = context.socket(zmq.DEALER)
+    decode.setsockopt(zmq.LINGER, 0)
+    decode.setsockopt(zmq.RCVTIMEO, 30_000)
+    decode.connect(f"tcp://127.0.0.1:{state['_side_channel_port']}")
+    try:
+        request = dict(h.req, src_block_ids=list(SRC))
+        decode.send_multipart([mc.MSG_WRITE_REQUEST, msgpack.dumps(request)])
+        deadline = time.monotonic() + 60
+        while not write_dones and time.monotonic() < deadline:
+            time.sleep(0.05)
+        landed = write_dones[0]["landed_slots"] if write_dones else None
+        assert landed and write_dones == [write_done(FIRST[0], True, landed)]
+        assert sent
+        h.check(SRC, DST)
+        assert not released, "stage 0 frees its pages on release only"
+        for _ in range(5):  # four decode ranks and a duplicate
+            decode.send_multipart([mc.MSG_RELEASE, release])
+        decode.send_multipart([mc.MSG_GET_META])  # answered after the releases
+        meta = msgspec.msgpack.decode(
+            decode.recv_multipart()[-1], type=mc.MooncakeAgentMetadata
+        )
+    finally:
+        decode.close()
+        context.term()
+        c._send_executor.shutdown()
+    assert released == ["xfer-a"]
+    assert "xfer-a" not in c._completed_prefills and not c._ready.wait("xfer-a", 0)
+    assert meta.engine_id == f"{state['local_ip']}:17002"
+    assert meta.kv_caches_base_addr == [v.data_ptr() for v in h.src_views]

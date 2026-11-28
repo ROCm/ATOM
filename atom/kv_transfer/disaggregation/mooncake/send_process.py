@@ -7,7 +7,10 @@ unchanged, in a process of its own over one HIP IPC mapping of the stage's paged
 
 from __future__ import annotations
 
+import logging
 import math
+import os
+import queue
 import threading
 import time
 from collections import OrderedDict
@@ -17,9 +20,23 @@ from typing import Any
 import numpy as np
 import torch
 
-from atom.kv_transfer.disaggregation.pd_producer import STAGING_SLOT_BYTES
+from atom.kv_transfer.disaggregation.pd_producer import (
+    STAGING_SLOT_BYTES,
+    mooncake_producer_connectors,
+)
+from atom.kv_transfer.disaggregation.staging_config import minimax_page_staging
+from atom.utils import envs, mooncake_hca
+
+logger = logging.getLogger("atom")
 
 READY, SAVED, STOP = "ready", "saved", "stop"
+BOUND, DONE, FATAL = "bound", "done", "fatal"
+# Spawn to BOUND: the child's imports (25 s cold from NFS on a CPU host), engine,
+# staging, warm-up and bind. A child that dies is seen at once (EOF).
+BOUND_TIMEOUT_S = 300.0
+# The child's HIP context, allocator and kernels: 298-386 MiB measured on MI355X;
+# every GPU run used this 1 GiB. Its staging is in the staging reserve.
+SEND_PROCESS_RESERVE_BYTES = 1 << 30
 # What the stage's config and registration set for the send path; the rest is
 # `_init_transfer_state`'s, as in the stage.
 STATE_KEYS = (
@@ -30,6 +47,24 @@ STATE_KEYS = (
     "_block_unit_specs", "_block_region_consumer_indices", "_fp4_index_layout",
     "_kv_staging_reserve", "_num_send_workers", "_cuda_device",
 )  # fmt: skip
+
+
+def send_process_enabled(config) -> bool:
+    """Whether the Mooncake producer of ``config`` sends from a send process; the
+    flag on a producer that cannot is refused, not ignored."""
+    if not envs.ATOM_PD_SEND_PROCESS:
+        return False
+    producers = mooncake_producer_connectors(config)
+    if not producers:
+        return False
+    if not minimax_page_staging(config) or any(
+        c.get("enable_chunked_transfer", False) for c in producers
+    ):
+        raise RuntimeError(
+            "ATOM_PD_SEND_PROCESS serves a MiniMax page-staging Mooncake producer "
+            "(ATOM_PD_MINIMAX_LANDING, TP1) without chunked transfer only"
+        )
+    return True
 
 
 @dataclass
@@ -58,6 +93,115 @@ def export_views(views: dict[int, torch.Tensor]) -> tuple[bytes, list]:
         (i, v.data_ptr() - base, tuple(v.shape)) for i, v in sorted(views.items())
     ]
     return get_ipc_handle(base), placed
+
+
+def start(stage, views: dict[int, torch.Tensor]) -> StageLink:
+    """Spawn ``stage``'s send process over ``views`` and wait until it serves."""
+    handle, placed = export_views(views)
+    state = {key: getattr(stage, key) for key in STATE_KEYS}
+    return StageLink(
+        SendProcessSpec(state, handle, placed, f"pd-send-pp{stage.pp_rank}")
+    )
+
+
+class StageLink:
+    """The stage's end: the child, the relay thread (the only writer to the
+    child) and the DONE / FATAL reader (the stage's main thread only)."""
+
+    def __init__(self, spec: SendProcessSpec) -> None:
+        from atom.utils import get_mp_context
+
+        ctx = get_mp_context()
+        child_in, self._to_child = ctx.Pipe(duplex=False)
+        self._from_child, child_out = ctx.Pipe(duplex=False)
+        self.label = spec.label
+        # Started from the runner's main thread, which PDEATHSIG follows.
+        self.proc = ctx.Process(
+            target=child_main,
+            args=(spec, child_in, child_out),
+            name=spec.label,
+            daemon=True,
+        )
+        started = time.monotonic()
+        self.proc.start()
+        child_in.close()
+        child_out.close()
+        try:
+            self._await_bound(started)
+        except BaseException:
+            self.proc.kill()
+            self.proc.join(5)
+            raise
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._error: BaseException | None = None
+        self._relay = threading.Thread(
+            target=self._relay_loop, name="pd-send-relay", daemon=True
+        )
+        self._relay.start()
+
+    def _await_bound(self, started: float) -> None:
+        if not self._from_child.poll(BOUND_TIMEOUT_S):
+            raise RuntimeError(f"{self.label} did not bind within {BOUND_TIMEOUT_S}s")
+        try:
+            kind, payload = self._from_child.recv()
+        except EOFError as exc:
+            raise RuntimeError(
+                f"{self.label} exited ({self.proc.exitcode}) before it bound"
+            ) from exc
+        if kind != BOUND:
+            raise RuntimeError(f"{self.label} failed to start: {payload}")
+        logger.info(
+            "%s serves this stage's P->D sends (engine %s), bound %.1fs after spawn",
+            self.label,
+            payload,
+            time.monotonic() - started,
+        )
+
+    def saved(self, entries: dict) -> None:
+        self._queue.put((SAVED, entries))
+
+    def ready(self, event, req_ids: list) -> None:
+        self._queue.put((READY, (event, list(req_ids))))
+
+    def _relay_loop(self) -> None:
+        try:
+            while True:
+                kind, payload = self._queue.get()
+                if kind == READY:
+                    event, payload = payload
+                    # The forward that wrote these pages has completed.
+                    event.synchronize()
+                self._to_child.send((kind, payload))
+                if kind == STOP:
+                    return
+        except BaseException as exc:  # noqa: BLE001 - raised by poll_done
+            self._error = exc
+
+    def poll_done(self) -> set:
+        """Transfers released since the last call; raises once the child or the
+        relay is gone. The stage's main thread, once per step."""
+        if self._error is not None:
+            raise RuntimeError(f"{self.label} relay failed") from self._error
+        done: set = set()
+        try:
+            while self._from_child.poll(0):
+                kind, payload = self._from_child.recv()
+                if kind != DONE:
+                    raise RuntimeError(f"{self.label} failed: {payload}")
+                done.update(payload)
+        except EOFError as exc:
+            raise RuntimeError(f"{self.label} exited ({self.proc.exitcode})") from exc
+        if not self.proc.is_alive():
+            raise RuntimeError(f"{self.label} exited ({self.proc.exitcode})")
+        return done
+
+    def close(self) -> None:
+        """STOP behind the queued hand-offs, then the child is gone."""
+        self._queue.put((STOP, None))
+        self.proc.join(5)
+        if self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(5)
 
 
 class ReadyTable:
@@ -114,7 +258,7 @@ def _connector_class():
 
         def serve(self) -> threading.Thread:
             """Engine, staging (its only registered memory), warm gathers, listener."""
-            mc._configure_mooncake_transport(self.protocol)
+            mooncake_hca.configure_transport(self.protocol)
             self._init_transfer_engine(",".join(self.ib_devices))
             device = next(iter(self._kv_source_views.values())).device
             staging = self._alloc_kv_staging(STAGING_SLOT_BYTES, device)
@@ -233,6 +377,55 @@ def _device_view(address: int, shape, device: torch.device) -> torch.Tensor:
 
     nbytes = math.prod(shape)
     return torch.as_tensor(DeviceBytes(address, nbytes), device=device).view(shape)
+
+
+class _LogPrefix(logging.Filter):
+    def __init__(self, prefix: str) -> None:
+        super().__init__()
+        self._prefix = prefix
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = f"{self._prefix} {record.msg}"
+        return True
+
+
+def child_main(spec: SendProcessSpec, from_stage, to_stage) -> None:
+    """The send process: serve the stage's transfers until STOP, EOF or a fault."""
+    from atom.utils import enable_orphan_reaping, set_process_title
+
+    enable_orphan_reaping()  # first: a dead stage takes this process with it
+    set_process_title(spec.label)
+    logger.addFilter(_LogPrefix(f"[pd-send pp{spec.state['pp_rank']}]"))
+    lock = threading.Lock()
+
+    def report(kind: str, payload) -> None:
+        with lock:
+            to_stage.send((kind, payload))
+
+    started = time.monotonic()
+    try:
+        torch.cuda.set_device(spec.state["_cuda_device"])
+        views = _open_views(spec)
+        connector = _connector_class().create(
+            spec.state, views, lambda tid: report(DONE, [tid])
+        )
+        listener = connector.serve()
+    except BaseException as exc:
+        logger.exception("failed to start")
+        try:
+            report(FATAL, repr(exc))
+        finally:
+            os._exit(1)
+    logger.info("set up in %.1fs after its imports", time.monotonic() - started)
+    report(BOUND, connector.engine_id)
+
+    def watch_listener() -> None:
+        listener.join()
+        report(FATAL, f"write listener exited: {connector._listener_error!r}")
+
+    threading.Thread(target=watch_listener, name="pd-send-watch", daemon=True).start()
+    _follow_stage(connector, from_stage)
+    os._exit(0)
 
 
 def _follow_stage(connector, from_stage) -> None:
