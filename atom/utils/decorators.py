@@ -521,6 +521,10 @@ def _support_torch_compile(
                         # print(arg.shape)
                         # print(f"torch._dynamo.mark_dynamic({arg, dims})")
                         torch._dynamo.mark_dynamic(arg, dims)
+                    elif isinstance(arg, IntermediateTensors):
+                        # A container, not a tensor: the loop below marks
+                        # the tensors it carries.
+                        continue
                     else:
                         raise ValueError(
                             "Unsupported dynamic dimensions"
