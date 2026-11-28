@@ -194,8 +194,9 @@ class PublicationOwner:
         if self.device.type == "cuda":
             if torch.cuda.current_device() != self.device.index:
                 raise PublicationError("publication on the wrong device")
-            if torch.cuda.is_current_stream_capturing():
-                raise PublicationError("publish metadata before actual graph capture")
+            # `begin` / `resume` checked that this epoch's stream is not
+            # capturing, so a publish only checks it is still on that stream.
+            # The runner seals an epoch (`finish`) before it captures on it.
             if self._get_current_stream is not None:
                 same_stream = (
                     self._get_current_stream(self.device.index)[0] == self._stream_id
@@ -203,6 +204,10 @@ class PublicationOwner:
             else:
                 same_stream = torch.cuda.current_stream(self.device) == self._stream
             if not same_stream:
+                if torch.cuda.is_current_stream_capturing():
+                    raise PublicationError(
+                        "publish metadata before actual graph capture"
+                    )
                 raise PublicationError("publish on the owner's current compute stream")
 
     def begin(self):
