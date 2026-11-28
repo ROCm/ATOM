@@ -611,10 +611,16 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # The last stage also holds it when the LM head is tied to it.
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         fuse_allreduce_norm = allreduce_norm_fusion_enabled()
 
@@ -635,11 +641,14 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         # The last layer's MoE output is still TP-partial when fused.
-        self.norm = Qwen3_5RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            fused_allreduce=fuse_allreduce_norm,
-        )
+        if get_pp_group().is_last_rank:
+            self.norm = Qwen3_5RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=fuse_allreduce_norm,
+            )
+        else:
+            self.norm = PPMissingLayer()
 
 
 class Qwen3_5ForCausalLMBase(nn.Module):
@@ -663,14 +672,16 @@ class Qwen3_5ForCausalLMBase(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
         )
 
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
+        if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            self.lm_head = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -794,7 +805,7 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
-        if inputs_embeds is None:
+        if inputs_embeds is None and get_pp_group().is_first_rank:
             inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
@@ -962,7 +973,7 @@ class _Qwen3_5MultimodalBase(nn.Module):
     ):
         # Keep the compiled language model on the inputs_embeds path so vision
         # embeddings are not dropped after text-only warmup.
-        if inputs_embeds is None:
+        if inputs_embeds is None and get_pp_group().is_first_rank:
             inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds

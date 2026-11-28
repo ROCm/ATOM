@@ -47,6 +47,7 @@ from atom.model_ops.utils import atom_parameter
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
     IntermediateTensors,
+    PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -347,10 +348,14 @@ class GptOssModel(nn.Module):
         # `model.embedding.weight` as unloaded (the weight is in fact loaded via
         # the shared-storage alias). `embedding` remains as an alias for the
         # internal call sites below.
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-        )
+        # Only the first pipeline stage embeds tokens.
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.embedding = self.embed_tokens
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
@@ -362,12 +367,15 @@ class GptOssModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(
-            self.config.hidden_size,
-            eps=1e-5,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
-            prefix=f"{prefix}.norm" if prefix else "norm",
-        )
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(
+                self.config.hidden_size,
+                eps=1e-5,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+                prefix=f"{prefix}.norm" if prefix else "norm",
+            )
+        else:
+            self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
@@ -450,11 +458,14 @@ class GptOssForCausalLM(nn.Module):
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
         )
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         # self.logits_processor = LogitsProcessor(self.config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors

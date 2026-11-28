@@ -31,6 +31,7 @@ from atom.model_loader.weight_names import (
     CheckpointNameRewriter,
     WeightsMapper,
 )
+from atom.models.utils import PPMissingLayer
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -285,11 +286,24 @@ def load_weights_into_model(
     # keep the answer. On a target-model load nearly every tensor is wanted, and
     # rewriting is a dozen substring scans plus a regex per tensor.
     rewritten: dict[str, str | None] = {}
+    # A pipeline stage builds a `PPMissingLayer` for each module another stage
+    # holds; nothing on this stage takes those tensors, so they are not read.
+    pp_missing = tuple(
+        f"{module_name}."
+        for module_name, module in model.named_modules()
+        if isinstance(module, PPMissingLayer)
+    )
+
+    def _rewrite(ckpt_name: str) -> str | None:
+        if ckpt_name not in rewritten:
+            name = rewriter.rewrite(ckpt_name)
+            if name is not None and name.startswith(pp_missing):
+                name = None
+            rewritten[ckpt_name] = name
+        return rewritten[ckpt_name]
 
     def _wanted(ckpt_name: str) -> bool:
-        if ckpt_name not in rewritten:
-            rewritten[ckpt_name] = rewriter.rewrite(ckpt_name)
-        return rewritten[ckpt_name] is not None
+        return _rewrite(ckpt_name) is not None
 
     # Cheap stat-only preflight: an incomplete download otherwise surfaces as a
     # confusing partial-expert-coverage error thousands of tensors later.
@@ -321,9 +335,9 @@ def load_weights_into_model(
             if load_dummy:
                 continue
             _orig_ckpt_name = name  # preserve for ckpt-side coverage report
-            # Normally a cache hit: the iterator just asked. Recomputed only if
-            # a caller supplied an iterator that ignores the predicate.
-            name = rewritten[name] if name in rewritten else rewriter.rewrite(name)
+            # Normally a cache hit: the iterator just asked. Computed here only
+            # if a caller supplied an iterator that ignores the predicate.
+            name = _rewrite(name)
             if name is None:
                 continue
             dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)
