@@ -2154,6 +2154,30 @@ models:
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
+      accuracy:
+        - &minimax_moriio_gsm8k
+          name: minimax-m3-fp8-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          env:
+            common:
+              KV_CONNECTOR: moriio
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_only: true
+          accuracy:
+            threshold: 0.90
+        - <<: *minimax_moriio_gsm8k
+          name: minimax-m3-fp8-2p1d-tp8-moriio-gsm8k
+          topology: 2p1d_tp8_moriio
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+
     accuracy:
       task: gsm8k
       fewshot: 5

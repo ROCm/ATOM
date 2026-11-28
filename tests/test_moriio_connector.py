@@ -1723,6 +1723,88 @@ class MergeContiguousBlocksTest(unittest.TestCase):
         self.assertEqual(self.merge([], [], []), ([], [], []))
 
 
+class MovesAsRegionsTest(unittest.TestCase):
+    """Which pools register as regions, and which are refused, on the CPU lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.regions = staticmethod(
+            load_function(CONNECTOR, "_moves_as_regions", {"Any": object})
+        )
+
+    @staticmethod
+    def cache(k, v, **extra):
+        import types
+
+        def tensor(addr):
+            return (
+                None if addr is None else types.SimpleNamespace(data_ptr=lambda: addr)
+            )
+
+        return types.SimpleNamespace(k_cache=tensor(k), v_cache=tensor(v), **extra)
+
+    @staticmethod
+    def tensors(*addrs):
+        import types
+
+        return types.SimpleNamespace(
+            block_regions=tuple(
+                types.SimpleNamespace(base_addr=a, semantic_role=f"plane_{a}")
+                for a in addrs
+            )
+        )
+
+    def test_mha_with_scale_and_index_planes_moves_as_regions(self):
+        caches = {"l0": self.cache(100, 200), "l1": self.cache(300, 400)}
+        self.assertTrue(self.regions(caches, self.tensors(100, 200, 300, 400, 500)))
+
+    def test_mha_whose_pages_are_its_k_and_v_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, 200), "l1": self.cache(300, 400)}
+        self.assertFalse(self.regions(caches, self.tensors(100, 200, 300, 400)))
+
+    def test_mla_whose_pages_are_its_kv_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, None), "l1": self.cache(300, None)}
+        self.assertFalse(self.regions(caches, self.tensors(100, 300)))
+
+    def test_mla_with_an_indexer_plane_is_refused(self):
+        caches = {"l0": self.cache(100, None)}
+        with self.assertRaisesRegex(NotImplementedError, "plane_500"):
+            self.regions(caches, self.tensors(100, 500))
+
+    def test_per_request_state_beside_kv_pages_keeps_the_block_path(self):
+        caches = {
+            "l0": self.cache(100, 200),
+            "s0": self.cache(600, 700, per_request_state=True),
+        }
+        self.assertFalse(self.regions(caches, self.tensors(100, 200)))
+
+    def test_per_request_state_beside_a_scale_plane_is_refused(self):
+        caches = {
+            "l0": self.cache(100, 200),
+            "s0": self.cache(600, 700, per_request_state=True),
+        }
+        with self.assertRaisesRegex(NotImplementedError, "plane_500"):
+            self.regions(caches, self.tensors(100, 200, 500))
+
+    def test_a_state_tensor_does_not_cover_a_page(self):
+        caches = {
+            "l0": self.cache(100, 200),
+            "s0": self.cache(600, 700, per_request_state=True),
+        }
+        with self.assertRaisesRegex(NotImplementedError, "plane_600"):
+            self.regions(caches, self.tensors(100, 200, 600))
+
+    def test_a_pool_without_paged_layers_moves_as_regions(self):
+        self.assertTrue(self.regions({}, self.tensors(100)))
+        state = {"s0": self.cache(600, 700, per_request_state=True)}
+        self.assertTrue(self.regions(state, None))
+
+    def test_no_published_pages_keeps_the_block_path(self):
+        caches = {"l0": self.cache(100, 200)}
+        self.assertFalse(self.regions(caches, None))
+        self.assertFalse(self.regions(caches, self.tensors()))
+
+
 class RegionPlanTest(unittest.TestCase):
     """Pair local and remote regions on the CPU lane."""
 

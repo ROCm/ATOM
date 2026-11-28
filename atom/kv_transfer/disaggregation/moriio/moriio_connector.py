@@ -281,8 +281,8 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # Region mode (backends that publish KVTransferTensors and no
-        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
+        # Region mode (backends whose storage is only fully described by their
+        # KVTransferTensors, e.g. DeepSeek-V4, MiniMax-M3). None until registered.
         self._regions: list[_Region] | None = None
         self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
 
@@ -305,11 +305,13 @@ class MoRIIOConnector(KVConnectorBase):
         ``self.num_k_chunks`` marks the K/V boundary.
 
         A backend with no per-layer block caches (DeepSeek-V4) publishes its
-        storage only as ``transfer_tensors`` regions; those are registered
-        instead, see :meth:`_register_regions`.
+        storage only as ``transfer_tensors`` regions, and an MHA pool whose PAGE
+        regions reach beyond its K and V (MiniMax-M3) would lose the rest; both
+        are registered as regions instead, see :meth:`_register_regions`. Any
+        other pool with such a region is refused, see :func:`_moves_as_regions`.
         """
         self.kv_caches = kv_caches
-        if all(getattr(c, "per_request_state", False) for c in kv_caches.values()):
+        if _moves_as_regions(kv_caches, transfer_tensors):
             self._start_handshake_listener(self._register_regions(transfer_tensors))
             return
         cache_tensor = None
@@ -466,6 +468,12 @@ class MoRIIOConnector(KVConnectorBase):
 
         self._regions = regions
         self.layer_name_to_local_kv_cache_metadata = local_meta
+        logger.info(
+            "RDMA region registration: %d PAGE + %d SLOT regions, %d chunks",
+            len(tt.pages),
+            len(tt.swa_block_regions),
+            sum(len(meta) for meta in local_meta.values()),
+        )
         return MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -2487,6 +2495,43 @@ class _PostFailed:
 
 
 _POST_FAILED = _PostFailed()
+
+
+def _moves_as_regions(kv_caches: dict[str, Any], transfer_tensors: Any) -> bool:
+    """Whether the pool registers as regions rather than layer by layer.
+
+    The per-layer path moves each paged layer's K and V, and per-request state
+    by slot, so a PAGE region that starts at no layer's K or V would be left
+    behind: MiniMax-M3's fp8 scales and indexer keys, a GDN hybrid's fp8
+    scales, a sparse MLA indexer cache. An all-MHA pool then moves as regions;
+    any other pool is refused, as region mode moves no per-request state and
+    MLA keeps the per-layer path. A pool with no paged layers has only its
+    regions.
+    """
+    paged = [
+        c for c in kv_caches.values() if not getattr(c, "per_request_state", False)
+    ]
+    if not paged:
+        return True
+    if transfer_tensors is None:
+        return False
+    moved = {
+        t.data_ptr() for c in paged for t in (c.k_cache, c.v_cache) if t is not None
+    }
+    unmoved = [
+        r.semantic_role or f"region {i}"
+        for i, r in enumerate(transfer_tensors.block_regions)
+        if r.base_addr not in moved
+    ]
+    if not unmoved:
+        return False
+    if len(paged) == len(kv_caches) and all(c.v_cache is not None for c in paged):
+        return True
+    raise NotImplementedError(
+        f"MoRIIO cannot move {len(unmoved)} of this model's PAGE regions, e.g. "
+        f"{unmoved[0]}: a model with MLA layers or per-request state moves "
+        "layer by layer, which carries only K and V"
+    )
 
 
 def _zmq_ctx(socket_type: int, addr: str):
