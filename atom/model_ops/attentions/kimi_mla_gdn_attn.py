@@ -207,6 +207,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        tensors.slot_region_views = self.state_slot_views()
         tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
             len(tensors.slot_regions)
         )

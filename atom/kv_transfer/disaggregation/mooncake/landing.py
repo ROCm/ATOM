@@ -92,6 +92,7 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 MSG_LANDING_READY = b"landing_ready"
+MSG_STATE_LANDING_READY = b"state_landing_ready"
 MSG_LANDING_CREDIT = b"landing_credit"
 
 # Prefill: a transfer needing fewer landing slots than this keeps the staged
@@ -329,6 +330,7 @@ class LandingReceiver:
         send: Callable[[str, list], None],
         finish: Callable[[str, bool], None],
         table_segments: int,
+        credit_pool: str = "",
     ) -> None:
         if not region_indices:
             raise ValueError("KV landing needs at least one region")
@@ -343,6 +345,9 @@ class LandingReceiver:
         self.epoch = int.from_bytes(os.urandom(7), "big")
         self._send = send
         self._finish = finish
+        # Empty for the MLA pool. A second pool on the same decode names
+        # itself so a returned credit goes back to the pool that lent it.
+        self.credit_pool = credit_pool
         self._region_bases = np.asarray(region_bases, dtype=np.int64)
         self._region_block_bytes = np.asarray(region_block_bytes, dtype=np.int64)
         self._region_enabled = np.zeros(len(region_bases), dtype=bool)
@@ -388,12 +393,12 @@ class LandingReceiver:
 
     # -- setup ---------------------------------------------------------------
 
-    def region(self) -> KVTransferRegion:
+    def region(self, semantic_role: str = "kv.landing") -> KVTransferRegion:
         return KVTransferRegion(
             base_addr=self.pool.data_ptr(),
             total_bytes=self.pool.numel(),
             unit_bytes=self.slot_bytes,
-            semantic_role="kv.landing",
+            semantic_role=semantic_role,
         )
 
     def start(self) -> None:
@@ -1046,9 +1051,14 @@ class LandingReceiver:
         self._tombstones[(req_id, request.nonce)] = time.monotonic()
 
     def _send_credits(self, addr: str, slots: list[int]) -> None:
-        payload = msgpack.dumps(
-            {"consumer": self.consumer_key, "epoch": self.epoch, "slots": slots}
-        )
+        payload = {
+            "consumer": self.consumer_key,
+            "epoch": self.epoch,
+            "slots": slots,
+        }
+        if self.credit_pool:
+            payload["pool"] = self.credit_pool
+        payload = msgpack.dumps(payload)
         try:
             self._send(addr, [MSG_LANDING_CREDIT, payload])
         except Exception:

@@ -1325,6 +1325,23 @@ class GDNStateMixin(PoolRowsMixin):
 
         return regions, num_slots
 
+    def state_slot_views(self) -> list[torch.Tensor]:
+        """``uint8 [num_slots, unit_bytes]`` for each region ``state_slot_regions``
+        publishes, so a producer can gather one slot without re-deriving strides.
+        """
+
+        caches = slot_indexed_caches(self.model_runner, self.replayssm)
+        views: list[torch.Tensor] = []
+        for cache in caches:
+            slot_bytes = math.prod(cache.shape[2:]) * cache.element_size()
+            slots = cache.shape[1]
+            for layer in range(cache.shape[0]):
+                views.append(cache[layer].view(torch.uint8).view(slots, slot_bytes))
+        if self.replayssm:
+            pos = self.model_runner.replayssm_write_pos
+            views.append(pos.view(torch.uint8).view(pos.shape[0], pos.element_size()))
+        return views
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
 

@@ -1639,13 +1639,22 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch, transfer):
     assert landing_reserve_bytes(_config(transfer)) == 0
     assert landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
-    # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) and the
-    # Kimi hybrid never land, so they reserve nothing.
+    # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) never
+    # lands MLA rows.
     v4 = _config(
         consumer, model_type="deepseek_v3", architectures=["DeepseekV4ForCausalLM"]
     )
     assert landing_reserve_bytes(v4) == 0
-    assert landing_reserve_bytes(_config(consumer, model_type="kimi_linear")) == 0
+    # Kimi's DCP decode lands its MLA rows in the same token-row pool as plain
+    # MLA (it reserved only the KDA state pool before its slot path staged
+    # them), plus that separate state pool. A pooled indexer is not admitted
+    # for the rows, so it keeps the state pool alone.
+    monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+    state_pool = (256 << 20) + 24 * segment_table_capacity(1024)
+    kimi = _config(consumer, model_type="kimi_linear")
+    assert landing_reserve_bytes(kimi) == LANDING_RESERVE + state_pool
+    pooled = _config(consumer, model_type="kimi_linear", index_kpool=4)
+    assert landing_reserve_bytes(pooled) == state_pool
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert landing_reserve_bytes(_config(consumer)) == 0
 

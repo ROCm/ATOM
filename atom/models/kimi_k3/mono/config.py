@@ -340,8 +340,9 @@ def _served_connectors(atom_config) -> tuple[str, ...]:
 
     Mooncake's consumer queues GPU work of its own only for a model that hands
     it a slot scatter (DeepSeek-V4's compressor staging) or for a DCP landing
-    pool (`mla_landing_configured`); K3 hands it none. A decode running CP is
-    left refused all the same: mono has never served one behind a connector.
+    pool (`landing_spec`); K3 hands it no scatter, and its landing pools need
+    DCP. A decode running CP is left refused all the same: mono has never
+    served one behind a connector.
     A producer, any other transport, or an offload tier beside it (`multi`)
     copies on streams of its own.
     """

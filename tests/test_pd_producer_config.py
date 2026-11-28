@@ -14,7 +14,17 @@ from atom.kv_transfer.disaggregation.pd_producer import (
     staging_pool_bytes,
     staging_slot_count,
 )
-from atom.kv_transfer.disaggregation.staging_config import mla_staging_reserve_bytes
+from atom.kv_transfer.disaggregation.staging_config import (
+    kimi_mla_admitted,
+    kimi_mla_landing_configured,
+    kimi_mla_staging_reserve_bytes,
+    kimi_state_landing_reserve_bytes,
+    kimi_state_staging_reserve_bytes,
+    kv_staging_reserve_bytes,
+    mla_landing_configured,
+    mla_staging_reserve_bytes,
+    staging_reserve_bytes,
+)
 
 
 @pytest.mark.parametrize(
@@ -165,6 +175,123 @@ def _mla_producer_config(workers, **overrides):
     return SimpleNamespace(**config)
 
 
+def _kimi_config(workers, *, role="kv_producer", dcp=1, **hf):
+    return SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "mooncake",
+            "kv_role": role,
+            "num_worker_threads": workers,
+        },
+        hf_config=SimpleNamespace(
+            **{"model_type": "kimi_linear", "kv_lora_rank": 512, **hf}
+        ),
+        decode_context_parallel_size=dcp,
+    )
+
+
+def test_kimi_state_reserve_is_a_separate_12mib_pool(monkeypatch):
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    # 16 send workers fit in the 256 MiB cap; 128 do not.
+    assert kimi_state_staging_reserve_bytes(_kimi_config(16)) == 16 * (12 << 20)
+    assert kimi_state_staging_reserve_bytes(_kimi_config(128)) == 256 << 20
+    # Kimi is not a plain MLA model, so that gate stays closed. Its MLA rows
+    # now stage through the slot path, so it reserves the same 8 MiB per send
+    # worker for them (it reserved none before); the KV pool is sized from
+    # that share alone, and the state pool comes on top.
+    assert mla_staging_reserve_bytes(_kimi_config(16)) == 0
+    assert kimi_mla_staging_reserve_bytes(_kimi_config(16)) == 128 << 20
+    assert kimi_mla_staging_reserve_bytes(_kimi_config(128)) == 256 << 20
+    assert kv_staging_reserve_bytes(_kimi_config(16)) == 128 << 20
+    assert staging_reserve_bytes(_kimi_config(16)) == (128 << 20) + 16 * (12 << 20)
+    assert (
+        kimi_state_staging_reserve_bytes(
+            SimpleNamespace(
+                kv_transfer_config={
+                    "kv_connector": "mooncake",
+                    "kv_role": "kv_producer",
+                    "num_worker_threads": 16,
+                },
+                hf_config=SimpleNamespace(model_type="glm5_next_text"),
+                decode_context_parallel_size=1,
+            )
+        )
+        == 0
+    )
+    decode = _kimi_config(1, role="kv_consumer", dcp=8)
+    reserved = kimi_state_landing_reserve_bytes(decode)
+    assert reserved > 256 << 20
+    assert (
+        kimi_state_landing_reserve_bytes(_kimi_config(1, role="kv_consumer", dcp=1))
+        == 0
+    )
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
+    assert kimi_state_landing_reserve_bytes(decode) == 0
+
+
+@pytest.mark.parametrize(
+    "hf, kpool_env, admitted",
+    [
+        ({}, None, True),
+        ({"index_kpool": 1}, None, True),
+        # A pooled indexer caches one key per pool, which PP refuses anyway.
+        ({"index_kpool": 4}, None, False),
+        # ATOM_GLM5_KPOOL=0 keeps one key per token whatever index_kpool says.
+        ({"index_kpool": 4}, "0", True),
+        ({"model_type": "glm5_next_text"}, None, False),
+        (
+            {"model_type": "deepseek_v3", "architectures": ["DeepseekV4ForCausalLM"]},
+            None,
+            False,
+        ),
+        (
+            {
+                "model_type": "kimi_k3_vl",
+                "text_config": SimpleNamespace(
+                    model_type="kimi_linear", num_attention_heads=64
+                ),
+            },
+            None,
+            True,
+        ),
+    ],
+)
+def test_kimi_mla_rows_are_admitted_only_with_a_per_token_indexer(
+    monkeypatch, hf, kpool_env, admitted
+):
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    if kpool_env is None:
+        monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_GLM5_KPOOL", kpool_env)
+    producer = _kimi_config(16, **hf)
+    decode = _kimi_config(1, role="kv_consumer", dcp=8, **hf)
+    assert kimi_mla_admitted(producer) is admitted
+    assert kimi_mla_staging_reserve_bytes(producer) == (128 << 20 if admitted else 0)
+    assert kimi_mla_landing_configured(decode) is admitted
+    # Whatever Kimi admits, the plain MLA gates never take a hybrid.
+    assert mla_staging_reserve_bytes(producer) == 0
+    assert not mla_landing_configured(decode)
+
+
+def test_kimi_mla_pools_need_the_dcp_side_and_their_switch(monkeypatch):
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+    # A DCP prefill writes whole blocks; a non-DCP decode takes whole blocks.
+    assert kimi_mla_staging_reserve_bytes(_kimi_config(16, dcp=8)) == 0
+    assert not kimi_mla_landing_configured(_kimi_config(1, role="kv_consumer"))
+    # Each side's pool follows its own role.
+    assert kimi_mla_staging_reserve_bytes(_kimi_config(16, role="kv_consumer")) == 0
+    assert not kimi_mla_landing_configured(_kimi_config(1, dcp=8))
+    monkeypatch.setenv("ATOM_PD_MLA_STAGING", "0")
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
+    assert kimi_mla_staging_reserve_bytes(_kimi_config(16)) == 0
+    assert staging_reserve_bytes(_kimi_config(16)) == 0
+    assert not kimi_mla_landing_configured(_kimi_config(1, role="kv_consumer", dcp=8))
+
+
 def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):
     monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
     assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
@@ -185,7 +312,8 @@ def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):
     [
         ({"hf_config": SimpleNamespace()}, {}),
         # DeepSeek-V4 loads through the V3 schema, which defaults kv_lora_rank,
-        # and Kimi's MLA hybrid has slot regions: neither stages MLA rows.
+        # and Kimi's MLA hybrid stages its rows through its own gate
+        # (kimi_mla_staging_reserve_bytes): neither is plain MLA.
         (
             {
                 "hf_config": SimpleNamespace(
