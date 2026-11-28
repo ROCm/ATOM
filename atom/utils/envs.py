@@ -729,6 +729,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3 NVFP4 decode, TP4: for 17-64 row decode steps a sparse layer's qkv linear only quantizes the activation
+    # (MXFP8 codes in the decode GEMM's tile layout) and the attention op runs aiter's one-launch QKV GEMM + q/k/index
+    # norm + RoPE + NVFP4 K/V/index-K insert on them (aiter qkv_chain). Needs an aiter that has it; 0 keeps today's path.
+    "ATOM_M3_QKV_CHAIN": lambda: os.getenv("ATOM_M3_QKV_CHAIN", "0") == "1",
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

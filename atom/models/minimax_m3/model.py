@@ -595,6 +595,23 @@ class MiniMaxM3SparseAttention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
+        # ATOM_M3_QKV_CHAIN (default off): decode rows the chain takes run this qkv linear as MXFP8 quant only and the
+        # attention op's insert as the fused QKV GEMM + norm/RoPE/NVFP4 insert (decided at run time, qkv_chain.take).
+        from atom.model_ops.minimax_m3 import qkv_chain
+
+        self.qkv_proj._qkv_chain = qkv_chain.linear_ok(
+            self.qkv_proj
+        ) and qkv_chain.layer_ok(
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_idx_heads,
+            rotary_dim,
+            cache_config,
+            index_cache_config,
+            self.skip_index_topk,
+            effective_layer_quant(quant_config, f"{prefix}.o_proj")
+            == (QuantType.per_Token, dtypes.fp8),
+        )
 
     def forward(
         self,
