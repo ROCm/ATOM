@@ -8,10 +8,11 @@ from copy import copy
 
 import torch
 import torch.distributed as dist
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import (
     native_quant_linear,
@@ -33,6 +34,7 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from atom.model_ops.dp_vocab_shard_pad import shard_gemm_pad
 from atom.model_ops.dspark_markov_argmax import (
     dspark_markov_argmax_tp,
     markov_weights_unsupported,
@@ -779,6 +781,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return self._head_and_sample_q(*out, anchor_ids)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
+        pad = self._dp_markov_sample_pad(*out, anchor_ids)
+        if pad is not None:
+            return self._head_and_sample_dp(*out, anchor_ids, pad)
         return self._head_and_sample(*out, anchor_ids)
 
     def _head_and_sample_q(self, normed, hc_hidden, anchor_ids):
@@ -807,6 +812,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
         confidence = self.mtp[-1].confidence_head(hc_hidden, markov.markov_w1(prev_ids))
         return out_ids, confidence
 
+    def _fused_markov(self) -> bool:
+        """Whether the greedy block picks through the fused Markov op, the one
+        whose pick over a vocab shard is exact (`dspark_markov_argmax_tp`)."""
+        markov = self.mtp[-1].markov_head
+        return markov.fused_sample and (
+            markov_weights_unsupported(markov.markov_w1.weight, markov.markov_w2.weight)
+            is None
+        )
+
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.
 
@@ -816,17 +830,107 @@ class DeepseekV41DSpark(DSparkDraftModel):
         instead: T small gathers in place of one of the whole vocab.
         """
         head = self.head
-        markov = self.mtp[-1].markov_head
         return (
             head is not None
             and head.tp_size > 1
             and head.bias is None
-            and markov.fused_sample
-            and markov_weights_unsupported(
-                markov.markov_w1.weight, markov.markov_w2.weight
-            )
-            is None
+            and self._fused_markov()
         )
+
+    def _dp_markov_sample_pad(self, normed, hc_hidden, anchor_ids) -> "int | None":
+        """The GEMM row pad of the DP-vocab-sharded greedy block, or None to
+        keep the replicated head.
+
+        Pure DP (TP1) replicates the LM head, so every rank's draft reads the
+        whole ``[V, dim]`` table for a few rows. ``ATOM_DP_DRAFT_ARGMAX``
+        shards that read over DP for ``ParallelLMHead.compute_argmax_token``,
+        which the DSpark block never calls -- its pick adds the Markov bias
+        first. This is the block's form of it (`_head_and_sample_dp`), under
+        the head's own gate (`_can_use_dp_sharded_argmax`): a pure-DP,
+        DP-uniform draft of at most ``ATOM_DP_DRAFT_ARGMAX_MAX_ROWS`` rows.
+        Every term is DP-agreed, so all ranks take the same branch.
+
+        The pad is `shard_gemm_pad`'s: measured, not assumed, so a shape whose
+        sharded GEMM it cannot make bit-identical to the replicated one stays
+        replicated, and the drafts are the replicated head's on every shape.
+        """
+        from atom.utils.forward_context import get_forward_context
+
+        head = self.head
+        if head is None or head.bias is not None or not self._fused_markov():
+            return None
+        if sp_is_enabled():
+            return None
+        if not head._can_use_dp_sharded_argmax(get_forward_context().context):
+            return None
+        # The anchors ride the hidden gather as one extra row.
+        if anchor_ids.numel() * anchor_ids.element_size() > (
+            normed.shape[1] * normed.element_size()
+        ):
+            return None
+        dp = get_dp_group()
+        return shard_gemm_pad(
+            head, normed.shape[0], dp.rank_in_group, dp.world_size, dp.cpu_group
+        )
+
+    def _head_and_sample_dp(self, normed, hc_hidden, anchor_ids, pad: int):
+        """``_head_and_sample`` with the LM head's vocab sharded over DP; the
+        same ids and confidences.
+
+        One all-gather brings every rank's ``[B * T, dim]`` rows and anchors;
+        each rank projects all of them onto its ``V / dp`` slice (``pad`` zero
+        rows appended, see `shard_gemm_pad`) and the block is picked position
+        by position with `dspark_markov_argmax_tp` over the DP group, which
+        exchanges only ``[dp * B, 2]`` per position. Each rank keeps its rows.
+        """
+        B, T, _ = hc_hidden.shape
+        head, last = self.head, self.mtp[-1]
+        markov = last.markov_head
+        dp = get_dp_group()
+        world, rank = dp.world_size, dp.rank_in_group
+        vshard = head.num_embeddings // world
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        rows, dim = normed.shape
+        # One collective: the anchors' bytes ride as row `rows`, copied as
+        # bytes so no id is ever read as a (possibly NaN) float.
+        anchor_bytes = anchor_ids.contiguous().view(torch.uint8)
+        nbytes = anchor_bytes.numel()
+        send = normed.new_zeros(rows + 1, dim)
+        send[:rows].copy_(normed)
+        send[rows].view(torch.uint8)[:nbytes].copy_(anchor_bytes)
+        gathered = dp.all_gather(send, dim=0, use_custom=use_custom)
+        gathered = gathered.view(world, rows + 1, dim)
+        anchors = (
+            gathered[:, rows]
+            .contiguous()
+            .view(torch.uint8)[:, :nbytes]
+            .contiguous()
+            .view(anchor_ids.dtype)
+            .reshape(world * B)
+        )
+        x = normed.new_empty(world * rows + pad, dim)
+        x[world * rows :].zero_()
+        x[: world * rows].view(world, rows, dim).copy_(gathered[:, :rows])
+        base_logits = head._vocab_shard_logits(x, rank, world)[: world * rows]
+        base_logits = base_logits.view(world * B, T, vshard)
+        out_ids = anchors.new_empty(world * B, T)
+        markov_w1 = markov.markov_w1.weight
+        markov_embeds = markov_w1.new_empty(world * B, T, markov_w1.shape[1])
+        for k in range(T):
+            dspark_markov_argmax_tp(
+                base_logits[:, k],
+                anchors if k == 0 else out_ids[:, k - 1],
+                markov_w1,
+                markov.markov_w2.weight,
+                out_ids[:, k],
+                rank * vshard,
+                dp,
+                use_custom=use_custom,
+                embed_out=markov_embeds[:, k],
+            )
+        own = slice(rank * B, (rank + 1) * B)
+        confidence = last.confidence_head(hc_hidden, markov_embeds[own])
+        return out_ids[own], confidence
 
     def _head_and_sample_sharded(self, normed, hc_hidden, anchor_ids):
         """``_head_and_sample`` with the LM head left sharded (see

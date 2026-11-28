@@ -1223,6 +1223,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
     # draft step; everything else falls back to the replicated local argmax.
+    # DeepSeek-V4.1's DSpark greedy block takes it too, with the Markov pick
+    # over the DP group and the GEMM padded to stay bit-identical
+    # (`dp_vocab_shard_pad`).
     "ATOM_DP_DRAFT_ARGMAX": lambda: (
         os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower() in ("1", "true")
     ),
