@@ -269,6 +269,9 @@ def register_plugin() -> None:
     from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
         apply_qwen4_exp_rocm_patch,
     )
+    from atom.plugin.sglang.patches.remote_instance_patch import (
+        apply_remote_instance_patch,
+    )
 
     # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
     # HC hidden-width adapters that upstream still does not provide.
@@ -278,6 +281,9 @@ def register_plugin() -> None:
     # eagle3_llama.
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
+    # R-Fork: replay ATOM post-load processing on the receiver before the raw
+    # copy; on the seed, drop send groups that refused receivers left.
+    apply_remote_instance_patch()
     install_sglang_replayssm_commit()
     register_kimi_k3_text_only_processor()
 
