@@ -676,6 +676,16 @@ reverse).
   otherwise re-pack the request's unsaved range on every PP stage every step.
   A failed save the base retires instead (its request finished, or its ID was
   reused) has nothing to pace and pauses nothing.
+- The base retries one request's failed save at most
+  `OFFLOAD_MAX_FAILED_SAVE_RETRIES` times (3) since its last stored save, and
+  never once that save has made no progress (a new range dispatched, or a save
+  stored) for `save_abandon_timeout_s`. Past either it drops the save with a
+  warning, so the request's blocks and state slot are freed; its prefix is
+  then missing from the Store and a later hit on it recomputes. Without the
+  bound a client whose puts all fail kept every request it saved parked in
+  `deferred_free_blocks` until admission stalled: each retry restarts the
+  reclaim clock, as it must, since the workers count a save's source read
+  deadline from its dispatch.
 - At startup every worker sends one chunk of random bytes through the Store and
   compares it back: an unregistered pool, an unreachable owner or a misrouted
   NIC fails startup instead of turning every lookup into a miss.
@@ -1678,6 +1688,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
 | `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)`, × `pipeline_parallel_size` on Kimi-K3's connector | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
+| `OFFLOAD_MAX_FAILED_SAVE_RETRIES` | 3 | Retries of one request's failed chunked save since its last stored save before the save is dropped and the request's blocks are released without it; 0 drops at the first failure. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — (48 MiB for `mooncake_store`) | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |

@@ -34,6 +34,11 @@ def _save_source_is_backed(block_ids, saved: int, aligned: int, block: int) -> b
 class PluginSchedulerMixin:
     """The plugin's view of an ATOM offload scheduler; listed before it."""
 
+    #: vLLM calls no `process_completions`: the adapter re-checks every
+    #: deferred free each step (`_collect_releases`), so a save given up on
+    #: needs no report, and one queued for it would never be drained.
+    _reports_given_up_saves = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._init_plugin_state()

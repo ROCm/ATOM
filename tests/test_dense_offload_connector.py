@@ -1584,3 +1584,60 @@ def test_dense_worker_loads_and_stores_under_the_prompts_salt(cache_salt, config
         worker._save_executor.shutdown(wait=True)
         worker._load_executor.shutdown(wait=True)
     assert received == [configs, configs]
+
+
+def test_a_frontend_without_process_completions_queues_no_given_up_saves(
+    monkeypatch,
+):
+    # A save given up on is reported through `process_completions`, so the
+    # engine re-checks its deferred free. The vLLM plugin never calls it (its
+    # adapter re-checks every deferred free each step): queued there, each
+    # dropped save's request ID would stay for the life of the server.
+    plugin = pytest.importorskip("atom.plugin.vllm.kv_transfer.plugin_schedulers")
+    from atom.kv_transfer.offload.chunked_scheduler import (
+        DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
+        DENSE_PAGE_STORE_CHANNEL,
+    )
+
+    monkeypatch.setenv("OFFLOAD_MAX_FAILED_SAVE_RETRIES", "1")
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=8),
+    )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+    native = DenseOffloadScheduler(_config("kv_producer"))
+    vllm = plugin.PluginDenseScheduler(_config("kv_producer"))
+    req_ids = {900, 901, 902, 903}
+    for scheduler in (native, vllm):
+        for req_id in sorted(req_ids):
+            seq = SimpleNamespace(
+                id=req_id,
+                num_cached_tokens=0,
+                num_prompt_tokens=16,
+                token_ids=list(range(16)),
+                block_table=list(range(4)),
+            )
+            scheduler.update_state_after_alloc(seq)
+            seq.num_cached_tokens = 16
+        sent = 0
+        for _ in range(4):
+            for request in scheduler.build_connector_meta().requests:
+                sent += 1
+                operation = request.save_operation
+                scheduler.connector_completion(
+                    ConnectorCompletion(
+                        DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True
+                    )
+                )
+                scheduler.connector_completion(
+                    ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, False)
+                )
+        assert sent == 2 * len(req_ids)  # the first attempt and one retry each
+        assert scheduler._save_tracker == {}
+
+    assert vllm._save_given_up == set()
+    assert native._save_given_up == req_ids
+    # The native engine hears of each once, on its next completion pass.
+    assert native.process_completions(KVConnectorOutput()).finished_saving == req_ids
+    assert native._save_given_up == set()

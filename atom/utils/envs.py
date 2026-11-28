@@ -1571,6 +1571,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
     "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
+    # Retries of one request's failed chunked (dense / KV-store) save, counted
+    # since its last stored save, before the save is dropped and the request's
+    # blocks are released without it. 0 drops at the first failure.
+    "OFFLOAD_MAX_FAILED_SAVE_RETRIES": lambda: _nonnegative_int_env(
+        "OFFLOAD_MAX_FAILED_SAVE_RETRIES", 3
+    ),
     # Early tier load (a waiting request whose async lookup answered gets its
     # blocks and its load on any scheduler tick): the KV-pressure bounds.
     # No early allocation once the KV pool would be fuller than this fraction.

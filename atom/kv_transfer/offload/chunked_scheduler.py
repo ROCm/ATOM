@@ -149,6 +149,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_previous_owner: dict[SaveOperationId, object] = {}
         self._save_quiescent: set[SaveOperationId] = set()
         self._save_retry_blocked: dict[str, SaveOperationId] = {}
+        self._ensure_save_retry_state()
         self._save_nonce = 0
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
@@ -795,6 +796,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if entry is None or entry[0] is not seq:
             return
         self._save_tracker.pop(sid, None)
+        self._forget_save_retries(sid, seq)
         lease_key = id(seq)
         leased = self._save_lease_blocks.get(lease_key)
         if not leased:
@@ -1063,6 +1065,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._perf_bump("late_save_dropped")
                     self._perf_bump("late_save_dropped_tokens", aligned - saved)
                     self._save_tracker.pop(sid, None)
+                    self._forget_save_retries(sid, seq)
                     continue
                 self._perf_bump("late_save_emit")
                 aligned, block_ids, late_acquired = late_source
@@ -1088,6 +1091,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_previous_frontier[save_operation] = saved
             self._save_previous_owner[save_operation] = seq
             self._save_inflight[sid] = save_operation
+            self._note_save_dispatch(sid, seq, aligned)
+            # Every dispatch, a retry too: the workers count a save's source
+            # read deadline from its own dispatch, so the reclaim may not
+            # start earlier. What bounds retries is `_save_retries_expired`.
             self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
@@ -1249,6 +1256,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
                     self._save_tracker.pop(sid, None)
+                    self._forget_save_retries(sid, owner)
             if blocks:
                 released.append(frozenset(blocks))
                 self.total_abnormal_lease_reclaims += len(blocks)
@@ -1307,6 +1315,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._finish_retired_request(sid)
             return
         if isinstance(active, SaveOperationId):
+            self._save_stored(sid, self._save_previous_owner.get(active))
             self._save_previous_frontier.pop(active, None)
             self._save_previous_owner.pop(active, None)
             self._save_quiescent.discard(active)
@@ -1431,6 +1440,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_inflight.pop(sid, None)
         self._source_safe_waiting_for_store.pop(operation, None)
         if succeeded:
+            self._save_stored(sid, self._save_previous_owner.get(operation))
             self._save_previous_frontier.pop(operation, None)
             self._save_previous_owner.pop(operation, None)
             self._save_quiescent.discard(operation)
@@ -1482,18 +1492,140 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return False
         if owner is not None and entry[0] is not owner:
             return False  # request ID was reused
-        if getattr(entry[0], "_offload_finished", False):
+        seq = entry[0]
+        self._ensure_save_retry_state()
+        if getattr(seq, "_offload_finished", False):
             # Teardown may already have returned the source blocks to the pool.
             # A missing cache entry is safer than a retry against recycled KV.
-            self._retire_finished_save(sid, entry[0])
+            self._retire_finished_save(sid, seq)
+            self._report_given_up_save(operation.req_id)
+            return False
+        retries = self._failed_save_retries.get(sid)
+        if retries is None or retries[0] is not seq:
+            retries = self._failed_save_retries[sid] = [seq, 0]
+        retries[1] += 1
+        expired = self._save_retries_expired(sid, seq)
+        if retries[1] > self._max_failed_save_retries or expired:
+            # The store keeps failing this request: give up on its save so
+            # `should_defer_free` lets its blocks and state slot go. Its
+            # prefix is then missing from the tier, and a later hit on it
+            # recomputes.
+            self._perf_bump("failed_save_dropped")
+            logger.warning(
+                "LMCache offload: dropping failed dense save req=%s after %d "
+                "retries%s; its prefix from token %d will not be stored",
+                sid,
+                retries[1] - 1,
+                " (no save progress within the abandon timeout)" if expired else "",
+                previous,
+            )
+            self._retire_finished_save(sid, seq)
+            self._report_given_up_save(operation.req_id)
             return False
         entry[1] = min(int(entry[1]), previous)
         logger.warning(
-            "LMCache offload: retrying failed dense save req=%s from token %d",
+            "LMCache offload: retrying failed dense save req=%s from token %d "
+            "(retry %d of %d)",
             sid,
             previous,
+            retries[1],
+            self._max_failed_save_retries,
         )
         return True
+
+    #: Whether a save given up on is queued for `process_completions` to report
+    #: as finished. A frontend that never calls it turns this off, or the queue
+    #: would never drain (see `PluginSchedulerMixin`).
+    _reports_given_up_saves = True
+
+    def _report_given_up_save(self, req_id) -> None:
+        """Queue ``req_id`` for the next `process_completions` to report."""
+        if self._reports_given_up_saves:
+            self._save_given_up.add(req_id)
+
+    def _ensure_save_retry_state(self) -> None:
+        """Create the failed-save retry bookkeeping, once.
+
+        A failed save is retried, but not forever: a store that keeps failing
+        (a client whose transfers all fail, a full store) would otherwise keep
+        every request it touched -- its blocks, and its per-request state slot
+        -- parked in `deferred_free_blocks`, each retry restarting the reclaim
+        clock (`_refresh_save_reclaim_clock`). Also called on first use, for a
+        scheduler built without ``__init__``.
+        """
+        if hasattr(self, "_failed_save_retries"):
+            return
+        # sid -> [seq, retries set up since its last stored save].
+        self._failed_save_retries: dict[str, list] = {}
+        # sid -> [seq, highest frontier dispatched, when its save last made
+        # progress: a new range dispatched or a save stored]. A retry of the
+        # same range is not progress (`_save_retries_expired`).
+        self._save_progress: dict[str, list] = {}
+        self._max_failed_save_retries = envs.OFFLOAD_MAX_FAILED_SAVE_RETRIES
+        # Raw request IDs whose save was given up on while handling a
+        # completion that is not itself a store terminal: reported as
+        # finished saves by the next `process_completions`, so the engine
+        # re-checks their deferred free.
+        self._save_given_up: set = set()
+
+    def _note_save_dispatch(self, sid: str, seq, frontier: int) -> None:
+        """Record a dispatched save; a range past every earlier one is progress."""
+        self._ensure_save_retry_state()
+        progress = self._save_progress.get(sid)
+        if progress is None or progress[0] is not seq:
+            self._save_progress[sid] = [seq, int(frontier), time.monotonic()]
+        elif frontier > progress[1]:
+            progress[1] = int(frontier)
+            progress[2] = time.monotonic()
+
+    def _save_stored(self, sid: str, seq) -> None:
+        """A save of ``seq`` was stored: its retry budget starts over."""
+        self._ensure_save_retry_state()
+        retries = self._failed_save_retries.get(sid)
+        if retries is not None and retries[0] is seq:
+            self._failed_save_retries.pop(sid, None)
+        progress = self._save_progress.get(sid)
+        if progress is not None and progress[0] is seq:
+            progress[2] = time.monotonic()
+
+    def _save_retries_expired(self, sid: str, seq) -> bool:
+        """Whether ``seq``'s save has made no progress for the abandon timeout.
+
+        The reclaim clock cannot bound retries: every dispatch, a retry of the
+        same range too, restarts it (`_refresh_save_reclaim_clock`), and must,
+        since the workers count a save's source read deadline from its
+        dispatch. This is the clock retries cannot restart; the DSV4 scheduler
+        keeps the same one (its `_save_retries_expired`).
+        """
+        self._ensure_save_retry_state()
+        progress = self._save_progress.get(sid)
+        if progress is None or progress[0] is not seq:
+            return False
+        timeout = float(self.save_abandon_timeout_s())
+        return timeout > 0 and time.monotonic() - progress[2] >= timeout
+
+    def _forget_save_retries(self, sid: str, seq) -> None:
+        """Drop ``seq``'s retry bookkeeping once its save is no longer tracked."""
+        self._ensure_save_retry_state()
+        for table in (self._failed_save_retries, self._save_progress):
+            record = table.get(sid)
+            if record is not None and record[0] is seq:
+                table.pop(sid, None)
+
+    def process_completions(self, output):
+        """Also report requests whose save was given up on as finished saves.
+
+        A failed save that every rank stops reading may be retired or dropped
+        on a source-safe or quiescent report, which is not a store terminal;
+        reporting the request here makes the engine re-check its deferred free
+        rather than wait for the stalled-save reclaim.
+        """
+        output = super().process_completions(output)
+        self._ensure_save_retry_state()
+        if self._save_given_up:
+            output.finished_saving = set(output.finished_saving) | self._save_given_up
+            self._save_given_up = set()
+        return output
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):
@@ -1514,6 +1646,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         seq = entry[0]
         if getattr(seq, "_offload_finished", False) and not self._has_pending_save(seq):
             self._save_tracker.pop(sid, None)
+            self._forget_save_retries(sid, seq)
 
     def blocks_waiting_for_store(self) -> int:
         return sum(
@@ -1527,6 +1660,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if operation is not None:
             self._cancel_save_statistics(operation)
         self._save_tracker.pop(sid, None)
+        self._ensure_save_retry_state()
+        self._failed_save_retries.pop(sid, None)
+        self._save_progress.pop(sid, None)
         owner = self._save_operation_owner.pop(operation, None)
         lease_key = id(owner) if owner is not None else None
         self._save_lease_at.pop(lease_key, None)
@@ -1609,6 +1745,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             self._save_tracker.pop(sid, None)
+        self._forget_save_retries(sid, seq)
         blocked = self._save_retry_blocked.get(sid)
         if (
             blocked is not None
@@ -1670,6 +1807,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 )
             if not self.should_defer_free(seq):
                 self._drop_finished_save_state(sid, seq)
+        else:
+            # Never tracked, or its save already retired: nothing to retry.
+            self._forget_save_retries(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 

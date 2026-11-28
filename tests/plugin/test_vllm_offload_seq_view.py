@@ -191,6 +191,12 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     scheduler._forget_tier_hit = ChunkedOffloadSchedulerBase._forget_tier_hit.__get__(
         scheduler
     )
+    for name in ("_forget_save_retries", "_ensure_save_retry_state"):
+        setattr(
+            scheduler,
+            name,
+            getattr(ChunkedOffloadSchedulerBase, name).__get__(scheduler),
+        )
 
     ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
 

@@ -45,6 +45,8 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     SaveSourceGroupId,
 )
+from atom.kv_transfer.offload import _offload_common as offload_common_mod
+from atom.kv_transfer.offload import chunked_scheduler as chunked_scheduler_mod
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.chunked_scheduler import (
@@ -4091,6 +4093,222 @@ def test_a_failed_save_the_base_retires_pauses_no_other_save(
     scheduler.update_state_after_alloc(live)
     live.num_cached_tokens = 16
     assert [r.req_id for r in scheduler.build_connector_meta().requests] == [48]
+
+
+class _ClockedTime:
+    """The ``time`` module with ``monotonic`` read from ``now``."""
+
+    def __init__(self, now):
+        self.monotonic = now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _failing_save_step(scheduler, worker, clock, *, advance=60.0):
+    """Dispatch what the scheduler emits, store it, report it, move the clock.
+
+    The clock moves past the longest retry pause (`_SAVE_RETRY_MAX_S`), so a
+    retry the base sets up goes out on the next step.
+    """
+    requests = scheduler.build_connector_meta().requests
+    for request in requests:
+        worker._do_save_req(request)
+    scheduler.process_completions(worker.get_finished())
+    clock.now += advance
+    return len(requests)
+
+
+def test_a_save_the_store_keeps_failing_is_dropped_after_its_retries(
+    cluster, make_worker, scheduler_clock, monkeypatch
+):
+    # A client whose every put fails used to retry its saves forever: the
+    # request kept its blocks (and its state slot) for good.
+    monkeypatch.setenv("OFFLOAD_MAX_FAILED_SAVE_RETRIES", "3")
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    seq = _seq(43, 44)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 44
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+
+    sent = [_failing_save_step(scheduler, worker, scheduler_clock) for _ in range(8)]
+
+    # The first attempt and three retries, then nothing more.
+    assert sent == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert "43" not in scheduler._save_tracker
+    assert not scheduler.should_defer_free(seq)
+    assert not scheduler.has_pending_work()
+    assert scheduler._failed_save_retries == {}
+    assert scheduler._save_progress == {}
+    # The store recovers: another request's save still goes out.
+    cluster.put_code = None
+    later = _seq(44, 20, offset=100)
+    scheduler.update_state_after_alloc(later)
+    later.num_cached_tokens = 20
+    assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert scheduler._save_inflight == {}
+
+
+def test_a_stored_save_gives_the_request_its_retries_back(
+    cluster, make_worker, scheduler_clock, monkeypatch
+):
+    monkeypatch.setenv("OFFLOAD_MAX_FAILED_SAVE_RETRIES", "3")
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    seq = _seq(45, 64)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 32
+
+    # Two failures, then the store takes the save: no drop.
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+    assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert scheduler._failed_save_retries["45"][1] == 2
+    cluster.put_code = None
+    assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert "45" not in scheduler._failed_save_retries
+    assert scheduler._save_tracker["45"][1] == 32
+
+    # Three more failures on the next range: within a budget that started
+    # over (four retries in all would have dropped it otherwise).
+    seq.num_cached_tokens = 64
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+    for _ in range(3):
+        assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert scheduler._save_tracker["45"][0] is seq
+    cluster.put_code = None
+    assert _failing_save_step(scheduler, worker, scheduler_clock) == 1
+    assert scheduler._save_tracker["45"][1] == 64
+    assert scheduler._save_inflight == {}
+    assert "45" not in scheduler._failed_save_retries
+
+
+def test_retries_of_one_range_cannot_outlive_the_abandon_timeout(
+    cluster, make_worker, scheduler_clock, monkeypatch
+):
+    # However many retries are allowed, a save that makes no progress -- no
+    # new range, nothing stored -- for `save_abandon_timeout_s` is dropped.
+    monkeypatch.setenv("OFFLOAD_MAX_FAILED_SAVE_RETRIES", "1000")
+    # The base's progress clock and the reclaim clock it restarts read the
+    # same hand-advanced clock as the store scheduler's pause.
+    for module in (chunked_scheduler_mod, offload_common_mod):
+        monkeypatch.setattr(
+            module, "time", _ClockedTime(lambda: scheduler_clock.now), raising=True
+        )
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    assert scheduler.save_abandon_timeout_s() == 300.0
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    seq = _seq(46, 44)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 44
+    # Parked as the engine parks a finished request whose save is pending.
+    start = scheduler_clock.now
+    seq._deferred_save_at = start
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+
+    stamps = []
+    elapsed = 0.0
+    while "46" in scheduler._save_tracker:
+        assert elapsed < 3600.0, "the failing save was never given up"
+        if _failing_save_step(scheduler, worker, scheduler_clock, advance=30.0):
+            stamps.append(seq._deferred_save_at - start)
+        elapsed = scheduler_clock.now - start
+
+    # Each retry still restarts the reclaim clock: the workers count its
+    # source read deadline from its own dispatch. But the retries stop once
+    # the first dispatch is a timeout old.
+    assert stamps == pytest.approx([30.0 * i for i in range(11)])
+    assert not scheduler.should_defer_free(seq)
+    assert scheduler._failed_save_retries == {}
+
+
+class _CannotNarrow:
+    """The store scheduler behind a composite whose other leg cannot narrow
+    its protection -- a P/D send in flight, as `MultiConnector` answers then.
+
+    The finished request is deferred whole, its state slot with it, and the
+    store never learns it finished (`_offload_finished`), so a failed save is
+    retried instead of retired.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def protected_block_ids(self, seq):
+        return None
+
+
+def test_a_request_whose_save_keeps_failing_gives_back_its_state_slot(
+    cluster, make_worker, scheduler_clock, monkeypatch
+):
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+
+    monkeypatch.setenv("OFFLOAD_MAX_FAILED_SAVE_RETRIES", "3")
+    engine = Scheduler(
+        MockConfig(
+            max_num_seqs=2,
+            max_model_len=64,
+            max_num_batched_tokens=64,
+            kv_cache_block_size=BLOCK,
+            num_kvcache_blocks=32,
+            pool_entries={STATE_SLOT_CLASS: 1},
+        )
+    )
+    seq = Sequence(list(range(1, 17)), BLOCK, has_per_req_cache=True)
+    engine.add(seq)
+    batch, seqs = engine.schedule()
+    no_tokens = ScheduledBatchOutput(
+        req_ids=[],
+        token_ids=[],
+        num_rejected=None,
+        num_bonus=None,
+        draft_token_ids=None,
+        is_deferred_out=True,
+    )
+    engine.postprocess(list(seqs.values()), no_tokens, batch=batch)
+    assert seq.state_slot >= 0 and seq.block_table
+
+    config = _config()
+    store = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    store.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 16
+    engine.kv_connector = _CannotNarrow(store)
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+
+    # The request finishes with its save still to store: deferred whole.
+    seq.status = SequenceStatus.ABORTED
+    assert engine.postprocess([], no_tokens) == [seq]
+    assert seq.id in engine.deferred_free_blocks
+    assert seq.state_slot >= 0
+
+    sent = 0
+    for _ in range(8):
+        for request in store.build_connector_meta().requests:
+            worker._do_save_req(request)
+            sent += 1
+        engine._update_from_kv_xfer_finished(worker.get_finished())
+        scheduler_clock.now += 60.0
+
+    assert sent == 4  # the first attempt and three retries
+    assert seq.id not in engine.deferred_free_blocks
+    assert seq.state_slot == -1 and not seq.block_table
+    assert not store.has_pending_work()
 
 
 @pytest.mark.parametrize("stored_last", [True, False])

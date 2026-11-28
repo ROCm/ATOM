@@ -442,6 +442,7 @@ def test_offload_env_vars_are_documented():
         ("OFFLOAD_COPY_WORKERS", 1),
         ("OFFLOAD_LOAD_WORKERS", 1),
         ("OFFLOAD_MIN_SAVE_TOKENS", 8192),
+        ("OFFLOAD_MAX_FAILED_SAVE_RETRIES", 3),
     ],
 )
 def test_empty_offload_knob_reads_as_its_default(monkeypatch, name, default):

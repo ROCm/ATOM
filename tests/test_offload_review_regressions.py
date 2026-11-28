@@ -49,7 +49,12 @@ def test_terminal_arrival_cancels_queued_lookup_but_live_discard_does_not():
             _release_failed_load_attempt=lambda *_: None,
             _forget_tier_hit=lambda *_: None,
         )
-        for name in ("_clear_pending_load", "_release_lookup"):
+        for name in (
+            "_clear_pending_load",
+            "_release_lookup",
+            "_forget_save_retries",
+            "_ensure_save_retry_state",
+        ):
             setattr(
                 state,
                 name,
