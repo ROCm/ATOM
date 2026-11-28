@@ -3015,6 +3015,9 @@ class MoE(nn.Module):
     while expert *weights* still use sqrtsoftplus(gate_logits). Accuracy verified.
     """
 
+    # Whether the routed MegaMoE call computes the shared expert (see __init__).
+    _shared_in_routed = False
+
     def __init__(
         self,
         layer_id: int,
@@ -3139,6 +3142,21 @@ class MoE(nn.Module):
         )
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
+        # A target layer's shared expert, computed apart, goes into the routed
+        # MegaMoE call (AITER's shared_in), which then returns routed + shared.
+        # The DSpark / MTP draft layers ("mtp.<i>") keep theirs.
+        from atom.model_ops.fused_moe.flydsl_mega_experts import (
+            attach_mega_shared_expert,
+        )
+
+        self._shared_in_routed = (
+            self.shared_experts is not None
+            and not prefix.startswith("mtp.")
+            and self.tp_size == 1
+            and not self._use_dual_stream
+            and not self._use_comm_fused_dispatch
+            and attach_mega_shared_expert(self.experts, self.shared_experts)
+        )
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix): maybe_dual_stream_forward
         # (dual-stream) and the comm-fused token-bucket dispatch.
@@ -3300,6 +3318,12 @@ class MoE(nn.Module):
         `torch.compile` traces this method (the CUDA event is not traceable);
         the traced graph keeps the separate add in `combine_outputs`.
         """
+        if self._shared_in_routed:
+            # The routed MegaMoE call adds the shared expert (run_mega_moe).
+            routed, _ = self.routed_expert_forward(x)
+            return self.combine_outputs(
+                routed, None, prefix=f"{self.prefix}.combine_outputs"
+            )
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         if (
             shared is not None
