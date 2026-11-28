@@ -1001,8 +1001,31 @@ class DSparkProposer(Drafter):
         slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
-        global_lens = anchor_positions + (1 + T)
         entry_tokens = self._draft_entry_tokens
+        if (
+            self.model.fuses_block_metadata
+            and not self._draft_is_dcp_sharded
+            and block_tables.is_cuda
+        ):
+            # Everything below the DCP branch and the model's
+            # `prepare_paged_block`, in one launch with the same numbers.
+            self.model.prepare_paged_block_fused(
+                attn_metadata,
+                block_tables,
+                anchor_positions,
+                self._blk_offsets,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+                entry_tokens,
+                self._paged_pad_ctx_len,
+            )
+            self._set_block_metadata(attn_metadata, slots, block_tables, ctx_lens)
+            attn_metadata.max_seqlen_k = max_seqlen_k
+            return
+        global_lens = anchor_positions + (1 + T)
         if self._draft_is_dcp_sharded:
             # DCP shards KV token-wise round-robin: one block table entry covers
             # block_size*dcp_world_size GLOBAL tokens, and rank r holds the
@@ -1058,11 +1081,7 @@ class DSparkProposer(Drafter):
             slots[scheduled_bs:].fill_(-1)
             ctx_lens[scheduled_bs:].fill_(self._paged_pad_ctx_len)
 
-        attn_metadata.slot_mapping = slots.view(-1)
-        attn_metadata.block_tables = block_tables
-        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
-        attn_metadata.context_lens = ctx_lens
-        attn_metadata.max_seqlen_q = T
+        self._set_block_metadata(attn_metadata, slots, block_tables, ctx_lens)
         attn_metadata.max_seqlen_k = max_seqlen_k
         if not self.model.block_attention_is_mla:
             # A non-MLA block read builds what it reads itself, so no CSR or
@@ -1170,6 +1189,15 @@ class DSparkProposer(Drafter):
         attn_metadata.reduce_indptr = ps["reduce_indptr"]
         attn_metadata.reduce_final_map = ps["reduce_final_map"]
         attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
+
+    def _set_block_metadata(self, attn_metadata, slots, block_tables, ctx_lens):
+        """Point ``attn_metadata`` at the block's slots, tables and lengths."""
+        running_bs, T = slots.shape
+        attn_metadata.slot_mapping = slots.view(-1)
+        attn_metadata.block_tables = block_tables
+        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
+        attn_metadata.context_lens = ctx_lens
+        attn_metadata.max_seqlen_q = T
 
     @property
     def _paged_pad_ctx_len(self) -> int:

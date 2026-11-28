@@ -435,6 +435,29 @@ class AllocationCap:
         # nothing to wait for.
         self._alloc_copied = torch.cuda.Event()
 
+    @staticmethod
+    def page_counts(allocated_pages, scheduled_bs: int, running_bs: int) -> list:
+        """The pages each of ``running_bs`` rows holds, as ``apply`` counts
+        them: pad rows and the warmup batch address page 0 by convention and
+        read one page; every row at least one."""
+        n = min(len(allocated_pages), scheduled_bs)
+        return [max(int(p), 1) for p in allocated_pages[:n]] + [1] * (running_bs - n)
+
+    def stage(self, allocated_pages, scheduled_bs: int, running_bs: int):
+        """``page_counts`` on the device: ``[running_bs]`` int32, in pages."""
+        # The host can run a step ahead of the device: the previous copy must
+        # have read the pinned buffer before it is rewritten.
+        self._alloc_copied.synchronize()
+        pages = self._alloc_host.numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
+        self._alloc_copied.record()
+        return alloc
+
     def apply(
         self,
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
@@ -445,19 +468,7 @@ class AllocationCap:
     ) -> torch.Tensor:
         """Mask ``slots`` past each row's allocation; return it in tokens."""
         running_bs = block_positions.shape[0]
-        # The host can run a step ahead of the device: the previous copy must
-        # have read the pinned buffer before it is rewritten.
-        self._alloc_copied.synchronize()
-        pages = self._alloc_host.numpy()[:running_bs]
-        n = min(len(allocated_pages), scheduled_bs)
-        pages[:n] = allocated_pages[:n]
-        # Pad rows and the warmup batch address page 0 by convention and read
-        # one page.
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._alloc[:running_bs]
-        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
-        self._alloc_copied.record()
+        alloc = self.stage(allocated_pages, scheduled_bs, running_bs)
         alloc.mul_(unit)
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         return alloc
@@ -504,6 +515,10 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # Whether `prepare_paged_block_fused` builds this rank's block metadata --
+    # the proposer's positions, slots and lengths and the model's own tables --
+    # in one launch, in place of those and `prepare_paged_block` (no DCP).
+    fuses_block_metadata = False
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
