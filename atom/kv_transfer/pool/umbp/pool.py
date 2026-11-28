@@ -29,6 +29,14 @@ locally.
 allocation, and UMBP adopts the `[P, N)` part of it through its IPC handle. It
 also tells UMBP how far the GPU has got.
 
+An engine rank that runs tensor-parallel attention has one runner per device,
+each with its shard of every block. The scheduler still addresses one pool: the
+runners' buffers are its parts (`UmbpPoolMemory.part`), which share UMBP's slot
+table, so a block is the same slot on every device. Each runner adopts its own
+buffer into its part and reports its own device's progress; UMBP copies a block
+between ranks part by part and treats it as landed only when every part's
+device has got there.
+
 That last part is what makes sharing safe. The scheduler publishes a block when
 the forward that fills it is issued, and frees one while a forward may still be
 writing it; a forward returns before the device is done. Within this engine
@@ -64,6 +72,9 @@ from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
 logger = logging.getLogger("atom")
 
 _KEY_BYTES = 8
+# How long the scheduler waits for the other runners of a tensor-parallel rank
+# to bring their parts of the pool: the engine waits for runner 0 only.
+_PARTS_WAIT_S = 120.0
 
 
 def _load_client_module():
@@ -82,10 +93,21 @@ def _connect(settings: UmbpPoolSettings):
     return module, module.L1Client(settings.address)
 
 
-def pool_id_for(config, settings: UmbpPoolSettings, rank: int = 0) -> str:
-    """The name both processes of one engine rank know their pool by."""
-    dp_rank = config.parallel_config.data_parallel_rank
-    return f"{settings.namespace}:dp{dp_rank}:tp{rank}"
+def pool_id_for(config, settings: UmbpPoolSettings) -> str:
+    """The name every process of one engine rank knows its pool by: the
+    scheduler, and each of the rank's runners for its part of it."""
+    parallel = getattr(config, "parallel_config", None)
+    dp_rank = getattr(parallel, "data_parallel_rank", 0) or 0
+    return f"{settings.namespace}:dp{dp_rank}"
+
+
+def pool_parts(config) -> int:
+    """How many runners an engine rank has, i.e. how many buffers its pool is
+    made of: one per device of its tensor-parallel group."""
+    world = getattr(config, "tp_world_size", None)
+    if world is None:
+        world = getattr(config, "tensor_parallel_size", 1)
+    return max(1, int(world or 1))
 
 
 def share_group_for(config, settings: UmbpPoolSettings) -> str:
@@ -112,6 +134,19 @@ def share_group_for(config, settings: UmbpPoolSettings) -> str:
     }
     digest = hashlib.sha1(json.dumps(facts, sort_keys=True).encode()).hexdigest()
     return f"atom-{digest[:16]}"
+
+
+def _open(client, pool_id: str, parts: int) -> int:
+    """Take over the pool's slots, once every runner has brought its part."""
+    deadline = time.monotonic() + (_PARTS_WAIT_S if parts > 1 else 0.0)
+    while True:
+        try:
+            return client.open(pool_id)
+        except RuntimeError as exc:
+            waiting = "not attached and bound" in str(exc)
+            if not waiting or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
 
 
 def _key(h: int) -> bytes:
@@ -144,11 +179,12 @@ class UmbpL1Pool(KVBlockPool):
         on_evict: Callable[[int], None] | None = None,
         on_remap: Callable[[int], None] | None = None,
         grant_batch: int = 32,
+        parts: int = 1,
     ):
         self._client = client
         self._op_hold, self._op_release, self._op_publish = ops
         self.pool_id = pool_id
-        opened = client.open(pool_id)
+        opened = _open(client, pool_id, parts)
         if opened != num_blocks:
             raise ValueError(
                 f"UMBP pool {pool_id} has {opened} blocks but the scheduler "
@@ -595,11 +631,23 @@ class UmbpPoolMemory(KVPoolMemory):
     counted_by_torch = True
     shares_blocks = True
 
-    def __init__(self, client, pool_id: str, group: str, ratio: float):
+    def __init__(
+        self,
+        client,
+        pool_id: str,
+        group: str,
+        ratio: float,
+        part: int = 0,
+        num_parts: int = 1,
+    ):
         self._client = client
         self.pool_id = pool_id
         self.group = group
         self.ratio = ratio
+        # Which of the pool's buffers this runner's is (its TP rank), of how
+        # many. One part: the rank has a single runner.
+        self.part = part
+        self.num_parts = num_parts
         self._device = None
         # Where UMBP's part was adopted from; None until `bind_layout`.
         self._mapped_base: int | None = None
@@ -624,7 +672,7 @@ class UmbpPoolMemory(KVPoolMemory):
         if self._watcher is None:
             self._watcher = threading.Thread(
                 target=self._report_progress,
-                name=f"umbp-l1-commit-{self.pool_id}",
+                name=f"umbp-l1-commit-{self.pool_id}-{self.part}",
                 daemon=True,
             )
             self._watcher.start()
@@ -650,16 +698,25 @@ class UmbpPoolMemory(KVPoolMemory):
             while issued and issued[0][1].query():
                 stamp = issued.popleft()[0]
             try:
-                self._client.commit(self.pool_id, stamp)
+                self._commit(stamp)
                 failed = False
             except Exception:  # sharing degrades, serving goes on
                 if not failed:
                     logger.exception(
-                        "UMBP pool %s: could not report device progress; other "
-                        "pools will not see this rank's new blocks",
+                        "UMBP pool %s part %d: could not report device progress; "
+                        "other pools will not see this rank's new blocks",
                         self.pool_id,
+                        self.part,
                     )
                 failed = True
+
+    # A pool of one part is addressed as every pool was before parts existed,
+    # so a server without them still serves it.
+    def _commit(self, stamp: int) -> None:
+        if self.num_parts == 1:
+            self._client.commit(self.pool_id, stamp)
+        else:
+            self._client.commit(self.pool_id, stamp, part=self.part)
 
     def close(self) -> None:
         """Stop reporting progress and let UMBP unmap its part; the memory
@@ -719,6 +776,8 @@ class UmbpPoolMemory(KVPoolMemory):
         allocation = hip_ipc.get_allocation_base(base)
         handle = hip_ipc.get_ipc_handle(allocation)
         device = buf.device.index if buf.device.index is not None else 0
+        whole = self.num_parts == 1
+        part = {} if whole else {"part": self.part, "num_parts": self.num_parts}
         self._client.attach(
             self.pool_id,
             self.group,
@@ -726,13 +785,19 @@ class UmbpPoolMemory(KVPoolMemory):
             buf.numel(),
             external_handle=handle,
             external_offset=base - allocation,
+            **part,
         )
-        self._client.bind_layout(self.pool_id, slots, layout)
+        if whole:
+            self._client.bind_layout(self.pool_id, slots, layout)
+        else:
+            self._client.bind_layout(self.pool_id, slots, layout, part=self.part)
         self._mapped_base = base
         logger.info(
-            "UMBP pool %s: adopted %d of %d blocks (ratio %.2f) of this process's "
-            "%.2f GiB pool on %s",
+            "UMBP pool %s part %d of %d: adopted %d of %d blocks (ratio %.2f) of "
+            "this process's %.2f GiB pool on %s",
             self.pool_id,
+            self.part,
+            self.num_parts,
             slots,
             num_blocks,
             self.ratio,
@@ -757,6 +822,7 @@ def make_umbp_l1_pool(
         num_blocks,
         on_evict=on_evict,
         on_remap=on_remap,
+        parts=pool_parts(config),
     )
     pool.shares_content = settings.fetch
     return pool
@@ -765,15 +831,18 @@ def make_umbp_l1_pool(
 def make_umbp_pool_memory(
     config, settings: UmbpPoolSettings, rank: int = 0
 ) -> UmbpPoolMemory:
-    if rank != 0:
-        raise NotImplementedError(
-            "the UMBP pool backs one runner per engine rank; tensor-parallel "
-            "attention within a rank is not supported yet"
+    parts = pool_parts(config)
+    if not 0 <= rank < parts:
+        raise ValueError(
+            f"runner {rank} has no part in a UMBP pool of {parts} "
+            "(one per tensor-parallel rank)"
         )
     _, client = _connect(settings)
-    pool_id = pool_id_for(config, settings, rank)
+    pool_id = pool_id_for(config, settings)
     group = share_group_for(config, settings)
-    return UmbpPoolMemory(client, pool_id, group, settings.share_ratio)
+    return UmbpPoolMemory(
+        client, pool_id, group, settings.share_ratio, part=rank, num_parts=parts
+    )
 
 
 def split_point(num_blocks: int, ratio: float) -> int:

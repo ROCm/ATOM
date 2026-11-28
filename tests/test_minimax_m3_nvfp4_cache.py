@@ -269,6 +269,11 @@ def test_a_tp4_rank_cuts_its_head_of_each_run_of_a_tp1_page(rank):
 MORIIO = {"kv_connector": "moriio", "kv_role": "kv_both"}
 PD = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
 STORE = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+# The pool the ranks share: a block moves between them as the bytes of its PAGE regions.
+POOL = {
+    "kv_connector": "umbp_pool",
+    "kv_connector_extra_config": {"address": "unix:///tmp/umbp-l1/server.sock"},
+}
 LMCACHE_BY_ANY_NAME = [
     OFFLOAD,
     {"kv_connector": "LMCacheConnectorV1", "kv_role": "offload"},
@@ -288,9 +293,11 @@ def test_lmcache_offload_takes_nvfp4_by_any_name(kvt):
         {**PD, "kv_role": "kv_consumer"},
         STORE,
         {"kv_connector": "multi", "connectors": [PD, STORE]},
+        POOL,
+        {"kv_connector": "multi", "connectors": [POOL, STORE]},
     ],
 )
-def test_nvfp4_pages_run_under_mooncake_pd_and_store(kvt):
+def test_nvfp4_pages_run_under_mooncake_pd_and_store_and_the_shared_pool(kvt):
     check(kv_transfer_config=kvt, **NV)
 
 
@@ -308,7 +315,8 @@ def test_nvfp4_pages_run_under_mooncake_pd_and_store(kvt):
 )
 def test_one_transport_that_moves_no_nvfp4_pages_refuses_nvfp4(kvt):
     with pytest.raises(
-        ValueError, match="only under lmcache_offload, mooncake, mooncake_store$"
+        ValueError,
+        match="only under lmcache_offload, mooncake, mooncake_store, umbp_pool$",
     ):
         check(kv_transfer_config=kvt, **NV)
 
@@ -342,6 +350,8 @@ DRAFT_DTYPE_TRANSPORTS = [
     STORE,
     {"kv_connector": "multi", "connectors": [PD, STORE]},
     {"kv_connector": "multi", "connectors": [PD, OFFLOAD]},
+    POOL,
+    {"kv_connector": "multi", "connectors": [POOL, STORE]},
 ]
 
 
