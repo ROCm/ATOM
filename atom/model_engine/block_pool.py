@@ -68,6 +68,12 @@ class BlockPool(KVBlockPool):
     queue on release. New content remains probationary until claimed, so a
     stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
     still go first; referenced blocks are never candidates in either policy.
+
+    `free(block_id, demote=True)` files a still-hashed block in `_demoted`
+    instead: reachable by hash like `_cached`, but spent before any of it (and
+    after the vacant half), least-recently-demoted first. The manager uses it
+    for the blocks a finished request generated into, which a later prompt
+    re-hits only if the client sends that exact output back.
     """
 
     def __init__(
@@ -117,6 +123,7 @@ class BlockPool(KVBlockPool):
         # stale entries.
         self._vacant: list[int] = list(range(self._first_block, num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
+        self._demoted: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(self._vacant)
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
@@ -174,7 +181,7 @@ class BlockPool(KVBlockPool):
         vacant count, which is the number that actually has to reach zero
         before `blocks_evicted` can start moving.
         """
-        return len(self._cached) + len(self._protected)
+        return len(self._cached) + len(self._protected) + len(self._demoted)
 
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
@@ -265,6 +272,7 @@ class BlockPool(KVBlockPool):
         # here rather than left to drift.
         self._cached.clear()
         self._protected.clear()
+        self._demoted.clear()
         self._reused.clear()
         self._vacant = sorted(self._free)
         heapify(self._vacant)
@@ -279,6 +287,7 @@ class BlockPool(KVBlockPool):
         """
         block = self.blocks[block_id]
         self._protected.pop(block_id, None)
+        self._demoted.pop(block_id, None)
         self._reused.discard(block_id)
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
@@ -305,6 +314,11 @@ class BlockPool(KVBlockPool):
         while self._vacant:
             block_id = heappop(self._vacant)
             if block_id in self._free and self.blocks[block_id].hash == -1:
+                self._free.discard(block_id)
+                return block_id
+        while self._demoted:
+            block_id, _ = self._demoted.popitem(last=False)
+            if block_id in self._free and self.blocks[block_id].hash != -1:
                 self._free.discard(block_id)
                 return block_id
         while self._cached:
@@ -336,6 +350,7 @@ class BlockPool(KVBlockPool):
         self._free.discard(block_id)
         self._cached.pop(block_id, None)
         self._protected.pop(block_id, None)
+        self._demoted.pop(block_id, None)
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
@@ -367,7 +382,12 @@ class BlockPool(KVBlockPool):
             self._used.add(block_id)
         return block
 
-    def free(self, block_id: int) -> None:
+    def free(self, block_id: int, demote: bool = False) -> None:
+        """Drop one reference. At zero the block goes back on the free list:
+        hashed content to `_cached` (or `_protected`, slru), or to `_demoted`
+        when `demote` -- evicted before every other hashed block -- and
+        unhashed blocks to `_vacant`. `demote` is ignored for a block slru
+        protects, and for one another holder still references."""
         if block_id in self._raw_unit_owner:
             raise AssertionError(
                 f"block {block_id} is a reserved raw unit; use release_units"
@@ -382,6 +402,8 @@ class BlockPool(KVBlockPool):
             if block_id in self._reused:
                 self._protected[block_id] = None
                 self._trim_protected()
+            elif demote:
+                self._demoted[block_id] = None
             else:
                 self._cached[block_id] = None
             return

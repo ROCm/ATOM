@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import array
+import inspect
 import logging
 from collections import deque
 from collections.abc import Callable
@@ -313,6 +314,20 @@ class BlockManager:
         self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
             WeakKeyDictionary()
         )
+        # A finished request's generated blocks (every block from the one
+        # holding its last prompt token's successor on) go to the evict-first
+        # end of the free list. Off: one LRU for all hashed blocks.
+        self.demote_generated: bool = envs.ATOM_PREFIX_DEMOTE_DECODE
+        if (
+            self.demote_generated
+            and "demote" not in inspect.signature(self.kv.free).parameters
+        ):
+            logger.warning(
+                "ATOM_PREFIX_DEMOTE_DECODE ignored: %s.free() has no `demote` "
+                "argument",
+                type(self.kv).__name__,
+            )
+            self.demote_generated = False
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -3852,8 +3867,20 @@ class BlockManager:
             self.kv.free(block_id)
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
-            self.kv.free(block_id)
+        # Tail first: the deepest blocks of the chain enter the free list (and
+        # so are evicted) before the prefix they extend.
+        if self.demote_generated and seq.is_finished:
+            # Blocks from `first_gen` on hold at least one generated token.
+            # One table entry spans `hash_block_size` global tokens (it is
+            # `block_size * dcp_world_size` under decode context parallelism).
+            first_gen = seq.num_prompt_tokens // self.hash_block_size
+            free = self.kv.free
+            table = seq.block_table
+            for i in range(len(table) - 1, -1, -1):
+                free(table[i], i >= first_gen)
+        else:
+            for block_id in reversed(seq.block_table):
+                self.kv.free(block_id)
         seq.num_cached_tokens = 0
         # The block table is gone, so nothing of this seq is hashed any more.
         # Covers preemption too, which frees through here and re-prefills.

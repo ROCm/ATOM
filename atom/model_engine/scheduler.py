@@ -54,6 +54,9 @@ from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.mixed_budget import decode_seats, prefill_floor
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.prefill_delayer import PrefillDecision
+from atom.model_engine.prefill_duty import PrefillDuty
+from atom.model_engine.prefill_finish_hold import FinishHold
+from atom.model_engine.prefill_itl_risk import ItlRiskHold
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Replay,
@@ -897,6 +900,76 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self._unreserved_prefill_limits = PrefillLimits(self.max_num_batched_tokens)
+        # The configured budget while `schedule()` runs one tick under a lower
+        # cap (None otherwise): what static admissibility is judged against.
+        self._uncapped_max_num_batched_tokens: int | None = None
+        # Prefill token budget of a step taken while decodes are running: every
+        # running decode stalls for the whole prefill step, so a smaller cap
+        # bounds each stall. 0 keeps `max_num_batched_tokens`. Never below one
+        # full decode batch, which the same budget sizes.
+        cap = envs.ATOM_SCHED_DECODE_PREFILL_CAP
+        if cap > 0:
+            spec_k = (
+                config.speculative_config.num_speculative_tokens
+                if config.speculative_config is not None
+                else 0
+            )
+            cap = max(cap, (spec_k + 1) * self.max_num_seqs)
+        idle_cap = envs.ATOM_SCHED_IDLE_PREFILL_CAP
+        if (cap > 0 or idle_cap > 0) and not config.enable_chunked_prefill:
+            # A prompt longer than the capped budget could never be admitted
+            # (it cannot be split), so the caps only make sense with chunking.
+            logger.warning(
+                "ATOM_SCHED_DECODE_PREFILL_CAP / ATOM_SCHED_IDLE_PREFILL_CAP "
+                "ignored: chunked prefill is disabled"
+            )
+            cap = idle_cap = 0
+        self._decode_prefill_cap = min(cap, self.max_num_batched_tokens)
+        # the same budget for a step taken while NO decode
+        # runs (warm-up storms, idle engine). Bounds the largest prefill step,
+        # and with it the activation peak the caching allocator keeps, without
+        # touching what `max_num_batched_tokens` sizes elsewhere (the profiling
+        # forward, the delayer's fill target, chunk geometry). 0 = off.
+        self._idle_prefill_cap = (
+            min(idle_cap, self.max_num_batched_tokens) if idle_cap > 0 else 0
+        )
+        duty = envs.ATOM_SCHED_PREFILL_DUTY
+        self._prefill_duty = (
+            PrefillDuty(
+                duty,
+                envs.ATOM_SCHED_PREFILL_DUTY_TAU_S,
+                envs.ATOM_SCHED_PREFILL_MAX_HOLD_S,
+                envs.ATOM_SCHED_PREFILL_MAX_WAIT_S,
+            )
+            if 0.0 < duty < 1.0
+            else None
+        )
+        # Opt-in: hold prefill while a short running request is about to
+        # finish (prefill_finish_hold.py). Off (None) by default.
+        fh_left = envs.ATOM_SCHED_FINISH_HOLD_LEFT
+        self._finish_hold = (
+            FinishHold(
+                fh_left,
+                envs.ATOM_SCHED_FINISH_HOLD_MAX_MS / 1000.0,
+                envs.ATOM_SCHED_FINISH_HOLD_MAX_TOKENS,
+            )
+            if fh_left > 0
+            else None
+        )
+        # Opt-in: hold prefill while its stall would push a running request
+        # across the target per-request ITL (prefill_itl_risk.py). Off (None)
+        # by default.
+        risk_ms = envs.ATOM_SCHED_ITL_RISK_MS
+        self._itl_risk = (
+            ItlRiskHold(
+                risk_ms,
+                envs.ATOM_SCHED_ITL_RISK_MAX_MS / 1000.0,
+                envs.ATOM_SCHED_ITL_RISK_PF_FIXED_MS,
+                envs.ATOM_SCHED_ITL_RISK_PF_MS_PER_KTOK,
+            )
+            if risk_ms > 0
+            else None
+        )
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
         # batch budget; the ranks then aim at one cost target, a costlier rank
@@ -2042,6 +2115,25 @@ class Scheduler:
             return 0.0
         return max(0.0, (time.time() - oldest_arrive) * 1000.0)
 
+    def _oldest_pending_prefill_s(self) -> float:
+        """Seconds since the oldest request still owed prefill (waiting, or
+        mid-chunk in `running`) arrived; 0 with none."""
+        oldest = min(
+            (
+                seq.arrive_time
+                for seq in itertools.chain(
+                    self._waiting_prefills(),
+                    (
+                        (s for s in self.running if s.is_partial_prefill)
+                        if self._partial_prefill_count
+                        else ()
+                    ),
+                )
+            ),
+            default=None,
+        )
+        return 0.0 if oldest is None else max(0.0, time.time() - oldest)
+
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
         by EngineCore at the end of each scheduler step. No-op when events are
@@ -2528,9 +2620,11 @@ class Scheduler:
             )
         # Only processors with explicit spans and request leases can chunk.
         is_multimodal = self._requires_atomic_prefill(seq)
-        if (
-            not self.enable_chunked_prefill or is_multimodal
-        ) and num_tokens > self.max_num_batched_tokens:
+        # Static capacity is the configured budget, not this tick's cap
+        # (`schedule()` lowers `max_num_batched_tokens` for one tick): a prompt
+        # above the cap only waits for a tick with room, it is not rejected.
+        budget = self._uncapped_max_num_batched_tokens or self.max_num_batched_tokens
+        if (not self.enable_chunked_prefill or is_multimodal) and num_tokens > budget:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
                 "(multimodal prompts without embedding spans are never chunked)."
@@ -2540,7 +2634,7 @@ class Scheduler:
             )
             return (
                 f"input tokens={num_tokens} > max_num_batched_tokens="
-                f"{self.max_num_batched_tokens}. {remedy}"
+                f"{budget}. {remedy}"
             )
         bm = self.block_manager
         total_blocks = bm.kv.num_usable_blocks
@@ -2630,10 +2724,48 @@ class Scheduler:
         # Prefixes other pools copied in since the last pass become hits now,
         # before any walk of this one.
         self.block_manager.kv.poll_fetches()
+        if len(self.running) > self._partial_prefill_count:
+            cap = self._decode_prefill_cap
+        else:
+            cap = self._idle_prefill_cap
+        full = self.max_num_batched_tokens
+        unreserved = self._unreserved_prefill_limits
+        if cap and self.waiting and self._requires_atomic_prefill(self.waiting[0]):
+            # An atomic prompt cannot be split: a cap below its size would
+            # requeue it on every tick (a head-of-line stall), so the budget
+            # never drops below the head waiter's size.
+            cap = max(cap, min(self.waiting[0].num_tokens, full))
+        if cap and self._partial_prefill_count:
+            # A running stateful prefill resumes from `replay_start`, below its
+            # cached tokens: the budget has to cover that replay plus one hash
+            # block of forward progress, or `_partial_prefill_chunk` returns 0
+            # on every capped tick and the prefill never finishes.
+            for seq in self.running:
+                if seq.is_partial_prefill:
+                    resume = seq.num_cached_tokens
+                    start = self.block_manager.replay_start(seq, resume, hit=False)
+                    need = resume - start + self.block_manager.hash_block_size
+                    cap = max(cap, min(need, full))
         try:
+            if cap:
+                self.max_num_batched_tokens = cap
+                self._uncapped_max_num_batched_tokens = full
+                self._unreserved_prefill_limits = PrefillLimits(cap)
             result = self._schedule()
         finally:
+            self.max_num_batched_tokens = full
+            self._uncapped_max_num_batched_tokens = None
+            self._unreserved_prefill_limits = unreserved
             self.block_manager.reserved_decode_blocks = 0
+        if self._prefill_duty is not None or self._itl_risk is not None:
+            kind = None
+            if result is not None and result[0] is not None and result[0].req_ids:
+                kind = "p" if result[0].total_seqs_num_prefill else "d"
+            now = time.perf_counter()
+            if self._prefill_duty is not None:
+                self._prefill_duty.observe(now, kind)
+            if self._itl_risk is not None:
+                self._itl_risk.observe(now, kind, self.running)
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
@@ -2790,10 +2922,50 @@ class Scheduler:
             prefill_cost = 0.0
         self._arrived_requests = 0
         delayer_allows = decision.allow
-
-        # Before the early return below: an idle rank keeps its peers' prefill
-        # company too.
+        # Read before the local holds, from the delayer's reduce. The holds are
+        # per-rank vetoes that bypass the group decision: when the group
+        # prefills (token graphs recorded) a held rank would only turn its
+        # decode into an idle step, so they stay off for such a tick.
         group_prefill_tick = self._group_prefill_tick(decision)
+        holds_on = not group_prefill_tick
+        if (
+            holds_on
+            and delayer_allows
+            and self._prefill_duty is not None
+            and self._prefill_duty.hold(
+                time.perf_counter(),
+                len(self.running) > self._partial_prefill_count,
+                self._oldest_pending_prefill_s,
+            )
+        ):
+            delayer_allows = False
+        if holds_on and delayer_allows and self._finish_hold is not None:
+            finish_due = (
+                (self._partial_prefill_count > 0 or bool(self.waiting))
+                and len(self.running) > self._partial_prefill_count
+                and self._finish_hold.due(self.running)
+            )
+            if self._finish_hold.hold(time.perf_counter(), finish_due):
+                delayer_allows = False
+        if holds_on and delayer_allows and self._itl_risk is not None:
+            risk_due = (
+                (self._partial_prefill_count > 0 or bool(self.waiting))
+                and len(self.running) > self._partial_prefill_count
+                and self._itl_risk.due(
+                    time.time(),
+                    self.running,
+                    min(
+                        self.max_num_batched_tokens,
+                        self._waiting_new_token_count()
+                        + self._partial_prefill_remaining_tokens(),
+                    ),
+                )
+            )
+            if self._itl_risk.hold(time.perf_counter(), risk_due):
+                delayer_allows = False
+
+        # (`group_prefill_tick` is read above, before the holds: an idle rank
+        # keeps its peers' prefill company too.)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -6725,6 +6897,25 @@ class PrefillScheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
+        ignored = [
+            name
+            for name in (
+                "ATOM_SCHED_DECODE_PREFILL_CAP",
+                "ATOM_SCHED_IDLE_PREFILL_CAP",
+                "ATOM_SCHED_FINISH_HOLD_LEFT",
+                "ATOM_SCHED_ITL_RISK_MS",
+            )
+            if getattr(envs, name)
+        ]
+        if 0.0 < envs.ATOM_SCHED_PREFILL_DUTY < 1.0:
+            ignored.append("ATOM_SCHED_PREFILL_DUTY")
+        if ignored:
+            logger.warning(
+                "%s ignored by the disaggregated prefill scheduler: the "
+                "prefill-policy flags apply only to the aggregated and decode "
+                "schedulers",
+                ", ".join(ignored),
+            )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)

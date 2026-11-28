@@ -194,6 +194,20 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _nonneg_int_env(name: str) -> int:
+    """Unset or empty reads as 0 (off); a set value must be an integer >= 0."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative, got {value}")
+    return value
+
+
 def _dp_sync_interval_env() -> int | None:
     """None for a non-integer, so every DP rank can reject it together; 0 and
     negative values mean 1."""
@@ -261,6 +275,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
+    ),
+    # a finished request's generated blocks are evicted before
+    # any other cached block. Off by default.
+    "ATOM_PREFIX_DEMOTE_DECODE": lambda: os.getenv("ATOM_PREFIX_DEMOTE_DECODE", "0")
+    == "1",
+    # prefill token budget of a step taken while no decode
+    # runs (ATOM_SCHED_DECODE_PREFILL_CAP's idle twin). 0 = max_num_batched_tokens.
+    "ATOM_SCHED_IDLE_PREFILL_CAP": lambda: _nonneg_int_env(
+        "ATOM_SCHED_IDLE_PREFILL_CAP"
     ),
     # DeepSeek-V4 bounded replay: when the compressed history hits further than
     # the nearest state checkpoint by more than the window's receptive field,
@@ -1459,6 +1482,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
+    ),
+    # Prefill token budget of a step taken while decodes are running (each
+    # running decode stalls for the whole step). 0: max_num_batched_tokens.
+    "ATOM_SCHED_DECODE_PREFILL_CAP": lambda: _nonneg_int_env(
+        "ATOM_SCHED_DECODE_PREFILL_CAP"
+    ),
+    # Max share of recent step time spent in prefill while decodes run
+    # (atom/model_engine/prefill_duty.py). 1.0 (default) or 0: off.
+    "ATOM_SCHED_PREFILL_DUTY": lambda: _finite_float_env(
+        "ATOM_SCHED_PREFILL_DUTY", 1.0, allow_zero=True
+    ),
+    "ATOM_SCHED_PREFILL_DUTY_TAU_S": lambda: _finite_float_env(
+        "ATOM_SCHED_PREFILL_DUTY_TAU_S", 1.0, allow_zero=False
+    ),
+    # A hold never lasts longer than this, so prefill cannot starve.
+    "ATOM_SCHED_PREFILL_MAX_HOLD_S": lambda: _finite_float_env(
+        "ATOM_SCHED_PREFILL_MAX_HOLD_S", 2.0, allow_zero=True
+    ),
+    # No hold while the oldest pending prefill has waited this long (0: off).
+    "ATOM_SCHED_PREFILL_MAX_WAIT_S": lambda: _finite_float_env(
+        "ATOM_SCHED_PREFILL_MAX_WAIT_S", 0.0, allow_zero=True
+    ),
+    # finish-aware prefill hold (prefill_finish_hold.py).
+    # Hold prefill while a running decode with max_tokens <= _MAX_TOKENS has
+    # at most _LEFT tokens to go, for at most _MAX_MS per hold. 0: off.
+    "ATOM_SCHED_FINISH_HOLD_LEFT": lambda: int(
+        os.getenv("ATOM_SCHED_FINISH_HOLD_LEFT", "0")
+    ),
+    "ATOM_SCHED_FINISH_HOLD_MAX_MS": lambda: _finite_float_env(
+        "ATOM_SCHED_FINISH_HOLD_MAX_MS", 500.0, allow_zero=True
+    ),
+    "ATOM_SCHED_FINISH_HOLD_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_SCHED_FINISH_HOLD_MAX_TOKENS", "400")
+    ),
+    # ITL-risk prefill hold (prefill_itl_risk.py). Hold
+    # prefill while its stall would push a running request's ITL from at or
+    # below _MS (ms per token) to above it, for at most _MAX_MS per hold. The
+    # stall is estimated as _PF_FIXED_MS + _PF_MS_PER_KTOK per 1K pending
+    # prefill tokens. 0: off.
+    "ATOM_SCHED_ITL_RISK_MS": lambda: _finite_float_env(
+        "ATOM_SCHED_ITL_RISK_MS", 0.0, allow_zero=True
+    ),
+    "ATOM_SCHED_ITL_RISK_MAX_MS": lambda: _finite_float_env(
+        "ATOM_SCHED_ITL_RISK_MAX_MS", 300.0, allow_zero=True
+    ),
+    "ATOM_SCHED_ITL_RISK_PF_FIXED_MS": lambda: _finite_float_env(
+        "ATOM_SCHED_ITL_RISK_PF_FIXED_MS", 31.6, allow_zero=True
+    ),
+    "ATOM_SCHED_ITL_RISK_PF_MS_PER_KTOK": lambda: _finite_float_env(
+        "ATOM_SCHED_ITL_RISK_PF_MS_PER_KTOK", 18.65, allow_zero=True
     ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
