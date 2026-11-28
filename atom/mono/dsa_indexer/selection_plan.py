@@ -58,6 +58,10 @@ SHORT_VERIFY_CTX = 8192
 SPLIT_MIN = 262144
 COUNT_BITS = 22
 ARRIVED = 1 << COUNT_BITS
+# a packed histogram pair (``IxBuild.packed_hist``): PACK bins' counts of
+# PACK_BITS each, then the launch's tag in the high PACK_TAG_BITS
+PACK = 3
+PACK_BITS = 18
 
 
 def request_owner(row, qlen, world):

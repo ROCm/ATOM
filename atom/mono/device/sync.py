@@ -283,6 +283,47 @@ class Mailbox:
             e += 2 * n
         return outs
 
+    def put_raw(self, a, i, lo, hi):
+        """Pair i as two raw words in one 8 B store, ``hi`` carrying its own tag
+        bits (a packed pair: ``poll_raw``)."""
+        bo.buffer_store(
+            fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32),
+            rsrc(_noted(a, "put")),
+            i * 2,
+            cache_modifier=_SCOPE_CM[a.space],
+        )
+
+    def poll_raw(self, specs, live):
+        """Packed pairs ``specs`` = [(Addr, pair index)] (at most POLL_MAX),
+        re-loaded together until ``live(hi)`` holds for every one: [(lo, hi)]."""
+        assert len(specs) <= POLL_MAX
+        cms = [_SCOPE_CM[a.space] for a, _ in specs]
+        bases = [_noted(a, "poll") for a, _ in specs]
+
+        def load_all():
+            words = []
+            for b, cm, (_, i) in zip(bases, cms, specs):
+                w = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(b),
+                        fx.Int32(i) * 2,
+                        vec_width=2,
+                        dtype=T.i32,
+                        cache_modifier=cm,
+                    )
+                )
+                words += [w[0], w[1]]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        def pending(v):
+            bad = ~live(v[1])
+            for e in range_constexpr(3, 2 * len(specs), 2):
+                bad = bad | ~live(v[e])
+            return bad
+
+        v = self.spin(specs[0][0], specs[0][1], load_all, pending)
+        return [(v[2 * k], v[2 * k + 1]) for k in range(len(specs))]
+
 
 @traced
 def publish(put, a, i, v, who):

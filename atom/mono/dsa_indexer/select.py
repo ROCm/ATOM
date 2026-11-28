@@ -38,7 +38,9 @@ from atom.mono.device.ops import (
     ballot,
     block_excl_scan,
     butterfly,
+    head_part,
     head_sum,
+    head_sums4,
     ld_dev,
     mfma_fp8,
     readlane,
@@ -65,6 +67,8 @@ from atom.mono.dsa_indexer.selection_plan import (
     COUNT_BITS,
     DEFAULT_RADIX,
     LOCAL_RADIX,
+    PACK,
+    PACK_BITS,
     SHORT_VERIFY_CTX,
     prefix_row,
     request_owner,
@@ -107,9 +111,14 @@ TASK_UNITS = 1 << TASK_UNITS_LG  # a score task's units at most
 STREAM_UNITS = 4
 
 
-def peer_pairs(tokens: int, world: int, replicated: bool, radix=DEFAULT_RADIX) -> dict:
+def peer_pairs(
+    tokens: int, world: int, replicated: bool, radix=DEFAULT_RADIX, packed=False
+) -> dict:
     return {
-        "hist": tokens * radix.passes * world * radix.bins,
+        "hist": tokens
+        * radix.passes
+        * world
+        * (packed_bins(radix) if packed else radix.bins),
         # replicated: (row, rank)'s winners in this rank's slab, their count
         "rcnt": tokens * world if replicated else 0,
         # A producer cannot reuse its slab/count until every reader is done.
@@ -126,6 +135,50 @@ def peer_pairs(tokens: int, world: int, replicated: bool, radix=DEFAULT_RADIX) -
 
 def hist_at(r, p, src, b, world, radix=DEFAULT_RADIX):
     return ((r * radix.passes + p) * world + src) * radix.bins + b
+
+
+PACK_TAG_BITS = 64 - PACK * PACK_BITS
+PACK_TAG_SHIFT = PACK * PACK_BITS - 32
+
+
+def packed_bins(radix=DEFAULT_RADIX):
+    return -(-radix.bins // PACK)
+
+
+def phist_at(r, p, src, q, world, radix=DEFAULT_RADIX):
+    """Row r's pass ``p`` histogram from rank ``src``, packed pair ``q``."""
+    return ((r * radix.passes + p) * world + src) * packed_bins(radix) + q
+
+
+def pack_tag(tag):
+    return tag & ((1 << PACK_TAG_BITS) - 1)
+
+
+def pack3(cs, tag):
+    """Three counts (< 2^PACK_BITS) and a tag -> the pair's (lo, hi) words."""
+    lo = cs[0] | (cs[1] << PACK_BITS)
+    hi = (
+        ((cs[1] >> (32 - PACK_BITS)) & ((1 << (2 * PACK_BITS - 32)) - 1))
+        | (cs[2] << (2 * PACK_BITS - 32))
+        | (pack_tag(tag) << PACK_TAG_SHIFT)
+    )
+    return lo, hi
+
+
+def packed_tag(hi):
+    return (hi >> PACK_TAG_SHIFT) & ((1 << PACK_TAG_BITS) - 1)
+
+
+def unpack3(lo, hi, f):
+    """Count ``f`` (0, 1, 2; traced) of a packed pair."""
+    mask = (1 << PACK_BITS) - 1
+    low = 32 - PACK_BITS
+    c0 = lo & mask
+    c1 = ((lo >> PACK_BITS) & ((1 << low) - 1)) | (
+        (hi & ((1 << (PACK_BITS - low)) - 1)) << low
+    )
+    c2 = (hi >> (PACK_BITS - low)) & mask
+    return (f == 0).select(c0, (f == 1).select(c1, c2))
 
 
 def radix_key(v):
@@ -892,6 +945,28 @@ def stage_score(c, p, u0, nu, width):
     if const_expr(rg > 1):
         _rows_store(c, staged)
         gpu.barrier()
+    xpose = c.get("xpose_sum", False)
+    pend = []
+
+    def flush():
+        # four (row, unit)s' sums at once, lane group g storing the g-th's
+        score = head_sums4(
+            [v for _, _, v in pend] + [fx.Float32(0.0)] * (4 - len(pend))
+        )
+        g = lane // 16
+        at, ok = None, None
+        for k, (r, i, _) in enumerate(pend):
+            col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+            st = (g == k) & (i < nu) & (col < ns[r])
+            if const_expr(not static):
+                st = st & (r < span)
+            at = logs[r] + col if k == 0 else (g == k).select(logs[r] + col, at)
+            ok = st if k == 0 else ok | st
+        bo.buffer_store(
+            score, rsrc(c["ilog"], c["ilog_bytes"]), at, mask=ok, cache_modifier=CM_DEV
+        )
+        pend.clear()
+
     for r in range_constexpr(rg):
         qs, ws = nxt
         if const_expr(r + 1 < rg):
@@ -899,19 +974,37 @@ def stage_score(c, p, u0, nu, width):
         for i in range_constexpr(width):
             b64, ks = keys[i]
             terms = _dot_terms(sh, qs, ws, b64, ks, wide=c.get("wide_fp8", False))
-            col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
-            score = fx.Float32(head_sum(terms))
-            # the row's keys alone: the next row's ILOG starts past its last
-            stored = (lane < 16) & (i < nu) & (col < ns[r])
-            if const_expr(not static):
-                stored = stored & (r < span)
-            if stored:
-                bo.buffer_store(
-                    score,
-                    rsrc(c["ilog"]),
-                    logs[r] + col,
-                    cache_modifier=CM_DEV,
-                )
+            if const_expr(xpose):
+                pend.append((r, i, head_part(terms)))
+                if const_expr(len(pend) == 4):
+                    flush()
+            else:
+                col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+                score = fx.Float32(head_sum(terms))
+                # the row's keys alone: the next row's ILOG starts past its last
+                stored = (lane < 16) & (i < nu) & (col < ns[r])
+                if const_expr(not static):
+                    stored = stored & (r < span)
+                if const_expr(c.get("flat_store", False)):
+                    # no branch a store: the units' MFMAs one block to schedule
+                    # (a masked lane's store falls past the ILOG's records)
+                    bo.buffer_store(
+                        score,
+                        rsrc(c["ilog"], c["ilog_bytes"]),
+                        logs[r] + col,
+                        mask=stored,
+                        cache_modifier=CM_DEV,
+                    )
+                else:
+                    if stored:
+                        bo.buffer_store(
+                            score,
+                            rsrc(c["ilog"]),
+                            logs[r] + col,
+                            cache_modifier=CM_DEV,
+                        )
+    if const_expr(len(pend) > 0):
+        flush()
     c["stamp"](c["tl_score"] + 2)
     # thread k: the piece's row k // TASK_UNITS, unit k % TASK_UNITS
     # Balanced short tasks can span 9..11 units instead of a power of two.
@@ -1237,12 +1330,26 @@ def _lead_push(c, r, p):
     histogram of pass ``p`` here (LDS ``hist``) pushed to every rank."""
     tid, world, rank = c["tid"], c["world"], c["rank"]
     radix = c["radix"]
-    for k in range_constexpr(radix.bins_per_thread):
-        b = _bin(tid, k, radix.bins)
-        if tid + k * THREADS < radix.bins:
-            v = fx.ptr_load(c["hist"] + b)
+    if const_expr(c["packed_hist"]):
+        # PACK bins a pair: a thread's PACK bins, those past the last 0
+        if tid < packed_bins(radix):
+            cs = []
+            for e in range_constexpr(PACK):
+                b = PACK * tid + e
+                v = fx.ptr_load(c["hist"] + fx.min(b, radix.bins - 1))
+                cs.append((b < radix.bins).select(v, fx.Int32(0)))
+            lo, hi = pack3(cs, c["tag"])
             for dst in range_constexpr(world):
-                c["put"](c["phist"][dst], hist_at(r, p, rank, b, world, radix), v)
+                c["put_raw"](
+                    c["phist"][dst], phist_at(r, p, rank, tid, world, radix), lo, hi
+                )
+    else:
+        for k in range_constexpr(radix.bins_per_thread):
+            b = _bin(tid, k, radix.bins)
+            if tid + k * THREADS < radix.bins:
+                v = fx.ptr_load(c["hist"] + b)
+                for dst in range_constexpr(world):
+                    c["put"](c["phist"][dst], hist_at(r, p, rank, b, world, radix), v)
 
 
 @traced
@@ -1264,17 +1371,20 @@ def _decide(c, r, p, nseg, split):
         radix.bins - 1 - (radix.bins_per_lane * at + k)
         for k in range(radix.bins_per_lane)
     ]
+    early = c.get("early_cnt", False)
     if split:
-        if const_expr(c["split_q"]):
-            _choose(c, p, bins, *_active_rank_counts(c, r, p, bins))
+        if const_expr(c["split_q"] or c["active_poll"]):
+            _choose(c, p, bins, *_active_rank_counts(c, r, p, bins), rank_count=early)
         else:
-            _choose(c, p, bins, *_rank_counts(c, r, p, bins))
+            _choose(c, p, bins, *_rank_counts(c, r, p, bins), rank_count=early)
     else:
         # no other rank holds a key of the row
         if nseg > 1:
             _row_counts(c, r, p, nseg)
         vs = [fx.ptr_load(c["hist"] + b) for b in bins]
-        _choose(c, p, bins, vs, [fx.Int32(0)] * radix.bins_per_lane, vs)
+        _choose(
+            c, p, bins, vs, [fx.Int32(0)] * radix.bins_per_lane, vs, rank_count=early
+        )
 
 
 @traced
@@ -1297,13 +1407,28 @@ def _rank_counts(c, r, p, bins):
     where every rank's leader pushed them): (their sums in rank order, the
     lower ranks', this rank's)."""
     world, rank = c["world"], c["rank"]
-    got = c["poll"](
-        [
-            (c["phist_own"], hist_at(r, p, src, b, world, c["radix"]), 1)
-            for b in bins
-            for src in range(world)
+    if const_expr(c["packed_hist"]):
+        tag = pack_tag(c["tag"])
+        pairs = c["poll_raw"](
+            [
+                (c["phist_own"], phist_at(r, p, src, b // PACK, world, c["radix"]))
+                for b in bins
+                for src in range(world)
+            ],
+            lambda hi: packed_tag(hi) == tag,
+        )
+        got = [
+            [unpack3(lo, hi, bins[k // world] % PACK)]
+            for k, (lo, hi) in enumerate(pairs)
         ]
-    )
+    else:
+        got = c["poll"](
+            [
+                (c["phist_own"], hist_at(r, p, src, b, world, c["radix"]), 1)
+                for b in bins
+                for src in range(world)
+            ]
+        )
     vs, lowers, heres = [], [], []
     for k in range(len(bins)):
         per_src = [fx.Int32(got[k * world + i][0]) for i in range(world)]
@@ -1319,10 +1444,13 @@ def _rank_counts(c, r, p, bins):
 
 
 @traced
-def _choose(c, p, bins, vs, lowers, heres):
+def _choose(c, p, bins, vs, lowers, heres, rank_count=False):
     """The row's counts of ``bins`` (``vs``; the lower ranks' and this rank's
     for the last pass's ties) -> the digit, the keys still needed and, on the
-    last pass, this rank's ties taken (LDS ``sel``)."""
+    last pass, this rank's ties taken (LDS ``sel``). ``rank_count``: also
+    this rank's keys above the digit added into LDS ``sel_rank`` (zeroed
+    before the first pass), its ties taken too on the last: the row's slots
+    here, as its segments' winners sum."""
     lane, wave = c["lane"], c["wave"]
     sel, scan = c["sel"], c["scan"]
     need = fx.ptr_load(sel + SEL_NEED)
@@ -1335,22 +1463,46 @@ def _choose(c, p, bins, vs, lowers, heres):
     deciding = wave < radix.waves
     if deciding & (lane == 63):
         fx.ptr_store(incl, scan + wave)
+    if const_expr(rank_count):
+        h_mine = heres[0]
+        for k in range_constexpr(1, radix.bins_per_lane):
+            h_mine = h_mine + heres[k]
+        h_incl = wave_incl_scan(h_mine, lane)
+        if deciding & (lane == 63):
+            fx.ptr_store(h_incl, scan + WAVES + wave)
     gpu.barrier()
     above = incl - mine
     for w in range_constexpr(radix.waves - 1):
         above = above + (w < wave).select(fx.ptr_load(scan + w), fx.Int32(0))
+    h_above = None
+    if const_expr(rank_count):
+        h_above = h_incl - h_mine
+        for w in range_constexpr(radix.waves - 1):
+            h_above = h_above + (w < wave).select(
+                fx.ptr_load(scan + WAVES + w), fx.Int32(0)
+            )
+    keep_bucket = radix.local or c.get("bucket_exit", False)
     for k in range_constexpr(radix.bins_per_lane):
         if deciding & (above < need) & (need <= above + vs[k]):
             fx.ptr_store(bins[k], sel + SEL_DIGIT)
             fx.ptr_store(need - above, sel + SEL_NEED)
-            if const_expr(radix.local):
+            if const_expr(keep_bucket):
                 fx.ptr_store(vs[k], sel + SEL_BUCKET)
             # the last pass: the threshold bin's count on the lower ranks
             # and here
             if const_expr(p == radix.passes - 1):
                 take = fx.min(need - above - lowers[k], heres[k])
                 fx.ptr_store(fx.max(take, 0), sel + SEL_TAKE)
+            if const_expr(rank_count):
+                got = fx.ptr_load(sel + c["sel_rank"]) + h_above
+                if const_expr(p == radix.passes - 1):
+                    got = got + fx.max(fx.min(need - above - lowers[k], heres[k]), 0)
+                fx.ptr_store(got, sel + c["sel_rank"])
+                # the bin's keys here, for a row that stops on it (``bucket_exit``)
+                fx.ptr_store(heres[k], sel + c["sel_rank"] + 1)
         above = above + vs[k]
+        if const_expr(rank_count):
+            h_above = h_above + heres[k]
     gpu.barrier()
 
 
@@ -1469,6 +1621,36 @@ def stage_short_selection(c, r, sid, n):
 
 
 @traced
+def _radix_pass(c, r, g, p, prefix, live, keys, nck, lo, here, nseg, lead, split):
+    """``stage_segment``'s pass p: its chunks' counts, the row's (every
+    rank's) histogram, the digit -> the prefix through it."""
+    radix = c["radix"]
+    _zero_hist(c)
+    _count(c, live, keys, p, prefix)
+    for kc in range(1, nck):
+        c_live, c_keys = _chunk_keys(c, r, lo + kc * CHUNK, here - kc * CHUNK)
+        _count(c, c_live, c_keys, p, prefix)
+    gpu.barrier()
+    c["stamp"](c["tl_pass"] + 3 * p)
+    # the row's segments' counts into one histogram; under the key split
+    # its leader pushes the row's (this rank's) to every rank
+    if nseg > 1:
+        _row_add(c, r, p, g)
+    if lead:
+        if nseg > 1:
+            _row_counts(c, r, p, nseg)
+        _lead_push(c, r, p)
+    c["stamp"](c["tl_pass"] + 3 * p + 1)
+    if const_expr(p == radix.passes - 1 and c["delay_rank"] >= 0):  # noqa: SIM102
+        # harness only (``IxBuild.delay_rank``): the last pass's pushes
+        # have landed on every rank; this one reads its own late
+        if c["rank"] == c["delay_rank"]:
+            sleep_ticks(c["delay_ticks"])
+    _decide(c, r, p, nseg, split)
+    return (prefix << radix.bits[p]) | fx.ptr_load(c["sel"] + SEL_DIGIT)
+
+
+@traced
 def stage_segment(c, r, g, sid, lg):
     """Segment g of long row r (the step's segment ``sid``): 2^lg chunks of
     local keys from g 2^lg CHUNK (thread i: PT of a chunk's). The exact global
@@ -1496,8 +1678,12 @@ def stage_segment(c, r, g, sid, lg):
         u = tid + ku * THREADS
         if u < units:
             c["poll"]([(c["sflag"], sflag_at(c, r) + lo // SCORE_KEYS + u, 1)])
+    early = c.get("early_cnt", False)
+    joint = c.get("joint_poll", False) and not c["replicated"]
     if tid == 0:
         fx.ptr_store(fx.Int32(c["shape"].topk), sel + SEL_NEED)
+        if const_expr(early):
+            fx.ptr_store(fx.Int32(0), sel + c["sel_rank"])
     gpu.barrier()
     c["stamp"](4)
     live, keys = _chunk_keys(c, r, lo, here)
@@ -1505,31 +1691,70 @@ def stage_segment(c, r, g, sid, lg):
     slots = thread_slots(c, req, lo, n, split)
     prefix = fx.Int32(0)
     radix = c["radix"]
-    for p in range_constexpr(radix.passes):
-        _zero_hist(c)
-        _count(c, live, keys, p, prefix)
-        for kc in range(1, nck):
-            c_live, c_keys = _chunk_keys(c, r, lo + kc * CHUNK, here - kc * CHUNK)
-            _count(c, c_live, c_keys, p, prefix)
-        gpu.barrier()
-        c["stamp"](c["tl_pass"] + 3 * p)
-        # the row's segments' counts into one histogram; under the key split
-        # its leader pushes the row's (this rank's) to every rank
-        if nseg > 1:
-            _row_add(c, r, p, g)
-        if lead:
+    exits = c.get("bucket_exit", False)
+    done = fx.Boolean(False)
+    if const_expr(exits):
+        for p in range_constexpr(radix.passes):
+            if const_expr(p == 0):
+                prefix = _radix_pass(
+                    c, r, g, p, prefix, live, keys, nck, lo, here, nseg, lead, split
+                )
+            else:
+                if ~done:
+                    prefix = _radix_pass(
+                        c, r, g, p, prefix, live, keys, nck, lo, here, nseg, lead, split
+                    )
+                else:
+                    prefix = prefix << radix.bits[p]
+            if const_expr(p < radix.passes - 1):
+                # the whole threshold bin needed (every rank decides alike):
+                # the lower digits cannot change which keys go, nor their order
+                done = done | (
+                    (fx.ptr_load(sel + SEL_BUCKET) == fx.ptr_load(sel + SEL_NEED))
+                    & (prefix != 0)
+                )
+    else:
+        for p in range_constexpr(radix.passes):
+            _zero_hist(c)
+            _count(c, live, keys, p, prefix)
+            for kc in range(1, nck):
+                c_live, c_keys = _chunk_keys(c, r, lo + kc * CHUNK, here - kc * CHUNK)
+                _count(c, c_live, c_keys, p, prefix)
+            gpu.barrier()
+            c["stamp"](c["tl_pass"] + 3 * p)
+            # the row's segments' counts into one histogram; under the key split
+            # its leader pushes the row's (this rank's) to every rank
             if nseg > 1:
-                _row_counts(c, r, p, nseg)
-            _lead_push(c, r, p)
-        c["stamp"](c["tl_pass"] + 3 * p + 1)
-        if const_expr(p == radix.passes - 1 and c["delay_rank"] >= 0):  # noqa: SIM102
-            # harness only (``IxBuild.delay_rank``): the last pass's pushes
-            # have landed on every rank; this one reads its own late
-            if c["rank"] == c["delay_rank"]:
-                sleep_ticks(c["delay_ticks"])
-        _decide(c, r, p, nseg, split)
-        prefix = (prefix << radix.bits[p]) | fx.ptr_load(sel + SEL_DIGIT)
+                _row_add(c, r, p, g)
+            if lead:
+                if nseg > 1:
+                    _row_counts(c, r, p, nseg)
+                _lead_push(c, r, p)
+            c["stamp"](c["tl_pass"] + 3 * p + 1)
+            if const_expr(  # noqa: SIM102
+                p == radix.passes - 1 and c["delay_rank"] >= 0
+            ):
+                # harness only (``IxBuild.delay_rank``): the last pass's pushes
+                # have landed on every rank; this one reads its own late
+                if c["rank"] == c["delay_rank"]:
+                    sleep_ticks(c["delay_ticks"])
+            _decide(c, r, p, nseg, split)
+            prefix = (prefix << radix.bits[p]) | fx.ptr_load(sel + SEL_DIGIT)
     take = fx.ptr_load(sel + SEL_TAKE)
+    if const_expr(exits):
+        # every key from the bin's lower bound goes, as one above the threshold
+        take = done.select(fx.Int32(0), take)
+        prefix = done.select(prefix - 1, prefix)
+    if const_expr(early and not c["replicated"]):  # noqa: SIM102
+        # the row's slots here known from its passes (``_choose``): its CNT
+        # out before the segments' winners are counted
+        if (tid == 0) & (g == nseg - 1):
+            got = fx.ptr_load(sel + c["sel_rank"])
+            if const_expr(exits):
+                got = got + done.select(
+                    fx.ptr_load(sel + c["sel_rank"] + 1), fx.Int32(0)
+                )
+            c["put"](c["cnt"], r, got)
     c["stamp"](5)
     # this segment's keys above the threshold and on it, a chunk's counts in
     # one scan: the slots before a thread's are the earlier threads' (and
@@ -1550,6 +1775,9 @@ def stage_segment(c, r, g, sid, lg):
         got = c["poll"]([(c["sge"], 2 * (sid - g + tid), 2)])
         fx.ptr_store(fx.Int32(got[0][0]), before + 2 * tid)
         fx.ptr_store(fx.Int32(got[0][1]), before + 2 * tid + 1)
+    if const_expr(joint):
+        # the earlier rows' counts from the top thread down, under the SGE poll
+        _rows_before_poll(c, r, (THREADS - 1) - tid)
     gpu.barrier()
     gt_before, eq_before = _sum_before(c, g)
     # the row's ties go to its segments in local order
@@ -1560,9 +1788,13 @@ def stage_segment(c, r, g, sid, lg):
         # this rank's winners from 0 of its slab row (``_put_slot``)
         off = fx.Int32(0)
     else:
-        if (tid == 0) & last:
-            c["put"](c["cnt"], r, total)
-        off = rows_before(c, r)
+        if const_expr(not early):  # noqa: SIM102
+            if (tid == 0) & last:
+                c["put"](c["cnt"], r, total)
+        if const_expr(joint):
+            off = _rows_before_sum(c, r)
+        else:
+            off = rows_before(c, r)
     base = off + gt_before + fx.min(take, eq_before)
     gt_excl, run = (excl >> 16) & 0xFFFF, excl & 0xFFFF
     _emit_chunk(
@@ -1651,14 +1883,28 @@ def rows_before(c, r):
     """The slots of the rows before r: a short row's are its keys here (from
     its context, no wait), a long row's its CNT (its last segment's). A short
     row never waits on work a CTA runs after it: its count needs none."""
-    tid, s, sel = c["tid"], c["S"], c["sel"]
-    if tid < r:
-        _, n, long, _ = row_kind(c, tid)
-        fx.ptr_store(n, sel + SEL_ROWS + tid)
-        if long:
-            got = c["poll"]([(c["cnt"], tid, 1)])
-            fx.ptr_store(fx.Int32(got[0][0]), sel + SEL_ROWS + tid)
+    _rows_before_poll(c, r, c["tid"])
     gpu.barrier()
+    return _rows_before_sum(c, r)
+
+
+@traced
+def _rows_before_poll(c, r, q):
+    """``rows_before``'s row q (< r) count -> SEL_ROWS + q (thread q's)."""
+    sel = c["sel"]
+    if q < r:
+        _, n, long, _ = row_kind(c, q)
+        fx.ptr_store(n, sel + SEL_ROWS + q)
+        if long:
+            got = c["poll"]([(c["cnt"], q, 1)])
+            fx.ptr_store(fx.Int32(got[0][0]), sel + SEL_ROWS + q)
+
+
+@traced
+def _rows_before_sum(c, r):
+    """``rows_before``'s sum of the counts ``_rows_before_poll`` stored (past
+    a barrier)."""
+    s, sel = c["S"], c["sel"]
     off = fx.Int32(0)
     if const_expr(s > 64):
         # Each wave reduces all row tiles instead of every lane serially

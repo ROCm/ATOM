@@ -16,7 +16,8 @@ run -- calls the indexer's own forward on every rank alike.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cache
 
 import torch
 from aiter.dist.parallel_state import (
@@ -45,6 +46,19 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+
+
+@cache
+def _log_dc1_dropped(names: tuple[str, ...], why: str) -> None:
+    """Once per set of options and reason: a build one of its DC1 options
+    does not fit runs with none of them (``IndexerBinding.key``)."""
+    logger.info(
+        "mono DSA indexer: kernel options %s off for this build (%s)",
+        ", ".join(names),
+        why,
+    )
+
+
 DUAL_SCORE_ROWS = (160, 192, 224, 256)
 
 
@@ -60,6 +74,7 @@ class IndexerBinding:
     peer_offset: int = 0
     dual_score: bool = False
     short_gemm: bool = False
+    dc1: int = 0  # ``IxBuild.dc1`` where it fits the build
 
     def key(self, rows: int, qlen: int = 1) -> kix.IxBuild:
         dual = (
@@ -70,7 +85,10 @@ class IndexerBinding:
                 or rows in DUAL_SCORE_ROWS
             )
         )
-        return kix.IxBuild(
+        dc1 = self.dc1
+        if rows < kix.PACKED_HIST_MIN_ROWS:
+            dc1 &= ~kix.DC1_PACKED_HIST
+        key = kix.IxBuild(
             self.shape,
             rows,
             self.world,
@@ -79,7 +97,14 @@ class IndexerBinding:
             qlen=qlen,
             score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
+            dc1=dc1,
         )
+        if key.dc1:
+            why = kix.unfit(key)
+            if why:
+                _log_dc1_dropped(kix.dc1_names(key.dc1), why)
+                key = replace(key, dc1=0)
+        return key
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:
         """Whether the kernel has a build for this step and, replicated, the
@@ -273,6 +298,7 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         replicated,
         dual_score=dual,
         short_gemm=short_gemm,
+        dc1=kix.DC1_DEFAULT,
     )
 
 

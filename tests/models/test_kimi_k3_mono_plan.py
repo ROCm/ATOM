@@ -420,17 +420,88 @@ def test_a_lean_width_restages_only_the_spilled_k1_builds(monkeypatch):
         k1.KdaPreBuild(tokens=56, qlen=8, nblocks=n, delta=True, state_len=10)
         for n in (2, 6)
     ]
+    k2key = runner.k2.K2Build(tokens=56, nblocks=2)
     built = runner.WidthBuild(
         k1_keys={1: fat[0], 2: fat[0], 5: fat[1]},
         k1_launchers={fat[0]: "spill", fat[1]: "fits"},
-        k2_keys={1: "k2"},
-        k2_launchers={"k2": "k2f"},
+        k2_keys={1: k2key},
+        k2_launchers={k2key: "k2f"},
     )
     lean = runner._lean_width(built, ["spill"])
     thin = replace(fat[0], gemv_unit=1)
     assert lean.k1_keys == {1: thin, 2: thin, 5: fat[1]}
     assert lean.k1_launchers == {thin: ("lean", 2), fat[1]: "fits"}
-    assert lean.k2_launchers == {"k2": "k2f"}
-    # a K2 spill, or a K1 already at one group a unit: nothing leaner
-    assert runner._lean_width(built, ["k2f"]) is None
+    assert lean.k2_keys == {1: k2key}
+    assert lean.k2_launchers == {k2key: "k2f"}
+    # a K1 already at one group a unit, x one unit ahead: nothing leaner
     assert runner._lean_width(lean, [("lean", 2)]) is None
+
+
+def test_a_lean_width_takes_a_unit_of_x_ahead_from_a_spilled_one_unit_k1(
+    monkeypatch,
+):
+    """A K1 build at one column group a unit that still spilled (K4's 35 and 45
+    rows at ``gemv_staging``'s x four units ahead) is rebuilt with x a unit
+    less ahead, down to one."""
+    pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+    pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    from atom.models.kimi_k3.mono import runner
+    from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+
+    monkeypatch.setattr(k1, "build", lambda key: ("lean", key.x_ahead))
+    key = k1.KdaPreBuild(
+        tokens=35, qlen=5, nblocks=3, delta=True, state_len=7, **k1.gemv_staging(35)
+    )
+    assert (key.gemv_unit, key.x_ahead) == (1, 4)
+    built = runner.WidthBuild(
+        k1_keys={9: key}, k1_launchers={key: "spill"}, k2_keys={}, k2_launchers={}
+    )
+    lean = runner._lean_width(built, ["spill"])
+    assert lean.k1_keys == {9: replace(key, x_ahead=3)}
+    assert lean.k1_launchers == {replace(key, x_ahead=3): ("lean", 3)}
+    one = replace(key, x_ahead=1)
+    built = runner.WidthBuild(
+        k1_keys={9: one}, k1_launchers={one: "spill"}, k2_keys={}, k2_launchers={}
+    )
+    assert runner._lean_width(built, ["spill"]) is None
+
+
+def test_a_lean_width_unpairs_only_the_spilled_k2_builds_early_weights(monkeypatch):
+    """``_lean_width``: the K2 builds whose launchers spilled (K4's 25 and 55
+    rows) are rebuilt with the sgu early weights unpaired, every layer keyed on
+    them moved to the lean key, the other K2 builds and K1 untouched; a K2
+    unpaired already has nothing leaner."""
+    pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+    pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    from atom.models.kimi_k3.mono import runner
+
+    k2 = runner.k2
+    monkeypatch.setattr(k2, "build", lambda key: ("lean", key.nblocks))
+    fat = [k2.K2Build(tokens=25, nblocks=n) for n in (1, 2)]
+    assert all(key.early_paired for key in fat)
+    built = runner.WidthBuild(
+        k1_keys={1: "k1"},
+        k1_launchers={"k1": "k1f"},
+        k2_keys={1: fat[0], 4: fat[0], 8: fat[1]},
+        k2_launchers={fat[0]: "spill", fat[1]: "fits"},
+    )
+    lean = runner._lean_width(built, ["spill"])
+    thin = replace(fat[0], early_paired=False)
+    assert lean.k2_keys == {1: thin, 4: thin, 8: fat[1]}
+    assert lean.k2_launchers == {thin: ("lean", 1), fat[1]: "fits"}
+    assert lean.k1_keys == {1: "k1"} and lean.k1_launchers == {"k1": "k1f"}
+    assert runner._lean_width(lean, [("lean", 1)]) is None
+    # an indexer spill: nothing leaner either
+    assert runner._lean_width(built, ["ix"]) is None
+
+
+def test_only_the_unpaired_k2_build_names_its_early_pairing():
+    """``layer.symbol``: the paired default keeps the K2 symbol without an
+    ``ep`` field; the lean build is told apart by ``ep0``."""
+    pytest.importorskip("flydsl", reason="the K3 K2 kernel module needs FlyDSL")
+    from atom.models.kimi_k3.mono.kernels import layer as k2
+
+    key = k2.K2Build(tokens=25, nblocks=3)
+    assert k2.symbol(key) == "_ZN4atom27k3_mono_k2_s25_nb3_r1_g0_t0E"
+    lean = replace(key, early_paired=False)
+    assert k2.symbol(lean) == "_ZN4atom31k3_mono_k2_s25_nb3_r1_ep0_g0_t0E"

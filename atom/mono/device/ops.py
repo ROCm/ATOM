@@ -509,15 +509,33 @@ def head_sum(terms):
     (relu term, weight) of head 16 h + 4 (lane // 16) + e; k = 4 h + e, pairs
     (0,2)(1,3)(4,6)(5,7) as fma(w_a r_a, w_b r_b), (s0 + s2) + (s1 + s3), then
     the lane groups xor 32, then xor 16."""
+    v = head_part(terms)
+    for off in (32, 16):
+        v = xred(v, off, lambda x, y: x + y)
+    return v
+
+
+def head_part(terms):
+    """``head_sum``'s lane's share, before the lane groups' reduction."""
     rw = [terms[k // 4, k % 4] for k in range(8)]
     firsts = [
         fx.Float32(fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1]))
         for a, b in ((0, 2), (1, 3), (4, 6), (5, 7))
     ]
-    v = (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
-    for off in (32, 16):
-        v = xred(v, off, lambda x, y: x + y)
-    return v
+    return (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
+
+
+def head_sums4(parts):
+    """``head_sum`` of four ``head_part`` values at once: lane group g (lane //
+    16) ends with part g's sum -- each the same additions, operands in the same
+    order, as its own ``head_sum`` -- off three swaps, not eight."""
+    x = [p.bitcast(fx.Int32) for p in parts]
+    a, c = permlane_swap(32, x[0], x[2])
+    b, d = permlane_swap(32, x[1], x[3])
+    s = a.bitcast(fx.Float32) + c.bitcast(fx.Float32)
+    t = b.bitcast(fx.Float32) + d.bitcast(fx.Float32)
+    u, w = permlane_swap(16, s.bitcast(fx.Int32), t.bitcast(fx.Int32))
+    return u.bitcast(fx.Float32) + w.bitcast(fx.Float32)
 
 
 def mfma_fp8(a, b, c):

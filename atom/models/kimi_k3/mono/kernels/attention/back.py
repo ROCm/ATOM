@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.kernels import token_groups
@@ -252,12 +252,34 @@ def stage_reduce(c, task):
     and sends the sum to every rank's DG; every other rank reads it there.
 
     There are ``s * COLS / 2`` work items and ``THREADS`` threads, so the pass
-    is strided past 8 rows.
+    is strided past 8 rows. A ``batch_polls`` build polls every pass at once
+    there (``reduce_owner``; another rank: its DG pairs in one batch).
     """
     s, tid = c["S"], c["tid"]
     n = s * (COLS // 2)
     owner = task // OWN_TASKS == c["rank"]
-    for i in range_constexpr((n + THREADS - 1) // THREADS):
+    npass = (n + THREADS - 1) // THREADS
+    if const_expr(c.get("batch_polls", False) and npass > 1):
+        if owner:
+            reduce_owner(c, task)
+        else:
+            es = [tid + THREADS * i for i in range(npass)]
+            ats = []
+            for i in range_constexpr(npass):
+                e = fx.min(es[i], n - 1)
+                ats.append((e // (COLS // 2), task * COLS + 2 * (e % (COLS // 2))))
+            got = c["poll"](
+                [(c["dg_own"], (t * HIDDEN + col) // 2, 1) for t, col in ats], npass
+            )
+            for i in range_constexpr(npass):
+                if es[i] < n:
+                    lo, hi = bf2_f32(got[i][0])
+                    t, cp = ats[i][0], es[i] % (COLS // 2)
+                    fx.ptr_store(lo, c["delta_lds"] + (t * COLS + 2 * cp))
+                    fx.ptr_store(hi, c["delta_lds"] + (t * COLS + 2 * cp + 1))
+        gpu.barrier()
+        return
+    for i in range_constexpr(npass):
         e = tid + THREADS * i
         if e < n:
             t = e // (COLS // 2)
@@ -285,6 +307,41 @@ def stage_reduce(c, task):
             fx.ptr_store(lo, c["delta_lds"] + (t * COLS + 2 * cp))
             fx.ptr_store(hi, c["delta_lds"] + (t * COLS + 2 * cp + 1))
     gpu.barrier()
+
+
+@traced
+def reduce_owner(c, task):
+    """``stage_reduce``'s owner in a ``batch_polls`` build past one pass:
+    every pass's 8 partials in one poll, each summed in rank order
+    (``sum_partials``' order) -> bf16 -> every rank's DG and this CTA's delta.
+    A pass past ``n`` repeats the last item and stores nothing."""
+    s, tid = c["S"], c["tid"]
+    n = s * (COLS // 2)
+    npass = (n + THREADS - 1) // THREADS
+    es = [tid + THREADS * i for i in range(npass)]
+    items, specs = [], []
+    for i in range_constexpr(npass):
+        e = fx.min(es[i], n - 1)
+        t, cp = e // (COLS // 2), e % (COLS // 2)
+        col = task * COLS + 2 * cp
+        items.append((t, cp, col))
+        for src in range_constexpr(TP):
+            at = ((src * s + t) * OWN_COLS + col - c["rank"] * OWN_COLS) // 2
+            specs.append((c["ar_own"], at, 1))
+    ws = c["poll"](specs, len(specs))
+    for i in range_constexpr(npass):
+        t, cp, col = items[i]
+        lo, hi = bf2_f32(ws[i * TP][0])
+        for src in range_constexpr(1, TP):
+            plo, phi = bf2_f32(ws[i * TP + src][0])
+            lo = lo + plo
+            hi = hi + phi
+        lo, hi = bf16_round(lo), bf16_round(hi)
+        if es[i] < n:
+            for p in range_constexpr(TP):
+                c["put_bf"](c["dg_peer"][p], t * HIDDEN + col, [lo, hi])
+            fx.ptr_store(lo, c["delta_lds"] + (t * COLS + 2 * cp))
+            fx.ptr_store(hi, c["delta_lds"] + (t * COLS + 2 * cp + 1))
 
 
 _BUILDS: dict = {}
