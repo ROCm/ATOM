@@ -1298,6 +1298,15 @@ class MooncakeConnector(KVConnectorBase):
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
             )
+            # Consumer segments opened ahead of their transfers, by (rail,
+            # target), and the one thread that opens them (`_open_consumer`).
+            self._opened_targets: set[tuple[str | None, str]] = set()
+            self._target_opener = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="mooncake-open-target",
+                initializer=torch.cuda.set_device,
+                initargs=(self._cuda_device,),
+            )
         else:
             # Consumer: write requests queue here and one daemon worker posts
             # them, in issue order, once the device has drained
@@ -2210,14 +2219,23 @@ class MooncakeConnector(KVConnectorBase):
         this consumer before anything is written, rather than every transfer
         after its pages already moved. The producer re-checks per transfer
         for layouts this cannot map (pipeline-parallel producer stages).
+
+        The request names this consumer, so the producer opens its segment
+        (`_open_consumer`) before the first write request arrives; a producer
+        that predates this ignores the extra frame.
         """
         if not self._has_slot_regions:
             return
+        consumer = {
+            "consumer_host": self.local_ip,
+            "consumer_rpc_port": self.rpc_port,
+            "consumer_ib_device": self.ib_device,
+        }
         sock = self.zmq_context.socket(zmq.DEALER)
         try:
             sock.setsockopt(zmq.LINGER, 0)
             sock.connect(addr)
-            sock.send_multipart([MSG_GET_META])
+            sock.send_multipart([MSG_GET_META, msgpack.dumps(consumer)])
             if not sock.poll(PD_META_TIMEOUT_MS):
                 logger.warning(
                     "[CONSUMER] producer at %s did not send its metadata in "
@@ -2394,9 +2412,20 @@ class MooncakeConnector(KVConnectorBase):
                         encoded = self._encoder.encode(self._local_metadata)
                         sock.send_multipart([identity, b"", encoded])
                         logger.debug("Sent metadata to peer")
+                        if len(parts) > 2:
+                            try:
+                                self._open_consumer(msgpack.loads(parts[2]))
+                            except Exception:
+                                # Only an early open is lost: the first write
+                                # request names the consumer again.
+                                logger.exception(
+                                    "[PRODUCER] bad consumer frame in a metadata "
+                                    "request"
+                                )
 
                     elif msg_type == MSG_WRITE_REQUEST:
                         request_data = msgpack.loads(parts[2])
+                        self._open_consumer(request_data)
                         if not request_data.get("chunked_transfer"):
                             request_data["_deadline"] = (
                                 time.monotonic() + PD_TRANSFER_DEADLINE_S
@@ -2461,6 +2490,47 @@ class MooncakeConnector(KVConnectorBase):
         except BaseException as exc:
             self._publish_listener_state(exc)
             raise
+
+    def _open_consumer(self, consumer: dict) -> None:
+        """Open a consumer's segment the first time it is named, off every
+        request path.
+
+        Mooncake otherwise opens a target inside the first transfer to it, a
+        P2P handshake that fetches its buffer list. Named by the consumer's
+        metadata request on first contact, else by its first write request;
+        opened once per (rail, target) on ``_target_opener``, so neither this
+        listener nor a send worker waits for it.
+        """
+        host = consumer.get("consumer_host")
+        port = consumer.get("consumer_rpc_port")
+        if host is None or port is None:
+            return
+        target = f"{host}:{port}"
+        device = None
+        if self._rail_pool is not None:
+            device = consumer.get("consumer_ib_device")
+        key = (device, target)
+        if key in self._opened_targets:
+            return
+        self._opened_targets.add(key)
+        self._target_opener.submit(self._open_segment, device, target)
+
+    def _open_segment(self, device: str | None, target: str) -> None:
+        """Open ``target`` on the engine its transfers use; a failed open is
+        retried when the consumer is next named, and a transfer before then
+        opens it itself, as it always could."""
+        try:
+            engine = self.transfer_engine
+            if self._rail_pool is not None:
+                engine = self._rail_pool.get(device)
+            if not hasattr(engine, "get_first_buffer_address"):
+                return
+            if engine.get_first_buffer_address(target) != 0:
+                return
+            logger.error("[PRODUCER] Consumer %s has NO registered buffers.", target)
+        except Exception:
+            logger.exception("[PRODUCER] opening consumer %s failed", target)
+        self._opened_targets.discard((device, target))
 
     def _ack_write_request(self, request_data: dict) -> None:
         """Tell the consumer this rank has the request, and for how long it writes.
@@ -2665,14 +2735,6 @@ class MooncakeConnector(KVConnectorBase):
                     request_data.get("consumer_dp_rank"),
                     request_data.get("consumer_ib_device"),
                 )
-
-            if hasattr(engine, "get_first_buffer_address"):
-                remote_buf = engine.get_first_buffer_address(target)
-                if remote_buf == 0:
-                    logger.error(
-                        "[PRODUCER] Consumer %s has NO registered buffers.",
-                        target,
-                    )
 
             if has_slot_data:
                 transfer_ok = self._execute_block_slot_transfer(

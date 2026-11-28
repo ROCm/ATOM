@@ -781,6 +781,7 @@ def _queue_only_consumer():
     conn._verified_producers = set()
     conn._has_slot_regions = False
     conn._staging_slots = mc.SlotPool()
+    conn.local_ip, conn.rpc_port, conn.ib_device = "decode", 42000, None
     return mc, conn
 
 
@@ -863,7 +864,19 @@ def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
     assert not conn._post_queued_write_requests()
     assert sent == []
     assert "state slots of [8192] B" in str(conn._write_request_error)
-    sock.send_multipart.assert_called_once_with([mc.MSG_GET_META])
+    # Naming this consumer, so the producer can open it before the write.
+    sock.send_multipart.assert_called_once_with(
+        [
+            mc.MSG_GET_META,
+            mc.msgpack.dumps(
+                {
+                    "consumer_host": "decode",
+                    "consumer_rpc_port": 42000,
+                    "consumer_ib_device": None,
+                }
+            ),
+        ]
+    )
 
     # Matching sizes pass, and the producer is asked only once.
     _, conn2 = _queue_only_consumer()
