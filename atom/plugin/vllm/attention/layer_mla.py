@@ -19,6 +19,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAAttention, MLAModules
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k
 from atom.plugin.vllm.attention.backend import (
     AiterMlaBackendForVllm,
     AiterSparseMlaBackendForVllm,
@@ -664,7 +665,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            k = (
+                cat_prefill_k(k_nope, k_pe, copies=True)
+                if self._prefill_k_cat_arch
+                else self._concat_k_nope_k_pe(k_nope, k_pe)
+            )
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -733,7 +738,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            k = (
+                cat_prefill_k(k_nope, k_pe, copies=True)
+                if self._prefill_k_cat_arch
+                else self._concat_k_nope_k_pe(k_nope, k_pe)
+            )
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -853,14 +862,23 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     [self.qk_nope_head_dim, self.v_head_dim], dim=-1
                 )
 
-                k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+                k = (
+                    cat_prefill_k(k_nope, k_pe)
+                    if self._prefill_k_cat_arch
+                    else torch.cat(
+                        (k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1
+                    )
+                )
         else:
             kv_nope = self.kv_b_proj(kv_c_normed).view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            # k = self._concat_k_nope_k_pe(k_nope, k_pe)
-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            k = (
+                cat_prefill_k(k_nope, k_pe)
+                if self._prefill_k_cat_arch
+                else torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+            )
 
         output_prefill = self._run_prefill_new_tokens(
             prefill=attn_metadata.prefill,

@@ -87,6 +87,7 @@ from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
     fused_qkv_per_tensor_quant,
 )
+from atom.model_ops.triton_mla_prefill_k_cat import cat_prefill_k, kernel_arch
 from atom.model_ops.utils import (
     dynamic_per_batched_tensor_quant,
     get_and_maybe_dequant_weights,
@@ -827,6 +828,9 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        # Prefill K by `cat_prefill_k` on gfx1250 layers; elsewhere each site keeps
+        # main's expression (`torch.cat`, or two copies at the vLLM plugin sites).
+        self._prefill_k_cat_arch = kernel_arch()
         # Set by a model whose prefill token graph records up to the attention
         # core (`records_prefill_split`).
         self.split_prefill_recording = False
@@ -1312,9 +1316,12 @@ class MLAAttention(nn.Module):
         a short-prompt smoke test happens to reach leaves the others to fail
         later, under chunked prefill, as a head-dim error.
 
-        The slice is deliberately NOT made contiguous. It leaves
-        ``stride(-2) == qk_nope_head_dim + pad`` against ``size(-1) ==
-        qk_nope_head_dim``, and all five flash-attention sites take it as is.
+        The slice is deliberately NOT made contiguous. On q and on the gathered
+        workspace K it leaves ``stride(-2) == qk_nope_head_dim + pad`` against
+        ``size(-1) == qk_nope_head_dim``, and flash-attention takes it as is.
+        On gfx1250, K from kv_b_proj is already the split view (row pitch
+        ``qk_nope_head_dim + v_head_dim``, like V), and the slice is a no-op on
+        it; other arches slice the concatenated K like q.
         Measured on gfx950 rather than assumed: against a ``.contiguous()``
         copy of the same slice the output is bit-identical (max abs diff 0.0),
         so the kernel takes its row pitch from the stride and not from
@@ -1370,13 +1377,22 @@ class MLAAttention(nn.Module):
             )
 
     def _prepare_prefill_k(self, k_nope, k_rope):
-        """Keep K split for FP8 quantization; materialize it for BF16 attention."""
+        """Keep K split for FP8 quantization; materialize it for BF16 attention.
+
+        Other arches concatenate K as on main. On gfx1250 with a zero rope pad,
+        K is the kv_b_proj split view itself (row pitch ``qk_nope_head_dim +
+        v_head_dim``, like V); `_drop_rope_pad` is then a no-op on it.
+        """
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
-        return (
-            torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
-            None,
-        )
+        if not self._prefill_k_cat_arch:
+            return (
+                torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
+                None,
+            )
+        if self.rope_is_zero_pad:
+            return k_nope, None
+        return cat_prefill_k(k_nope, k_rope), None
 
     def _flash_attn_prefill(
         self,
