@@ -1537,7 +1537,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // A wall-clock throughput floor: machine load, not the code, decides it in a
+    // full parallel run. Run it alone:
+    // cargo test --release --lib test_load_counter_performance -- --ignored
     #[test]
+    #[ignore = "wall-clock throughput floor; run alone with --ignored"]
     fn test_load_counter_performance() {
         use std::time::Instant;
 
