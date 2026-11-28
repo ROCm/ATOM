@@ -41,6 +41,9 @@ from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
 )
+from aiter.ops.triton.fusions.fused_kv_cache import (
+    q_nope_prestored_supported,
+)
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as triton_cat_and_cache_mla
 from torch import nn
@@ -623,9 +626,14 @@ def _mla_absorb_bf16_enabled() -> bool:
     SGLANG_MLA_ABSORB_BF16 (PR #31604): on the tight MLPerf DeepSeek-R1 accuracy
     gate the low-precision absorb bmm is decisive, and BF16 recovers the margin.
     Default off (unchanged FP8 behavior)."""
-    import os
+    return envs.ATOM_MLA_ABSORB_BF16
 
-    return os.environ.get("ATOM_MLA_ABSORB_BF16", "0") == "1"
+
+def _mla_absorb_bf16_fuse_qout_enabled() -> bool:
+    """With BF16 absorb, have the K-up GEMM write q_nope straight into the fused
+    rope kernel's q_out (skipping a BF16 round trip of the K-up result). Opt in
+    with ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 pending isolated GPU validation."""
+    return envs.ATOM_MLA_ABSORB_BF16_FUSE_QOUT
 
 
 def _maybe_view_mxfp4_weight_for_gather(
@@ -950,6 +958,14 @@ class MLAAttention(nn.Module):
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
         # Shuffled KV cache; the decode kernel follows use_triton_mla.
         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
+        # aiter owns which archs take q_nope already written into q_out.
+        self._q_nope_prestored_supported = q_nope_prestored_supported()
+        self._absorb_bf16_fuse_qout = (
+            self.kv_shuffled
+            and self._q_nope_prestored_supported
+            and _mla_absorb_bf16_fuse_qout_enabled()
+            and not is_rocm_aiter_fp4bmm_enabled()
+        )
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
@@ -1534,8 +1550,9 @@ class MLAAttention(nn.Module):
             absorb_bf16 = _mla_absorb_bf16_enabled()
             if absorb_bf16:
                 # BF16 absorb: keep the up-proj matrices in BF16 and skip the
-                # per-batched-tensor FP8 quant; the bmm sites run torch.bmm. A
-                # None scale is the BF16 marker the bmm paths branch on.
+                # per-batched-tensor FP8 quant; the bmm sites run AITER's Triton
+                # batched_gemm_bf16. A None scale is the BF16 marker the bmm
+                # paths branch on.
                 self.W_K, self.W_K_scale = W_K.contiguous(), None
                 self.W_V, self.W_V_scale = W_V.contiguous(), None
             else:
@@ -1952,7 +1969,12 @@ class MLAAttention(nn.Module):
         )
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, k_up_proj=True):
+    def _q_proj_and_k_up_proj(
+        self, x, x_scale=None, group=False, k_up_proj=True, q_nope_out=None
+    ):
+        # q_nope_out: optional (B, N, L) destination (BF16-absorb path only),
+        # e.g. the q_nope slice of the fused-rope q_out; the GEMM stores into
+        # it in its dtype and it is returned as the K-up result.
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
@@ -1995,8 +2017,13 @@ class MLAAttention(nn.Module):
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
-            # then -> (B,N,L) to match the fp8/fp4 output layout.
-            ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
+            # then -> (B,N,L) to match the fp8/fp4 output layout. A prestored q_out
+            # (q_nope_out) takes the result through YQ's transposed strides.
+            if q_nope_out is None:
+                ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
+            else:
+                _aiter_triton_bf16_bmm(q_nope, W_K, YQ=q_nope_out.transpose(0, 1))
+                ql_nope = q_nope_out
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
@@ -3721,6 +3748,7 @@ class MLAAttention(nn.Module):
                 and self.dcp_prefill_qrep
                 and attn_metadata.dcp_sparse_prefill_kv is None,
             )
+            q_out_prestored = None
             absorb_into_q_out = (
                 use_qrep
                 and context.is_prefill
@@ -3729,6 +3757,32 @@ class MLAAttention(nn.Module):
             if absorb_into_q_out:
                 q_nope, q_rope = self._q_proj_and_k_up_proj(
                     q, x_scale=q_scale, group=use_qrep, k_up_proj=False
+                )
+            elif (
+                self._absorb_bf16_fuse_qout
+                and self.W_K_scale is None
+                and q.shape[0] >= 64
+                and kv_cache.numel() > 0
+                and attn_metadata.slot_mapping.numel() == q.shape[0]
+            ):
+                # BF16 absorb + shuffled-KV fused rope: the K-up GEMM stores q_nope
+                # (cast to the q dtype) straight into q_out[..., :kv_lora_rank], so the
+                # rope kernel skips the q_nope read/rewrite. M>=64 is provisional
+                # pending an isolated GPU sweep; an FP8 q_out rounds through BF16.
+                q_out_prestored = torch.empty(
+                    (
+                        q.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q.device,
+                )
+                q_nope, q_rope = self._q_proj_and_k_up_proj(
+                    q,
+                    x_scale=q_scale,
+                    group=use_qrep,
+                    q_nope_out=q_out_prestored[..., : self.kv_lora_rank],
                 )
             else:
                 q_nope, q_rope = self._q_proj_and_k_up_proj(
@@ -3762,7 +3816,9 @@ class MLAAttention(nn.Module):
             else:
                 write_slot_mapping = attn_metadata.slot_mapping
 
-            if self.use_seg_mla:
+            if q_out_prestored is not None:
+                q_out = q_out_prestored
+            elif self.use_seg_mla:
                 # Seg path: allocate q_out with a padded last dim so each head row
                 # has a 768-byte stride (required by the gfx1250 decode asm). The
                 # kernel only writes the first kv_lora_rank + qk_rope_head_dim
@@ -3825,6 +3881,7 @@ class MLAAttention(nn.Module):
                         apply_scale=True,
                         q_out=q_out,
                         shuffled_kv_cache=True,
+                        q_nope_prestored=q_out_prestored is not None,
                     )
                 elif self.use_seg_mla and self.dcp_world_size <= 1:
                     kv_cache_seg = self._seg_kv_cache_view(kv_cache)
