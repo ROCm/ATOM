@@ -5,16 +5,8 @@ on:
     - cron: '48 13 * * *'  # Every day at 21:48 Beijing Time (UTC+8)
   workflow_dispatch:
     inputs:
-      build_rocm7:
-        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts>, and the plugin image sglang-latest (scheduled nightly runs always build every live line; default enabled)"
-        type: boolean
-        default: true
-      build_rocm10:
-        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0, and the plugin image sglang-latest-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
-        type: boolean
-        default: true
       base_image_override:
-        description: "Build one literal base image instead of the lines above, e.g. rocm/pytorch:latest or rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0. Publishes under a suffix read from the image."
+        description: "Build one literal base image instead of the live line, e.g. rocm/pytorch:latest or rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0. Publishes under a suffix read from the image."
         default: ""
       atom_repo:
         description: "ATOM repo"
@@ -81,15 +73,21 @@ on:
         type: boolean
         default: false
 
-# The live lines, defined once for the whole workflow. LINE_STABLE owns the
-# unsuffixed tags (latest, nightly_<ts>, vllm-latest, sglang-latest);
-# LINE_NEXT publishes the native tags and the SGLang plugin image, suffixed
-# with the ROCm version read out of its image. The vLLM plugin image stays
-# on LINE_STABLE. Promoting ROCm 10 is these two values and nothing else:
-# `latest` follows, and the line that used to be stable simply stops being built.
+# The one live line, defined once for the whole workflow. It owns the unsuffixed
+# tags (latest, nightly_<ts>, vllm-latest, sglang-latest) because it is the
+# stable line; nothing else is built unless base_image_override names an image.
+#
+# This was two lines until now, rocm7 alongside a suffixed ROCm 10 one. The
+# ROCm 10 line took over as stable and the ROCm 7 line stopped being built,
+# which is exactly the promotion the two-value design was written for -- the
+# suffix is not renamed, it disappears, because a stable line publishes
+# unsuffixed tags.
+#
+# Named for the major only, the way rocm7 was: the suffix/name agreement check
+# below only fires on a name carrying a minor (rocm[0-9]*.[0-9]*), and a stable
+# line has no suffix for it to disagree with anyway.
 env:
-  LINE_STABLE: rocm7
-  LINE_NEXT: rocm10.0
+  LINE_STABLE: rocm10
 
 jobs:
   # Which lines this run builds. A separate job because `strategy.matrix` is
@@ -113,38 +111,12 @@ jobs:
             exit 0
           fi
 
-          lines=""
-          add() { lines="${lines:+${lines},}\"$1\""; }
-
-          # vLLM stays on the stable line, so a vLLM-only rebuild has nothing
-          # to publish on LINE_NEXT. SGLang is built on every selected line.
-          if [ "${{ inputs.only_release_oot }}" = "true" ] && [ "${{ inputs.only_release_sglang }}" != "true" ]; then
-            printf 'lines=["%s"]\n' "${LINE_STABLE}" >> "${GITHUB_OUTPUT}"
-            echo "Lines: ${LINE_STABLE} (only_release_oot)"
-            exit 0
-          fi
-
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Like the OOT and SGLang layers, a scheduled run builds every
-            # live line regardless of the toggles; the toggles exist so a
-            # manual run can build one line without the other.
-            add "${LINE_STABLE}"
-            add "${LINE_NEXT}"
-          else
-            # The line names come from LINE_STABLE / LINE_NEXT, never spelled
-            # out here: a toggle selects a line, it does not name one. Writing
-            # them out is how renaming the line to rocm10.0 left this branch
-            # emitting "rocm10", which then resolved to nothing.
-            if [ "${{ inputs.build_rocm7 }}" = "true" ]; then add "${LINE_STABLE}"; fi
-            if [ "${{ inputs.build_rocm10 }}" = "true" ]; then add "${LINE_NEXT}"; fi
-          fi
-
-          if [ -z "${lines}" ]; then
-            echo "No line selected: enable at least one of build_rocm7 / build_rocm10, or set base_image_override."
-            exit 1
-          fi
-          echo "lines=[${lines}]" >> "${GITHUB_OUTPUT}"
-          echo "Lines: [${lines}]"
+          # One live line, so there is nothing to select: a scheduled run and a
+          # manual run build the same thing. only_release_oot and
+          # only_release_sglang no longer pick a line, they only decide which
+          # layers that line publishes.
+          printf 'lines=["%s"]\n' "${LINE_STABLE}" >> "${GITHUB_OUTPUT}"
+          echo "Lines: ${LINE_STABLE}"
 
   docker-release:
     name: Nightly Docker Release
@@ -228,14 +200,52 @@ jobs:
           EXTRA_BUILD_ARGS=""
 
           case "${FLAVOR}" in
-            rocm7)
-              BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
-              ;;
-            rocm10.0)
+            rocm10)
               # rocm10-base is a stage inside atom_release.dockerfile, not an
-              # image to pull: the ROCm 10 stack is assembled from the AMD
-              # stable wheel channel on plain ubuntu:24.04.
+              # image to pull: the ROCm 10 stack is assembled from an AMD wheel
+              # channel on plain ubuntu:24.04.
+              #
+              # The ROCm 7 line that used to live here built on
+              # rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0.
+              # It is no longer a line; pass that reference to
+              # base_image_override to build on it one-off.
+              #
+              # The pin is a nightly, deliberately: the device-memory queue
+              # signal work (rocm-systems #12988/#13424/#13507) is in no GA
+              # release yet -- 10.2 GA does not carry it -- and 10.3.0a20261118
+              # is a build where it is present and on by default. Everything is
+              # an exact version, so the build stays reproducible; refresh the
+              # pin with docker/resolve_rocm_versions.py before the channel's
+              # ~90-day retention ages it out.
               BASE_IMAGE="rocm10-base"
+              EXTRA_BUILD_ARGS="--build-arg ROCM_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_SDK_VERSION=10.3.0a20261118"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCH_VERSION=2.14.0"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCHVISION_VERSION=0.29.0"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TORCHAUDIO_VERSION=2.11.0.3"
+              # Empty: the nightly triton commit drifts independently of torch,
+              # so torch's own dependency is the only pin that cannot conflict.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCM_TRITON_VERSION="
+              # rocprofiler-register attaches on torch import and hard-gates the
+              # device-memory queue signals off, so the line that exists to carry
+              # that fix has to turn it off to actually carry it.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg ROCPROFILER_REGISTER_ENABLED=0"
+              # The pinned RCCL commit carries its own hipMemFabricHandle_st
+              # shim, written when HIP had none. ROCm 10.3 defines the type
+              # itself (hip_runtime_api.h:852), so the source build dies on a
+              # redefinition. Nothing is lost by skipping it: the pip SDK ships
+              # librccl.so.1 and rccl/rccl.h, and the image keeps those.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg BUILD_RCCL=0"
+              # Triton is pinned to the build AITER is tuned against, not left
+              # to the SDK channel's nightly. AITER's gfx950 FF-A16W16-fused
+              # configs overflow LDS and fail with OutOfResources on a Triton
+              # they were not tuned for (ROCm/aiter#8266). release_1031 has no
+              # rocm-10.2.0 or 10.3.0 index yet -- both 403 -- so rocm-10.1.0 is
+              # the ROCm 10 build to take, which is also where AITER's own
+              # install_triton.sh lands for a 10.x SDK.
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_INDEX_URL=https://pypi.amd.com/triton/release_1031/rocm-10.1.0/simple/"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_PIN_VERSION=3.9.0+amd.rocm10.1.0.gitf1bf9132"
+              EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS} --build-arg TRITON_KERNELS_PIN_VERSION=1.0.0+amd.rocm10.1.0.gitf1bf9132"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something
@@ -270,7 +280,14 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Build Docker image
-        timeout-minutes: 180
+        # 180 was sized for the ROCm 7 line, which started from a ready-made
+        # rocm/pytorch image. The ROCm 10 line assembles the SDK from wheels
+        # (~4 GB) and builds AITER from source for both arches, which alone ran
+        # 114 min locally; an uncached build timed out at 180. Only the first
+        # build pays it: every version is pinned now, so the rocm10-base and
+        # build_aiter layers are cache-stable and a daily run re-does just the
+        # atom_image stage, which is what CACHEBUST invalidates.
+        timeout-minutes: 300
         run: |
           ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
           if [ "${ATOM_COMMIT}" = "HEAD" ]; then
@@ -587,7 +604,7 @@ jobs:
           # The vLLM layer belongs to the stable line only. A second line must
           # not build it, and must not publish over vllm-latest.
           if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by the ROCm 7 line)."
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by ${LINE_STABLE})."
             exit 0
           fi
           OOT_BASE_IMAGE="${CI_IMAGE}"
@@ -622,7 +639,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by the ROCm 7 line)."
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by ${LINE_STABLE})."
             exit 0
           fi
           # Record every tag this job creates, so Clean Up can remove exactly
@@ -658,7 +675,7 @@ jobs:
         timeout-minutes: 180
         run: |
           # Built from this line's native image. The push step appends
-          # TAG_SUFFIX, so the ROCm 10 image is sglang-latest-rocm10.0 and
+          # TAG_SUFFIX, so the ROCm 10 image is sglang-latest-rocm10.3 and
           # does not replace sglang-latest.
           SGLANG_BASE_IMAGE="${CI_IMAGE}"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"

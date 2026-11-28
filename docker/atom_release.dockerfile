@@ -32,12 +32,23 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 # wheels, installed into site-packages rather than /opt/rocm). Ported from
 # sglang's docker/rocm.Dockerfile rocm1000-base stage.
 #
-# Version policy (ticket: ATOM v0.1.7 for ROCm 10.1, GA 2026-10-05):
-#   - Main line: stable channel 10.0.0 (the combination sglang validated).
-#   - 10.1 tracking line: nightly channel with 10.1.0a<date> versions
-#     (rc.repo.amd.com has no 10.1 artifacts yet). NOT a release artifact;
-#     it exists to surface 10.1 breaks early. Once 10.1 RC/GA lands on the
-#     stable channel, flip these ARGs and re-run the golden test.
+# Version policy: always an exact ROCM_SDK_VERSION, from whichever channel
+# ROCM_INDEX_URL names. The stable channel carries GA versions (10.0.0 is the
+# combination sglang validated); the nightly channel carries dated builds.
+#
+# The ROCm 10 line pins a *nightly*, which is unusual and deliberate: the
+# device-memory queue signal work (rocm-systems #12988/#13424/#13507) is absent
+# from 10.2 GA -- verified down to the shipped libamdhip64.so -- so no GA
+# release carries it yet, and without it MI355X decode pays 8-12%. The pin is a
+# nightly at or above 10.3.0a20261115, the first build where the queue-signal
+# default is on (#15318, merged 2026-11-14); earlier builds have the code but
+# default it off.
+#
+# A pinned nightly expires: the channel keeps a rolling ~90 days (measured
+# 2026-11-19: 88 consecutive dated builds, oldest 10.1.0a20260823, nothing
+# older). Refresh the pin before it ages out -- docker/resolve_rocm_versions.py
+# reports the newest date carrying a complete, self-consistent set, which is
+# the date to pin. Drop all of this once the work ships in a GA release.
 #
 # Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
 # the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
@@ -64,6 +75,10 @@ ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
 # is a set of --build-arg values -- a base version, an index URL -- and not a
 # new stage. The nightly channel prunes old date-stamped builds, so such a
 # line has to resolve its versions at build time rather than pin them.
+#
+# Note the torch trio is pinned separately from the SDK: one nightly date
+# publishes several torch lines side by side (2.13, 2.14, 2.15, 2.16.0a0 against
+# the same SDK), so the SDK version alone does not determine them.
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -160,6 +175,19 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 # install.sh and Mooncake's cmake both expect /opt/rocm, and the amdsmi pip
 # install below refers to /opt/rocm/share/amd_smi.
 RUN ln -s ${ROCM_HOME} /opt/rocm
+
+# Device-memory queue signals are gated on no profiler tool being attached: the
+# host writes those signals through the BAR, and a tool's host atomics on them
+# are not atomic over PCIe. rocprofiler-register attaches on import of torch, so
+# a torch stack silently loses the optimisation even where DEBUG_CLR_DEV_SIGNALS
+# defaults on -- measured on 10.3.0a20261118: queue signals 0 (profiler tool: 1)
+# by default, 1 once this is 0. The tracking line passes 0 to actually exercise
+# the fix; anything that needs rocprof/kineto overrides it back to 1 at runtime.
+#
+# "1" and unset behave identically. Never pass an empty value: an empty
+# ROCPROFILER_REGISTER_ENABLED makes device init fail with hipErrorInvalidDevice.
+ARG ROCPROFILER_REGISTER_ENABLED="1"
+ENV ROCPROFILER_REGISTER_ENABLED=${ROCPROFILER_REGISTER_ENABLED}
 
 # amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
 # the AMD SMI python package; ATOM's numa_utils imports it. The SDK's
@@ -270,19 +298,28 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         fi; \
     fi
 
-# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
-# newer Triton (3.8.0) that regressed benchmark throughput; install the
-# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
-# here in the shared base so every downstream stage (the aiter build included)
-# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
-# The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
-# installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
-# force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
-# rocm10-base flavor is excluded.
+# Pin Triton to a build AITER has been tuned against, here in the shared base so
+# every downstream stage (the aiter build included) links the same one. Empty
+# TRITON_PIN_VERSION keeps whatever is already installed.
+#
+# Which build matters, not just the version number. AITER's kernel configs are
+# tuned per Triton build, closely enough that a tile fitting in LDS under one
+# build overflows it under another: ROCm/aiter#8266 reports gfx950
+# FF-A16W16-fused tiles needing 168864 B against a 163840 B limit. So take a
+# build AITER exercises in its own CI rather than whichever one the SDK channel
+# happened to produce that night.
+#
+# The index is per line: release_0914/rocm-7.2.0 for a rocm/pytorch base,
+# release_1031/rocm-10.1.0 for the ROCm 10 line (10.2.0 and 10.3.0 are 403 on
+# that index today; 10.1.0 is the newest ROCm 10 build published there, which is
+# also where AITER's own install_triton.sh lands for a 10.x SDK). The ROCm 10
+# line used to be excluded from pinning entirely, which left it on the SDK
+# channel's nightly Triton -- same 3.9 series, but a build nobody had run AITER
+# against.
 ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
 ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
 ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
-RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
+RUN if [ -n "${TRITON_PIN_VERSION}" ]; then \
         echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
         pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
             "triton==${TRITON_PIN_VERSION}" \
@@ -684,12 +721,19 @@ ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45e
 # the pip SDK's (torch 2.11 on ROCm 10.0, 2.13 on the 10.1 nightly), and the
 # validation below asserts that exact version string. LMCache publishes no
 # ROCm 10 wheel today -- every rocm asset on their releases, up to v0.5.5rc7,
-# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP c_ops
+# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP cuda_ops
 # from source, which is how the images validated on gfx950 were built. ROCM_HOME
 # is set only by the rocm10-base stage and inherited through the image, so it
 # tells the two apart. Collapse this back to one path once a matching wheel
 # exists.
-ARG LMCACHE_TAG=v0.4.5
+# v0.4.5 pins -std=c++17 on most of its extensions. torch 2.14's ATen headers
+# use C++20 requires-clauses to separate overloads that differ only in return
+# type (TensorBase.h: symint::sizes), so c++17 compiles them as a redefinition
+# and the build dies in torch's own header. From v0.5.0 the ROCm build profile
+# passes no -std at all and inherits torch's default, which is c++20
+# (cpp_extension.py: common_cflags). v0.5.6 also matches the wheel the ROCm 7
+# line installs (0.5.6.dev139), so the two paths stop drifting apart.
+ARG LMCACHE_TAG=v0.5.6
 RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
     if [ -z "${ROCM_HOME}" ]; then \
       echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
@@ -731,7 +775,7 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
       assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
       print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
     else \
-      echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+      echo "========== [ATOM] LMCache HIP cuda_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
           git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
           cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
           "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
@@ -744,19 +788,24 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
           # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
           # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
           "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
-          "${VENV_PYTHON}" -c "import glob, torch; \
-      c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
-      assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
+          # The extension is lmcache.cuda_ops, which is what the wheel branch
+          # above and .github/scripts/validate_lmcache_wheel_for_atom.py already
+          # assert; it was lmcache.c_ops up to v0.4.x and no alias was left
+          # behind. Import rather than glob a path: an editable install is free
+          # to keep the .so outside the source tree, and __file__ is the check
+          # that actually matters -- a python fallback would not end in .so.
+          "${VENV_PYTHON}" -c "import torch; \
       torch.cuda.is_available = lambda: True; \
-      import lmcache, lmcache.c_ops; \
+      import lmcache, lmcache.cuda_ops; \
       from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
       from lmcache.v1.memory_management import MemoryFormat; \
       from lmcache.v1.lookup_client.factory import LookupClientFactory; \
       from lmcache.v1.config import LMCacheEngineConfig; \
       from lmcache.v1.metadata import LMCacheMetadata; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
-      print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
+      assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
+      assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
+      print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
     fi
 
 # ========== AgentX harness (agentic benchmark client) ==========
