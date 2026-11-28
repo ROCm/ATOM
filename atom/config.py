@@ -2769,10 +2769,18 @@ class Config:
         if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
             return
         if not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; pass "
-                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
-            )
+            # Pure TP runs the same kernel in its TP mode.
+            if (
+                self.tensor_parallel_size < 2
+                or self.pipeline_parallel_size > 1
+                or self.parallel_config.data_parallel_size > 1
+                or self.prefill_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "moe_backend='mega' without expert parallelism or "
+                    "--sequence-parallel-size needs TP >= 2 without PP, DP or PCP"
+                )
+            return
         if self.moe_all2all_backend == "rccl":
             raise ValueError(
                 "moe_backend='mega' owns its MoRI transport and cannot use the "

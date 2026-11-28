@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from atom.model_ops.fused_moe import sp_mega_moe as fusion
-from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, local_token_tile
+from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, TPMegaMoE, local_token_tile
 
 
 def _layer(moe):
@@ -84,7 +84,9 @@ def test_mega_moe_runs_where_aiter_picks_fp4_activations(
     )
     if not use_mega:
         return
-    layer.sp_mega_moe = SimpleNamespace(runs=backend.runs, forward=Mock())
+    layer.sp_mega_moe = SimpleNamespace(
+        runs=backend.runs, forward=Mock(), serves_block=False
+    )
     x, logits = torch.ones(rows, 8), torch.zeros(rows, 128)
     out = moe.FusedMoE.forward_impl(layer, x, logits)
     assert out is layer.sp_mega_moe.forward.return_value
@@ -174,7 +176,7 @@ def _servable_layer(moe):
 
 def _pcp_group(monkeypatch, group):
     parallel_state = ModuleType("aiter.dist.parallel_state")
-    parallel_state.get_pcp_group = lambda: group
+    parallel_state.get_pcp_group = parallel_state.get_tp_group = lambda: group
     monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
 
 
@@ -182,9 +184,12 @@ def _model(layer):
     return SimpleNamespace(modules=lambda: [torch.nn.Identity(), layer])
 
 
-def _config(backend="mega", mnbt=1024):
+def _config(backend="mega", mnbt=1024, tp=False):
     return SimpleNamespace(
-        moe_backend=backend, sequence_parallel_size=4, max_num_batched_tokens=mnbt
+        moe_backend=backend,
+        sequence_parallel_size=1 if tp else 4,
+        enable_expert_parallel=False,
+        max_num_batched_tokens=mnbt,
     )
 
 
@@ -211,7 +216,7 @@ class MegaMoeSetupError(RuntimeError):
     pass
 
 
-def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
+def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, tp=False):
     layer = _servable_layer(sp_modules.moe)
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
@@ -223,7 +228,7 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
     return layer, partial(
-        fusion.initialize_sp_mega_moe, _model(layer), _config(mnbt=mnbt)
+        fusion.initialize_sp_mega_moe, _model(layer), _config(mnbt=mnbt, tp=tp)
     )
 
 
@@ -343,3 +348,192 @@ def test_epoch_reset_first_fails_on_any_rank_timeout(
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
         backend.before_step(16)
     runtime.reset.assert_not_called()
+
+
+# -- pure TP (TPMegaMoE) --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("override", "selected"),
+    [
+        ({}, True),
+        ({"moe_backend": "standard"}, False),
+        ({"enable_expert_parallel": True}, False),  # MoRI MegaMoE
+        ({"sequence_parallel_size": 4}, False),
+    ],
+)
+def test_mega_backend_selects_the_tp_mode_on_pure_tp_only(override, selected):
+    config = _config(tp=True)
+    vars(config).update(override)
+    assert fusion.tp_mega_moe_selected(config) is selected
+
+
+def _tp_servable_layer(moe):
+    layer = _servable_layer(moe)
+    vars(layer).update(
+        local_num_experts=4,
+        num_fused_shared_experts=0,
+        tp_mega_shared={"w1_shared": 5, "w1_shared_scale": 6},
+        scoring_func="sigmoid",
+        use_grouped_topk=False,
+        custom_routing_function=None,
+    )
+    for name, shape in (
+        ("w13_weight", (4, 256, 128)),
+        ("w2_weight", (4, 256, 64)),
+        ("w13_weight_scale", (4 * 256, 8)),
+        ("w2_weight_scale", (4 * 256, 4)),
+    ):
+        value = torch.empty(shape, dtype=torch.uint8)
+        value.is_shuffled = True
+        setattr(layer, name, value)
+    return layer
+
+
+def test_tp_needs_the_mxfp8_shared_expert_kept_apart_and_unreduced(sp_modules):
+    layer = _tp_servable_layer(sp_modules.moe)
+    assert fusion._unsupported_layer(layer, tp=True) is None
+    # SP serves the fused shared expert only.
+    assert "fused shared expert" in fusion._unsupported_layer(layer)
+    layer.num_fused_shared_experts = 1
+    assert "kept apart" in fusion._unsupported_layer(layer, tp=True)
+    layer.num_fused_shared_experts = 0
+    # A step the kernel does not take must stay TP-partial, like the standard MoE.
+    layer.reduce_results = True
+    assert "needs unreduced" in fusion._unsupported_layer(layer, tp=True)
+    layer.reduce_results = False
+    layer.tp_mega_shared = None
+    assert "tp_mega_shared" in fusion._unsupported_layer(layer, tp=True)
+    layer.tp_mega_shared = {}
+    layer.scoring_func = "softmax"
+    assert "sigmoid" in fusion._unsupported_layer(layer, tp=True)
+
+
+def _tp_runtime(max_local=16, bigm_m=0, **attrs):
+    return SimpleNamespace(
+        max_local_tokens=max_local,
+        bigm_m=bigm_m,
+        cfg=SimpleNamespace(world_size=4, rank=0),
+        **attrs,
+    )
+
+
+@pytest.mark.parametrize("rows", [8, 1, 3, 13])
+def test_tp_forward_is_one_launch_with_the_shared_route_appended(monkeypatch, rows):
+    """Routed weights scaled by the routed scale, then the shared expert (the
+    last expert, weight 1); the output buffer is the caller's, the kernel pads
+    a row count that is not a multiple of tp itself."""
+    import aiter
+
+    from atom.utils import forward_context
+
+    launches = []
+
+    def launch(hidden, weights, ids, *, out):
+        launches.append((hidden.shape[0], weights.clone(), ids.clone()))
+        out.copy_(hidden * 2)
+
+    def gating(weights, ids, logits, bias, renormalize, scale, *, score_func, **kw):
+        weights.copy_(torch.full_like(weights, 0.25) * scale)
+        ids.copy_(torch.arange(weights.shape[1], dtype=torch.int32))
+
+    monkeypatch.setattr(aiter, "topk_gating", gating, raising=False)
+    monkeypatch.setattr(forward_context, "pass_scheduled_tokens_gpu", lambda r: None)
+    runtime = _tp_runtime(set_weights=Mock(), forward=launch)
+    backend = TPMegaMoE(runtime, None, 1, None)
+    layer = SimpleNamespace(
+        w13_weight=1, w13_weight_scale=2, w2_weight=3, w2_weight_scale=4,
+        tp_mega_shared={"w1_shared": 5, "w1_shared_scale": 6, "w2_shared": 7,
+                        "w2_shared_scale": 8},
+        top_k=4, local_num_experts=128, e_score_correction_bias=None,
+        renormalize=True, routed_scaling_factor=2.0, scoring_func="sigmoid",
+    )  # fmt: skip
+    x = (torch.arange(rows) + 1).bfloat16()[:, None].expand(rows, 8).contiguous()
+    before = x.clone()
+    out = backend.forward(layer, x, torch.zeros(rows, 128))
+    torch.testing.assert_close(out, before * 2)
+    torch.testing.assert_close(x, before)
+    runtime.set_weights.assert_called_once_with(
+        w1=1, w1_scale=2, w2=3, w2_scale=4,
+        w1_shared=5, w1_shared_scale=6, w2_shared=7, w2_shared_scale=8,
+    )  # fmt: skip
+    ((launched, weights, ids),) = launches
+    assert launched == rows
+    assert (weights[:, :4] == 0.5).all() and (weights[:, 4] == 1.0).all()
+    assert (ids[:, :4] == torch.arange(4)).all() and (ids[:, 4] == 128).all()
+
+
+def test_tp_serves_the_small_engine_and_big_m_but_not_between(monkeypatch):
+    # 32768 rows a step (8192 local), big-M from 8192 rows (2048 local).
+    backend = TPMegaMoE(_tp_runtime(max_local=8192, bigm_m=2048), None, 1, None)
+    capturing = [False]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    top, (low, high) = fusion.TP_SMALL_MAX_ROWS, fusion.TP_STANDARD_ROWS
+    served = [0, 1, 256, 257, low - 1, low, high, high + 1, top, top + 1, 8191]
+    served += [8192, 32768, 32769]
+    expected = [False, True, True, True, True, False, False, True, True, False]
+    expected += [False, True, True, False]
+    assert [backend.runs(rows) for rows in served] == expected
+    assert [backend.tier(r) for r in (16, 257, high, top + 1, 8192)] == [
+        "small-M",
+        "LB",
+        "standard",
+        "standard",
+        "big-M",
+    ]
+    # Big-M is not graph-capturable: a recorded step keeps the standard MoE.
+    capturing[0] = True
+    assert backend.runs(256) and not backend.runs(8192)
+    # No big-M path (AITER without it, or a small step budget).
+    small = TPMegaMoE(_tp_runtime(max_local=64), None, 1, None)
+    assert [small.runs(rows) for rows in (1, 256, 257)] == [True, True, False]
+
+
+def test_tp_steps_count_one_launch_a_layer_and_their_coverage(monkeypatch, host_copies):
+    monkeypatch.setattr(fusion, "RESET_LAUNCHES", 8)
+    runtime = _tp_runtime(
+        reset=Mock(), error_flag=lambda: torch.zeros(1, dtype=torch.int32),
+        poll_errors=lambda: 0,
+    )  # fmt: skip
+    backend = TPMegaMoE(runtime, None, 3, None)
+    for rows in (1, 64, 65, 0):
+        backend.before_step(rows)
+    assert backend.launches == 6
+    assert backend.coverage == {"small-M": [2, 65], "standard": [1, 65]}
+    backend.before_step(8)
+    runtime.reset.assert_called_once_with()
+    assert backend.launches == 0
+
+
+def test_tp_runtime_is_the_ar_kernel_with_the_shared_expert(monkeypatch, sp_modules):
+    runtime = Mock(
+        max_local_tokens=8192,
+        bigm_m=2048,
+        cfg=SimpleNamespace(world_size=4, rank=0),
+        **{"poll_errors.return_value": 0},
+    )
+    factory = Mock(return_value=runtime)
+    layer, initialize = _initialize(monkeypatch, sp_modules, factory, 32768, tp=True)
+    vars(layer).update(vars(_tp_servable_layer(sp_modules.moe)))
+    backend = initialize()
+    cfg = factory.call_args.args[0]
+    assert (cfg["comm_mode"], cfg["comm_dtype"], cfg["act_dtype"]) == (
+        "ar",
+        "bf16",
+        "auto",
+    )
+    # 4 routed experts + the shared one, top-4 + 1; AITER's own big-M threshold.
+    assert (cfg["experts"], cfg["topk"]) == (5, 5)
+    assert "bigm_min_tokens" not in cfg and cfg["max_local_tokens"] == 8192
+    assert factory.call_args.kwargs["w1_shared"] == 5
+    # The small-batch engine's row counts (4096 rows, 1024 local).
+    local = fusion.TP_SMALL_MAX_ROWS // 4
+    assert list(runtime.prepare.call_args.args[0]) == list(range(1, local + 1))
+    assert isinstance(backend, TPMegaMoE) and layer.sp_mega_moe is backend
+    assert backend.bigm_rows == 8192 and backend.max_rows == 32768
+
+
+def test_tp_refuses_a_fused_shared_expert(monkeypatch, sp_modules):
+    _, initialize = _initialize(monkeypatch, sp_modules, Mock(), tp=True)
+    with pytest.raises(RuntimeError, match="with TP: experts: needs the MXFP8"):
+        initialize()

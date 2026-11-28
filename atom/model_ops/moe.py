@@ -2866,8 +2866,9 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 
 
 def _mxfp4_moe_method_cls() -> type[Mxfp4MoEMethod]:
-    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    # Without EP, `mega` runs SP / TP MegaMoE over the native weights instead.
+    config = get_current_atom_config()
+    if config.moe_backend == "mega" and config.enable_expert_parallel:
         return MegaMxfp4MoEMethod
     return Mxfp4MoEMethod
 
@@ -4228,7 +4229,8 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        config = get_current_atom_config()
+        if config.moe_backend != "mega" or not config.enable_expert_parallel:
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -5963,8 +5965,12 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         # Decided here, at run time: the row count is symbolic while compiling.
-        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
-            hidden_states.shape[0]
+        # (TP MegaMoE covers the shared expert too: the model's MoE block
+        # calls it, see `TPMegaMoE.serves_block`.)
+        if (
+            self.sp_mega_moe is not None
+            and not self.sp_mega_moe.serves_block
+            and self.sp_mega_moe.runs(hidden_states.shape[0])
         ):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
 

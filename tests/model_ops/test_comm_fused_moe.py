@@ -1491,7 +1491,8 @@ def test_online_quant_method_class_follows_the_online_switch(
     monkeypatch.setattr(
         moe_ops,
         "get_current_atom_config",
-        lambda: SimpleNamespace(moe_backend=backend),
+        # `mega` selects the MegaMoE method under EP (TP / SP keep Mxfp4).
+        lambda: SimpleNamespace(moe_backend=backend, enable_expert_parallel=True),
     )
     monkeypatch.setattr(moe_ops, "sp_is_enabled", lambda: False)
 
