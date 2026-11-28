@@ -7,7 +7,11 @@ use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    core::steps::workflow_data::WorkerRemovalWorkflowData, observability::metrics::MeshMetrics,
+    core::{
+        steps::{tokenizer_registration::drop_tokenizer, workflow_data::WorkerRemovalWorkflowData},
+        worker::RuntimeType,
+    },
+    observability::metrics::MeshMetrics,
 };
 
 /// Step to remove workers from the worker registry.
@@ -47,6 +51,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
             })
             .collect();
 
+        // Their models' tokenizers go with an ATOM model's last worker: the next
+        // registration loads one with its own template.
+        let atom_models: HashSet<String> = worker_urls
+            .iter()
+            .filter_map(|url| app_context.worker_registry.get_by_url(url))
+            .filter(|w| w.metadata().runtime_type == RuntimeType::Atom)
+            .map(|w| w.model_id().to_string())
+            .collect();
+
         let mut removed_count = 0;
         for worker_url in worker_urls.iter() {
             if app_context
@@ -57,6 +70,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                 removed_count += 1;
             }
         }
+
+        // Under the admission lock: a worker admitted with the loaded tokenizer is
+        // registered before the check or admitted after the drop, never in between.
+        let admitting = app_context.template_admission.lock();
+        for model in &atom_models {
+            if app_context.worker_registry.get_by_model(model).is_empty() {
+                drop_tokenizer(app_context, model);
+            }
+        }
+        drop(admitting);
 
         // Log if some workers were already removed (e.g., by another process)
         if removed_count != worker_urls.len() {

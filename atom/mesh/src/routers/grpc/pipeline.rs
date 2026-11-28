@@ -6,6 +6,8 @@ use axum::response::Response;
 use http::HeaderMap;
 use tracing::error;
 
+#[cfg(feature = "grpc-client")]
+use super::engine::atom::pair::AtomPairs;
 use super::engine::{Dispatcher, GrpcEngine};
 use crate::{
     app_context::AppContext,
@@ -142,6 +144,15 @@ impl Pipeline {
         Self::with_label(worker_registry, policy_registry, metrics_labels::BACKEND_PD)
     }
 
+    /// Runs ATOM pairs through `pairs` rather than the dual dispatch.
+    #[cfg(feature = "grpc-client")]
+    pub(crate) fn with_atom_pairs(self, pairs: AtomPairs) -> Self {
+        Self {
+            engine: Arc::new(GrpcEngine::with_atom_pairs(pairs)),
+            ..self
+        }
+    }
+
     fn with_label(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -208,7 +219,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_chat_err(&model, start, e),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
             .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
@@ -268,7 +279,7 @@ impl Pipeline {
             Ok(p) => p,
             Err(e) => return self.record_generate_err(&model_for_metric, start, e),
         };
-        let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self
             .engine
             .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
@@ -319,7 +330,7 @@ impl Pipeline {
 
         let (mut payload, resp_ctx) = prepare::prepare_chat(req, headers, model_id, &components)?;
         let placement = self.plan_for(&payload, &resp_ctx).await?;
-        let _guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
+        let _guards = self.load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = self
             .engine
             .dispatch_with_tokenizer(&placement, &mut payload, &resp_ctx.tokenizer)
@@ -327,6 +338,18 @@ impl Pipeline {
             .map_err(engine_err_to_response)?;
 
         render::chat_aggregator::process_typed(stream, resp_ctx).await
+    }
+
+    /// The loads held until the response ends; none when dispatch holds them.
+    fn load_guards(
+        &self,
+        plan: &PlacementPlan,
+        headers: Option<&HeaderMap>,
+    ) -> Vec<WorkerLoadGuard> {
+        if self.engine.holds_load(plan) {
+            return Vec::new();
+        }
+        make_load_guards(plan, headers)
     }
 
     async fn plan_for(
@@ -349,6 +372,7 @@ impl Pipeline {
             // Image routing keys are HTTP chat only: this path routes on
             // the text and tokens alone.
             media_count: 0,
+            chat_template: payload.chat_template.as_ref(),
         };
         self.planner
             .plan(&descriptor)

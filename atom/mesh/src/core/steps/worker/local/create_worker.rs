@@ -166,7 +166,7 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
         .unwrap_or(WorkerType::Regular)
 }
 
-fn determine_runtime_type(
+pub(super) fn determine_runtime_type(
     connection_mode: &ConnectionMode,
     data: &LocalWorkerWorkflowData,
     config: &WorkerConfigRequest,
@@ -265,11 +265,11 @@ fn create_dp_aware_workers(
         if let Some(ref tokenizer_path) = config.tokenizer_path {
             builder = builder.tokenizer_path(tokenizer_path.clone());
         }
-        if let Some(ref reasoning_parser) = config.reasoning_parser {
-            builder = builder.reasoning_parser(reasoning_parser.clone());
+        if let Some(parser) = parser(&config.reasoning_parser, final_labels, "reasoning_parser") {
+            builder = builder.reasoning_parser(parser);
         }
-        if let Some(ref tool_parser) = config.tool_parser {
-            builder = builder.tool_parser(tool_parser.clone());
+        if let Some(parser) = parser(&config.tool_parser, final_labels, "tool_call_parser") {
+            builder = builder.tool_parser(parser);
         }
         if let Some(ref chat_template) = config.chat_template {
             builder = builder.chat_template(chat_template.clone());
@@ -293,6 +293,15 @@ fn create_dp_aware_workers(
     }
 
     Ok(workers)
+}
+
+/// The configured parser, else the one an ATOM worker names in GetModelInfo's `label`.
+fn parser(
+    configured: &Option<String>,
+    labels: &HashMap<String, String>,
+    label: &str,
+) -> Option<String> {
+    configured.clone().or_else(|| labels.get(label).cloned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -323,11 +332,11 @@ fn create_single_worker(
     if let Some(ref tokenizer_path) = config.tokenizer_path {
         builder = builder.tokenizer_path(tokenizer_path.clone());
     }
-    if let Some(ref reasoning_parser) = config.reasoning_parser {
-        builder = builder.reasoning_parser(reasoning_parser.clone());
+    if let Some(parser) = parser(&config.reasoning_parser, final_labels, "reasoning_parser") {
+        builder = builder.reasoning_parser(parser);
     }
-    if let Some(ref tool_parser) = config.tool_parser {
-        builder = builder.tool_parser(tool_parser.clone());
+    if let Some(parser) = parser(&config.tool_parser, final_labels, "tool_call_parser") {
+        builder = builder.tool_parser(parser);
     }
     if let Some(ref chat_template) = config.chat_template {
         builder = builder.chat_template(chat_template.clone());

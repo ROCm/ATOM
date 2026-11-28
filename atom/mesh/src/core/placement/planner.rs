@@ -211,23 +211,32 @@ impl PdPlanner for DefaultPlanner {
             }
         }
 
-        let regular_pool = self.workers.workers_filtered(
-            req.model_id,
-            Some(WorkerType::Regular),
-            conn_mode.clone(),
-        );
-        let prefill_pool = self.workers.workers_filtered(
-            req.model_id,
-            Some(WorkerType::Prefill {
-                bootstrap_port: None,
-            }),
-            conn_mode.clone(),
-        );
-        let decode_pool = self.workers.workers_filtered(
-            req.model_id,
-            Some(WorkerType::Decode),
-            conn_mode.clone(),
-        );
+        // A chat goes only to the workers that serve the template its prompt rendered
+        // with; a pool that has none of them refuses it, to be retried.
+        let mut template_refused = false;
+        let mut pool = |worker_type| {
+            let pool =
+                self.workers
+                    .workers_filtered(req.model_id, Some(worker_type), conn_mode.clone());
+            let Some(template) = req.chat_template else {
+                return pool;
+            };
+            let had_workers = !pool.is_empty();
+            let pool: Vec<_> = pool
+                .into_iter()
+                .filter(|worker| template.served_by(worker.as_ref()))
+                .collect();
+            template_refused |= had_workers && pool.is_empty();
+            pool
+        };
+        let regular_pool = pool(WorkerType::Regular);
+        let prefill_pool = pool(WorkerType::Prefill {
+            bootstrap_port: None,
+        });
+        let decode_pool = pool(WorkerType::Decode);
+        if template_refused {
+            return Err(PlacementError::ChatTemplateChanged);
+        }
 
         if !regular_pool.is_empty() {
             self.plan_single(req, regular_pool).await

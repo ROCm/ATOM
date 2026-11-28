@@ -991,6 +991,7 @@ mod e_generation_payload {
             log_metrics: false,
             dp_session_id: None,
             dp_parent_session_id: None,
+            chat_template: None,
         }
     }
 
@@ -1529,6 +1530,84 @@ mod h_prepare_chat_generate {
             .err()
             .expect("unknown model must be Err");
         assert!(!err.status().is_success());
+    }
+
+    /// An ATOM worker advertising no template has its chats served when the tokenizer
+    /// was loaded with a template file, which outranks the worker's.
+    #[test]
+    fn test_a_template_file_serves_chats_of_a_worker_without_a_template() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let components = test_mocks::app_context_with_tokenizer_registry(registry.clone());
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let status = || {
+            let chat = prepare_chat(chat_req(false), None, Some("m".into()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        let loaded = registry.get_by_name("m").unwrap().id;
+        components
+            .tokenizer_template_files
+            .write()
+            .insert(loaded, "t.jinja".into());
+        // Past the template check (the mock tokenizer then fails to render).
+        assert_ne!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+    }
+
+    /// A chat rendered with the tokenizer's template file is placed on an ATOM worker
+    /// without a template of its own, as that file outranks the worker's.
+    #[test]
+    fn test_a_template_files_chat_is_served_by_a_worker_without_a_template() {
+        use crate::core::{BasicWorkerBuilder, RuntimeType};
+
+        let components = test_mocks::app_context_with_hf_tokenizer("m");
+        let loaded = components.tokenizer_registry.get_by_name("m").unwrap().id;
+        let files = &components.tokenizer_template_files;
+        files.write().insert(loaded, "t.jinja".into());
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id("m")
+            .label("chat_template", "{{ messages }}")
+            .build();
+        let (payload, _) = prepare_chat(chat_req(false), None, Some("m".into()), &components)
+            .expect("HF tokenizer must succeed");
+        let template = payload.chat_template.expect("rendered here");
+        assert!(template.served_by(&worker));
+    }
+
+    /// A tokenizer found by its id renders with the encoder controls it was loaded
+    /// with, as one found by name does: the tokenizer and its entry come from one
+    /// lookup, and a chat with controls needs no template.
+    #[test]
+    fn test_a_tokenizer_found_by_id_renders_with_its_chat_controls() {
+        use crate::{
+            core::{BasicWorkerBuilder, RuntimeType},
+            routers::prepare::chat_render::ChatControls,
+        };
+
+        let registry = test_mocks::tokenizer_registry_with("m");
+        let id = registry.get_by_name("m").unwrap().id;
+        let components = test_mocks::app_context_with_tokenizer_registry(registry);
+        let worker = BasicWorkerBuilder::new("grpc://atom:4")
+            .runtime_type(RuntimeType::Atom)
+            .model_id(id.as_str())
+            .build();
+        components.worker_registry.register(Arc::new(worker));
+        let status = || {
+            let chat = prepare_chat(chat_req(false), None, Some(id.clone()), &components);
+            chat.err().map(|refused| refused.status())
+        };
+        assert_eq!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        let controls = &components.chat_controls;
+        controls
+            .write()
+            .insert(id.clone(), ChatControls::DeepseekV41);
+        assert_ne!(status(), Some(http::StatusCode::NOT_IMPLEMENTED));
     }
 
     #[test]

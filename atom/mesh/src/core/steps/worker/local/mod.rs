@@ -8,6 +8,8 @@ mod follow_kv_events;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
+#[cfg(all(test, feature = "grpc-client"))]
+mod tests;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;

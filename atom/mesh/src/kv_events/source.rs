@@ -1,5 +1,6 @@
 //! Where a worker's DP ranks publish KV events: ATOM serves them at
-//! `GET /kv_event_sources`, keyed by the global DP rank each publisher binds for.
+//! `GET /kv_event_sources`, and its gRPC server in GetServerInfo, keyed by the global
+//! DP rank each publisher binds for.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -67,7 +68,8 @@ pub async fn fetch(
     parse(sources, base_url).map_err(|e| format!("{url}: {e}"))
 }
 
-fn parse(
+/// `sources` as the worker at `base_url` reports them, each rank's reached from the router.
+pub fn parse(
     sources: BTreeMap<String, KvEventSource>,
     base_url: &str,
 ) -> Result<BTreeMap<u32, KvEventSource>, String> {

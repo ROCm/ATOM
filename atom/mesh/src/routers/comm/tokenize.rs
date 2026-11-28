@@ -299,6 +299,8 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         name: request.name.clone(),
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
+        inline_chat_template: None,
+        worker_url: None,
         cache_config: None,
         fail_on_duplicate: true,
     };
@@ -362,7 +364,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
 
     if let Some(entry) = removed {
         crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
-        context.chat_controls.write().remove(&entry.id);
+        context.forget_tokenizer(&entry.id);
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,

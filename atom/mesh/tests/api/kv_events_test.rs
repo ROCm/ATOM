@@ -229,6 +229,141 @@ async fn a_worker_whose_engine_has_kv_events_off_is_not_followed() {
     worker.stop().await;
 }
 
+/// An ATOM gRPC worker reports its sources in GetServerInfo: it is followed there, a
+/// wildcard host standing for its gRPC address's.
+#[cfg(feature = "grpc-client")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_atom_grpc_worker_is_followed_at_the_sources_its_server_info_reports() {
+    let mut publisher = PubSocket::new();
+    let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+    let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    bos_tokenizer(dir.path());
+    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let url = atom_grpc::serve(dir.path(), json!({"0": source})).await;
+    let mut config = TestRouterConfig::random(3994);
+    config.kv_events = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+
+    let (status, _) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+    assert!(status.is_success(), "{status}");
+    let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
+    let sources = sources_once(&app, Some(&mut publisher), joined).await;
+    let endpoint = format!("tcp://127.0.0.1:{port}");
+    let want = json!({"worker": url, "endpoint": endpoint, "dp_rank": 0, "block_size": 4,
+        "connected": true});
+    for (key, value) in want.as_object().unwrap() {
+        assert_eq!(&sources[0][key], value, "{key}");
+    }
+    ctx.shutdown().await;
+}
+
+/// An ATOM gRPC server answering registration, its GetServerInfo carrying `sources`.
+#[cfg(feature = "grpc-client")]
+mod atom_grpc {
+    use std::path::Path;
+
+    use mesh::atom_engine::grpc::{
+        atom_engine_server::{AtomEngine, AtomEngineServer},
+        AbortRequest, AbortResponse, Frames, GenerateRequest, GenerateResponse,
+        GetModelInfoRequest, GetModelInfoResponse, GetServerInfoRequest, GetServerInfoResponse,
+        HealthCheckRequest, HealthCheckResponse, PrepareStructuredOutputRequest,
+        PrepareStructuredOutputResponse,
+    };
+    use serde_json::{json, Value};
+    use tonic::{
+        transport::{server::TcpIncoming, Server},
+        Request, Response, Status, Streaming,
+    };
+
+    type Empty<T> = tokio_stream::Empty<Result<T, Status>>;
+
+    struct Atom {
+        tokenizer: String,
+        sources: Value,
+    }
+
+    #[tonic::async_trait]
+    impl AtomEngine for Atom {
+        type GenerateStream = Empty<GenerateResponse>;
+        type SessionStream = Empty<Frames>;
+
+        async fn generate(
+            &self,
+            _: Request<GenerateRequest>,
+        ) -> Result<Response<Self::GenerateStream>, Status> {
+            Err(Status::unimplemented("generate"))
+        }
+
+        async fn abort(&self, _: Request<AbortRequest>) -> Result<Response<AbortResponse>, Status> {
+            Err(Status::unimplemented("abort"))
+        }
+
+        async fn get_model_info(
+            &self,
+            _: Request<GetModelInfoRequest>,
+        ) -> Result<Response<GetModelInfoResponse>, Status> {
+            Ok(Response::new(GetModelInfoResponse {
+                model_path: self.tokenizer.clone(),
+                tokenizer_path: self.tokenizer.clone(),
+                served_model_name: "atom-grpc".into(),
+                max_context_length: 4096,
+                ..Default::default()
+            }))
+        }
+
+        async fn get_server_info(
+            &self,
+            _: Request<GetServerInfoRequest>,
+        ) -> Result<Response<GetServerInfoResponse>, Status> {
+            Ok(Response::new(GetServerInfoResponse {
+                protocol_version: 1,
+                kv_transfer_info_json: json!({"tp_size": 1, "dp_size": 1}).to_string(),
+                server_info_json: json!({"model_id": "atom-grpc", "dp_size": 1}).to_string(),
+                kv_event_sources_json: self.sources.to_string(),
+            }))
+        }
+
+        async fn health_check(
+            &self,
+            _: Request<HealthCheckRequest>,
+        ) -> Result<Response<HealthCheckResponse>, Status> {
+            Ok(Response::new(HealthCheckResponse {
+                healthy: true,
+                message: String::new(),
+            }))
+        }
+
+        async fn session(
+            &self,
+            _: Request<Streaming<Frames>>,
+        ) -> Result<Response<Self::SessionStream>, Status> {
+            Err(Status::unimplemented("session"))
+        }
+
+        async fn prepare_structured_output(
+            &self,
+            _: Request<PrepareStructuredOutputRequest>,
+        ) -> Result<Response<PrepareStructuredOutputResponse>, Status> {
+            Err(Status::unimplemented("prepare_structured_output"))
+        }
+    }
+
+    /// Serves it on a free local port, its tokenizer at `tokenizer`; returns its URL.
+    pub async fn serve(tokenizer: &Path, sources: Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let atom = Atom {
+            tokenizer: tokenizer.to_str().unwrap().into(),
+            sources,
+        };
+        let router = Server::builder().add_service(AtomEngineServer::new(atom));
+        tokio::spawn(router.serve_with_incoming(TcpIncoming::from(listener)));
+        url
+    }
+}
+
 /// Each rank also reads the Mooncake Store it reports offloading to, with a pool whose
 /// master answers and one whose master is down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

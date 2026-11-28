@@ -1,12 +1,13 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{json, Value};
 
 use super::fast_tokenizer::FastTokenizer;
 use crate::{
+    core::{worker::RuntimeType, Worker},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},
         common::StringOrArray,
@@ -26,6 +27,49 @@ pub struct ProcessedMessages {
     pub stop_sequences: Option<StringOrArray>,
 }
 
+/// The label with the template kwargs an ATOM worker renders chats with by default:
+/// GetModelInfo's `default_chat_template_kwargs_json`, a JSON object.
+const DEFAULT_TEMPLATE_KWARGS_LABEL: &str = "default_chat_template_kwargs_json";
+
+/// A model's default template kwargs, from the first of its `workers` with the label.
+pub(crate) fn default_template_kwargs(
+    workers: &[Arc<dyn Worker>],
+) -> Result<Option<HashMap<String, Value>>, String> {
+    workers
+        .iter()
+        .find_map(|worker| worker.metadata().labels.get(DEFAULT_TEMPLATE_KWARGS_LABEL))
+        .map(|json| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("Invalid {DEFAULT_TEMPLATE_KWARGS_LABEL} label {json}: {e}"))
+        })
+        .transpose()
+}
+
+/// Why atomesh cannot render chats as `workers`' ATOM worker does, if it cannot: the
+/// worker reports no chat template and the router sets none (`configured`). A model
+/// with `ChatControls` renders with its encoder instead (`chat_render`).
+pub(crate) fn atom_chat_render_gap(
+    workers: &[Arc<dyn Worker>],
+    configured: bool,
+) -> Option<String> {
+    if configured {
+        return None;
+    }
+    workers
+        .iter()
+        .filter(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+        .find(|worker| {
+            worker.chat_template().is_none()
+                && !worker.metadata().labels.contains_key("chat_template")
+        })
+        .map(|worker| {
+            format!(
+                "its ATOM worker {} renders them without a chat template, which atomesh needs",
+                worker.url()
+            )
+        })
+}
+
 /// Process chat messages and apply the HuggingFace chat template, with the
 /// request's `reasoning_effort` and then its `chat_template_kwargs` as the
 /// template kwargs.
@@ -42,6 +86,77 @@ pub fn process_chat_messages(
         &request.messages,
         tokenizer,
         &template_kwargs(request),
+    )
+}
+
+/// The label with an ATOM worker's reasoning toggle, `[name, off value, on value]`:
+/// GetModelInfo's `reasoning_toggle_json`.
+const REASONING_TOGGLE_LABEL: &str = "reasoning_toggle_json";
+
+/// What an ATOM model's chat renders its reasoning controls with: its toggle, if any.
+pub(crate) struct AtomChat {
+    pub toggle: Option<(String, Value, Value)>,
+}
+
+impl AtomChat {
+    /// The model's, from the first of its `workers` with the toggle label.
+    pub(crate) fn of(workers: &[Arc<dyn Worker>]) -> Result<Self, String> {
+        let toggle = workers
+            .iter()
+            .find_map(|worker| worker.metadata().labels.get(REASONING_TOGGLE_LABEL))
+            .map(|json| {
+                serde_json::from_str(json)
+                    .map_err(|e| format!("Invalid {REASONING_TOGGLE_LABEL} label {json}: {e}"))
+            })
+            .transpose()?;
+        Ok(Self { toggle })
+    }
+}
+
+/// The efforts ATOM's chat templates read (`VALID_TEMPLATE_EFFORTS` in
+/// atom/entrypoints/openai/reasoning.py); ATOM's HTTP chat drops any other.
+const ATOM_TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`;
+/// for an ATOM model (`atom`), its reasoning effort then over both as ATOM's HTTP chat
+/// applies it (`apply_reasoning_controls`): "none" switches the toggle off, an effort
+/// its templates read becomes `thinking_effort`.
+pub fn process_chat_messages_with_defaults(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    default_kwargs: Option<&HashMap<String, Value>>,
+    atom: Option<&AtomChat>,
+) -> Result<ProcessedMessages, String> {
+    let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
+
+    if let (None, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+    let effort = request.reasoning_effort.as_deref();
+    if let (Some(atom), Some(effort)) = (atom, effort) {
+        if let (Some((name, off, _)), "none") = (&atom.toggle, effort) {
+            combined_template_kwargs.insert(name.clone(), off.clone());
+        }
+        if ATOM_TEMPLATE_EFFORTS.contains(&effort) {
+            let effort = Value::String(effort.to_string());
+            combined_template_kwargs.insert("thinking_effort".to_string(), effort);
+        }
+    }
+
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        &combined_template_kwargs,
     )
 }
 

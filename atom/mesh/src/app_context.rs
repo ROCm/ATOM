@@ -55,6 +55,17 @@ pub struct AppContext {
     /// The encoder ATOM renders a tokenizer's chats with, by registry id, for
     /// the checkpoints that have their own (`chat_render`).
     pub(crate) chat_controls: Arc<RwLock<HashMap<String, ChatControls>>>,
+    /// Registry ids of the tokenizers loaded with a worker's inline chat template
+    /// (an ATOM worker's GetModelInfo), with that template.
+    pub tokenizer_inline_templates: Arc<RwLock<HashMap<String, String>>>,
+    /// Registry ids of the tokenizers a registration loaded with a template file, with
+    /// that file's path.
+    pub tokenizer_template_files: Arc<RwLock<HashMap<String, String>>>,
+    /// Per tokenizer name, held while a registration loads its tokenizer.
+    pub tokenizer_registering: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while ATOM workers' template is admitted and they are registered, and
+    /// while a model's last worker leaving drops its tokenizer.
+    pub template_admission: Arc<parking_lot::Mutex<()>>,
     /// `router_config`'s tokenization byte limits.
     pub(crate) tokenize_limits: TokenizeLimits,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -110,6 +121,13 @@ pub struct AppContextBuilder {
 }
 
 impl AppContext {
+    /// Drops what registration recorded about the tokenizer with registry id `id`.
+    pub fn forget_tokenizer(&self, id: &str) {
+        self.chat_controls.write().remove(id);
+        self.tokenizer_inline_templates.write().remove(id);
+        self.tokenizer_template_files.write().remove(id);
+    }
+
     pub fn builder() -> AppContextBuilder {
         AppContextBuilder::new()
     }
@@ -317,6 +335,10 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chat_controls: Default::default(),
+            tokenizer_inline_templates: Default::default(),
+            tokenizer_template_files: Default::default(),
+            tokenizer_registering: Default::default(),
+            template_admission: Default::default(),
             tokenize_limits,
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,

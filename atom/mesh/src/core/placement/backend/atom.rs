@@ -13,7 +13,7 @@ use super::{BackendAdapter, PairCtx};
 use crate::config::types::AtomPdRankMappingPolicy;
 use crate::core::{Worker, WorkerRegistry};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AtomPrefillInfo {
     pub tp_sizes: HashMap<String, usize>,
     pub chunked_transfer: HashMap<String, Value>,

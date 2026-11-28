@@ -3732,3 +3732,69 @@ mod e2_generate_streaming_branches {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
+
+/// A streamed response dropped while its source waits for output drops the source,
+/// which ends its call and frees the loads it holds.
+mod c3_streaming_client_disconnect {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use axum::response::Response;
+    use futures::Stream;
+
+    use super::test_support::{chat_ctx, generate_ctx};
+    use crate::routers::render::{chat_streaming, generate_streaming};
+    use crate::routers::token_handle::engine_error::EngineError;
+    use crate::routers::token_handle::token_chunk::TokenChunk;
+    use crate::routers::token_handle::token_handle::{TokenHandle, TokenSource};
+
+    /// A source with no output yet, as a decode is before its first token.
+    struct Waiting(Arc<AtomicBool>);
+
+    impl Stream for Waiting {
+        type Item = Result<TokenChunk, EngineError>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl TokenSource for Waiting {
+        fn mark_completed(&mut self) {}
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn assert_dropped_with_its_response(render: impl FnOnce(TokenHandle) -> Response) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let response = render(TokenHandle::new(Waiting(dropped.clone())));
+        tokio::task::yield_now().await;
+        drop(response);
+        let released = async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), released)
+            .await
+            .expect("the source outlived its response");
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_drops_its_source_when_the_client_leaves() {
+        assert_dropped_with_its_response(|s| chat_streaming::process(s, chat_ctx(), "pd")).await;
+    }
+
+    #[tokio::test]
+    async fn test_generate_stream_drops_its_source_when_the_client_leaves() {
+        let render = |s| generate_streaming::process(s, generate_ctx(), "pd");
+        assert_dropped_with_its_response(render).await;
+    }
+}

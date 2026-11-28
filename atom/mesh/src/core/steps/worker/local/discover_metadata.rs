@@ -251,14 +251,15 @@ async fn fetch_grpc_metadata(
             Ok((labels, runtime.to_string()))
         }
         None => {
-            // Try SGLang first, then vLLM as fallback
-            if let Ok(labels) = do_fetch(&grpc_url, "sglang").await {
-                return Ok((labels, "sglang".to_string()));
+            for runtime in ["sglang", "vllm"] {
+                if let Ok(labels) = do_fetch(&grpc_url, runtime).await {
+                    return Ok((labels, runtime.to_string()));
+                }
             }
-            let labels = do_fetch(&grpc_url, "vllm")
-                .await
-                .map_err(|e| format!("gRPC metadata failed (tried SGLang and vLLM): {}", e))?;
-            Ok((labels, "vllm".to_string()))
+            let labels = do_fetch(&grpc_url, "atom").await.map_err(|e| {
+                format!("gRPC metadata failed (tried SGLang, vLLM and ATOM): {}", e)
+            })?;
+            Ok((labels, "atom".to_string()))
         }
     }
 }
@@ -368,7 +369,10 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 Ok((labels, None))
             }
             ConnectionMode::Grpc { .. } => {
-                let runtime_type = config.runtime.as_deref();
+                let runtime_type = config
+                    .runtime
+                    .as_deref()
+                    .or(context.data.detected_runtime_type.as_deref());
                 fetch_grpc_metadata(&config.url, runtime_type)
                     .await
                     .map(|(labels, runtime)| (labels, Some(runtime)))

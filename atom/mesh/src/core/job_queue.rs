@@ -478,7 +478,7 @@ impl JobQueue {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
-                    context.chat_controls.write().remove(&entry.id);
+                    context.forget_tokenizer(&entry.id);
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id

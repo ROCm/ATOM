@@ -9,13 +9,21 @@ use uuid::Uuid;
 
 use crate::{
     app_context::AppContext,
+    core::{
+        placement::{types::RenderedTemplate, PlacementError},
+        steps::tokenizer_registration::loaded_template,
+        worker::RuntimeType,
+    },
     protocols::{
         chat::ChatCompletionRequest,
         common::{InputIds, StringOrArray},
         generate::GenerateRequest,
     },
-    routers::comm::error,
-    tokenizer::{registry::TokenizerRegistry, traits::Tokenizer},
+    routers::comm::{error, placement_response::placement_err_to_response},
+    tokenizer::{
+        registry::{TokenizerEntry, TokenizerRegistry},
+        traits::Tokenizer,
+    },
 };
 
 pub(crate) mod chat_render;
@@ -31,7 +39,10 @@ pub(crate) mod tool_constraints;
 #[cfg(test)]
 mod tests;
 
-use chat_template::ProcessedMessages;
+use chat_template::{
+    atom_chat_render_gap, default_template_kwargs, process_chat_messages_with_defaults, AtomChat,
+    ProcessedMessages,
+};
 use generation_payload::{GenerationPayload, LogprobConfig, SamplingParams, StopConfig};
 use response_context::{ProtocolRequest, ResponseContext};
 use stop_decoder_builder::create_stop_decoder;
@@ -41,13 +52,24 @@ pub fn lookup_tokenizer(
     model_id: &str,
     registry: &TokenizerRegistry,
 ) -> Result<Arc<dyn Tokenizer>, Response> {
-    registry.get(model_id).ok_or_else(|| {
-        error!(model = %model_id, "Tokenizer not found for model");
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {}", model_id),
-        )
-    })
+    lookup_tokenizer_entry(model_id, registry).map(|entry| entry.tokenizer)
+}
+
+/// The tokenizer `TokenizerRegistry::get` finds, with the id it was loaded under.
+fn lookup_tokenizer_entry(
+    model_id: &str,
+    registry: &TokenizerRegistry,
+) -> Result<TokenizerEntry, Response> {
+    let entry = registry.get_by_name(model_id);
+    entry
+        .or_else(|| registry.get_by_id(model_id))
+        .ok_or_else(|| {
+            error!(model = %model_id, "Tokenizer not found for model");
+            error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {}", model_id),
+            )
+        })
 }
 
 pub fn prepare_chat(
@@ -93,13 +115,55 @@ pub fn prepare_chat_with(
         error!("model_id not set");
         error::internal_error("model_id_not_set", "model_id not set in request")
     })?;
-    let tokenizer = lookup_tokenizer(model_id_str, &components.tokenizer_registry)?;
+    // The tokenizer and what it was loaded with, read in one lookup: a model's last
+    // worker leaving drops it, and a tokenizer job may publish it between two.
+    let entry = lookup_tokenizer_entry(model_id_str, &components.tokenizer_registry)?;
+    let tokenizer = entry.tokenizer.clone();
+    let workers = components.worker_registry.get_by_model(model_id_str);
+    // What its tokenizer was loaded with: a template file is a template, as
+    // --chat-template is; a model with encoder controls renders without one.
+    let id = entry.id;
+    let controls = components.chat_controls.read().get(&id).copied();
+    let templated = components.router_config.chat_template.is_some()
+        || components.tokenizer_template_files.read().contains_key(&id);
+    if let Some(gap) = controls
+        .is_none()
+        .then(|| atom_chat_render_gap(&workers, templated))
+        .flatten()
+    {
+        return Err(error::not_implemented(
+            "chat_template_unavailable",
+            format!(
+                "Chats for model {model_id_str} are not served over gRPC: {gap}. Route its \
+                 chats to ATOM over HTTP; completions are served over gRPC."
+            ),
+        ));
+    }
+    let default_kwargs = default_template_kwargs(&workers)
+        .map_err(|e| error::internal_error("invalid_default_template_kwargs", e))?;
 
     let body_ref = filter_chat_request_by_tool_choice(&req);
+    let atom = workers
+        .iter()
+        .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+        .then(|| AtomChat::of(&workers))
+        .transpose()
+        .map_err(|e| error::internal_error("invalid_reasoning_toggle", e))?;
 
-    let controls = components.chat_controls_of(model_id_str);
-    let (text, prompt_opener) = chat_render::render_chat(&body_ref, sent, &*tokenizer, controls)
-        .map_err(|e| error::bad_request("process_messages_failed", e))?;
+    let (text, prompt_opener) = match controls {
+        Some(_) => chat_render::render_chat(&body_ref, sent, &*tokenizer, controls),
+        None => process_chat_messages_with_defaults(
+            &body_ref,
+            &*tokenizer,
+            default_kwargs.as_ref(),
+            atom.as_ref(),
+        )
+        .map(|processed| {
+            let opener = response_context::prompt_opener(&processed.text);
+            (processed.text, opener)
+        }),
+    }
+    .map_err(|e| error::bad_request("process_messages_failed", e))?;
     let processed = ProcessedMessages {
         text,
         stop_sequences: body_ref.stop.clone(),
@@ -135,6 +199,18 @@ pub fn prepare_chat_with(
         tool_constraints,
     );
     (payload.dp_session_id, payload.dp_parent_session_id) = dp_session_ids(headers.as_ref());
+    if controls.is_none() {
+        // Rendered with the template: only the ATOM workers serving it read these ids.
+        let fingerprint = loaded_template(components, &id).ok_or_else(|| {
+            let err = PlacementError::ChatTemplateChanged;
+            placement_err_to_response(err, Some(model_id_str))
+        })?;
+        let loaded_file = components.tokenizer_template_files.read().get(&id).cloned();
+        payload.chat_template = Some(RenderedTemplate {
+            fingerprint,
+            fallback_file: loaded_file.or_else(|| components.router_config.chat_template.clone()),
+        });
+    }
 
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -294,6 +370,7 @@ pub(crate) fn build_chat_payload(
         log_metrics: false,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 
@@ -347,6 +424,7 @@ pub(crate) fn build_generate_payload(
         log_metrics: req.log_metrics,
         dp_session_id: None,
         dp_parent_session_id: None,
+        chat_template: None,
     }
 }
 

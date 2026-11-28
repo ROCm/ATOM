@@ -163,6 +163,8 @@ async fn router(model: &Path, backend: &str) -> (PreparePoolRuntime, Arc<AppCont
         name: MODEL.to_string(),
         source: model.to_str().unwrap().to_string(),
         chat_template_path: None,
+        inline_chat_template: None,
+        worker_url: None,
         cache_config: None,
         fail_on_duplicate: true,
     };

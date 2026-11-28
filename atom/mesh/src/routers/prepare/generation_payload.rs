@@ -4,7 +4,7 @@
 //! No backend types appear here — `to_sglang_proto` / `to_vllm_proto` are
 //! the only sites that import `mesh_grpc::*`.
 
-use crate::protocols::common::StringOrArray;
+use crate::{core::placement::types::RenderedTemplate, protocols::common::StringOrArray};
 
 pub struct GenerationPayload {
     pub request_id: String,
@@ -24,6 +24,8 @@ pub struct GenerationPayload {
     /// ATOM only: the request's DP session and its parent, from its headers.
     pub dp_session_id: Option<String>,
     pub dp_parent_session_id: Option<String>,
+    /// A chat's prompt, rendered here: the template it rendered with.
+    pub chat_template: Option<RenderedTemplate>,
 }
 
 pub struct SamplingParams {

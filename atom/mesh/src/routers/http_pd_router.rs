@@ -776,6 +776,7 @@ impl PDRouter {
             headers: context.headers.as_deref(),
             stream: context.is_stream,
             media_count: context.media_count,
+            chat_template: None,
         };
         let plan = planner
             .plan(&descriptor)
