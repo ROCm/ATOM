@@ -1,7 +1,7 @@
 use super::{
     AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigResult, FastokensConfig,
     HealthCheckConfig, MetricsConfig, PolicyConfig, PreparePoolConfig, RetryConfig, RouterConfig,
-    RoutingMode, TokenizerCacheConfig,
+    RoutingMode, SessionAffinityConfig, TokenizerCacheConfig,
 };
 use crate::core::ConnectionMode;
 
@@ -95,6 +95,11 @@ impl RouterConfigBuilder {
 
     pub fn policy(mut self, policy: PolicyConfig) -> Self {
         self.config.policy = policy;
+        self
+    }
+
+    pub fn session_affinity(mut self, session_affinity: SessionAffinityConfig) -> Self {
+        self.config.session_affinity = session_affinity;
         self
     }
 

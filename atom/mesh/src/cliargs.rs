@@ -4,7 +4,9 @@ use crate::{
     config::{
         AtomPdRankMappingPolicy, BackendType, CircuitBreakerConfig, ConfigError, ConfigResult,
         HealthCheckConfig, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
-        TokenizerCacheConfig,
+        SessionAffinityConfig, SessionParentMode, TokenizerCacheConfig,
+        DEFAULT_SESSION_AFFINITY_MAX_ENTRIES, DEFAULT_SESSION_AFFINITY_TTL_SECS,
+        DEFAULT_SESSION_ID_HEADERS,
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
@@ -277,6 +279,39 @@ pub struct CliArgs {
     /// Store a worker offloads to; /kv_storage/sources shows every store and its pools
     #[arg(long, default_value_t = 9003, help_heading = "Routing Policy")]
     pub mooncake_admin_port: u16,
+
+    /// Headers checked in order for a session key. The first non-empty value wins.
+    /// `x-correlation-id` is not included: this router uses it as a per-request id.
+    /// An empty list turns session affinity off; `dp_sticky` then keys on `x-session-id`.
+    /// With gRPC workers these headers and parent groups are off.
+    #[arg(
+        long,
+        default_value = DEFAULT_SESSION_ID_HEADERS,
+        help_heading = "Routing Policy"
+    )]
+    pub session_id_headers: String,
+
+    /// Idle seconds before a session binding can be placed again.
+    #[arg(long, default_value_t = DEFAULT_SESSION_AFFINITY_TTL_SECS, help_heading = "Routing Policy")]
+    pub session_affinity_ttl_secs: u64,
+
+    /// Most bindings each session table holds. Past it, the least recently used
+    /// tenth of the table is dropped.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+        help_heading = "Routing Policy"
+    )]
+    pub session_affinity_max_entries: usize,
+
+    /// `independent` binds each session alone. `group` shares a binding across one parent's children.
+    #[arg(
+        long,
+        default_value = "independent",
+        value_parser = ["independent", "group"],
+        help_heading = "Routing Policy"
+    )]
+    pub session_parent_mode: String,
 
     /// With --kv-storage-weight, how long a request waits for the stores its workers load
     /// from to say what they hold of the prompt, in milliseconds. Past it a store's lookup
@@ -590,6 +625,32 @@ impl CliArgs {
         }
     }
 
+    fn session_affinity_config(&self) -> ConfigResult<SessionAffinityConfig> {
+        let parent_mode = match self.session_parent_mode.as_str() {
+            "independent" => SessionParentMode::Independent,
+            "group" => SessionParentMode::Group,
+            other => {
+                return Err(ConfigError::InvalidValue {
+                    field: "session_parent_mode".to_string(),
+                    value: other.to_string(),
+                    reason: "expected independent or group".to_string(),
+                });
+            }
+        };
+        let session_id_headers = self
+            .session_id_headers
+            .split(',')
+            .map(|header| header.trim().to_ascii_lowercase())
+            .filter(|header| !header.is_empty())
+            .collect();
+        Ok(SessionAffinityConfig {
+            session_id_headers,
+            ttl_secs: self.session_affinity_ttl_secs,
+            max_entries: self.session_affinity_max_entries,
+            parent_mode,
+        })
+    }
+
     fn validate_tls_args(&self) -> ConfigResult<()> {
         match (&self.tls_cert_path, &self.tls_key_path) {
             (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -623,6 +684,7 @@ impl CliArgs {
         };
 
         let policy = self.parse_policy(&self.policy);
+        let session_affinity = self.session_affinity_config()?;
         let atom_pd_rank_mapping_policy = self
             .atom_pd_rank_mapping_policy
             .parse::<AtomPdRankMappingPolicy>()
@@ -665,6 +727,7 @@ impl CliArgs {
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .atom_pd_concurrent(self.atom_pd_concurrent)
             .policy(policy)
+            .session_affinity(session_affinity)
             .connection_mode(connection_mode)
             .host(&self.host)
             .port(self.port)
@@ -982,6 +1045,61 @@ mod tests {
             PolicyConfig::DpSticky
         ));
     }
+
+    /// The router config `atomesh launch <flags>` builds.
+    fn launch_config(flags: &[&str]) -> ConfigResult<RouterConfig> {
+        let cli = Cli::try_parse_from(
+            ["atomesh", "launch"]
+                .into_iter()
+                .chain(flags.iter().copied()),
+        )
+        .expect("flags should parse");
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        args.to_router_config(Vec::new())
+    }
+
+    #[test]
+    fn cli_session_affinity_flags_reach_router_config() {
+        let config = launch_config(&[
+            "--session-affinity-ttl-secs",
+            "14400",
+            "--session-parent-mode",
+            "group",
+            "--session-id-headers",
+            "x-session-affinity, X-Correlation-ID",
+        ])
+        .expect("router config");
+        let affinity = config.session_affinity;
+        assert_eq!(affinity.ttl_secs, 14400);
+        assert_eq!(affinity.parent_mode, SessionParentMode::Group);
+        assert_eq!(
+            affinity.session_id_headers,
+            ["x-session-affinity", "x-correlation-id"]
+        );
+
+        let off = launch_config(&["--session-id-headers", ""]).expect("router config");
+        assert!(!off.session_affinity.is_enabled());
+    }
+
+    #[test]
+    fn cli_rejects_zero_session_ttl_and_invalid_session_headers() {
+        for (flags, field) in [
+            (
+                ["--session-affinity-ttl-secs", "0"],
+                "session_affinity_ttl_secs",
+            ),
+            (
+                ["--session-id-headers", "x-session-id,x session"],
+                "session_id_headers",
+            ),
+        ] {
+            let error = launch_config(&flags).expect_err("the flag should be rejected");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
 }
 
 impl Default for CliArgs {
@@ -1004,6 +1122,10 @@ impl Default for CliArgs {
             prefix_hash_load_factor: 1.25,
             dp_aware: false,
             kv_events: false,
+            session_id_headers: DEFAULT_SESSION_ID_HEADERS.to_string(),
+            session_affinity_ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
+            session_affinity_max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+            session_parent_mode: "independent".to_string(),
             mooncake_admin_port: 9003,
             kv_storage_deadline_ms: 3,
             kv_storage_weight: 0.0,

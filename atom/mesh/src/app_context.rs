@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use reqwest::Client;
 
 use crate::{
-    config::RouterConfig,
+    config::{RouterConfig, SessionAffinityConfig},
     core::{
         prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
         WorkerService,
@@ -438,7 +438,21 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        let session_affinity = config.effective_session_affinity();
+        let configured = &config.session_affinity;
+        let defaults = SessionAffinityConfig::default();
+        let customized = configured.session_id_headers != defaults.session_id_headers
+            || configured.parent_mode != defaults.parent_mode;
+        if customized && session_affinity != *configured {
+            tracing::warn!(
+                "session affinity settings are not supported with gRPC workers; \
+                 dp_sticky keys on x-session-id"
+            );
+        }
+        self.policy_registry = Some(Arc::new(PolicyRegistry::with_session_affinity(
+            config.policy.clone(),
+            session_affinity,
+        )));
         self
     }
 

@@ -53,6 +53,91 @@ impl std::str::FromStr for AtomPdRankMappingPolicy {
     }
 }
 
+/// Idle time before a session binding is eligible for a new placement.
+pub const DEFAULT_SESSION_AFFINITY_TTL_SECS: u64 = 120 * 60;
+
+/// Comma-separated session headers. The first non-empty value wins.
+/// `x-correlation-id` is not a session key: this router treats it as a per-request id.
+pub const DEFAULT_SESSION_ID_HEADERS: &str =
+    "x-dynamo-session-id,x-session-id,x-smg-routing-key,x-session-affinity";
+
+/// Most bindings one session table holds. A key that is not stable per session,
+/// such as a per-request value, would otherwise grow the table for a whole TTL.
+pub const DEFAULT_SESSION_AFFINITY_MAX_ENTRIES: usize = 1_000_000;
+
+/// `independent` gives each session its own binding. `group` binds requests
+/// that carry a parent session id under one shared key; the parent session
+/// itself keeps its own binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionParentMode {
+    #[default]
+    Independent,
+    Group,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionAffinityConfig {
+    /// Headers checked in order for a session key. An empty list turns session
+    /// affinity off: `dp_sticky` then keys on `x-session-id` only.
+    pub session_id_headers: Vec<String>,
+    pub ttl_secs: u64,
+    pub max_entries: usize,
+    pub parent_mode: SessionParentMode,
+}
+
+impl Default for SessionAffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_headers: DEFAULT_SESSION_ID_HEADERS
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+            ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
+            max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+            parent_mode: SessionParentMode::Independent,
+        }
+    }
+}
+
+impl SessionAffinityConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.session_id_headers.is_empty()
+    }
+
+    /// Reject settings that would expire every request, bound nothing, or name a
+    /// header no request can carry.
+    pub fn validate(&self) -> ConfigResult<()> {
+        if self.ttl_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "session_affinity_ttl_secs".to_string(),
+                value: "0".to_string(),
+                reason: "idle ttl must be at least 1 second".to_string(),
+            });
+        }
+        if self.max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "session_affinity_max_entries".to_string(),
+                value: "0".to_string(),
+                reason: "the session table must hold at least 1 binding".to_string(),
+            });
+        }
+        if let Some(header) = self
+            .session_id_headers
+            .iter()
+            .find(|header| http::HeaderName::from_bytes(header.as_bytes()).is_err())
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "session_id_headers".to_string(),
+                value: header.clone(),
+                reason: "not a valid HTTP header name".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -78,6 +163,9 @@ pub struct RouterConfig {
     pub atom_pd_concurrent: bool,
 
     pub policy: PolicyConfig,
+    /// Session table settings for `dp_sticky`. Prefill and decode each get a table.
+    #[serde(default)]
+    pub session_affinity: SessionAffinityConfig,
     pub host: String,
     pub port: u16,
     pub max_payload_size: usize,
@@ -364,7 +452,7 @@ pub enum PolicyConfig {
     RoundRobin,
 
     /// Session-affinity policy for data-parallel workers.
-    /// Requests with the same `X-Session-ID` are routed to the same healthy worker.
+    /// Requests with the same session key are routed to the same healthy worker.
     #[serde(rename = "dp_sticky")]
     DpSticky,
 
@@ -527,6 +615,7 @@ impl Default for RouterConfig {
             },
             backend: BackendType::Sglang,
             policy: PolicyConfig::Random,
+            session_affinity: SessionAffinityConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912,     // 512MB
@@ -567,6 +656,22 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Session affinity as the policies get it. gRPC workers do not support it:
+    /// the gRPC pipeline reports no dispatch or failure to the policies, so a
+    /// binding could never be released. There the session headers and parent
+    /// groups are off, and `dp_sticky` keys on `x-session-id` as it did before
+    /// session affinity; the TTL and table size still bound its table.
+    pub fn effective_session_affinity(&self) -> SessionAffinityConfig {
+        if matches!(self.connection_mode, ConnectionMode::Grpc { .. }) {
+            return SessionAffinityConfig {
+                session_id_headers: Vec::new(),
+                parent_mode: SessionParentMode::Independent,
+                ..self.session_affinity.clone()
+            };
+        }
+        self.session_affinity.clone()
+    }
+
     /// Preparation settings, with the legacy ext-proc options filling unset
     /// values when the external-processing transport is enabled.
     fn effective_prepare_pool(&self) -> PreparePoolConfig {
@@ -797,6 +902,26 @@ mod tests {
         assert_eq!(config.resolved_prepare_workers(), 3);
         assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
         assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+    }
+
+    #[test]
+    fn grpc_workers_turn_session_affinity_off() {
+        let http = RouterConfig::default();
+        assert_eq!(http.effective_session_affinity(), http.session_affinity);
+
+        let grpc = RouterConfig {
+            connection_mode: ConnectionMode::Grpc { port: None },
+            session_affinity: SessionAffinityConfig {
+                ttl_secs: 60,
+                parent_mode: SessionParentMode::Group,
+                ..SessionAffinityConfig::default()
+            },
+            ..RouterConfig::default()
+        };
+        let effective = grpc.effective_session_affinity();
+        assert!(!effective.is_enabled());
+        assert_eq!(effective.parent_mode, SessionParentMode::Independent);
+        assert_eq!(effective.ttl_secs, 60);
     }
 
     #[test]
