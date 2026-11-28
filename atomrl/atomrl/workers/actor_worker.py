@@ -15,6 +15,7 @@ import shutil
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -387,6 +388,7 @@ class AtomActorWorker(BaseWorker):
                 "moe_router_bias_update_rate": meg_cfg.get(
                     "moe_router_bias_update_rate", None
                 ),
+                "freeze_moe_router": meg_cfg.get("freeze_moe_router", False),
                 "moe_token_dispatcher_type": meg_cfg.get(
                     "moe_token_dispatcher_type", "alltoall"
                 ),
@@ -398,6 +400,7 @@ class AtomActorWorker(BaseWorker):
                 ),
                 "moe_mori_kernel_type": meg_cfg.get("moe_mori_kernel_type"),
                 "moe_permute_fusion": meg_cfg.get("moe_permute_fusion", False),
+                "te_attention_backend": meg_cfg.get("te_attention_backend"),
                 # One key: the Megatron TransformerConfig field name, which is
                 # what all three engines read. ``r3_enabled`` was an alias.
                 "moe_enable_routing_replay": r3_enabled,
@@ -501,6 +504,7 @@ class AtomActorWorker(BaseWorker):
             "weight_decay": float(policy.get("weight_decay", 0.01)),
             "clip_grad": float(policy.get("max_grad_norm", 1.0)),
             "lr_warmup_steps": int(policy.get("lr_warmup_steps", 10)),
+            "lr_warmup_init": float(policy.get("lr_warmup_init", 0.0)),
             "lr_warmup_steps_ratio": float(policy.get("warmup_ratio", 0.0)),
         }
         for key in ("adam_beta1", "adam_beta2", "adam_eps"):
@@ -533,6 +537,17 @@ class AtomActorWorker(BaseWorker):
             self._device,
         )
 
+    def snapshot_reference_weights(self) -> None:
+        """Keep the current (initial) weights as the reference policy that
+        ``compute_log_probs`` uses when the batch asks for ``reference_policy``."""
+        snapshot = getattr(self._engine, "snapshot_reference_weights", None)
+        if snapshot is None:
+            raise NotImplementedError(
+                f"{type(self._engine).__name__} holds no reference policy; "
+                "controller.ray.ref_in_actor needs a Megatron engine."
+            )
+        snapshot()
+
     def compute_log_probs(self, batch: DataProto) -> DataProto:
         """Return per-token log-probs (and optionally entropy) for the policy.
 
@@ -553,9 +568,17 @@ class AtomActorWorker(BaseWorker):
         if "input_ids" not in batch.tensors:
             raise KeyError("batch must contain 'input_ids'")
 
+        reference = bool(batch.meta.get("reference_policy", False))
+        if reference and not hasattr(self._engine, "reference_weights"):
+            raise NotImplementedError(
+                f"{type(self._engine).__name__} holds no reference policy; "
+                "controller.ray.ref_in_actor needs a Megatron engine."
+            )
+
         # Megatron backend owns its own (GPTModel) forward + logprob path.
         if hasattr(self._engine, "engine_compute_log_probs"):
-            out = self._engine.engine_compute_log_probs(batch)
+            with self._engine.reference_weights() if reference else nullcontext():
+                out = self._engine.engine_compute_log_probs(batch)
             src = getattr(self._engine, "is_mp_src_rank_with_outputs", None)
             if src is not None and not src():
                 return DataProto(meta=dict(batch.meta))
@@ -1536,6 +1559,34 @@ class AtomActorWorker(BaseWorker):
             itemsize = torch.bfloat16.itemsize
         return itemsize * param.numel()
 
+    @staticmethod
+    def _largest_checkpoint_tensor_bytes(model_path: str) -> int:
+        """Bytes of the largest tensor in a safetensors checkpoint, from the headers.
+
+        An upper bound on any single tensor the weight sync sends: the rollout
+        receives the checkpoint's tensors under their HF names, and FP32 ones go
+        out as BF16.
+        """
+        import json
+        import struct
+
+        largest = 0
+        for path in sorted(Path(model_path).glob("*.safetensors")):
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(header_len))
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                start, end = meta["data_offsets"]
+                largest = max(largest, int(end) - int(start))
+        if largest == 0:
+            raise FileNotFoundError(
+                f"no safetensors tensors under {model_path!r}; cannot size the "
+                "weight-sync bucket for a lazily gathered model"
+            )
+        return largest
+
     def update_weights_ipc_send(
         self,
         bucket_size_mb: int = 512,
@@ -1665,10 +1716,17 @@ class AtomActorWorker(BaseWorker):
         # expert weight is 768 MiB, past the 512 MiB default. vLLM re-opens per
         # bucket and needs no such floor.
         min_bucket_bytes = 0
-        if is_atom:
+        if is_atom and hasattr(params, "__len__"):
             min_bucket_bytes = max(
                 (self._sent_nbytes(p, keep_fp32) for _, p in params),
                 default=0,
+            )
+        elif is_atom:
+            # The Megatron engines hand out a lazy generator whose every tensor
+            # comes out of a collective; it can be drained once, by the send
+            # below. Scanning it here first left nothing to send.
+            min_bucket_bytes = self._largest_checkpoint_tensor_bytes(
+                str(get_nested_config(self.config, "policy", "model_name", default=""))
             )
 
         # ATOM's receive loop needs the whole bucket for its largest tensor

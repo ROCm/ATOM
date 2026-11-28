@@ -329,6 +329,41 @@ def _seq_log_ratio(
     return lr_sum
 
 
+def rollout_is_weights(
+    log_ratio: Tensor,
+    response_mask: Tensor,
+    rollout_is: str = "token",
+    rollout_is_threshold: str | float = 2.0,
+    rollout_is_seq_reduction: str = "sum",
+) -> tuple[Tensor, Tensor]:
+    """Truncated importance-sampling weights ``exp(log_ratio)`` and the raw ones
+    before truncation, both masked; no metrics, so cheap enough to call per row."""
+    valid_levels = {"token", "sequence"}
+    if rollout_is not in valid_levels:
+        raise ValueError(
+            f"Invalid rollout_is: {rollout_is}. Must be one of {valid_levels}."
+        )
+
+    threshold_upper, threshold_lower = _parse_rollout_is_threshold(rollout_is_threshold)
+
+    if rollout_is == "token":
+        log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        raw_weights = torch.exp(log_ratio_safe)
+    else:  # sequence
+        lr_sum = _seq_log_ratio(log_ratio, response_mask, rollout_is_seq_reduction)
+        lr_sum_safe = torch.clamp(lr_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        raw_weights = torch.exp(lr_sum_safe).expand_as(log_ratio)
+
+    raw_weights = raw_weights * response_mask
+
+    if threshold_lower is None:
+        is_weights = raw_weights.clamp(max=threshold_upper)
+    else:
+        kept = (raw_weights >= threshold_lower) & (raw_weights <= threshold_upper)
+        is_weights = torch.where(kept, raw_weights, torch.zeros_like(raw_weights))
+    return is_weights, raw_weights
+
+
 def compute_rollout_correction_weights(
     log_ratio: Tensor,
     response_mask: Tensor,
@@ -341,30 +376,14 @@ def compute_rollout_correction_weights(
 
     Returns (is_weights [B, T], metrics).
     """
-    valid_levels = {"token", "sequence"}
-    if rollout_is not in valid_levels:
-        raise ValueError(
-            f"Invalid rollout_is: {rollout_is}. Must be one of {valid_levels}."
-        )
-
     threshold_upper, threshold_lower = _parse_rollout_is_threshold(rollout_is_threshold)
-    use_icepop = threshold_lower is not None
-
-    if rollout_is == "token":
-        log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        raw_weights = torch.exp(log_ratio_safe)
-    else:  # sequence
-        lr_sum = _seq_log_ratio(log_ratio, response_mask, rollout_is_seq_reduction)
-        lr_sum_safe = torch.clamp(lr_sum, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        raw_weights = torch.exp(lr_sum_safe).expand_as(log_ratio)
-
-    raw_weights = raw_weights * response_mask
-
-    if not use_icepop:
-        is_weights = raw_weights.clamp(max=threshold_upper)
-    else:
-        kept = (raw_weights >= threshold_lower) & (raw_weights <= threshold_upper)
-        is_weights = torch.where(kept, raw_weights, torch.zeros_like(raw_weights))
+    is_weights, raw_weights = rollout_is_weights(
+        log_ratio,
+        response_mask,
+        rollout_is,
+        rollout_is_threshold,
+        rollout_is_seq_reduction,
+    )
 
     # Metrics
     metrics: dict[str, float] = {}
@@ -446,7 +465,7 @@ def compute_rollout_correction_weights(
             (raw_seq_mean < th_lower_eff2).float().mean().item()
         )
 
-    if use_icepop:
+    if threshold_lower is not None:
         oob = (raw_weights < threshold_lower) | (raw_weights > threshold_upper)
         metrics["rollout_is_oob_ratio"] = _masked_mean(
             oob.float(), response_mask

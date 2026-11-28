@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ except ModuleNotFoundError:
 
 import atomrl.engine.training  # noqa: F401 - populate EngineRegistry
 from atomrl.algorithms.loss_functions import asymmetric_clip_loss
+from atomrl.algorithms.rollout_correction import rollout_is_weights
 from atomrl.core.config import OptimizerConfig
 from atomrl.core.protocol import DataProto
 from atomrl.engine.training import megatron_engine, megatron_lumen_dsv4_engine
@@ -34,6 +36,7 @@ from atomrl.engine.training.megatron_base_engine import (
     moe_dispatcher_kwargs,
 )
 from atomrl.engine.training.megatron_native_engine import MegatronNativeEngine
+from atomrl.trainer.rl_trainer import RLTrainer
 from atomrl.workers.actor_worker import AtomActorWorker
 
 
@@ -256,6 +259,210 @@ def test_row_policy_loss_aligns_token_indexed_response_mask_after_left_padding()
     assert token_log_probs.grad[0, 2].item() != 0.0
 
 
+# One left-padded row: shifted-token columns of width 6, the real block starts
+# at column 2, its first transition is prompt and the next three are response.
+_TRAIN_LP = torch.tensor([[-0.7, -1.2, -0.3, -2.0]])
+_ON_POLICY_ROW = {
+    "response_mask": torch.tensor([[0, 0, 0, 1, 1, 1]]),
+    "advantages": torch.tensor([0.8]),
+    "rollout_log_probs": torch.tensor([[0.0, 0.0, -0.9, -1.1, -0.2, -2.3]]),
+}
+
+
+def _grpo_row_loss(tensors, token_lp, *, force, token_ent=None, in_loss_is=None, **cfg):
+    cfg = {"force_on_policy_ratio": force, "clip_ratio_high": 0.2, **cfg}
+    return object.__new__(MegatronBaseEngine)._row_policy_loss(
+        tensors,
+        r=0,
+        start=2,
+        token_lp=token_lp,
+        algo_name="grpo",
+        cfg_fn=lambda name, default: cfg.get(name, default),
+        bnt=3,
+        dp=1,
+        loss_agg_mode="token-mean",
+        global_batch_size=1,
+        token_ent=token_ent,
+        in_loss_is=in_loss_is,
+    )
+
+
+_IN_LOSS_IS = {"rollout_is": "token", "rollout_is_threshold": "1e9"}
+
+
+def test_force_on_policy_ratio_forms_rollout_is_weights_in_the_loss() -> None:
+    """NeMo-RL's force_on_policy_ratio with IS correction: weights
+    exp(train_logp.detach() - rollout_logp) from the training forward equal the
+    ones the controller forms from a separate old-log-prob pass."""
+    old = torch.cat([torch.zeros(1, 2), _TRAIN_LP], dim=1)
+    ris, _ = rollout_is_weights(
+        old - _ON_POLICY_ROW["rollout_log_probs"],
+        _ON_POLICY_ROW["response_mask"].float(),
+        **_IN_LOSS_IS,
+    )
+    two_pass_lp = _TRAIN_LP.clone().requires_grad_(True)
+    loss_a, _ = _grpo_row_loss(
+        {**_ON_POLICY_ROW, "old_log_probs": old, "rollout_is_weights": ris},
+        two_pass_lp,
+        force=False,
+    )
+    loss_a.backward()
+
+    reuse_lp = _TRAIN_LP.clone().requires_grad_(True)
+    loss_b, stats = _grpo_row_loss(
+        _ON_POLICY_ROW, reuse_lp, force=True, in_loss_is=_IN_LOSS_IS
+    )
+    loss_b.backward()
+
+    unweighted, _ = _grpo_row_loss(
+        _ON_POLICY_ROW, _TRAIN_LP.clone().requires_grad_(True), force=True
+    )
+    assert not torch.allclose(unweighted.detach(), loss_b.detach())
+    assert torch.allclose(loss_a.detach(), loss_b.detach(), rtol=1e-6)
+    assert torch.allclose(two_pass_lp.grad, reuse_lp.grad, rtol=1e-6)
+    assert stats["ris_tok"] == 3.0
+    assert stats["ris_sum"] == pytest.approx(float(ris[0, 3:].sum()), rel=1e-6)
+
+
+def test_row_policy_loss_adds_the_reference_kl_under_the_global_token_count() -> None:
+    """kl_coeff * k3 KL, normalized by the batch's token count (bnt=3) as the
+    PG term is, and its per-token mean reported for the controller."""
+    old = torch.cat([torch.zeros(1, 2), _TRAIN_LP], dim=1)
+    ref = torch.tensor([[0.0, 0.0, -0.5, -1.0, -0.6, -1.5]])
+    base = {**_ON_POLICY_ROW, "old_log_probs": old, "ref_log_probs": ref}
+    plain, _ = _grpo_row_loss(base, _TRAIN_LP.clone(), force=False)
+    with_kl, stats = _grpo_row_loss(
+        base, _TRAIN_LP.clone(), force=False, kl_coeff=0.01, kl_penalty="k3"
+    )
+    logr = ref[:, 3:] - _TRAIN_LP[:, 1:]
+    k3 = torch.exp(logr) - 1 - logr
+    # A difference of two float32 losses: relative error ~1e-5.
+    assert float(with_kl - plain) == pytest.approx(0.01 * float(k3.sum()) / 3, rel=1e-4)
+    assert stats["refkl_tok"] == 3.0
+    assert stats["refkl_sum"] == pytest.approx(float(k3.sum()), rel=1e-6)
+
+
+def test_reference_weights_swap_in_and_back_bit_for_bit() -> None:
+    engine = object.__new__(MegatronBaseEngine)
+    engine.module = torch.nn.Linear(4, 3)
+    initial = {k: v.clone() for k, v in engine.module.state_dict().items()}
+    engine.snapshot_reference_weights()
+    with torch.no_grad():
+        for p in engine.module.parameters():
+            p.add_(torch.randn_like(p))
+    trained = {k: v.clone() for k, v in engine.module.state_dict().items()}
+    storage = [p.data_ptr() for p in engine.module.parameters()]
+
+    with engine.reference_weights():
+        for k, v in engine.module.state_dict().items():
+            assert torch.equal(v, initial[k])
+    for k, v in engine.module.state_dict().items():
+        assert torch.equal(v, trained[k])
+    assert [p.data_ptr() for p in engine.module.parameters()] == storage
+    with engine.reference_weights():
+        for k, v in engine.module.state_dict().items():
+            assert torch.equal(v, initial[k])
+
+
+def test_reference_forward_needs_a_snapshot() -> None:
+    engine = object.__new__(MegatronBaseEngine)
+    engine.module = torch.nn.Linear(2, 2)
+    with (
+        pytest.raises(RuntimeError, match="snapshot_reference_weights"),
+        engine.reference_weights(),
+    ):
+        pass
+
+
+def test_overlap_param_gather_is_refused_at_the_snapshot() -> None:
+    """At setup, not after the first rollout: the reference forward would
+    otherwise fail only once a whole rollout had been spent."""
+    engine = object.__new__(MegatronBaseEngine)
+    engine.module = torch.nn.Linear(2, 2)
+    engine._overlap_param_gather = True
+    with pytest.raises(NotImplementedError, match="overlap_param_gather"):
+        engine.snapshot_reference_weights()
+
+
+def test_actor_runs_a_reference_request_under_the_reference_weights() -> None:
+    seen = []
+
+    class _Engine:
+        in_reference = False
+
+        def engine_compute_log_probs(self, batch):
+            seen.append(self.in_reference)
+            return DataProto(tensors={"log_probs": torch.zeros(1, 2)})
+
+        @contextmanager
+        def reference_weights(self):
+            self.in_reference = True
+            try:
+                yield
+            finally:
+                self.in_reference = False
+
+    actor = object.__new__(AtomActorWorker)
+    actor._engine = _Engine()
+    ids = {"input_ids": torch.ones(1, 3, dtype=torch.long)}
+    actor.compute_log_probs(DataProto(tensors=ids, meta={"reference_policy": True}))
+    actor.compute_log_probs(DataProto(tensors=ids, meta={}))
+    assert seen == [True, False]
+
+    actor._engine = SimpleNamespace(engine_compute_log_probs=lambda batch: None)
+    with pytest.raises(NotImplementedError, match="ref_in_actor"):
+        actor.compute_log_probs(DataProto(tensors=ids, meta={"reference_policy": True}))
+
+
+def test_force_on_policy_ratio_matches_a_separate_old_log_prob_pass() -> None:
+    """Old log-probs from a separate pass over the same weights equal the
+    training forward's; taking them detached from that forward instead must not
+    change the loss or the gradient."""
+    two_pass_lp = _TRAIN_LP.clone().requires_grad_(True)
+    old = torch.cat([torch.zeros(1, 2), _TRAIN_LP], dim=1)
+    loss_a, stats_a = _grpo_row_loss(
+        {**_ON_POLICY_ROW, "old_log_probs": old}, two_pass_lp, force=False
+    )
+    loss_a.backward()
+
+    reuse_lp = _TRAIN_LP.clone().requires_grad_(True)
+    loss_b, stats_b = _grpo_row_loss(_ON_POLICY_ROW, reuse_lp, force=True)
+    loss_b.backward()
+
+    assert torch.equal(loss_a.detach(), loss_b.detach())
+    assert torch.equal(two_pass_lp.grad, reuse_lp.grad)
+    assert stats_b["ppo_kl_sum"] == 0.0
+    assert stats_a["tmpe_tok"] == 0.0
+
+
+def test_force_on_policy_ratio_reports_what_the_skipped_pass_did() -> None:
+    """token_mult_prob_error and entropy move into the training forward with the
+    controller's definitions."""
+    entropy = torch.tensor([[0.5, 1.0, 1.5, 2.0]])
+    _, stats = _grpo_row_loss(
+        _ON_POLICY_ROW,
+        _TRAIN_LP.clone().requires_grad_(True),
+        force=True,
+        token_ent=entropy,
+    )
+    old = torch.cat([torch.zeros(1, 2), _TRAIN_LP], dim=1)
+    expected = RLTrainer._token_mult_prob_error(
+        old,
+        _ON_POLICY_ROW["rollout_log_probs"],
+        _ON_POLICY_ROW["response_mask"],
+    )["rollout_corr/token_mult_prob_error"]
+
+    assert stats["tmpe_tok"] == 3.0
+    assert stats["tmpe_sum"] / stats["tmpe_tok"] == pytest.approx(expected, rel=1e-6)
+    assert stats["ent_sum"] / stats["ent_tok"] == pytest.approx(1.5)
+
+
+def test_row_policy_loss_still_needs_old_log_probs_without_the_flag() -> None:
+    assert _grpo_row_loss(
+        _ON_POLICY_ROW, _TRAIN_LP.clone().requires_grad_(True), force=False
+    ) == (None, None)
+
+
 def test_native_pp_grpo_passes_sequence_normalization_under_dp_cp(
     monkeypatch,
 ) -> None:
@@ -375,11 +582,12 @@ def test_actor_optimizer_config_propagates_optimizer_type() -> None:
     actor = AtomActorWorker(rank=0, world_size=1, config={})
 
     config = actor._build_optimizer_config(
-        {"optimizer_type": "sgd", "sgd_momentum": 0.0}
+        {"optimizer_type": "sgd", "sgd_momentum": 0.0, "lr_warmup_init": 3e-8}
     )
 
     assert config["optimizer_type"] == "sgd"
     assert config["sgd_momentum"] == 0.0
+    assert config["lr_warmup_init"] == 3e-8
 
     # The same dict is what the FSDP2 engine builds its OptimizerConfig from, so
     # every key in it has to be a field on that dataclass.

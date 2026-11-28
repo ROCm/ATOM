@@ -1,0 +1,155 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 ATOM Project Contributors
+#
+# NeMo-RL's GRPO loss and data: KL 0.01 (k3) to the initial model, whose
+# log-probs the actors compute with its weights swapped in; leave-one-out
+# advantages; Math-Verify reward; prompts up to 4096 tokens; warmup from 3e-8;
+# old log-probs from the training forward (force_on_policy_ratio).
+
+# F4: B4 with FP8 generation. ATOM quantizes the rollout weights online
+# (per_block_fp8; attention and lm_head stay BF16), training stays BF16, and the
+# loss carries token-level importance-sampling correction without truncation.
+# NeMo-RL v0.8 recipe: 64 prompts x 32 generations = 2048 samples per step, one
+# optimizer step, prompt + response <= 4096, T=1.0, Adam lr 3e-7 (50 warmup),
+# wd 0.01, betas (0.9, 0.999), clip 1.0, PPO clip 0.2. Deviations: README.md.
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+controller:
+  ray:
+    enabled: true
+    fuse_actor_ref: false
+    ref_in_actor: true
+    actor:
+      num_workers: 8
+      dispatch_mode: dp_compute_proto
+
+policy:
+  model_name: "${oc.env:DATA_ROOT}/models/Qwen3-8B"
+  training_backend: megatron_native
+  generation_backend: atom
+  max_total_sequence_length: 4096
+  max_response_length: 4096
+  max_prompt_length: 4096
+  train_global_batch_size: 2048
+  gen_batch_size: 0
+  train_micro_batch_size: 1
+  max_token_len_per_gpu: 16384
+  learning_rate: 3.0e-7
+  lr_warmup_steps: 50
+  lr_warmup_init: 3.0e-8
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  training:
+    optimizer_dtype: bf16
+    fsdp_cfg:
+      param_offload: false
+      optimizer_offload: false
+      reshard_after_forward: true
+    megatron_cfg:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      sequence_parallel: false
+      use_distributed_optimizer: true
+      log_probs_chunk_size: 1024
+      enable_dynamic_batch: true
+      max_tokens_per_gpu: 16384
+  generation:
+    atom_cfg:
+      transport: ray_http
+      tensor_parallel_size: 1
+      kv_cache_dtype: bf16
+      gpu_memory_utilization: 0.60
+      enable_prefix_caching: false
+      online_quant_config:
+        global_quant_config: per_block_fp8
+        exclude_layer: ["model.layers.*.self_attn.*", "lm_head"]
+    vllm_cfg:
+      transport: ray_http
+      ray_http_start_server: false
+      gpu_memory_utilization: 0.60
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: false
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+      max_num_seqs: 256
+      quantization: ""
+      calculate_log_probs: true
+      enable_sleep_mode: true
+      sleep_level: 2
+      update_weights_bucket_megabytes: 512
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+algorithm:
+  name: grpo
+  adv_estimator: grpo_leave_one_out
+  use_kl_in_reward: false
+  kl_penalty: k3
+  force_on_policy_ratio: true
+  loss_agg_mode: token-mean
+  clip_ratio: 0.2
+  clip_ratio_high: 0.2
+  grpo:
+    num_generations: 32
+    kl_coeff: 0.01
+    clip_ratio: 0.2
+    num_ppo_epochs: 1
+    num_mini_batches: 1
+
+quantization:
+  rollout:
+    # FP8 comes from ATOM's online quantization above; "fp8" here would feed
+    # FP8Config and could switch on FP8 paths on the training side.
+    precision: bf16
+  training:
+    fp8: null
+    lumen_norm: false
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: "1e9"
+    rollout_is_batch_normalize: false
+    rollout_rs: ""
+
+moe:
+  r3:
+    enabled: false
+
+reward:
+  type: function
+  function: atomrl.rewards.math_reward.dapo_math_reward
+  scorer: hf_math_verify
+  num_workers: 8
+  dataset: "${oc.env:DATA_ROOT}/data/omi2_train_1M/train.parquet"
+  shuffle: true
+  shuffle_seed: 42
+
+val_dataset: ""
+val_steps: 0
+val_batch_size: 0
+eval:
+  enabled: false
+  num_samples: 0
+
+checkpointing:
+  checkpoint_dir: ""
+  save_steps: 100000
+  save_total_limit: 0
+  resume: false
+
+logger:
+  wandb_enabled: false
+  log_interval: 1
+
+num_training_steps: 10
+seed: 42

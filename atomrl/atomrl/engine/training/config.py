@@ -56,6 +56,7 @@ class OptimizerConfig:
     lr_scheduler_type: str = "cosine"
     lr_warmup_steps: int = 10
     lr_warmup_steps_ratio: float = 0.0
+    lr_warmup_init: float = 0.0
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
@@ -128,6 +129,8 @@ class RayControllerConfig:
 
     enabled: bool = False
     fuse_actor_ref: bool = False
+    # See atomrl.core.config.RayControllerConfig.ref_in_actor.
+    ref_in_actor: bool = False
     actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
@@ -182,6 +185,7 @@ class MegatronConfig:
     moe_shared_expert_intermediate_size: int | None = None
     moe_aux_loss_coeff: float = 0.0  # 0 keeps RL loss unchanged
     moe_router_bias_update_rate: float | None = None
+    freeze_moe_router: bool = False
     moe_token_dispatcher_type: str = "alltoall"
     # Flex dispatcher backend when ``moe_token_dispatcher_type`` is ``flex``.
     # ``mori`` matches Megatron-LM ``ENABLE_MORI=true``.
@@ -201,6 +205,10 @@ class MegatronConfig:
     # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"  # "flash" | "unfused"
+    # Megatron native: TransformerEngine's attention backend, as Megatron's
+    # attention_backend (auto | flash | fused | unfused). None: fused on ROCm
+    # when flash_attn is installed, else auto.
+    te_attention_backend: str | None = None
     use_packed_sequences: bool = (
         True  # varlen flash packing; disable for incompatible ROCm kernels
     )
@@ -345,6 +353,8 @@ class PolicyConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     max_total_sequence_length: int = 4096
     max_response_length: int = 20480
+    # See atomrl.core.config.PolicyConfig.max_prompt_length.
+    max_prompt_length: int = 0
     train_global_batch_size: int = 64
     # Number of *prompt* sequences sampled per generation round for DAPO dynamic
     # sampling (verl: data.gen_batch_size). 0 = same as the number of prompts
@@ -358,6 +368,8 @@ class PolicyConfig:
     optimizer_type: str = "adamw"
     learning_rate: float = 1e-6
     lr_warmup_steps: int = 10
+    # See atomrl.core.config.PolicyConfig.lr_warmup_init.
+    lr_warmup_init: float = 0.0
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     sgd_momentum: float = 0.0
@@ -672,6 +684,9 @@ class RewardConfig:
     # back to the top-level ``config.seed``.
     shuffle: bool = True
     shuffle_seed: int | None = None
+    # See atomrl.core.config.RewardConfig.scorer.
+    scorer: str = "dapo"
+    num_workers: int = 8
 
 
 @dataclass

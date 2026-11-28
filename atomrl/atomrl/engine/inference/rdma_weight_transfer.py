@@ -35,8 +35,13 @@ def _missing_reloadable_names(
         TensorNameClass,
         classify_tensor_name,
     )
+    from atomrl.engine.inference.vllm_moe_weight_sync import _coverage_aliases
 
-    missing = expected_names - loaded_names
+    missing = {
+        name
+        for name in expected_names - loaded_names
+        if loaded_names.isdisjoint(_coverage_aliases(name))
+    }
     return sorted(
         name
         for name in missing

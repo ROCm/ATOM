@@ -60,7 +60,7 @@ env: {}
 # (e.g. a local build, atomrl:release), "@<key>" swaps in another image
 # definition from examples.yaml.
 images:
-  release: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+  release: rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 
 # Where results go (default atomrl/output/regression).
 # results_dir: /data/atomrl/regression

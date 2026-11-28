@@ -26,6 +26,8 @@ __all__ = [
     "opd_kl_divergence",
     "policy_gradient_loss",
     "reduce_reported_loss",
+    "reference_kl_loss",
+    "reference_kl_tokens",
     "sft_loss",
     "value_loss",
 ]
@@ -373,6 +375,68 @@ def kl_penalty(
         denom = torch.clamp(w.sum(), min=1.0)
         return (kl * w).sum() / denom
     return kl.mean()
+
+
+_REFERENCE_KL_TYPES = {"kl": "k1", "k1": "k1", "mse": "k2", "k2": "k2"}
+_REFERENCE_KL_TYPES.update({"low_var_kl": "k3", "k3": "k3"})
+
+
+def reference_kl_tokens(
+    logprobs: Tensor,
+    ref_logprobs: Tensor,
+    kl_type: str = "k3",
+    input_clamp: float = 20.0,
+    output_clamp: float = 10.0,
+) -> Tensor:
+    """Per-token KL(pi || pi_ref) estimate as NeMo-RL's ``calculate_kl`` forms it.
+
+    The samples come from the policy being optimized, so the estimate is
+    weighted by ``exp(logp - logp.detach())``: 1 in value, and the score-function
+    gradient ``kl * grad(logp)`` in the backward. A token whose log-ratio hits
+    ``input_clamp`` contributes no gradient through that weight. ``kl_type`` is
+    ``algorithm.kl_penalty``: k1 (kl), k2 (mse) or k3 (low_var_kl).
+    """
+    kind = _REFERENCE_KL_TYPES.get(kl_type)
+    if kind is None:
+        raise ValueError(
+            f"reference KL supports {sorted(_REFERENCE_KL_TYPES)}, not {kl_type!r}"
+        )
+    weight = torch.exp(logprobs - logprobs.detach())
+    logr = ref_logprobs - logprobs
+    clamped = logr.clamp(min=-input_clamp, max=input_clamp)
+    weight = torch.where(logr == clamped, weight, weight.detach())
+    if kind == "k1":
+        kl = -clamped
+    elif kind == "k2":
+        kl = clamped.square() / 2
+    else:
+        kl = torch.exp(clamped) - 1 - clamped
+    return (weight * kl).clamp(min=-output_clamp, max=output_clamp)
+
+
+def reference_kl_loss(
+    logprobs: Tensor,
+    ref_logprobs: Tensor,
+    *,
+    mask: Tensor | None,
+    kl_type: str = "k3",
+    loss_agg_mode: str = "token-mean",
+    dp_size: int = 1,
+    batch_num_tokens: int | None = None,
+    global_batch_size: int | None = None,
+) -> Tensor:
+    """:func:`reference_kl_tokens` reduced exactly as the policy loss is, so a
+    row's KL is normalized by the same global token count as its PG term."""
+    kl = reference_kl_tokens(logprobs, ref_logprobs, kl_type)
+    loss_mask = mask.to(dtype=kl.dtype) if mask is not None else torch.ones_like(kl)
+    return agg_loss(
+        kl,
+        loss_mask,
+        loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
 
 
 def opd_kl_divergence(

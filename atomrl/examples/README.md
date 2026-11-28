@@ -10,7 +10,7 @@ reference metrics; together they form AtomRL's regression suite.
 
 ```bash
 git clone https://github.com/ROCm/ATOM.git && cd ATOM/atomrl
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119   # release image
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125   # release image
 export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1 6     # models and data, once
 bash examples/run.sh list            # the catalog below, live
@@ -23,7 +23,7 @@ on the next run without a rebuild.
 
 ## Catalog
 
-Status as of 2026-11-19, on the release image above. *Validated*: passes against its
+Status as of 2026-11-26, on the release image above. *Validated*: passes against its
 references on the hardware shown. *Long run*: full-size, run on request, no recorded
 pass yet.
 
@@ -45,77 +45,77 @@ pass yet.
       <td><code>dapo-qwen3-8b-vllm-bf16</code> (1)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>3.8 min</td>
+      <td>3.1 min</td>
     </tr>
     <tr>
       <td>Qwen3-8B, FSDP2 BF16, vLLM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-vllm-fp8-rollout</code> (2)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>2.6 min</td>
+      <td>2.8 min</td>
     </tr>
     <tr>
       <td>Qwen3-8B, FSDP2 FP8, vLLM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-vllm-fp8-e2e</code> (3)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>4.0 min</td>
+      <td>3.5 min</td>
     </tr>
     <tr>
       <td>Qwen3-8B, FSDP2 FP8, ATOM FP8 rollout</td>
       <td><code>dapo-qwen3-8b-atom-fp8</code> (4)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>12.3 min</td>
+      <td>10.9 min</td>
     </tr>
     <tr>
       <td>Qwen3-8B, FSDP2 BF16, ATOM BF16 rollout</td>
       <td><code>dapo-qwen3-8b-atom-bf16</code> (5)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>7.4 min</td>
+      <td>8.0 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, FSDP2 BF16, vLLM BF16</td>
       <td><code>dapo-qwen3moe-vllm-bf16</code> (6)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>10.1 min</td>
+      <td>8.0 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, Megatron EP=8, vLLM BF16</td>
       <td><code>dapo-qwen3moe-megatron-ep8</code> (7)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>8.7 min</td>
+      <td>8.2 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, FSDP2 BF16, ATOM BF16 rollout</td>
       <td><code>dapo-qwen3moe-atom-bf16</code> (9)</td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>16.3 min</td>
+      <td>15.8 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, fully async, 4 + 4 GPUs</td>
       <td><code>dapo-qwen3moe-vllm-fully-async</code></td>
       <td>1×8 MI355X</td>
       <td>validated</td>
-      <td>13.4 min</td>
+      <td>12.8 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, fully async, two nodes, vLLM</td>
       <td><code>dapo-qwen3moe-fully-async-vllm-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>17.0 min</td>
+      <td>15.0 min</td>
     </tr>
     <tr>
       <td>Qwen3-30B-A3B, fully async, two nodes, ATOM</td>
       <td><code>dapo-qwen3moe-fully-async-atom-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>26.9 min</td>
+      <td>22.4 min</td>
     </tr>
     <tr>
       <td rowspan="3"><a href="GRPO/README.md">GRPO</a></td>
@@ -123,14 +123,14 @@ pass yet.
       <td><code>grpo-qwen3moe-vllm-2node</code> (8)</td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>25.0 min</td>
+      <td>20.5 min</td>
     </tr>
     <tr>
       <td>the same with ATOM rollout</td>
       <td><code>grpo-qwen3moe-atom-2node</code></td>
       <td>2×8 MI355X</td>
       <td>validated</td>
-      <td>25.2 min</td>
+      <td>28.4 min</td>
     </tr>
     <tr>
       <td>DeepSeek-V4-Flash, Megatron TP4/PP4/EP4, vLLM FP8</td>
@@ -138,6 +138,63 @@ pass yet.
       <td>3×8</td>
       <td>long run</td>
       <td></td>
+    </tr>
+    <tr>
+      <td rowspan="8"><a href="GRPOPerf/README.md">GRPOPerf</a></td>
+      <td>B1: Qwen3-30B-A3B on-policy, Megatron EP8 + colocated ATOM</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-2node</code> (B1)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>55 min</td>
+    </tr>
+    <tr>
+      <td>B2: Qwen3-30B-A3B 1-step off, trainer and ATOM on separate nodes</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-2node</code> (B2)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>B3: Qwen3-8B 1-step off, 4 + 4 GPUs</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff</code> (B3)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>32 min</td>
+    </tr>
+    <tr>
+      <td>B4: Qwen3-8B on-policy, colocated</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy</code> (B4)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>34 min</td>
+    </tr>
+    <tr>
+      <td>F1: B1 with FP8 generation</td>
+      <td><code>grpoperf-qwen3moe-onpolicy-fp8gen-2node</code> (F1)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>41 min</td>
+    </tr>
+    <tr>
+      <td>F2: B2 with FP8 generation</td>
+      <td><code>grpoperf-qwen3moe-1stepoff-fp8gen-2node</code> (F2)</td>
+      <td>2×8 MI355X</td>
+      <td>long run</td>
+      <td>36 min</td>
+    </tr>
+    <tr>
+      <td>F3: B3 with FP8 generation</td>
+      <td><code>grpoperf-qwen3-8b-1stepoff-fp8gen</code> (F3)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>31 min</td>
+    </tr>
+    <tr>
+      <td>F4: B4 with FP8 generation</td>
+      <td><code>grpoperf-qwen3-8b-onpolicy-fp8gen</code> (F4)</td>
+      <td>1×8 MI355X</td>
+      <td>long run</td>
+      <td>34 min</td>
     </tr>
     <tr>
       <td rowspan="2"><a href="FlowGRPO/README.md">FlowGRPO</a></td>
@@ -160,7 +217,7 @@ pass yet.
       <td><code>sddd-eagle3-smoke-hf</code></td>
       <td>1 GPU</td>
       <td>validated</td>
-      <td>0.9 min</td>
+      <td>0.8 min</td>
     </tr>
     <tr>
       <td>Kimi K2.5 Eagle3, phases 1 and 2, ATOM MXFP4 teacher</td>
@@ -190,14 +247,14 @@ pass yet.
       <td><code>unit-tests</code></td>
       <td>1×8</td>
       <td>validated</td>
-      <td>6.2 min</td>
+      <td>5.0 min</td>
     </tr>
     <tr>
       <td>GRPO on Qwen3-0.6B, one GPU (<a href="../configs/"><code>../configs/</code></a>)</td>
       <td><code>quickstart-grpo-qwen3-0.6b</code></td>
       <td>1 GPU</td>
       <td>validated</td>
-      <td>14.2 min</td>
+      <td>13.8 min</td>
     </tr>
   </tbody>
 </table>
@@ -215,6 +272,7 @@ Reference metrics, spreads and per-run results: [release/VALIDATION.md](../relea
 bash examples/run.sh suite                       # t0 + t1, plus t2 when two hosts are configured
 bash examples/run.sh suite --tier t1 --only 1,4,9
 bash examples/run.sh suite --tier long --only flowgrpo-qwen-image-lumen
+bash examples/run.sh suite --tier long --only B1,B2,B3,B4,F1,F2,F3,F4   # GRPOPerf, two hosts
 bash examples/run.sh compare <results-A> <results-B>
 ```
 

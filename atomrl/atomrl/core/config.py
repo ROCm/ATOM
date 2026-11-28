@@ -59,6 +59,8 @@ class OptimizerConfig:
     lr_scheduler_type: str = "cosine"
     lr_warmup_steps: int = 10
     lr_warmup_steps_ratio: float = 0.0
+    # PolicyConfig.lr_warmup_init; read by the Megatron engines only.
+    lr_warmup_init: float = 0.0
     total_training_steps: int = 1000
     min_lr_ratio: float = 0.0
     num_cycles: float = 0.5
@@ -169,6 +171,11 @@ class RayControllerConfig:
 
     enabled: bool = False
     fuse_actor_ref: bool = False
+    # Reference log-probs from the actors themselves: each keeps its shard of
+    # the initial weights on the GPU and swaps them in for a forward through the
+    # policy's own model, layout and packed log-prob path, as NeMo-RL does (it
+    # keeps them on the host). No reference workers start. megatron_native only.
+    ref_in_actor: bool = False
     actor: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     ref: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
     rollout: RayWorkerRoleConfig = field(default_factory=RayWorkerRoleConfig)
@@ -230,6 +237,8 @@ class MegatronConfig:
     moe_shared_expert_intermediate_size: int | None = None
     moe_aux_loss_coeff: float = 0.0  # 0 keeps RL loss unchanged
     moe_router_bias_update_rate: float | None = None
+    # Keep the router at its initial weights (NeMo-RL's GRPO default).
+    freeze_moe_router: bool = False
     moe_token_dispatcher_type: str = "alltoall"
     # Flex dispatcher backend when ``moe_token_dispatcher_type`` is ``flex``.
     # ``mori`` matches Megatron-LM ``ENABLE_MORI=true``
@@ -250,6 +259,10 @@ class MegatronConfig:
     # Long-sequence memory: flash attention (O(L) vs local O(L^2)) + memory-efficient
     # chunked/fused token log-prob. Both default off (unchanged smoke behavior).
     attention_backend: str = "unfused"  # "flash" | "unfused"
+    # Megatron native: TransformerEngine's attention backend, as Megatron's
+    # attention_backend (auto | flash | fused | unfused). None: fused on ROCm
+    # when flash_attn is installed, else auto.
+    te_attention_backend: str | None = None
     use_packed_sequences: bool = (
         True  # varlen flash packing; disable for incompatible ROCm kernels
     )
@@ -410,6 +423,10 @@ class PolicyConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     max_total_sequence_length: int = 4096
     max_response_length: int = 20480
+    # Prompt tokens the rollout keeps; longer prompts are truncated. 0 keeps the
+    # old cap, min(max_total_sequence_length // 2, 1024). When set, a prompt that
+    # fills max_total_sequence_length is left out of the loss, as NeMo-RL does.
+    max_prompt_length: int = 0
     train_global_batch_size: int = 64
     # Number of *prompt* sequences sampled per generation round for DAPO dynamic
     # sampling (verl: data.gen_batch_size). 0 = same as the number of prompts
@@ -423,6 +440,9 @@ class PolicyConfig:
     optimizer_type: str = "adamw"
     learning_rate: float = 1e-6
     lr_warmup_steps: int = 10
+    # Learning rate the warmup starts from (Megatron engines; NeMo-RL's
+    # lr_warmup_init). With 0 the first update is a no-op.
+    lr_warmup_init: float = 0.0
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     sgd_momentum: float = 0.0
@@ -645,6 +665,16 @@ class AlgorithmConfig:
     clip_ratio_c: float = 3.0
     # Rollout correction (also available via quantization.rollout_correction)
     rollout_correction: RolloutCorrectionConfig | None = None
+    # Use the training forward's own log-probs, detached, as the old log-probs
+    # and skip the separate old-log-prob forward (NeMo-RL's
+    # force_on_policy_ratio). Exact because the Ray path makes one optimizer
+    # step per batch, so the old policy is the one being trained. Ray path and
+    # megatron_native only; the non-Ray path refuses it at setup. Rollout IS
+    # stays, formed in the loss from exp(detached training logp - rollout logp)
+    # as NeMo-RL does; refused are rollout_is_batch_normalize, rollout RS,
+    # bypass_mode and rollout_correction.enabled, which need the old log-probs
+    # before training or the whole batch's weights at once.
+    force_on_policy_ratio: bool = False
 
 
 @dataclass
@@ -771,6 +801,12 @@ class RewardConfig:
     # back to the top-level ``config.seed``.
     shuffle: bool = True
     shuffle_seed: int | None = None
+    # How the Ray path scores math rollouts: "dapo" (math_reward.compute_score,
+    # string match on the last Answer: line or \boxed{}, +-1) or
+    # "hf_math_verify" (NeMo-RL's symbolic Math-Verify check, 1 / 0) in
+    # ``num_workers`` spawned processes.
+    scorer: str = "dapo"
+    num_workers: int = 8
 
 
 @dataclass

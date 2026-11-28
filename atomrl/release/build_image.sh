@@ -25,10 +25,11 @@ echo "==> building $TAG"
 echo "    base        $BASE_IMAGE"
 echo "    arch        $ARCH"
 echo "    aiter       $AITER_SHA (official ROCm)"
-echo "    mori        $MORI_SHA (official ROCm)"
+echo "    mori        $MORI_PACKAGE_VERSION (official ROCm package)"
 echo "    ATOM/AtomRL current checkout"
 echo "    Lumen       in-tree atomrl/lumen"
-echo "    megatron    $WITH_MEGATRON"
+echo "    megatron    $MEGATRON_CORE_VERSION (WITH_MEGATRON=$WITH_MEGATRON)"
+echo "    flash_attn  $FLASH_ATTN_REF (source build)"
 
 cd "$REPO_ROOT"
 ATOM_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
@@ -42,7 +43,8 @@ docker build -f atomrl/docker/Dockerfile.release -t "$TAG" \
   --build-arg AITER_SHA="$AITER_SHA" \
   --build-arg APEX_SHA="$APEX_SHA" \
   --build-arg TE_SHA="$TE_SHA" \
-  --build-arg MEGATRON_COMMIT="$MEGATRON_COMMIT" \
+  --build-arg FLASH_ATTN_REF="$FLASH_ATTN_REF" \
+  --build-arg MEGATRON_CORE_VERSION="$MEGATRON_CORE_VERSION" \
   --build-arg WITH_MEGATRON="$WITH_MEGATRON" \
   .
 

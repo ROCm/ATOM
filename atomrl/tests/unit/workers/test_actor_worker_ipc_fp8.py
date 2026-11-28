@@ -27,9 +27,11 @@ class _Sender:
     """Captures the (name, tensor) stream instead of putting it on a socket."""
 
     captured: typing.ClassVar[list[tuple[str, torch.Tensor]]] = []
+    last_kwargs: typing.ClassVar[dict] = {}
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        _Sender.last_kwargs = kwargs
         # main folds the real sender's counters into the returned timing dict.
         self.stats: dict[str, float] = {}
         _Sender.captured = []
@@ -86,6 +88,32 @@ def test_ipc_send_quantizes_when_asked(worker) -> None:
     )
     # Norms stay BF16: quantizing them would be a correctness bug, not a saving.
     assert sent["model.layers.0.input_layernorm.weight"].dtype == torch.bfloat16
+
+
+def test_ipc_send_to_atom_drains_a_lazy_generator_once(worker, tmp_path) -> None:
+    # The Megatron engines return a one-shot generator. Sizing ATOM's bucket by
+    # scanning it used to exhaust it, so the sync sent no tensors at all and the
+    # rollout kept its initial weights ("ATOM online weight reload: weights=0").
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            "model.embed_tokens.weight": torch.zeros(64, 32, dtype=torch.bfloat16),
+            "model.norm.weight": torch.zeros(32, dtype=torch.bfloat16),
+        },
+        str(tmp_path / "model-00001-of-00001.safetensors"),
+    )
+    worker.config = {
+        "policy": {"generation_backend": "atom", "model_name": str(tmp_path)}
+    }
+
+    worker.update_weights_ipc_send()
+
+    assert [name for name, _ in _Sender.captured] == [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.input_layernorm.weight",
+    ]
+    assert _Sender.last_kwargs["min_bucket_bytes"] == 64 * 32 * 2
 
 
 def test_ipc_send_stays_bf16_by_default(worker) -> None:

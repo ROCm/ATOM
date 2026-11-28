@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -527,6 +528,76 @@ def test_response_position_metrics_take_the_common_width() -> None:
     assert got["rollout_corr/pos_0_127/tokens"] == 4.0
 
 
+def test_token_mult_prob_error_matches_nemo_rl_definition() -> None:
+    # NeMo-RL: masked mean of exp(|generation_logprobs - train_logprobs|).
+    rollout_logp = torch.tensor([[0.0, -0.5, -1.0, -2.0, 0.0]])
+    response_mask = torch.tensor([[0, 1, 1, 1, 0]])
+    padded_old_logp = torch.tensor([[9.0, -0.4, -1.3, -2.0, 9.0, 9.0]])
+
+    got = RLTrainer._token_mult_prob_error(padded_old_logp, rollout_logp, response_mask)
+
+    want = (math.exp(0.1) + math.exp(0.3) + math.exp(0.0)) / 3
+    assert got["rollout_corr/token_mult_prob_error"] == pytest.approx(want)
+    assert (
+        RLTrainer._token_mult_prob_error(
+            padded_old_logp, rollout_logp, torch.zeros_like(response_mask)
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("use_atom", [True, False], ids=["atom", "vllm"])
+def test_ipc_sync_frees_actor_cache_before_waking_the_rollout(use_atom) -> None:
+    # A colocated Megatron actor held its training peak in the allocator cache;
+    # ATOM's weight wake then found 238 MiB free and the sync failed with
+    # "update_weights_ipc failed ... HIP out of memory" on Qwen3-30B-A3B. vLLM
+    # on ROCm wakes its KV cache into the same free memory.
+    from atomrl.core.config import WeightSyncConfig
+
+    calls: list = []
+
+    class _Stop(Exception):
+        pass
+
+    class _Mgr:
+        num_replicas = 1
+
+        @property
+        def servers(self):
+            calls.append("send")
+            raise _Stop
+
+    stub = SimpleNamespace(
+        _ray_rollout_mgr=_Mgr(),
+        _actor_wg=SimpleNamespace(num_workers=1),
+        _rollout_wg=None,
+        _ray_use_atom=use_atom,
+        _ray_use_vllm=not use_atom,
+        _ray_vllm_engine=SimpleNamespace(
+            enable_sleep=True,
+            wake=lambda tags=None: calls.append(("wake", tuple(tags or ()))),
+        ),
+        _ipc_endpoints_match_actors=lambda mgr: True,
+        _release_actor_cached_memory=lambda: calls.append("free"),
+        global_step=0,
+        config=SimpleNamespace(
+            weight_sync=WeightSyncConfig(),
+            policy=SimpleNamespace(
+                generation=SimpleNamespace(
+                    vllm_cfg=SimpleNamespace(
+                        update_weights_bucket_megabytes=512, use_shm=False
+                    )
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(_Stop):
+        RLTrainer._sync_weights_ipc(stub)
+
+    assert calls == ["free", ("wake", ("weights",)), "send"]
+
+
 def test_ipc_sync_refuses_fp8_quantize_on_the_safetensors_fallback() -> None:
     """The fallback exports BF16 through disk and cannot honour fp8_quantize.
 
@@ -544,3 +615,120 @@ def test_ipc_sync_refuses_fp8_quantize_on_the_safetensors_fallback() -> None:
 
     with pytest.raises(RuntimeError, match="safetensors weight-sync fallback"):
         RLTrainer._sync_weights_ipc(stub)
+
+
+def _force_on_policy_trainer(**changes) -> RLTrainer:
+    from atomrl.core.config import AtomRLConfig
+
+    cfg = AtomRLConfig()
+    cfg.algorithm.force_on_policy_ratio = True
+    cfg.policy.training_backend = "megatron_native"
+    for path, value in changes.items():
+        section, key = path.rsplit(".", 1)
+        obj = cfg
+        for part in section.split("."):
+            obj = getattr(obj, part)
+        setattr(obj, key, value)
+    trainer = object.__new__(RLTrainer)
+    trainer.config = cfg
+    return trainer
+
+
+def test_force_on_policy_ratio_is_off_by_default() -> None:
+    trainer = _force_on_policy_trainer(**{"algorithm.force_on_policy_ratio": False})
+    assert trainer._check_force_on_policy_ratio() is False
+
+
+def test_force_on_policy_ratio_accepts_megatron_native_without_correction() -> None:
+    trainer = _force_on_policy_trainer()
+    assert trainer._check_force_on_policy_ratio() is True
+    assert trainer._in_loss_rollout_is is None
+
+
+def test_force_on_policy_ratio_moves_rollout_is_into_the_loss() -> None:
+    """NeMo-RL runs force_on_policy_ratio with IS correction: the weights come
+    from the training forward's detached log-probs, so the trainer hands the
+    settings to the loss instead of refusing them."""
+    trainer = _force_on_policy_trainer(
+        **{
+            "quantization.rollout_correction.rollout_is": "token",
+            "quantization.rollout_correction.rollout_is_threshold": "1e9",
+        }
+    )
+    assert trainer._check_force_on_policy_ratio() is True
+    assert trainer._in_loss_rollout_is == {
+        "rollout_is": "token",
+        "rollout_is_threshold": "1e9",
+        "rollout_is_seq_reduction": "sum",
+    }
+
+
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        ({"policy.training_backend": "fsdp2"}, "training_backend"),
+        (
+            {
+                "quantization.rollout_correction.rollout_is": "token",
+                "quantization.rollout_correction.rollout_is_batch_normalize": True,
+            },
+            "rollout_is_batch_normalize",
+        ),
+        ({"quantization.rollout_correction.rollout_rs": "seq_mean_k1"}, "rollout_rs"),
+        ({"quantization.rollout_correction.bypass_mode": True}, "bypass_mode"),
+        (
+            {"quantization.rollout_correction.enabled": True},
+            "rollout_correction.enabled",
+        ),
+    ],
+)
+def test_force_on_policy_ratio_refuses_what_reads_old_log_probs_first(
+    changes, named
+) -> None:
+    """These read the old log-probs before training, need the whole batch's
+    weights at once, or (for FSDP2) would turn their absence into an SFT loss,
+    so the flag must fail before step 1."""
+    trainer = _force_on_policy_trainer(**changes)
+    with pytest.raises(ValueError, match=named):
+        trainer._check_force_on_policy_ratio()
+
+
+def test_force_on_policy_ratio_is_refused_off_the_ray_path() -> None:
+    """Only the Ray path reads the flag; elsewhere it used to be ignored."""
+    trainer = _force_on_policy_trainer()
+    trainer._use_ray_controller = False
+    with pytest.raises(ValueError, match="Ray controller path only"):
+        trainer.setup()
+
+
+def _trainer_with_policy(**policy) -> RLTrainer:
+    from atomrl.core.config import AtomRLConfig
+
+    cfg = AtomRLConfig()
+    for key, value in policy.items():
+        setattr(cfg.policy, key, value)
+    trainer = object.__new__(RLTrainer)
+    trainer.config = cfg
+    return trainer
+
+
+def test_prompt_cap_defaults_to_1024_and_follows_max_prompt_length() -> None:
+    assert _trainer_with_policy()._max_prompt_length() == 1024
+    assert _trainer_with_policy(max_prompt_length=4096)._max_prompt_length() == 4096
+    capped = _trainer_with_policy(
+        max_prompt_length=9000, max_total_sequence_length=4096
+    )
+    assert capped._max_prompt_length() == 4096
+
+
+def test_a_prompt_that_fills_the_sequence_is_left_out_of_the_loss() -> None:
+    """NeMo-RL keeps prompts up to max_total_sequence_length and drops one that
+    reaches it from the loss; a prompt a token shorter still trains."""
+    trainer = _trainer_with_policy(max_prompt_length=6, max_total_sequence_length=6)
+    am = torch.ones(2, 7, dtype=torch.long)
+    mask = trainer._build_response_mask(am, am, [6, 5])
+    assert mask[0].sum() == 0
+    assert mask[1].tolist() == [0, 0, 0, 0, 1, 1]
+
+    legacy = _trainer_with_policy(max_total_sequence_length=6)
+    assert legacy._build_response_mask(am, am, [6, 5])[0].tolist() == [0] * 5 + [1]

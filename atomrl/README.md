@@ -186,7 +186,7 @@ For the validated MI350X / MI355X examples:
 ```bash
 git clone https://github.com/ROCm/ATOM.git
 cd ATOM/atomrl
-docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.3-261119
+docker pull rocm/atom-dev:atomrl-dapo-gfx950-rocm7.2.4-261125
 export DATA_ROOT=/path/to/data
 bash examples/run.sh prepare 1
 bash examples/run.sh 1

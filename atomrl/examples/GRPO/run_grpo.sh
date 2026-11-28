@@ -51,8 +51,11 @@ cd "$ATOMRL_DIR"
 # ═══════════════════════════════════════════════════════════════════════
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
 export LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH:-/opt/rocm/lib}"
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Honor a caller-provided value, including an explicit empty one, as run_dapo.sh does.
+for _v in PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF; do
+  _conf="${!_v-expandable_segments:True}"
+  if [ -n "$_conf" ]; then export "$_v=$_conf"; else unset "$_v"; fi
+done
 export NCCL_TIMEOUT=7200 NCCL_CUMEM_ENABLE=0
 # Cross-node weight broadcast uses the RoCE path validated in IB-RDMA-Test:
 # node1/node2 ens11np0, mlx5_0, GID 3. RCCL still owns the transport; no MILES

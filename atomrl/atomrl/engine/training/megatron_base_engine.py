@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -21,10 +21,12 @@ import torch.distributed as dist
 
 from atomrl.algorithms.loss_functions import (
     asymmetric_clip_loss,
-    kl_penalty,
     policy_gradient_loss,
     reduce_reported_loss,
+    reference_kl_loss,
+    reference_kl_tokens,
 )
+from atomrl.algorithms.rollout_correction import rollout_is_weights
 from atomrl.core.protocol import DataProto
 from atomrl.core.types import AlgorithmName
 from atomrl.engine.training.base_engine import BaseEngine
@@ -101,6 +103,24 @@ def _gap_dump_dir() -> str | None:
             return sentinel.read().strip() or None
     except OSError:
         return None
+
+
+# Sum / token-count pairs that ``_row_policy_loss`` adds: under
+# force_on_policy_ratio what the skipped old-log-prob pass would report and the
+# in-loss importance weights, and with a reference policy its KL. Returned as
+# pairs because the controller averages each key over workers, which keeps
+# sum / count exact.
+_ROW_STAT_NAMES = ("tmpe", "ent", "ris", "refkl")
+_ON_POLICY_STATS = tuple(f"{n}_{p}" for n in _ROW_STAT_NAMES for p in ("sum", "tok"))
+
+
+def on_policy_metrics(sums: dict[str, float]) -> dict[str, float]:
+    out = {}
+    for name in _ROW_STAT_NAMES:
+        if sums.get(f"{name}_tok", 0.0) > 0:
+            out[f"{name}_sum"] = sums[f"{name}_sum"]
+            out[f"{name}_tok"] = sums[f"{name}_tok"]
+    return out
 
 
 class _FusedTokenLogProb(torch.autograd.Function):
@@ -403,12 +423,22 @@ class MegatronBaseEngine(BaseEngine):
         dp,
         loss_agg_mode,
         global_batch_size,
+        token_ent=None,
+        in_loss_is=None,
     ):
         """DAPO/PG loss + PPO-KL metrics for one sequence, given its (grad-carrying)
         per-token log-prob ``token_lp`` [1, Lm]. Returns ``(loss_tensor|None, stats|None)``.
-        Shared by the packed and per-row training paths."""
+        Shared by the packed and per-row training paths.
+
+        With ``force_on_policy_ratio`` the old log-probs are ``token_lp``
+        detached, so this forward also reports what the skipped old-log-prob
+        pass would have: NeMo-RL's token_mult_prob_error against the rollout and,
+        given the no-grad ``token_ent`` aligned with ``token_lp``, the entropy.
+        ``in_loss_is`` (the rollout-correction settings) then forms the
+        importance weights from them as well, as NeMo-RL does."""
         Lm = token_lp.shape[-1]
         dev = token_lp.device
+        force_on_policy = bool(cfg_fn("force_on_policy_ratio", False))
 
         def _col(name, shift):
             x = t.get(name)
@@ -418,8 +448,8 @@ class MegatronBaseEngine(BaseEngine):
             s0 = start + (1 if shift else 0)
             return x[s0:].reshape(1, -1)
 
-        old_lp = _col("old_log_probs", shift=False)
-        if old_lp is None:
+        old_lp = None if force_on_policy else _col("old_log_probs", shift=False)
+        if old_lp is None and not force_on_policy:
             return None, None
         # Trainer masks are normally width S-1 and already aligned to log-prob
         # columns. Preserve compatibility with token-indexed width-S masks.
@@ -438,18 +468,26 @@ class MegatronBaseEngine(BaseEngine):
         ref_lp0 = _col("ref_log_probs", shift=False)
         rlp0 = _col("rollout_log_probs", shift=False)
 
-        cand = [token_lp, old_lp, adv]
-        for v in (resp_mask, ris, ref_lp0, rlp0):
+        cand = [token_lp, adv]
+        for v in (old_lp, resp_mask, ris, ref_lp0, rlp0):
             if v is not None:
                 cand.append(v)
         Le = min(v.shape[-1] for v in cand)
         token_lp = token_lp[..., :Le]
-        old_lp = old_lp[..., :Le]
+        old_lp = token_lp.detach() if force_on_policy else old_lp[..., :Le]
         adv = adv[..., :Le]
         mask = resp_mask[..., :Le].float() if resp_mask is not None else None
         ris = ris[..., :Le] if ris is not None else None
         ref_lp = ref_lp0[..., :Le] if ref_lp0 is not None else None
         rlp = rlp0[..., :Le] if rlp0 is not None else None
+        if force_on_policy and in_loss_is and rlp is not None:
+            ris, _ = rollout_is_weights(
+                old_lp - rlp,
+                mask if mask is not None else torch.ones_like(old_lp),
+                in_loss_is["rollout_is"],
+                in_loss_is["rollout_is_threshold"],
+                in_loss_is.get("rollout_is_seq_reduction", "sum"),
+            )
 
         if algo_name == AlgorithmName.DAPO.value:
             loss = asymmetric_clip_loss(
@@ -487,8 +525,19 @@ class MegatronBaseEngine(BaseEngine):
                 mask=mask,
             )
         kl_c = float(cfg_fn("kl_coeff", 0.0))
-        if kl_c > 0.0 and ref_lp is not None:
-            loss = loss + kl_c * kl_penalty(token_lp, ref_lp, mask=mask)
+        kl_type = str(cfg_fn("kl_penalty", "k3"))
+        use_ref_kl = kl_c > 0.0 and ref_lp is not None
+        if use_ref_kl:
+            loss = loss + kl_c * reference_kl_loss(
+                token_lp,
+                ref_lp,
+                mask=mask,
+                kl_type=kl_type,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp,
+                batch_num_tokens=bnt,
+                global_batch_size=global_batch_size,
+            )
 
         stats = {
             "loss": float(loss.detach()),
@@ -496,16 +545,85 @@ class MegatronBaseEngine(BaseEngine):
             "ppo_kl_tok": 0.0,
             "rc_kl_sum": 0.0,
             "rc_kl_tok": 0.0,
+            **dict.fromkeys(_ON_POLICY_STATS, 0.0),
         }
         if mask is not None:
             with torch.no_grad():
                 tok = float(mask.sum())
                 stats["ppo_kl_sum"] = float(((old_lp - token_lp) * mask).sum())
                 stats["ppo_kl_tok"] = tok
+                if use_ref_kl:
+                    kl_tok = reference_kl_tokens(token_lp.detach(), ref_lp, kl_type)
+                    stats["refkl_sum"] = float((kl_tok * mask).sum())
+                    stats["refkl_tok"] = tok
+                if force_on_policy and ris is not None:
+                    stats["ris_sum"] = float((ris * mask).sum())
+                    stats["ris_tok"] = tok
                 if rlp is not None:
                     stats["rc_kl_sum"] = float(((rlp - token_lp) * mask).sum())
                     stats["rc_kl_tok"] = tok
+                if force_on_policy and rlp is not None:
+                    gap = (rlp.float() - token_lp.float()).abs()
+                    stats["tmpe_sum"] = float((torch.exp(gap) * mask).sum())
+                    stats["tmpe_tok"] = tok
+                if force_on_policy and token_ent is not None:
+                    ent = token_ent[..., :Le].to(dev).float()
+                    stats["ent_sum"] = float((ent * mask).sum())
+                    stats["ent_tok"] = tok
         return loss, stats
+
+    def _row_entropy_nograd(self, logits, targets):
+        """No-grad entropy [1, L] for one row's logits, for the metrics that the
+        old-log-prob pass reports and ``force_on_policy_ratio`` skips."""
+        with torch.no_grad():
+            _, ent = self._logprob_entropy_nograd(logits.detach(), targets, True)
+        return ent.view(1, -1)
+
+    # ---- frozen reference policy held by the actor ----
+    def snapshot_reference_weights(self) -> None:
+        """Keep this rank's current weights, on the GPU, as the reference policy.
+
+        Taken before the first update (and before a checkpoint resume), so the
+        reference is the initial model. Refuses ``overlap_param_gather`` here,
+        at setup, rather than at the first reference forward after a rollout."""
+        self._refuse_overlap_param_gather()
+        with torch.no_grad():
+            self._reference_weights = {
+                name: p.detach().clone() for name, p in self.module.named_parameters()
+            }
+
+    @contextmanager
+    def reference_weights(self):
+        """Run the enclosed forwards with the reference weights in the model.
+
+        The weights are exchanged in place, so parameter storage (and the DDP
+        buffers it is a view of) never moves, and they are exchanged back on the
+        way out, bit for bit."""
+        if getattr(self, "_reference_weights", None) is None:
+            raise RuntimeError(
+                "snapshot_reference_weights() must run before a reference forward."
+            )
+        self._refuse_overlap_param_gather()
+        self._swap_reference_weights()
+        try:
+            yield
+        finally:
+            self._swap_reference_weights()
+
+    def _refuse_overlap_param_gather(self) -> None:
+        if getattr(self, "_overlap_param_gather", False):
+            raise NotImplementedError(
+                "a reference forward needs the updated weights gathered first; "
+                "overlap_param_gather defers that into the next forward"
+            )
+
+    @torch.no_grad()
+    def _swap_reference_weights(self) -> None:
+        for name, p in self.module.named_parameters():
+            ref = self._reference_weights[name]
+            cur = p.data.clone()
+            p.data.copy_(ref)
+            ref.copy_(cur)
 
     # ---- engine-level compute_log_probs (actor delegates here) ----
     def engine_compute_log_probs(self, batch: DataProto) -> DataProto:
@@ -608,6 +726,8 @@ class MegatronBaseEngine(BaseEngine):
         rc_kl_sum = 0.0
         rc_kl_tok = 0.0
         n_rows = 0
+        force_on_policy = bool(_cfg("force_on_policy_ratio", False))
+        on_policy_sums = dict.fromkeys(_ON_POLICY_STATS, 0.0)
 
         def _accum(stats):
             nonlocal loss_accum, ppo_kl_sum, ppo_kl_tok, rc_kl_sum, rc_kl_tok, n_rows
@@ -617,6 +737,8 @@ class MegatronBaseEngine(BaseEngine):
             ppo_kl_tok += stats["ppo_kl_tok"]
             rc_kl_sum += stats["rc_kl_sum"]
             rc_kl_tok += stats["rc_kl_tok"]
+            for key in _ON_POLICY_STATS:
+                on_policy_sums[key] += stats[key]
 
         # Collect valid (non-empty) rows.
         rows = []
@@ -645,6 +767,11 @@ class MegatronBaseEngine(BaseEngine):
                     token_lp = self._token_logprob_train(
                         seg[:-1], ids_list[k][1:]
                     ).view(1, -1)
+                    token_ent = (
+                        self._row_entropy_nograd(seg[:-1], ids_list[k][1:])
+                        if force_on_policy
+                        else None
+                    )
                     loss, stats = self._row_policy_loss(
                         t,
                         r,
@@ -656,6 +783,8 @@ class MegatronBaseEngine(BaseEngine):
                         dp,
                         loss_agg_mode,
                         global_batch_size,
+                        token_ent=token_ent,
+                        in_loss_is=meta.get("in_loss_rollout_is"),
                     )
                     if loss is None:
                         continue
@@ -673,6 +802,11 @@ class MegatronBaseEngine(BaseEngine):
                 token_lp = self._token_logprob_train(logits[:-1], ids[1:]).view(
                     1, -1
                 )  # [1,L-1]
+                token_ent = (
+                    self._row_entropy_nograd(logits[:-1], ids[1:])
+                    if force_on_policy
+                    else None
+                )
                 loss, stats = self._row_policy_loss(
                     t,
                     r,
@@ -684,6 +818,8 @@ class MegatronBaseEngine(BaseEngine):
                     dp,
                     loss_agg_mode,
                     global_batch_size,
+                    token_ent=token_ent,
+                    in_loss_is=meta.get("in_loss_rollout_is"),
                 )
                 if loss is None:
                     continue
@@ -706,6 +842,7 @@ class MegatronBaseEngine(BaseEngine):
         if rc_kl_tok > 0:
             metrics["rollout_corr_kl_sum"] = rc_kl_sum
             metrics["rollout_corr_kl_tok"] = rc_kl_tok
+        metrics.update(on_policy_metrics(on_policy_sums))
         return metrics
 
     def _engine_update_sft(self, batch: DataProto) -> dict[str, float]:

@@ -176,6 +176,54 @@ def compute_grpo_advantage(batch: DataProto, config: AtomRLConfig) -> DataProto:
     return batch
 
 
+@register_adv_est("grpo_leave_one_out")
+def compute_grpo_leave_one_out_advantage(
+    batch: DataProto, config: AtomRLConfig
+) -> DataProto:
+    """NeMo-RL's GRPO advantage (``use_leave_one_out_baseline`` and
+    ``normalize_rewards``).
+
+    Each sample is measured against the other ``g - 1`` of its group: its
+    baseline is their mean and its scale their sample std. The difference is
+    divided by ``std + 1e-6`` only where those others vary; when they all share
+    one reward (e.g. the single correct answer of a group) it stays unscaled. A
+    group of one has no baseline and gets zero advantage.
+    """
+    if "rewards" not in batch.tensors:
+        raise KeyError("GRPO requires tensor key 'rewards' on the batch.")
+    rewards = batch.tensors["rewards"]
+    if rewards.dim() > 1:
+        rewards = rewards.squeeze(-1)
+    g = config.algorithm.grpo.num_generations
+    if rewards.shape[0] % g != 0:
+        raise ValueError(
+            f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
+        )
+    grouped = rewards.to(dtype=torch.float32).view(-1, g)
+    if g == 1:
+        batch.tensors["advantages"] = torch.zeros_like(grouped).reshape(-1)
+        return batch
+
+    others = g - 1
+    baseline = (grouped.sum(dim=1, keepdim=True) - grouped) / others
+    others_sq = (grouped.square().sum(dim=1, keepdim=True) - grouped.square()) / others
+    if others > 1:
+        var = (others_sq - baseline.square()) * (others / (others - 1))
+        std = var.clamp_min(0.0).sqrt()
+    else:
+        std = torch.zeros_like(baseline)
+    self_mask = torch.eye(g, dtype=torch.bool, device=grouped.device)
+    pairs = grouped.unsqueeze(1).expand(-1, g, -1)
+    others_min = pairs.masked_fill(self_mask, float("inf")).amin(dim=-1)
+    others_max = pairs.masked_fill(self_mask, float("-inf")).amax(dim=-1)
+    scale = (std > 0) & (others_min != others_max)
+
+    adv = grouped - baseline
+    adv = torch.where(scale, adv / (std + 1e-6), adv)
+    batch.tensors["advantages"] = adv.reshape(-1)
+    return batch
+
+
 @register_adv_est("dapo")
 def compute_dapo_advantage(batch: DataProto, config: AtomRLConfig) -> DataProto:
     """DAPO: group-relative advantages with dynamic sampling and overlong shaping."""
