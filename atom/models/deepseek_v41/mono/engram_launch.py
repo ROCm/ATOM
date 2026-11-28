@@ -3,7 +3,10 @@
 # Copyright (c) 2026 ATOM Project Contributors
 """An Engram layer's memory gate on a mono step in one launch
 (``kernels.engram``): the owed post settled, the FP8 ``wkv`` and the gate, in
-place of the column gather and the original ``EngramOp``. A column-sharded
+place of the column gather and the original ``EngramOp``. Every weight is read
+in place: the gate weight is ``q_weight * k_weight`` multiplied in the kernel,
+not ``EngramOp.gate_weight`` (a copy derived at load, which an in-place update
+of q / k leaves as it was). A column-sharded
 step's on this rank's own columns of every row; a token-parallel step's on the
 rank's own rows; TP 1 every row. A layer or a step it is not built for keeps
 the original."""
@@ -36,8 +39,12 @@ def _engram_served(block) -> bool:
         op.hc_mult == HC
         and op.hidden_size == HIDDEN
         and op.engram_hidden_size == eg.WIDTH
-        and op.gate_weight is not None
-        and op.gate_weight.dtype == torch.float32
+        and all(
+            t.dtype == torch.bfloat16
+            and tuple(t.shape) == (HC, HIDDEN)
+            and t.is_contiguous()
+            for t in (op.q_weight, op.k_weight)
+        )
         and w.weight.dtype == torch.float8_e4m3fn
         and tuple(w.weight.shape) == ((HC + 1) * HIDDEN, eg.WIDTH)
         and scale is not None
@@ -72,6 +79,17 @@ class MonoEngram:
         self.out = torch.empty(
             1, max_rows, HC, HIDDEN, dtype=torch.bfloat16, device=dev
         )
+
+    def weight_pointers(self) -> dict[str, torch.Tensor]:
+        """The weights the launch reads, every one the model's in place."""
+        out = {}
+        for layer, block in self.blocks.items():
+            op = block.engram
+            out[f"engram {layer} wkv"] = op.wkv.weight
+            out[f"engram {layer} wkv scale"] = op.wkv.weight_scale
+            out[f"engram {layer} q_weight"] = op.q_weight
+            out[f"engram {layer} k_weight"] = op.k_weight
+        return out
 
     def build(self, rows: int, split: bool):
         """The launcher of an S-row step's gate over ``rows`` rows (``split``:
@@ -110,7 +128,8 @@ class MonoEngram:
             "post": at(state.post_mix, HC), "comb": at(state.combination, HC * HC),
             "emb": at(emb, eg.WIDTH), "w": op.wkv.weight.data_ptr(),
             "ws": op.wkv.weight_scale.data_ptr(),
-            "gate_w": op.gate_weight.data_ptr(), "out": at(self.out, HC * HIDDEN),
+            "gate_q": op.q_weight.data_ptr(), "gate_k": op.k_weight.data_ptr(),
+            "out": at(self.out, HC * HIDDEN),
             "parts": self.parts.data_ptr(), "sym": peer_args["sym"],
             "peers": peer_args["peers"], "rank": peer_args["rank"], "layer": layer_id,
         }  # fmt: skip

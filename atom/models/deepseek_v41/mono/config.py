@@ -5,7 +5,11 @@
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    _takes_weight_updates,
+    common_refusals,
+    first_refusal,
+)
 from atom.utils import envs
 
 # the TP sizes the kernels are built for (``kernels.dims``); at TP8 on gfx950 the
@@ -29,6 +33,9 @@ MAX_REQUESTS = 8
 # a token's keys at most: the window and the selection (128 + 512), every key's
 # value slice in a merge task's LDS at once (``kernels.attention``)
 ATTENTION_KEYS_MAX = 640
+# the shared refusal of a runner that takes rollout weight updates
+# (``deployment.common_refusals``), which V4.1 answers at bind instead
+WEIGHT_UPDATE_REFUSAL = "rollout weight updates"
 # (top-k, candidate blocks, rows a block, index heads, index head dim)
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 
@@ -41,7 +48,15 @@ def config_refusal(atom_config) -> str | None:
     hf = atom_config.hf_config
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+    # the shared refusals but the one of a runner that takes rollout weight
+    # updates: the mono path registers what it derives from the weights and
+    # audits its weight pointers at bind (``weight_refresh``), so such a runner
+    # is refused there, by a path whose audit fails, not here
+    checks += [
+        c
+        for c in common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA)
+        if not (isinstance(c[1], str) and c[1].startswith(WEIGHT_UPDATE_REFUSAL))
+    ] + [
         # the kernels read the native 32x32 FP8 dense weights
         (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
         (
@@ -94,5 +109,19 @@ def config_refusal(atom_config) -> str | None:
         (envs.ATOM_DSV41_SIDE_STREAMS == 0, "ATOM_DSV41_SIDE_STREAMS"),
         # the MoE kernel reads a rank's experts by logical id, not EPLB's slots
         (not atom_config.eplb_enable, "EPLB"),
+        # a runner that takes weight updates also sleeps: unless the weights
+        # and the KV pool stay resident (with graphs), a sleep reallocates
+        # both under the addresses the mono launches hold
+        (
+            not _takes_weight_updates(atom_config)
+            or (
+                getattr(atom_config, "sleep_keeps_memory_resident", False)
+                and not getattr(atom_config, "enforce_eager", True)
+            ),
+            (
+                "rollout weight updates without sleep_keeps_memory_resident "
+                "(a sleep would move the weights and the KV pool mono binds)"
+            ),
+        ),
     ]
     return first_refusal(checks)

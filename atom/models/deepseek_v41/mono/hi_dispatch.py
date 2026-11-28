@@ -56,10 +56,11 @@ class HiDecodeModel(MonoDecodeModel):
     ) -> None:
         # ATOM's K1 / K2 on the steps the hook does not serve, with their own
         # output buffer; no mono LM head (the hook's verify head runs) and no
-        # draft context launch (the draft writes its own context there)
+        # draft context launch (the draft writes its own context there); the
+        # hook's derived weights and audits (``hi_runner``), its runner's too
         super().__init__(
             model, drafter, max_model_len, index_fp4, dp_ranks, None, None,
-            draft_context=False,
+            draft_context=False, derived=hook.derived,
         )  # fmt: skip
         self._hi = hook
         # the hook's in-graph verify, not ATOM's mono LM head
@@ -159,8 +160,8 @@ class HiDraftModel(MonoDraftModel):
     the hi path. (The context-KV write of a served step is the hook's ``CTX`` launch, inside the target graph.)
     """
 
-    def __init__(self, draft: nn.Module, dp_ranks: int, hook) -> None:
-        super().__init__(draft, dp_ranks)
+    def __init__(self, draft: nn.Module, dp_ranks: int, hook, derived=None) -> None:
+        super().__init__(draft, dp_ranks, derived)
         self.hi = hook
 
     def block_backbone(self, input_ids, positions, num_draft):
@@ -177,7 +178,6 @@ class HiDraftModel(MonoDraftModel):
                 self.model.embed(input_ids.view(-1)),
                 positions,
                 metadata.state_slot_out[:requests],
-                self.model._noise_embedding(),
             )
             return _HI_DRAFT
         return super().block_backbone(input_ids, positions, num_draft)
@@ -199,7 +199,12 @@ def _tp() -> tuple:
 
 
 def install_hi(
-    model: nn.Module, atom_config, drafter, metadata_builder, dp_ranks: int
+    model: nn.Module,
+    atom_config,
+    drafter,
+    metadata_builder,
+    dp_ranks: int,
+    derived=None,
 ) -> nn.Module:
     """``model`` wrapped for the hi hook (and ``drafter``'s draft model for its draft), on a deployment the hi path
     serves (``hi_gate.decide``). Collective (the agreement, the hook's peer groups): every rank calls it at the same
@@ -207,7 +212,9 @@ def install_hi(
     before anything collective or allocated, its verdict agreed over the TP
     group (``consensus.tp_uniform_local_validation``): every rank builds, or every rank raises ``MonoUnsupported``
     naming the ranks that refused (``dispatch.install_mono_decode`` falls back under "auto") with nothing built, the
-    draft model left as it was."""
+    draft model left as it was. ``derived``: the deployment's derived weights (``weight_refresh``): the
+    hook's packed weights registered into it, its weight-update audit (agreed) the install's last refusal.
+    """
     group, world, rank = _tp()
     draft = drafter.model
     # whatever this rank's check raises is its refusal: a rank that alone raised would leave the others waiting in
@@ -224,27 +231,41 @@ def install_hi(
     except MonoUnsupported as agreed:
         raise agreed from refused
     try:
-        return _install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+        return _install_hi(
+            model, atom_config, drafter, metadata_builder, dp_ranks, derived
+        )
     except MonoUnsupported:
         drafter.model = draft
         raise
 
 
 def _install_hi(
-    model, atom_config, drafter, metadata_builder, dp_ranks: int
+    model, atom_config, drafter, metadata_builder, dp_ranks: int, derived
 ) -> nn.Module:
     engram = metadata_builder.engram
     # the hi runtime's layers for every layer: weights (packed from the target's and the draft's loaded tensors),
     # kernels and peer groups bound here, before the KV cache is sized (the Engram table lookup's hash constants from
     # ATOM's own hash mapping)
-    hook = hi_runner.install(model, atom_config, engram.mapping, drafter.model)
+    hook = hi_runner.install(model, atom_config, engram.mapping, drafter.model, derived)
     hook.runner = metadata_builder.model_runner
     if hook.eng:
         # the Engram lookup from ATOM's host shards, its staging skipped on served steps
         hook.use_host_tables(engram.host, engram.host.overlap)
     # the draft's context write and block draft on the hi path
-    drafter.model = HiDraftModel(drafter.model, dp_ranks, hook)
+    draft = drafter.model
+    drafter.model = HiDraftModel(draft, dp_ranks, hook, derived)
     hook.bind_draft(drafter)
+    # every weight pointer the hook binds in a parameter's storage or a derived buffer it registered: under a runner
+    # that takes weight updates, where not, the install refuses (every rank alike)
+    group, world, _ = _tp()
+    refused = None
+    try:
+        hook.audit_weights(model, draft)
+    except MonoUnsupported as error:
+        refused = error
+    tp_uniform_local_validation(
+        refused, group=group, world_size=world, context="weight-update audit"
+    )
     # the round's host work at the builder's points (``round.HiRound``): the routing decision with lean host prep on the
     # steps it serves, the device-side round advance on top of it, the verdict / Engram commit inside the target graph
     metadata_builder.use_decode_round(hi_round.install(hook, metadata_builder))

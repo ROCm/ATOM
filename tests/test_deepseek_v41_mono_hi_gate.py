@@ -434,7 +434,9 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: "atom mono")
+    # (resolving the runner's qualname would import it here, logging its own lines)
+    monkeypatch.setattr(dispatch, "_takes_weight_updates", lambda cfg: False)
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
             dispatch.install_mono_decode(
@@ -522,7 +524,11 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         def step(*a, **k):
             log.append(name)
             return SimpleNamespace(
-                eng={}, bind_draft=lambda d: log.append("bind_draft")
+                eng={},
+                bind_draft=lambda d: log.append("bind_draft"),
+                # the weight-update audit of what the hook bound
+                audit_weights=lambda model, draft: log.append("audit"),
+                derived=None,
             )
 
         return step
@@ -636,7 +642,7 @@ def test_every_rank_passing_builds_after_the_agreement(hi_dispatch_module, monke
     log, args, _ = _install_world(hi_dispatch_module, monkeypatch)
     hi_dispatch_module.install_hi(*args)
     assert log == [("check", 4, 1), ("agree", None, "tp cpu group"), "hi layers", "draft model", "bind_draft",
-                   "round", "use round", "decode model"]  # fmt: skip
+                   "audit", ("agree", None, "tp cpu group"), "round", "use round", "decode model"]  # fmt: skip
 
 
 def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
@@ -653,9 +659,10 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
     monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
     decoder = SimpleNamespace(write_context="atom mono context write")
-    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: decoder)
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a, **k: decoder)
+    monkeypatch.setattr(dispatch, "_takes_weight_updates", lambda cfg: False)
     monkeypatch.setattr(
-        dispatch, "MonoDraftModel", lambda m, dp: SimpleNamespace(model=m)
+        dispatch, "MonoDraftModel", lambda m, dp, derived=None: SimpleNamespace(model=m)
     )
     model, cfg, drafter, builder, _ = args
     with caplog.at_level(logging.INFO, logger="atom"):

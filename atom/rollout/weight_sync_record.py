@@ -44,6 +44,10 @@ class WeightSyncRecord:
         _, written = self._parts.setdefault(id(param), (frozenset(whole), set()))
         written.add(part)
 
+    def touched(self) -> set[int]:
+        """The ids of every parameter this sync wrote, whole or in part."""
+        return self._written | set(self._parts)
+
     def missing(self, params: Mapping[str, torch.nn.Parameter]) -> list[str]:
         """The names in *params* this sync left as they were, a calibrated
         one aside (``is_calibrated``)."""

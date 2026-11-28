@@ -34,8 +34,9 @@ from atom.models.deepseek_v41.mono.config import (
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.models.deepseek_v41.mono.weight_refresh import DerivedWeights
 from atom.mono.runtime.consensus import MonoUnsupported
-from atom.mono.runtime.deployment import dp_attention_ranks
+from atom.mono.runtime.deployment import _takes_weight_updates, dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
 
@@ -93,7 +94,15 @@ class MonoVerifyHead(VerifyHead):
 
 class MonoDecodeModel(nn.Module):
     """The loaded V4.1 runtime model, with its supported steps routed to mono,
-    and its verify head the mono LM head launch (``MonoVerifyHead``)."""
+    and its verify head the mono LM head launch (``MonoVerifyHead``).
+
+    Under an in-place weight update (``weight_updater``): the parameters are
+    ``model``'s, named as ``model`` names them (``weight_sync_target``);
+    ``mono_derived`` holds the deployment's derived weights and its bound
+    paths' weight-update audits (``weight_refresh``), every runner under this
+    wrapper (the draft's too) registering into it, and answers the update's
+    hooks (``weight_update_refusal`` before it writes, ``after_weight_update``
+    once it has)."""
 
     def __init__(
         self,
@@ -105,10 +114,12 @@ class MonoDecodeModel(nn.Module):
         outputs,
         sampling,
         draft_context: bool = True,
+        derived: DerivedWeights | None = None,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
+        self.mono_derived = DerivedWeights() if derived is None else derived
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
         # created on its first eligible step (``LazyRunner``); ``sampling``
@@ -124,10 +135,33 @@ class MonoDecodeModel(nn.Module):
                 outputs,
                 sampling,
                 draft_context,
+                self.mono_derived,
             ),
             "V4.1 mono decode",
         )
         self.verify_head = MonoVerifyHead(self.serves_step, lambda: self._mono.runner)
+
+    @property
+    def weight_sync_target(self) -> nn.Module:
+        """The model whose parameters a weight update writes, by its names."""
+        return self.model
+
+    def weight_update_refusal(self) -> str | None:
+        """Why an in-place weight update would leave a mono launch reading a
+        stale copy (a bound path whose audit failed), or None."""
+        return self.mono_derived.refusal()
+
+    def after_weight_update(self, changed) -> None:
+        """Re-derive, in place, the derived weights whose sources ``changed``
+        (the parameters the update wrote; None: all) overlap: every address
+        kept, so captured graphs and hi's pointer tables stay valid."""
+        report = self.mono_derived.rebuild(changed)
+        if report.rebuilt:
+            logger.info(
+                "V4.1 mono: %d derived weights rebuilt in place in %.1f ms",
+                len(report.rebuilt),
+                report.seconds * 1e3,
+            )
 
     def serves_step(self, rows: int, embeds: bool = False) -> bool:
         """Whether the mono kernels serve this forward's ``rows``-row step:
@@ -183,7 +217,9 @@ class MonoDraftModel(nn.Module):
     ``MAX_REQUESTS`` a rank while the MoE's rows over every rank stay within
     ``MAX_MOE_ROWS``."""
 
-    def __init__(self, draft: nn.Module, dp_ranks: int = 0) -> None:
+    def __init__(
+        self, draft: nn.Module, dp_ranks: int = 0, derived: DerivedWeights | None = None
+    ) -> None:
         super().__init__()
         self.model = draft
         self._max_requests = (
@@ -191,7 +227,9 @@ class MonoDraftModel(nn.Module):
             if dp_ranks
             else MAX_REQUESTS
         )
-        self._mono = LazyRunner(lambda: DraftMonoRunner(draft), "V4.1 mono draft")
+        self._mono = LazyRunner(
+            lambda: DraftMonoRunner(draft, derived), "V4.1 mono draft"
+        )
         # the last block's backbone ran on the mono kernels: its head may too
         # (a pass's head follows its backbone, recorded or not)
         self._served = False
@@ -269,6 +307,10 @@ def install_mono_decode(
         logger.info("V4.1 mono decode off: %s", why)
         return model
     dp_ranks = dp_attention_ranks(atom_config)
+    # What every mono path here derives from the weights, and its audits: under
+    # a runner that takes weight updates a path whose audit fails is refused
+    # at its bind (``weight_refresh``)
+    derived = DerivedWeights(strict=_takes_weight_updates(atom_config))
     # The decoder layers on the high-interactivity monokernels where they serve
     # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
     # other takes ATOM's mono decode below, unchanged.
@@ -279,14 +321,18 @@ def install_mono_decode(
         from atom.models.deepseek_v41.mono.hi_dispatch import install_hi
 
         try:
-            return install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+            return install_hi(
+                model, atom_config, drafter, metadata_builder, dp_ranks, derived
+            )
         except MonoUnsupported as why:
             if hi_gate.mode() == "1":
                 raise
             hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
+            # nothing of the hook's is bound: neither its entries nor its audit
+            derived = DerivedWeights(strict=derived.strict)
     draft = None
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
-        draft = drafter.model = MonoDraftModel(drafter.model, dp_ranks)
+        draft = drafter.model = MonoDraftModel(drafter.model, dp_ranks, derived)
     # the forward's output buffer and the step's staged sampling (one slot:
     # mono refuses pipeline parallel, whose forward_vars ring would swap them)
     staged = metadata_builder.model_runner.forward_vars
@@ -298,6 +344,7 @@ def install_mono_decode(
         dp_ranks,
         staged["outputs"],
         (staged["temperatures"].gpu, staged["top_ps"].gpu),
+        derived=derived,
     )
     if draft is not None:
         draft.context_writer = decoder.write_context

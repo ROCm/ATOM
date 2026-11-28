@@ -45,8 +45,9 @@ Outputs:
   projects; zeros on a row that does not emit).
 
 Args: ``pos`` int32 [batch] (the step's first position per request), ``rope`` / ``rope.sin`` (ATOM's bf16 RoPE
-caches, ``rope_cs``), ``norm`` bf16 [512], the weights bf16 [512, 5120] (``pack``), the request words and the page
-geometry (``paged.REQ``).
+caches, ``rope_cs``), ``norm`` bf16 [512] (and with the index keys ``knorm`` bf16 [128]: the model's own norm weights,
+read in place, so an in-place weight update reaches them), the weights bf16 [512, 5120] (``pack``), the request words
+and the page geometry (``paged.REQ``).
 """
 
 from __future__ import annotations
@@ -89,10 +90,8 @@ from .norm import dot2_bf16
 
 THREADS = MI355X.threads
 HD, ROPE, HIDDEN, IHD = 512, 64, 5120, 128  # IHD: the indexer's key width
-# the bf16 ``aux`` arg (one pointer: SGPRs): the compressor's norm [512], then (index keys) wk [128, 512] in the
-# pool's lane order (``pack_wk``), k_norm [128]
-AUX_WK = HD // 2  # words
-AUX_KNORM = AUX_WK + IHD * HD // 2
+# the bf16 ``aux`` arg of the index keys: wk [128, 512] in the pool's lane order (``pack_wk``: a CTA's load is 8 KB
+# contiguous); the norms are the model's own (``norm`` / ``knorm``)
 FP4_GROUP = 16  # the compressed cache's QAT group (E4M3 scales)
 FP4_MIN_AMAX = 6 * 2**-9  # fp4_act_quant's clamp: the smallest scale is E4M3's 2^-9
 NORM_LANES = 64  # the norm's sum map: lane i holds channels 8 i .. 8 i + 7 (NormSpec(512, threads 64, wps 4))
@@ -112,7 +111,9 @@ class _Plan:
     score_part: str  # "" at ratio 1
     pos: str
     rope: str
-    aux: str
+    norm: str  # the compressor's norm weight [512]
+    aux: str  # "" without the index-key path
+    knorm: str  # the indexer's k_norm weight [128]; "" without the index-key path
     cache: str
     cache_len: int
     kv_state: str
@@ -197,12 +198,12 @@ def _index_loads(k, p: _Plan, c, epos):
     """The index-key path's plain loads, issued at task start (their latency hides under the dots' wait): lane c's
     16 wk steps (``pack_wk``), its RoPE pair and its k_norm weight."""
     r_aux = rsrc(k.args[p.aux])
-    wk = [fx.Vector(bo.buffer_load(r_aux, AUX_WK + (i * THREADS + c) * 4, vec_width=4, dtype=T.i32))
+    wk = [fx.Vector(bo.buffer_load(r_aux, (i * THREADS + c) * 4, vec_width=4, dtype=T.i32))
           for i in range(16)]  # fmt: skip
     ci = fx.min(c, fx.Int32(IHD - 1))
     kpair = fx.max(ci - (IHD - ROPE), fx.Int32(0)) // 2
     cs_k = rope_cs(k, p.rope, epos, kpair)
-    g_lo, g_hi = bf2_f32(ld_i32(k.args[p.aux], AUX_KNORM + ci // 2))
+    g_lo, g_hi = bf2_f32(ld_i32(k.args[p.knorm], ci // 2))
     return wk, cs_k, ((ci & 1) == 1).select(g_hi, g_lo)
 
 
@@ -309,7 +310,7 @@ def _pool(k, t, p: _Plan):
         k, t
     )  # (a padded or dead request's row writes none of ATOM's storage)
     # plain loads first (independent of the dots): gamma, the RoPE pair, the state partner
-    gw = ld_i32(k.args[p.aux], c // 2)
+    gw = ld_i32(k.args[p.norm], c // 2)
     g_lo, g_hi = bf2_f32(gw)
     gamma = ((c & 1) == 1).select(g_hi, g_lo)
     epos = fx.max(pos + (1 - p.ratio), fx.Int32(0))
@@ -443,8 +444,12 @@ class Compressor(Block):
             slots,
             eps,
         )
-        self.wkv, self.wgate, self.aux = f"{name}.wkv", f"{name}.wgate", f"{name}.aux"
+        self.wkv, self.wgate = f"{name}.wkv", f"{name}.wgate"
+        self.norm = f"{name}.norm"
         self.index_out = index_out
+        indexed = index_out is not None
+        self.aux = f"{name}.aux" if indexed else ""
+        self.knorm = f"{name}.knorm" if indexed else ""
         mk = lambda n, w: GatheredDot(f"{name}.{n}", x, w, Channel(f"{name}.{n}", HD, Fmt.F32),
                                       kslices=kslices, sum_stage=False, tiles=tiles)  # fmt: skip
         self.dots = [mk("kv", self.wkv)] + (
@@ -462,8 +467,8 @@ class Compressor(Block):
         )
         return _Plan(self.name, sc.rows, spec, sc.batch, self.ratio, self.slots, self.kslices,
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
-                     self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
-                     self.latent.name if self.latent else "", self.eps, self.poll_batch,
+                     self.norm, self.aux, self.knorm, self.cache, self.cache_len, self.kv_state, self.score_state,
+                     self.out.name, self.latent.name if self.latent else "", self.eps, self.poll_batch,
                      self.index_out.name if self.index_out else "", flag, self.qat)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -474,7 +479,8 @@ class Compressor(Block):
             writes += self.index_out.regions(sc.rows, (pname,))
         if p.flag:
             writes.append(Region(p.rd, sc.batch, (pname,), exchange=True))
-        args = (self.pos, self.rope, rope_sin(self.rope), self.aux, self.cache, *paged.REQ) + (
+        index = (self.aux, self.knorm) if self.index_out is not None else ()
+        args = (self.pos, self.rope, rope_sin(self.rope), self.norm, *index, self.cache, *paged.REQ) + (
             (self.kv_state, self.score_state) if self.ratio == 2 else ())  # fmt: skip
         lds = HD + (HD // 2 + IHD if self.index_out is not None else 0)
         # the caches' entries are for later launches: this launch's readers take them from ``out`` / ``index_out``
@@ -485,19 +491,17 @@ class Compressor(Block):
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
         """``layer``: a dict of the layer's tensors as the checkpoint names them
-        (``attn.compressor.{wkv,wgate,norm}.weight``), any device; returns bf16 tensors on that device.
-        """
+        (``attn.compressor.{wkv,wgate,norm}.weight``), any device; returns bf16 tensors on that device: the norms
+        (and ``wkv`` / ``wgate``) the given tensors themselves where those are bf16 and contiguous (ATOM's, read in
+        place), ``aux`` the one re-laid-out copy (``pack_wk``)."""
         bf = lambda n: layer[n].to(torch.bfloat16).contiguous()
         out = {self.wkv: bf("attn.compressor.wkv.weight")}
         if self.ratio == 2:
             out[self.wgate] = bf("attn.compressor.wgate.weight")
-        aux = [bf("attn.compressor.norm.weight").flatten()]
+        out[self.norm] = bf("attn.compressor.norm.weight").flatten()
         if self.index_out is not None:
-            aux += [
-                pack_wk(bf("attn.indexer.wk.weight")).flatten(),
-                bf("attn.indexer.k_norm.weight").flatten(),
-            ]
-        out[self.aux] = torch.cat(aux)
+            out[self.aux] = pack_wk(bf("attn.indexer.wk.weight")).flatten()
+            out[self.knorm] = bf("attn.indexer.k_norm.weight").flatten()
         return out
 
 

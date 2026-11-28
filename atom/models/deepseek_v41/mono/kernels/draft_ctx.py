@@ -15,9 +15,11 @@ in one launch, after the target's mono step, on the step's rows:
    tagged pairs.
 3. ``mnorm``: a CTA a row: its 5120 columns polled from CX, ``main_norm``
    (bf16), MXFP8 -> H8 / H8S, its flag (HF).
-4. ``wkv``: the three stages' ``wkv`` (one [1536, 5120] FP8 weight, every
-   rank all of it), a task 8 row groups x a K slice, the rows' H8 in LDS ->
-   fp32 partials KVP [slice][row][column], its flag (WF).
+4. ``wkv``: the three stages' ``wkv`` (each the KV rows of its stage's own
+   ``wqkv_a``, read in place: a [512, 5120] FP8 weight and its E8M0 rows, every
+   rank all of it; one [1536, 5120] product), a task 8 row groups of one stage
+   x a K slice, the rows' H8 in LDS -> fp32 partials KVP [slice][row][column],
+   its flag (WF).
 5. ``kvrow``: a wave a (row, stage): the slices summed -> bf16, ``kv_norm``
    -> bf16, RoPE of the last 64 columns -> bf16, the QAT (E4M3, group 32,
    ceil E8M0) into the stage's fp8 window ring by ``write_window``'s rule.
@@ -84,13 +86,14 @@ SETS = WAVES  # row groups a GEMV task: a wave each
 ROPE = 64
 HALF = ROPE // 2
 WKV_SLICE_STEPS = 2  # wkv: 40 K steps in 20 slices, 12 x 20 tasks
+STAGE_SETS = KV_DIM // RG // SETS  # wkv tasks' row-group sets a stage
 # the launch's mailbox tag: past every layer's and the column gathers'
 CTX_TAG = 240
 
 ABI = KernelAbi(
     (
-        "tap0", "tap1", "tap2", "wp", "wps", "wk", "wks", "mnorm_w", "kvn0",
-        "kvn1", "kvn2", "pos", "pos_w", "ring_pos", "ring_pos_w", "batch",
+        "tap0", "tap1", "tap2", "wp", "wps", "wk0", "wk1", "wk2", "wks0",
+        "wks1", "wks2", "mnorm_w", "kvn0", "kvn1", "kvn2", "pos", "pos_w", "ring_pos", "ring_pos_w", "batch",
         "cu", "slots", "cached", "cached_w", "wptrs", "layer0", "layer1",
         "layer2", "ring", "cos", "sin", "max_pos", "parts", "h8", "kvp",
         "scratch", "sym", "peers", "rank",
@@ -402,13 +405,18 @@ def load_h8(c, b, n, q):
 
 @traced
 def wkv(c, task):
-    """wkv task ``task``: 8 row groups of the 1536 x K slice, every block."""
+    """wkv task ``task``: 8 row groups of the 1536 x K slice, every block.
+    Its row groups are one stage's (512 rows: ``STAGE_SETS`` tasks a stage),
+    read from that stage's own weight: the same bytes, in the same order, as
+    the stages' rows concatenated."""
     p, a, lane, wave = c["key"], c["args"], c["lane"], c["wave"]
     j, q = task // p.wkv_slices, task % p.wkv_slices
     k = WKV_SLICE_STEPS * KSTEP
+    stage = j // STAGE_SETS
     ops = gemv_fp8_loads(
-        c, a["wk"], a["wks"], k, j * SETS, split=1, tiled=True, k_row=HIDDEN,
-        k0=q * k,
+        c, pick([a["wk0"], a["wk1"], a["wk2"]], stage),
+        pick([a["wks0"], a["wks1"], a["wks2"]], stage), k,
+        (j % STAGE_SETS) * SETS, split=1, tiled=True, k_row=HIDDEN, k0=q * k,
     )  # fmt: skip
     col = (j * SETS + wave) * RG + 4 * (lane // 16)
     for b in range_constexpr(p.blocks):
@@ -511,8 +519,9 @@ def build_draft_ctx(key: DraftCtxBuild):
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def draft_ctx(
-        tap0: Int64, tap1: Int64, tap2: Int64, wp: Int64, wps: Int64, wk: Int64,
-        wks: Int64, mnorm_w: Int64, kvn0: Int64, kvn1: Int64, kvn2: Int64,
+        tap0: Int64, tap1: Int64, tap2: Int64, wp: Int64, wps: Int64, wk0: Int64,
+        wk1: Int64, wk2: Int64, wks0: Int64, wks1: Int64, wks2: Int64,
+        mnorm_w: Int64, kvn0: Int64, kvn1: Int64, kvn2: Int64,
         pos: Int64, pos_w: Int32, ring_pos: Int64, ring_pos_w: Int32,
         batch: Int64, cu: Int64, slots: Int64, cached: Int64, cached_w: Int32,
         wptrs: Int64, layer0: Int32, layer1: Int32, layer2: Int32, ring: Int32,
@@ -535,7 +544,8 @@ def build_draft_ctx(key: DraftCtxBuild):
             "red": fx.recast_iter(fx.Float32, lds + RG * (key.x_words + key.x_codes)),
             "args": {
                 "tap0": tap0, "tap1": tap1, "tap2": tap2, "wp": wp, "wps": wps,
-                "wk": wk, "wks": wks, "mnorm_w": mnorm_w, "kvn0": kvn0,
+                "wk0": wk0, "wk1": wk1, "wk2": wk2, "wks0": wks0,
+                "wks1": wks1, "wks2": wks2, "mnorm_w": mnorm_w, "kvn0": kvn0,
                 "kvn1": kvn1, "kvn2": kvn2, "pos": pos, "pos_w": pos_w,
                 "ring_pos": ring_pos, "ring_pos_w": ring_pos_w, "batch": batch,
                 "cu": cu, "slots": slots, "cached": cached, "cached_w": cached_w,
@@ -571,8 +581,9 @@ def build_draft_ctx(key: DraftCtxBuild):
 
     @launcher(name)
     def launch(
-        tap0: Int64, tap1: Int64, tap2: Int64, wp: Int64, wps: Int64, wk: Int64,
-        wks: Int64, mnorm_w: Int64, kvn0: Int64, kvn1: Int64, kvn2: Int64,
+        tap0: Int64, tap1: Int64, tap2: Int64, wp: Int64, wps: Int64, wk0: Int64,
+        wk1: Int64, wk2: Int64, wks0: Int64, wks1: Int64, wks2: Int64,
+        mnorm_w: Int64, kvn0: Int64, kvn1: Int64, kvn2: Int64,
         pos: Int64, pos_w: Int32, ring_pos: Int64, ring_pos_w: Int32,
         batch: Int64, cu: Int64, slots: Int64, cached: Int64, cached_w: Int32,
         wptrs: Int64, layer0: Int32, layer1: Int32, layer2: Int32, ring: Int32,
@@ -582,7 +593,8 @@ def build_draft_ctx(key: DraftCtxBuild):
     ):  # fmt: skip
         _ = keyed
         draft_ctx(
-            tap0, tap1, tap2, wp, wps, wk, wks, mnorm_w, kvn0, kvn1, kvn2, pos,
+            tap0, tap1, tap2, wp, wps, wk0, wk1, wk2, wks0, wks1, wks2, mnorm_w,
+            kvn0, kvn1, kvn2, pos,
             pos_w, ring_pos, ring_pos_w, batch, cu, slots, cached, cached_w,
             wptrs, layer0, layer1, layer2, ring, cos, sin, max_pos, parts, h8,
             kvp, scratch, sym, peers, rank,
