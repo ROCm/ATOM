@@ -901,6 +901,8 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # Set for the warmup's unsplit forward: every rank vetoes its TBO split.
+    _warmup_unsplit = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1544,6 +1546,15 @@ class ModelRunner:
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
 
+    def _warmup_splits_under_dp(self, batch: ScheduledBatch) -> bool:
+        """Whether the warmup ``batch`` splits into TBO micro-batches in a DP
+        group, where a peer's veto can run the same width unsplit. The same on
+        every rank: each warms up the same batch from the same config."""
+        if get_dp_group().world_size <= 1 or not self.config.enable_tbo:
+            return False
+        meets_min_tokens, can_split, _, _ = self._local_tbo_eligibility(batch)
+        return meets_min_tokens and can_split
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
@@ -1577,31 +1588,44 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
-        seqs = [
-            Sequence(
-                [0] * seq_len,
-                block_size=self.block_size,
+        def warmup_batch() -> ScheduledBatch:
+            seqs = [
+                Sequence(
+                    [0] * seq_len,
+                    block_size=self.block_size,
+                )
+                for _ in range(num_seqs)
+            ]
+            for seq in seqs:
+                seq.type = SequenceType.PREFILL
+            num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
+            total_tokens_num = int(num_scheduled_tokens.sum())
+            return ScheduledBatch(
+                seqs={seq.id: seq for seq in seqs},
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num,
+                total_tokens_num_prefill=total_tokens_num,
+                total_seqs_num=num_seqs,
+                total_seqs_num_prefill=num_seqs,
+                is_dummy_run=True,
             )
-            for _ in range(num_seqs)
-        ]
-        for seq in seqs:
-            seq.type = SequenceType.PREFILL
-        seqs = {seq.id: seq for seq in seqs}
 
-        num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
-        total_tokens_num = int(num_scheduled_tokens.sum())
-
-        dummy_batch = ScheduledBatch(
-            seqs=seqs,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_tokens_num=total_tokens_num,
-            total_tokens_num_prefill=total_tokens_num,
-            total_seqs_num=num_seqs,
-            total_seqs_num_prefill=num_seqs,
-            is_dummy_run=True,
-        )
+        dummy_batch = warmup_batch()
+        total_tokens_num = dummy_batch.total_tokens_num
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
+        if self._warmup_splits_under_dp(dummy_batch):
+            # A DP group runs this width unsplit too: one rank decoding beside
+            # its peers' prefill vetoes the split (`sync_dp_metadata`), and the
+            # MoE then gathers every rank's whole prefill, twice a split's
+            # rows. Profile that forward as well, so the peak `get_num_blocks`
+            # reads is the larger of the two.
+            self._warmup_unsplit = True
+            try:
+                self.forward(warmup_batch())
+            finally:
+                self._warmup_unsplit = False
+            self.tokenID_processor.clean()
         torch.cuda.empty_cache()
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
@@ -2699,8 +2723,9 @@ class ModelRunner:
         decision.
         """
         # A decode does not vote: whether the group splits is
-        # `ForwardMode.decide`'s, from the group's `running_bs`.
-        if not (self.config.enable_tbo and batch.has_prefill):
+        # `ForwardMode.decide`'s, from the group's `running_bs`. The unsplit
+        # warmup forward vetoes on every rank alike (`warmup_model`).
+        if not (self.config.enable_tbo and batch.has_prefill) or self._warmup_unsplit:
             return (False, False, 0, 0)
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
