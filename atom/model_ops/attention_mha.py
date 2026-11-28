@@ -1369,6 +1369,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The selection's block-table shape follows the KV layout: one page-128 page a
         # block for MXFP4 KV, the page-16 SHUFFLE defaults otherwise.
         self._select_page_kwargs = {}
+        # ATOM_M3_FUSED_INDEX_SELECT: read the flag and probe aiter once here, not per step
+        self._decode_select_supported = self._probe_decode_select()
         if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
@@ -2003,6 +2005,62 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             **self._select_page_kwargs,
         )
 
+    def _qout_buffers(self, q, rows: int):
+        """ATOM_M3_ATTN_QOUT: (codes, scales) byte buffers for the attention to write o_proj's MXFP8 input
+        into, parked in ``_qout_result`` for the layer's o_proj (``attn_qout.oproj_input``); None keeps the
+        bf16 output. Only when every row of q is a metadata row (no pad rows)."""
+        self._qout_result = None
+        if (
+            not getattr(self, "_qout_enabled", False)
+            or rows != q.shape[0]
+            or not 8 <= rows <= 128
+        ):
+            return None
+        from atom.model_ops.minimax_m3 import attn_qout
+
+        codes = torch.empty(
+            (rows, q.shape[1] * q.shape[2]), dtype=torch.uint8, device=q.device
+        )
+        scales = torch.empty(
+            (rows, q.shape[1] * q.shape[2] // 32), dtype=torch.uint8, device=q.device
+        )
+        self._qout_result = (
+            codes.view(attn_qout.FP8_DTYPE),
+            scales.view(torch.float8_e8m0fnu),
+            rows,
+        )
+        return codes, scales
+
+    def _probe_decode_select(self):
+        """aiter's ``decode_select_supported`` when ``ATOM_M3_FUSED_INDEX_SELECT`` is set on an
+        NVFP4 KV cache and the installed aiter has the fused selection, else None. Bound once
+        in ``__init__``: the flag and the import are not read on the decode hot path."""
+        if not envs.ATOM_M3_FUSED_INDEX_SELECT or self.kv_cache_dtype != "nvfp4":
+            return None
+        try:
+            from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+                decode_select_supported,
+            )
+        except ImportError:  # an aiter without the fused selection
+            return None
+        return decode_select_supported
+
+    def _fused_index_select(self, rows: int, sparse_metadata) -> bool:
+        """Whether this decode step lets the NVFP4 attention select the top-16 itself
+        (``ATOM_M3_FUSED_INDEX_SELECT``): one-GPU NVFP4 index, a row count aiter measured
+        it at, an aiter that has ``index_score=``. Anything else keeps scorer + selector.
+        """
+        if (
+            self._decode_select_supported is None
+            or self.indexer_cp_group is not None
+            or self.index_cache_dtype not in FP4_CACHE_DTYPES
+            or sparse_metadata.index_scorer is None
+            or not sparse_metadata.index_scorer.nvfp4
+            or self.topk != 16
+        ):
+            return False
+        return self._decode_select_supported(rows, self.topk)
+
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
         self,
@@ -2041,11 +2099,35 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         rows = decode_md.seq_lens.shape[0] * max_query_len
         assert rows <= q.shape[0], (rows, q.shape)
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
+        fused_scores = None
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
             index_q = index_q[:rows]
-            if self.indexer_cp_group is not None:
+            if self._fused_index_select(rows, sparse_metadata):
+                # scorer only: the attention below selects the top-16 itself
+                from atom.model_ops.minimax_m3.index_topk import (
+                    minimax_m3_index_score_decode,
+                )
+
+                fused_scores = minimax_m3_index_score_decode(
+                    index_q,
+                    self.index_cache,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    self.num_kv_heads,
+                    self.scale,
+                    max_query_len,
+                    self._index_scorer(sparse_metadata),
+                )
+                topk_idx = torch.empty(
+                    (self.num_kv_heads, rows, self.topk),
+                    dtype=torch.int32,
+                    device=index_q.device,
+                )
+                sparse_bt = sparse_ctx = None
+            elif self.indexer_cp_group is not None:
                 selected = self._cp_index_topk_decode(
                     index_q,
                     decode_md.block_table,
@@ -2073,7 +2155,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     index_scorer=self._index_scorer(sparse_metadata),
                     **self._select_page_kwargs,
                 )
-            topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
+            if fused_scores is None:
+                topk_idx, sparse_bt, sparse_ctx = self._selection_triple(selected)
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
@@ -2107,6 +2190,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             if rows < q.shape[0]:
                 output[rows:].zero_()
             if self.kv_cache_dtype == "nvfp4":
+                fused_kw = (
+                    {}
+                    if fused_scores is None
+                    else {
+                        "index_score": fused_scores,
+                        "index_max_seq_len": sparse_metadata.max_seq_len,
+                        "init_blocks": self.init_blocks,
+                        "local_blocks": self.local_blocks,
+                    }
+                )
+                qout = self._qout_buffers(q, rows)
+                if qout is not None:
+                    fused_kw["quant_out"] = qout
                 self._sparse_pa_nvfp4_decode(
                     q[:rows],
                     k_cache,
@@ -2114,10 +2210,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     decode_md.block_table,
                     decode_md.seq_lens,
                     self.scale,
-                    out=output[:rows],
+                    out=output[:rows] if qout is None else None,
                     k_scale=self.nvfp4_k_scale,
                     v_scale=self.nvfp4_v_scale,
                     query_len=max_query_len,
+                    **fused_kw,
                 )
             elif fp4_kv:
                 self._sparse_pa_mxfp4(

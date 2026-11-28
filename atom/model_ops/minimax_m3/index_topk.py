@@ -1759,6 +1759,58 @@ def _triton_decode_score(
 
 
 @torch.no_grad()
+def minimax_m3_index_score_decode(
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    max_query_len: int,
+    index_scorer,
+) -> torch.Tensor:
+    """The FP4 decode scorer alone: the step's fp32 block scores ``[num_kv_heads, total_q,
+    max_block]`` (a view of the scorer workspace; only each row's live blocks are written),
+    for a consumer that selects the top-k itself (aiter ``sparse_pa_nvfp4_decode(index_score=)``).
+    Same scorer call as :func:`minimax_m3_index_topk_decode`."""
+    total_q, num_idx_heads, _ = idx_q.shape
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    views, _, score_decode = _fp4_index_ops(index_scorer)
+    if index_scorer.work_map is None:
+        raise ValueError(
+            "the FP4 index decode needs the step's index_scorer "
+            "(a work map and the score workspace)"
+        )
+    score_max_block = index_scorer.max_block
+    if triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE) > score_max_block:
+        raise ValueError(
+            f"a context of {max_seq_len} tokens is wider than the {score_max_block} "
+            "blocks the index scorer's work map was built at"
+        )
+    _require_packable(score_max_block)
+    # fails if the step outgrows the workspace
+    score_out = index_scorer.scores.logits(
+        num_kv_heads * total_q, score_max_block
+    ).view(num_kv_heads, total_q, score_max_block)
+    k_data, k_scale = views(index_kv_cache)
+    return score_decode(
+        idx_q,
+        k_data,
+        k_scale,
+        block_table,
+        seq_lens,
+        max_query_len,
+        num_kv_heads,
+        sm_scale,
+        score_max_block,
+        work_map=index_scorer.work_map,
+        out=score_out,
+    )
+
+
 def minimax_m3_index_topk_decode(
     idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
@@ -1837,36 +1889,16 @@ def minimax_m3_index_topk_decode(
     )
 
     if index_scorer is not None:
-        views, _, score_decode = _fp4_index_ops(index_scorer)
-        if index_scorer.work_map is None:
-            raise ValueError(
-                "the FP4 index decode needs the step's index_scorer "
-                "(a work map and the score workspace)"
-            )
-        score_max_block = index_scorer.max_block
-        if max_block > score_max_block:
-            raise ValueError(
-                f"a context of {max_seq_len} tokens is wider than the {score_max_block} "
-                "blocks the index scorer's work map was built at"
-            )
-        _require_packable(score_max_block)
-        # fails if the step outgrows the workspace
-        score_out = index_scorer.scores.logits(
-            num_idx_heads * total_q, score_max_block
-        ).view(num_idx_heads, total_q, score_max_block)
-        k_data, k_scale = views(index_kv_cache)
-        score = score_decode(
+        score = minimax_m3_index_score_decode(
             idx_q,
-            k_data,
-            k_scale,
+            index_kv_cache,
             block_table,
             seq_lens,
-            max_query_len,
+            max_seq_len,
             num_idx_heads,
             sm_scale,
-            score_max_block,
-            work_map=index_scorer.work_map,
-            out=score_out,
+            max_query_len,
+            index_scorer,
         )
     else:
         score = _triton_decode_score(
