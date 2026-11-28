@@ -40,7 +40,13 @@ def runtime(modules, monkeypatch):
     )
     monkeypatch.setitem(sys.modules, language.__name__, language)
     monkeypatch.setattr(modules.gluon, "language", language, raising=False)
-    monkeypatch.setattr(modules.gluon, "jit", lambda function: function)
+    # Bare `@gluon.jit` and the keyword form `gluon.jit(do_not_specialize=[...])(fn)`
+    # (the runtime-B attn_res kernel) both return the function itself.
+    monkeypatch.setattr(
+        modules.gluon,
+        "jit",
+        lambda function=None, **_: function if function is not None else (lambda fn: fn),
+    )
     monkeypatch.setattr(modules.arch, "get_arch", Mock(return_value="gfx1250"))
     monkeypatch.setitem(
         modules.attn_res.envs.environment_variables,
