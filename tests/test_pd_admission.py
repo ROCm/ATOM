@@ -1008,3 +1008,25 @@ def test_admission_state_is_exported_from_the_metrics_snapshot(build):
     assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, **counters}
     sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
     assert exported() == pending() | {pending_bytes: 0, **counters}
+
+
+def test_a_draft_window_state_class_is_admitted_beside_the_pages(build, monkeypatch):
+    """Its rings are one slot a request; only the pages are credited."""
+    from atom.spec_decode import draft_window as dw
+
+    window = dw.DraftWindow(
+        window=40, read_page=4, lookahead=4, block_size=4, anchor_margin=8
+    )
+    monkeypatch.setattr(dw, "draft_window", lambda config: window)
+    build(pool_entry_bytes={"kv": 1024, "state": 64})
+
+
+def test_a_window_state_receive_keeps_its_delta(build, monkeypatch, seq_factory):
+    sched, _ = build()
+    seq = seq_factory(list(range(8)))
+    seq.has_per_req_cache = True
+    connector = sched.kv_connector
+    monkeypatch.setattr(connector, "_window_state", False)
+    assert connector._receive_prefix(seq, 1, (4, 1)) == (0, 1)
+    monkeypatch.setattr(connector, "_window_state", True)
+    assert connector._receive_prefix(seq, 1, (4, 1)) == (1, 1)

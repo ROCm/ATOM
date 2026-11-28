@@ -736,7 +736,13 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+        from atom.spec_decode.draft_window import draft_window
+
+        if (
+            self.config.hf_config.model_type in self._per_req_cache_model_types()
+            or draft_window(self.config) is not None
+        ):
+            # A draft window kept as per-request state is state too.
             self.has_per_req_cache = True
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.

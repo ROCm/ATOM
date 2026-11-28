@@ -73,7 +73,10 @@ def _build_m3(
     num_blocks: int | None,
     _permit_per_request_state: bool,
 ) -> Any:
-    # Complete PAGE regions, the NSA index cache included.
+    # Complete PAGE regions, the NSA index cache included. A draft window kept
+    # as state rides the slots, which a state tier moves (`store_state_tier`).
+    if getattr(transfer_tensors, "slot_regions", None):
+        transfer_tensors = transfer_tensors.without_slots()
     return pure_page_codec(transfer_tensors, num_blocks)
 
 

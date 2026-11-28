@@ -78,7 +78,16 @@ class PdAdmissionController:
         ):
             raise ValueError("pd_admission requires D PP=1, DCP=1, PCP=1 and SP=1")
         # Credits are counted in pages, so the paged KV must be the only pool.
-        entry_bytes = list(config.pool_entry_bytes.values())
+        # A draft window kept as state is one slot a request, which admission
+        # checks apart (`BlockManager.can_allocate`), so only its pages count.
+        from atom.model_ops.attentions.pool_layout.sub_pool_spec import PAGED_CLASS
+        from atom.spec_decode.draft_window import draft_window
+
+        entry_bytes = [
+            size
+            for name, size in config.pool_entry_bytes.items()
+            if name == PAGED_CLASS or draft_window(config) is None
+        ]
         if len(entry_bytes) != 1 or entry_bytes[0] <= 0:
             raise ValueError("pd_admission requires a single paged KV pool layout")
         block_bytes = entry_bytes[0]

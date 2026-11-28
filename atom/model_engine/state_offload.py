@@ -403,13 +403,13 @@ def tier_verified_for_s(pool_gib: float) -> float:
 #: Offload layouts whose worker half builds a `StateOffloadTier`. Not every
 #: `lmcache_offload` does: `dense` has no per-request state at all and `hybrid`
 #: (DSV4) keeps its own in the SLOT sidecar. `qwen` subclasses the K3 tier.
-_STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
+_STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen", "m3"})
 
 #: Of those, the layouts that keep the tier under PP. Only K3's PAGE
 #: checkpoints span the stages (`paged_checkpoints_span_pipeline`); Qwen keeps
 #: fork checkpoints under PP, publishes no layout id, and its worker turns the
 #: tier off.
-_PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
+_PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "m3"})
 
 
 def state_tier_spans_pipeline(layout: str) -> bool:
@@ -561,7 +561,13 @@ def state_tier_capability(config) -> StateTierCapability:
         return replace(none, reason=str(exc))
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
-    if name == "mooncake_store" and layout != "kimi_k3":
+    from atom.spec_decode.draft_window import draft_window
+
+    # M3's state is a draft window's, which only the Store's tier carries.
+    windowed = draft_window(config) is not None
+    if layout == "m3" and (name != "mooncake_store" or not windowed):
+        return replace(none, reason=f"layout {layout!r} keeps no state here")
+    if name == "mooncake_store" and layout not in ("kimi_k3", "m3"):
         return replace(none, reason=f"the Mooncake Store keeps no {layout!r} state")
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size > 1 and not state_tier_spans_pipeline(layout):
