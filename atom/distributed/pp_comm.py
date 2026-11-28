@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import torch
 from aiter.dist.parallel_state import (
-    _split_tensor_dict,
     ensure_model_parallel_initialized,
     get_pp_group,
     get_tp_group,
@@ -109,35 +108,97 @@ def init_pp_aware_dist_env(
     )
 
 
+# A frame's metadata is one fixed-size gloo message on a tag of its own. Gloo
+# delivers a message only once its receive is posted, so the receiving stage
+# posts the next frame's metadata receive as soon as it has this one's: the
+# message lands while the frame is computed, and asking for the frame costs no
+# gloo round trip before its RCCL receives are posted.
+_META_TAG = 0x50504D44
+_META_BYTES = 4096
+
+
+def _on_device_group(device: str) -> bool:
+    """Whether a tensor on this device type goes over the device group rather
+    than the CPU group."""
+    return device != "cpu"
+
+
+def _meta_message(entries: list) -> torch.Tensor:
+    raw = pickle.dumps(entries)
+    if len(raw) > _META_BYTES - 8:
+        raise ValueError(
+            f"PP frame metadata takes {len(raw)} bytes, over the "
+            f"{_META_BYTES - 8} its message holds: {entries}"
+        )
+    # On the CPU whatever the default device: the model runner sets one.
+    message = torch.zeros(_META_BYTES, dtype=torch.uint8, device="cpu")
+    message[:8] = torch.tensor([len(raw)], dtype=torch.int64, device="cpu").view(
+        torch.uint8
+    )
+    message[8 : 8 + len(raw)] = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return message
+
+
+def _read_meta(message: torch.Tensor) -> list:
+    size = int(message[:8].view(torch.int64)[0])
+    return pickle.loads(message[8 : 8 + size].numpy().tobytes())
+
+
+@dataclass
+class _MetaRecv:
+    """A posted receive of a frame's metadata message."""
+
+    work: torch.distributed.Work
+    message: torch.Tensor
+    source: tuple  # (cpu_group, src global rank) it was posted for
+
+
+_next_meta: _MetaRecv | None = None
+
+
+def _post_meta_recv(cpu_group, src: int) -> _MetaRecv:
+    message = torch.empty(_META_BYTES, dtype=torch.uint8, device="cpu")
+    work = torch.distributed.irecv(message, src=src, group=cpu_group, tag=_META_TAG)
+    return _MetaRecv(work, message, (cpu_group, src))
+
+
 def send_intermediate_tensors(it: IntermediateTensors) -> None:
     """Blocking send of hidden_states/residual to the next PP stage."""
-    pp = get_pp_group()
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
-    dst = (pp.rank_in_group + 1) % pp.world_size
-    pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
+    commit_pp_send_work(async_send_intermediate_tensors(it))
 
 
 def recv_intermediate_tensors() -> IntermediateTensors:
     """Receive hidden_states/residual from the previous PP stage."""
+    global _next_meta
     pp = get_pp_group()
-    src = (pp.rank_in_group - 1) % pp.world_size
-    tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
+    src = pp.ranks[(pp.rank_in_group - 1) % pp.world_size]
+    pending = _next_meta
+    if pending is None or pending.source != (pp.cpu_group, src):
+        pending = _post_meta_recv(pp.cpu_group, src)
+    _next_meta = None
+    pending.work.wait()
+    entries = _read_meta(pending.message)
+    _next_meta = _post_meta_recv(pp.cpu_group, src)
+
+    ag_group = pp_send_allgather_group()
+    tensors = {}
+    for key, slot, value in entries:
+        if slot is not None:
+            device, dtype, shape = slot
+            value = torch.empty(shape, dtype=dtype, device=device)
+            if value.numel():
+                gather = ag_group
+                if gather is not None and value.numel() % gather.world_size:
+                    gather = None
+                part = value
+                if gather is not None:
+                    part = value.reshape(gather.world_size, -1)[gather.rank_in_group]
+                group = pp.device_group if _on_device_group(device) else pp.cpu_group
+                torch.distributed.recv(part, src=src, group=group)
+                if gather is not None:
+                    value = gather.all_gather(part, dim=0).reshape(shape)
+        tensors[key] = value
     return IntermediateTensors(tensors)
-
-
-def _async_send_object(
-    obj: object, dst_global: int, cpu_group: torch.distributed.ProcessGroup
-) -> list[P2PWork]:
-    """Async version of aiter GroupCoordinator.send_object."""
-    raw = pickle.dumps(obj)
-    object_tensor = torch.frombuffer(raw, dtype=torch.uint8).clone()
-    size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
-    works: list[P2PWork] = []
-    w = torch.distributed.isend(size_tensor, dst=dst_global, group=cpu_group)
-    works.append(P2PWork(w, size_tensor))
-    w = torch.distributed.isend(object_tensor, dst=dst_global, group=cpu_group)
-    works.append(P2PWork(w, object_tensor))
-    return works
 
 
 def async_send_intermediate_tensors(
@@ -154,26 +215,39 @@ def async_send_intermediate_tensors(
     dst_global = pp.ranks[dst_local]
 
     tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
-    metadata_list, tensor_list = _split_tensor_dict(tensors)
-    owned_ids = {id(tensors[k]) for k in owned if k in tensors}
-
-    works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
+    # (key, slot, value): a tensor's slot is its (device type, dtype, shape);
+    # anything else has none and travels as the value itself.
+    entries = [
+        (
+            (key, (value.device.type, value.dtype, tuple(value.shape)), None)
+            if isinstance(value, torch.Tensor)
+            else (key, None, value)
+        )
+        for key, value in tensors.items()
+    ]
+    message = _meta_message(entries)
+    works = [
+        P2PWork(
+            torch.distributed.isend(
+                message, dst=dst_global, group=pp.cpu_group, tag=_META_TAG
+            ),
+            message,
+        )
+    ]
 
     ag_group = pp_send_allgather_group()
     ag_size = 1 if ag_group is None else ag_group.world_size
     ag_rank = 0 if ag_group is None else ag_group.rank_in_group
 
-    for tensor in tensor_list:
-        if tensor.numel() == 0:
+    for key, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
             continue
-        is_owned = id(tensor) in owned_ids
         if ag_group is not None and tensor.numel() % ag_size == 0:
             tensor = tensor.reshape(ag_size, -1)[ag_rank]
-        buf = tensor if is_owned else tensor.clone()
-        if buf.device.type == "cpu":
-            w = torch.distributed.isend(buf, dst=dst_global, group=pp.cpu_group)
-        else:
-            w = torch.distributed.isend(buf, dst=dst_global, group=pp.device_group)
+        buf = tensor if key in owned else tensor.clone()
+        on_device = _on_device_group(tensor.device.type)
+        group = pp.device_group if on_device else pp.cpu_group
+        w = torch.distributed.isend(buf, dst=dst_global, group=group)
         works.append(P2PWork(w, buf))
 
     return works

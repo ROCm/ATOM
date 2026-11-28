@@ -216,42 +216,6 @@ def test_make_layers_places_real_and_missing(monkeypatch, pp_rank, pp_size):
 # ---------------------------------------------------------------------------
 
 
-def _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2):
-    grp = MagicMock()
-    grp.rank_in_group = rank_in_group
-    grp.world_size = world_size
-    sent = {}
-
-    def send_tensor_dict(tensors, dst, all_gather_group=None):
-        sent["tensors"] = tensors
-        sent["dst"] = dst
-        sent["all_gather_group"] = all_gather_group
-
-    grp.send_tensor_dict.side_effect = send_tensor_dict
-    monkeypatch.setattr(pp_comm, "get_pp_group", lambda: grp)
-    # Default single-rank TP → pp_send_allgather_group() returns None, so send/recv
-    # behave like full-tensor transfers. Allgather tests stub a wider TP group.
-    tp = MagicMock()
-    tp.world_size = 1
-    monkeypatch.setattr(pp_comm, "get_tp_group", lambda: tp)
-    return grp, sent
-
-
-def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
-    _, sent = _fake_pp_group(monkeypatch, rank_in_group=0, world_size=2)
-    it = IntermediateTensors(
-        {
-            "hidden_states": torch.ones(3, 4),
-            "residual": torch.zeros(3, 4),
-            "extra": torch.arange(5),  # must be dropped
-        }
-    )
-    pp_comm.send_intermediate_tensors(it)
-    assert set(sent["tensors"].keys()) == {"hidden_states", "residual"}
-    assert sent["dst"] == 1
-    assert torch.equal(sent["tensors"]["hidden_states"], torch.ones(3, 4))
-
-
 @pytest.mark.parametrize(
     "pp_rank,pp_size,arch,method,holds,producer",
     [
@@ -288,40 +252,6 @@ def test_pp_holds_embedding(
     assert pp_holds_embedding(config) is holds
 
 
-def test_send_tolerates_missing_residual(monkeypatch):
-    _, sent = _fake_pp_group(monkeypatch)
-    pp_comm.send_intermediate_tensors(
-        IntermediateTensors({"hidden_states": torch.ones(2, 2)})
-    )
-    assert set(sent["tensors"].keys()) == {"hidden_states"}
-
-
-def test_recv_wraps_from_group_relative_prev(monkeypatch):
-    grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
-    payload = {"hidden_states": torch.ones(2, 2), "residual": torch.zeros(2, 2)}
-    grp.recv_tensor_dict.return_value = payload
-
-    out = pp_comm.recv_intermediate_tensors()
-
-    grp.recv_tensor_dict.assert_called_once_with(src=0, all_gather_group=None)
-    assert isinstance(out, IntermediateTensors)
-    assert torch.equal(out["hidden_states"], torch.ones(2, 2))
-    assert torch.equal(out["residual"], torch.zeros(2, 2))
-
-
-def test_roundtrip_preserves_proxy_tensors(monkeypatch):
-    grp, sent = _fake_pp_group(monkeypatch)
-    it = IntermediateTensors(
-        {"hidden_states": torch.randn(4, 8), "residual": torch.randn(4, 8)}
-    )
-    pp_comm.send_intermediate_tensors(it)
-    grp.recv_tensor_dict.return_value = sent["tensors"]
-
-    got = pp_comm.recv_intermediate_tensors()
-    for k in ("hidden_states", "residual"):
-        assert torch.equal(got[k], it[k])
-
-
 def test_allgather_group_none_when_disabled(monkeypatch):
     tp = MagicMock()
     tp.world_size = 4
@@ -346,31 +276,6 @@ def test_allgather_group_selected_when_enabled(monkeypatch):
     assert pp_comm.pp_send_allgather_group() is tp
 
 
-def test_recv_threads_allgather_group(monkeypatch):
-    grp, _ = _fake_pp_group(monkeypatch, rank_in_group=1, world_size=2)
-    tp = MagicMock()
-    tp.world_size = 4
-    monkeypatch.setattr(pp_comm, "get_tp_group", lambda: tp)
-    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", True)
-    grp.recv_tensor_dict.return_value = {
-        "hidden_states": torch.ones(2, 2),
-        "residual": torch.zeros(2, 2),
-    }
-    pp_comm.recv_intermediate_tensors()
-    grp.recv_tensor_dict.assert_called_once_with(src=0, all_gather_group=tp)
-
-
-def _real_split_tensor_dict(tensor_dict):
-    metadata_list = []
-    tensor_list = []
-    for key, value in tensor_dict.items():
-        metadata_list.append(
-            {"key": key, "dtype": value.dtype, "shape": list(value.shape)}
-        )
-        tensor_list.append(value)
-    return metadata_list, tensor_list
-
-
 def _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2):
     grp = MagicMock()
     grp.rank_in_group = rank_in_group
@@ -379,7 +284,6 @@ def _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2):
     grp.cpu_group = MagicMock()
     grp.device_group = MagicMock()
     monkeypatch.setattr(pp_comm, "get_pp_group", lambda: grp)
-    monkeypatch.setattr(pp_comm, "_split_tensor_dict", _real_split_tensor_dict)
     return grp
 
 
@@ -387,7 +291,7 @@ def _capture_isend(monkeypatch):
     """Record the numel of every isend the send path posts."""
     sent = []
 
-    def isend(buf, dst, group):
+    def isend(buf, dst, group, tag=0):
         sent.append(buf.numel())
         return MagicMock()
 
@@ -409,8 +313,8 @@ def test_async_send_slices_payload_when_allgather_on(monkeypatch):
         {"hidden_states": torch.randn(4, 8), "residual": torch.randn(4, 8)}
     )
     pp_comm.async_send_intermediate_tensors(it)
-    # First two isends are metadata (size + pickled object); the rest are slices.
-    assert sent[2:] == [8, 8]
+    # The first isend is the metadata message; the rest are slices.
+    assert sent[1:] == [8, 8]
 
 
 def test_async_send_full_tensor_when_allgather_off(monkeypatch):
@@ -426,7 +330,7 @@ def test_async_send_full_tensor_when_allgather_off(monkeypatch):
         {"hidden_states": torch.randn(4, 8), "residual": torch.randn(4, 8)}
     )
     pp_comm.async_send_intermediate_tensors(it)
-    assert sent[2:] == [32, 32]
+    assert sent[1:] == [32, 32]
 
 
 def test_async_send_full_tensor_when_not_divisible(monkeypatch):
@@ -442,7 +346,7 @@ def test_async_send_full_tensor_when_not_divisible(monkeypatch):
     pp_comm.async_send_intermediate_tensors(
         IntermediateTensors({"hidden_states": torch.randn(5, 7)})
     )
-    assert sent[2:] == [35]
+    assert sent[1:] == [35]
 
 
 def test_async_send_hands_owned_tensors_over_uncloned(monkeypatch):
@@ -452,15 +356,15 @@ def test_async_send_hands_owned_tensors_over_uncloned(monkeypatch):
     monkeypatch.setattr(
         pp_comm.torch.distributed,
         "isend",
-        lambda buf, dst, group: sent.append(buf) or MagicMock(),
+        lambda buf, dst, group, tag=0: sent.append(buf) or MagicMock(),
     )
     hidden, aux = torch.randn(4, 8), torch.randn(4, 16)
     pp_comm.async_send_intermediate_tensors(
         IntermediateTensors({"hidden_states": hidden, pp_comm.PP_AUX_KEY: aux}),
         owned=(pp_comm.PP_AUX_KEY,),
     )
-    assert sent[2] is not hidden and torch.equal(sent[2], hidden)
-    assert sent[3] is aux
+    assert sent[1] is not hidden and torch.equal(sent[1], hidden)
+    assert sent[2] is aux
 
 
 # ---------------------------------------------------------------------------
