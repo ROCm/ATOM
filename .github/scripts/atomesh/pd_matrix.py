@@ -470,6 +470,7 @@ def build_cell(
         raise ValueError("eval_only requires run_eval=true")
     if eval_only and accuracy_cfg.get("task", "gsm8k") not in {
         "gsm8k",
+        "mmmu_val",
         "swebench_lite",
     }:
         raise ValueError("eval_only requires a supported accuracy task")
@@ -527,6 +528,7 @@ def build_cell(
         "eval_only": eval_only,
         "accuracy": {
             "task": str(accuracy_cfg.get("task", "gsm8k")),
+            "metric": str(accuracy_cfg.get("metric", "exact_match,flexible-extract")),
             "fewshot": int(accuracy_cfg.get("fewshot", 3)),
             "limit": suite_cfg.get("eval_limit", accuracy_cfg.get("limit")),
             "concurrency": accuracy_concurrency,
@@ -534,6 +536,8 @@ def build_cell(
             "endpoint": str(accuracy_cfg.get("endpoint", "completions")),
             "batch_size": accuracy_cfg.get("batch_size"),
             "max_gen_toks": accuracy_cfg.get("max_gen_toks"),
+            "model_args": accuracy_cfg.get("model_args"),
+            "gen_kwargs": accuracy_cfg.get("gen_kwargs"),
             "apply_chat_template": bool(accuracy_cfg.get("apply_chat_template", False)),
             "fewshot_as_multiturn": bool(
                 accuracy_cfg.get("fewshot_as_multiturn", False)
