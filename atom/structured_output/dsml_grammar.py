@@ -24,8 +24,6 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import unquote
 
-from .schema import canonical_defs
-
 q = json.dumps
 
 # A raw string the client can compare exactly: annotations do not constrain.
@@ -224,6 +222,8 @@ def _invoke_rules(
     if parameters is None:
         rules.add(f"invoke_{i}: {invoke_open} {rules.shared('free_body')}")
         return
+    from .schema import canonical_defs
+
     parameters = canonical_defs(parameters)
     defs = {
         k: parameters[k] for k in _DEF_CONTAINERS if isinstance(parameters.get(k), dict)
