@@ -1,6 +1,7 @@
 # DeepSeek-V4.1-Flash agentic on ATOM — MI355X single node
 
-- Hardware: MI355X, one node; each server uses 2 or 4 GPUs
+- Hardware: MI355X, one node; each server uses 2 or 4 GPUs (8 in
+  [DEP8 at concurrency 256](#dep8-at-concurrency-256))
 - Image: `rocm/atom-dev:nightly_202611101510`
 - Model: `DeepSeek-V4.1-Flash`, FP8 (MXFP8) KV, FP4 index cache
 - Execution: level 3, FULL graphs, DSpark with 5 draft tokens and fixed acceptance length 3.51
@@ -104,3 +105,75 @@ export AIPERF_REQUIRED_SERVER_METRIC_PREFIX='atom:'
 
 agentx profile   --url http://localhost:8000   --model deepseek-ai/DeepSeek-V4.1-Flash --tokenizer "$MODEL_PATH"   --concurrency "$CONC" --benchmark-duration 3600   --tokenizer-trust-remote-code   --server-metrics http://localhost:8000/metrics   --output-artifact-dir "./aiperf-tp$TP-c$CONC"   --public-dataset semianalysis_cc_traces_weka_062126
 ```
+
+## DEP8 at concurrency 256
+
+This layout is not an InferenceX point. One server spans all eight GPUs with
+DP attention and expert parallelism. Under EP8, a rank that runs a long prefill
+holds up the other seven at every expert exchange, and that wait lands in the
+P90 TPOT. The recipe keeps long prefills out of the decode steps: a step admits
+at most 8192 tokens per DP rank (`--max-num-batched-tokens 8192`), and after a
+prefill the delayer runs 96 decode steps before the next one
+(`ATOM_PREFILL_DECODE_INTERVAL=96`).
+
+Measured on 8x MI355X with `rocm/atom-dev:nightly_202611171508` (ATOM
+`5f3ae2b5b`), AgentX through `.github/scripts/aiperf_agentic.sh`
+(agentx-harness 1.0.9, 3,600 seconds, 10 warmup requests per lane), fixed
+acceptance length 3.51, no profiler attached. Both runs are valid, with no
+failed requests and no context overflows:
+
+| DEP8, c256 | P90 interactivity (tok/s/user) | P90 TPOT (ms) | Throughput (tok/s/GPU) | TTFT p50 / p90 (s) | P90 E2E-normalized interactivity | Requests | Cache hit |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| DEP c256 settings | 104.81 | 9.54 | 173,078 | 1.53 / 7.30 | 26.69 | 35,140 | 96.3% |
+| This recipe | 175.04 | 5.71 | 103,419 | 20.18 / 49.28 | 3.96 | 22,063 | 95.9% |
+
+The first row runs the DEP2 c256 settings above at TP 8 (interval 10, a
+16384-token step budget, GPU memory utilization 0.9, capture sizes 1–32 plus
+48/64/128) with `MORI_SHMEM_HEAP_SIZE=16G`. This recipe sets the interval to
+96 and the step budget to 8192, binds each rank to its GPU's NUMA node, uses
+0.95 of GPU memory and captures 1–32 plus 40/48/56/64 (a DP rank decodes at
+most 256 / 8 = 32 sequences). The four changes were measured together.
+
+The recipe trades throughput for interactivity: P90 interactivity rises 67%
+and throughput falls 40%. Each new turn waits longer for its prefill, which
+also lowers the E2E-normalized interactivity (`.github/scripts/atomesh/interactivity.py`),
+so in the closed loop each session completes fewer turns in the hour.
+
+The nightly variant `DSpark5 DEP8 AL3.51` in
+[`models_agentic_nightly.json`](../.github/benchmark/models_agentic_nightly.json)
+runs this recipe with 5 warmup requests per lane.
+
+```bash
+export MODEL_PATH="/models/deepseek-ai/DeepSeek-V4.1-Flash"
+export OMP_NUM_THREADS=4
+export ATOM_NUMA_BIND=1
+export ATOM_DISABLE_MMAP=true
+export AITER_LOG_LEVEL=WARNING
+export GPU_MAX_HW_QUEUES=5
+# EP8 all-to-all buffers plus the DSpark drafter's MoE outgrow MoRI's 4 GB default heap.
+export MORI_SHMEM_HEAP_SIZE=16G
+export ATOM_ENABLE_PREFILL_DELAYER=1
+export ATOM_PREFILL_DECODE_INTERVAL=96
+export ATOM_DP_SESSION_AFFINITY=1
+export ATOM_DP_LB_REQ_EQUIV=512
+
+python3 -u -m atom.entrypoints.openai_server \
+  --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --trust-remote-code \
+  --host 0.0.0.0 --server-port 8000 \
+  --tensor-parallel-size 8 --enable-dp-attention --enable-expert-parallel \
+  --dp-load-balance least_tokens \
+  --kv_cache_dtype fp8 --index-cache-dtype fp4 \
+  --gpu-memory-utilization 0.95 \
+  --max-num-batched-tokens 8192 --attn-prefill-chunk-size 16384 \
+  --enable_prefix_caching --block-size 16 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 --cudagraph-mode FULL \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,40,48,56,64]" \
+  --method dspark --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 3.51 \
+  --tool-call-parser dsml_v41 \
+  --timeout-keep-alive 900
+```
+
+Run the client above with `TP=8` and `CONC=256`.

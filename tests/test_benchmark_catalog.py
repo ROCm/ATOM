@@ -469,7 +469,7 @@ def test_agentic_nightly_grid_and_shared_capture_recipe():
     assert points == (
         {(2, "tp", c) for c in [1, 2, 4, 8, 16, 32, 64, 128]}
         | {(4, "tp", c) for c in [1, 4, 8]}
-        | {(2, "dtp", 128), (2, "dep", 128)}
+        | {(2, "dtp", 128), (2, "dep", 128), (8, "dep", 256)}
     )
 
 
@@ -485,8 +485,11 @@ def test_agentic_nightly_subset_keeps_each_tp_grid():
     configs = build_configs(inputs={"profile": "nightly", "concurrency": "1,4,8"})
     assert len(configs) == 2
     assert all(json.loads(config["concurrency"]) == [1, 4, 8] for config in configs)
+    (config,) = build_configs(inputs={"profile": "nightly", "concurrency": "256"})
+    assert "-tp 8" in config["server_args"]
+    assert json.loads(config["concurrency"]) == [256]
     with pytest.raises(ValueError, match="subset"):
-        build_configs(inputs={"profile": "nightly", "concurrency": "256"})
+        build_configs(inputs={"profile": "nightly", "concurrency": "192"})
 
 
 def test_agentic_manual_default_stays_a_two_point_test():
