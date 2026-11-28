@@ -50,6 +50,18 @@ def test_embed_state_is_bit_exact(shape, hc_mult):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_embed_state_under_torch_compile():
+    compiled = torch.compile(_mhc().embed_state, fullgraph=True, dynamic=True)
+    for rows in (17, 33):
+        hidden = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+        fused = compiled(hidden, 4)
+        assert fused is not None
+        residual, pre_mix = _torch_body(hidden, 4)
+        assert torch.equal(fused[0], residual)
+        assert torch.equal(fused[1], pre_mix)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_embed_state_empty_and_strided_rows():
     mhc = _mhc()
     empty = torch.empty(0, 256, device="cuda", dtype=torch.bfloat16)

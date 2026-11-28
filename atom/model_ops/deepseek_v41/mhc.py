@@ -232,15 +232,10 @@ def embed_state(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """(residual, pre_mix) of `from_embeddings`, bit for bit, in one launch.
 
-    None where the torch body serves instead: CPU tensors, non-contiguous
-    rows, an ``hc_mult`` that is not a power of two up to 16 (the kernel
-    spans the streams with one `tl.arange`), and a traced forward
-    (`torch.compiler.is_compiling()`), where the compiler fuses the torch
-    body itself.
+    Return None for CPU tensors, non-contiguous inputs, or an ``hc_mult``
+    outside the supported powers of two up to 16.
     """
-    if torch.compiler.is_compiling() or not (
-        hidden.is_cuda and hidden.is_contiguous() and hc_mult in (1, 2, 4, 8, 16)
-    ):
+    if not (hidden.is_cuda and hidden.is_contiguous() and hc_mult in (1, 2, 4, 8, 16)):
         return None
     *outer, hidden_size = hidden.shape
     residual = torch.empty(
