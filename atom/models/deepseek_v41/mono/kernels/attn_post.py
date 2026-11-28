@@ -293,6 +293,15 @@ def merge0(s, tiles, first):
     return (first + score_tasks(s, tiles)[1]) % BLOCKS
 
 
+def merge_task_live(task, s, d):
+    """Whether merge task ``task`` holds a live head. A ragged head tile's dead
+    head groups (TP8: the rank's 8 heads in a 16-head tile) make tasks that
+    gather V and write nothing (``irq_slice`` puts live heads only): half of
+    TP8's merge tasks and their V gathers."""
+    _, tile, hg, _ = merge_task(task, s, d.head_tiles)
+    return tile * HEAD_TILE + hg * aplan.merge_heads(s) < d.heads
+
+
 def woa0(s, tiles, first):
     """wo_a's first CTA: past the merge tasks, so no wo_a
     task waits behind a merge task to start its weights' loads."""
@@ -813,7 +822,14 @@ def run_attn_post(
     if const_expr(aplan.merge_one_test(s, merges, BLOCKS)):
         merge_one = first_task(bid, merge0(s, tiles, key.score0))
         if merge_one < merges:
-            stage_attn_irq(c, merge_one)
+            # a merge with no live head writes nothing: not run (bit-exact) --
+            # not in an indexer layer, whose attention waits on the selection
+            # (the skip buys nothing there; its build stays as it was)
+            if const_expr(d.heads % HEAD_TILE == 0 or bound_max > 0):
+                stage_attn_irq(c, merge_one)
+            else:  # a compile-time test, then a traced one
+                if merge_task_live(merge_one, s, d):
+                    stage_attn_irq(c, merge_one)
     else:
         for task in range(
             first_task(bid, merge0(s, tiles, key.score0)), merges, BLOCKS
