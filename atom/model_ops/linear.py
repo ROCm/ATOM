@@ -1450,6 +1450,18 @@ class LinearBase(nn.Module):
             ):
                 shuffle_weights(self.weight)
                 if self.native_a8_group_rows == 1:
+                    if getattr(self, "mxfp8_w4_scales", False):
+                        from atom.model_ops.minimax_m3.tp1_prefill import (
+                            shuffle_scale_w4,
+                        )
+
+                        # MiniMax-M3.1 TP1 prefill: the 8-wave GEMM's preshuffled
+                        # copy of the row-major scales (tp1_prefill.psc_layout).
+                        self.register_buffer(
+                            "weight_scale_w4",
+                            shuffle_scale_w4(self.weight_scale.data),
+                            persistent=False,
+                        )
                     # Needs aiter with ROCm/aiter#8084.
                     from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
 

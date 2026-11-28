@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The cache key: the checkpoint and the drafter's, the model's HF config, the
-shard a rank holds, the quantization config, and the launch options and
-environment variables listed here as changing what loading produces. Nothing
-else is looked at: after a change to loading code, or to a setting that is
-not listed, stop the daemon by hand
+shard a rank holds, the quantization config, the launch options and
+environment variables listed here as changing what loading produces, and the
+MiniMax-M3.1 TP1 prefill switch as resolved. Nothing else is looked at: after a
+change to loading code, or to a setting that is not listed, stop the daemon by hand
 (``python -m atom.model_loader.weight_cache stop``)."""
 
 from __future__ import annotations
@@ -134,6 +134,8 @@ def compute_key(config, rank: int) -> dict:
     under the daemon's load leave it a key no server's files give. (So does
     the first load of a hub id, which downloads them: that launch or the next
     one loads from disk or replaces the daemon once, depending on timing.)"""
+    from atom.model_ops.minimax_m3 import tp1_prefill
+
     hf = config.hf_config
     try:
         hf_dict = hf.to_dict()
@@ -170,6 +172,9 @@ def compute_key(config, rank: int) -> dict:
         "quant": quant.compute_hash() if quant else None,
         "options": {k: _setting(config, k) for k in _CONFIG_FIELDS},
         "env": {k: os.environ.get(k) for k in _ENV_VARS},
+        # The path keeps a preshuffled copy of its linears' weight scales
+        # (tp1_prefill.want_w4_scales); resolved as the compile cache keys it.
+        "m3_tp1_prefill": tp1_prefill.path_enabled(config),
     }
 
 

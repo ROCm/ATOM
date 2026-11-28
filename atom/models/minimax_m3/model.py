@@ -704,6 +704,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         linears = (attn.qkv_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj)
         if not all(tp1_prefill.linear_supported(linear) for linear in linears):
             return
+        tp1_prefill.want_w4_scales(*linears)
         from atom.config import get_current_atom_config
 
         context = get_current_atom_config().compilation_config.static_forward_context
@@ -726,11 +727,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         attn = self.self_attn
         qkv_proj, o_proj = attn.qkv_proj, attn.o_proj
         norm = self.input_layernorm
+        qkv_w = (qkv_proj.weight, qkv_proj.weight_scale, qkv_proj.weight_scale_w4)
         if residual is None:
             residual = hidden_states
-            qkv = tp1_prefill.linear_bf16(
-                norm(hidden_states), qkv_proj.weight, qkv_proj.weight_scale
-            )
+            qkv = tp1_prefill.linear_bf16(norm(hidden_states), *qkv_w)
         else:
             routed, shared = (
                 hidden_states
@@ -738,20 +738,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 else (hidden_states, None)
             )
             residual, xq, xs = tp1_prefill.norm_mxfp8(
-                routed, shared, residual, norm.weight, norm.variance_epsilon
+                routed,
+                shared,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                qkv_proj.weight.shape[0],
             )
-            qkv = tp1_prefill.linear_q(xq, xs, qkv_proj.weight, qkv_proj.weight_scale)
+            qkv = tp1_prefill.linear_q(xq, xs, *qkv_w)
         aux_hidden_state = residual.clone() if capture_aux else None
         attn_out = tp1_prefill.linear_bf16(
             attn.attend(positions, qkv).view(-1, attn.q_size),
             o_proj.weight,
             o_proj.weight_scale,
+            o_proj.weight_scale_w4,
         )
         norm = self.post_attention_layernorm
         if self.is_moe_layer:
             moe = self.block_sparse_moe
             normed, residual, q8, s8 = tp1_prefill.norm_moe_input(
-                attn_out, residual, norm.weight, norm.variance_epsilon
+                attn_out,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                moe.shared_experts.gate_up_proj.weight.shape[0],
             )
             out = tp1_prefill.moe_ffn(
                 normed, q8, s8, moe.gate(normed), self.tp1_ffn_name
@@ -760,7 +770,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 out = tp1_prefill.materialize(*out)
         else:
             residual, q8, s8 = tp1_prefill.norm_mxfp8(
-                attn_out, None, residual, norm.weight, norm.variance_epsilon
+                attn_out,
+                None,
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                self.mlp.gate_up_proj.weight.shape[0],
             )
             out = tp1_prefill.mlp(q8, s8, self.tp1_ffn_name)
         if aux_hidden_state is not None:
