@@ -31,6 +31,8 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8_quant,
+    fused_allreduce_gemma_rms_norm_mxfp8_supported,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -669,6 +671,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Fixed at construction, so the arch probe stays out of the graph.
+        self.input_ar_mxfp8 = fused_allreduce_gemma_rms_norm_mxfp8_supported(
+            self.self_attn.qkv_proj
+        )
+        self.post_attention_ar_mxfp8 = (
+            not self.is_moe_layer
+            and fused_allreduce_gemma_rms_norm_mxfp8_supported(self.mlp.gate_up_proj)
+        )
 
     def forward(
         self,
@@ -697,6 +707,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     hidden_states, residual, self.input_layernorm
                 )
             )
+        elif self.input_ar_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm,
+                )
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -718,6 +736,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
                     hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        elif self.post_attention_ar_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
                 )
             )
             hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
