@@ -196,5 +196,5 @@ class MonoDraftContext:
             "sin": p(self.rope.sin_cache), "max_pos": self.rope.cos_cache.shape[0],
             "parts": p(self.parts), "h8": p(self.h8), "kvp": p(self.kvp),
             "scratch": p(self.scratch), "sym": peers["sym"],
-            "peers": peers["peers"], "rank": peers["rank"],
+            "peers": peers["peers"], "rank": peers["rank"], "epoch": peers["epoch"],
         }  # fmt: skip

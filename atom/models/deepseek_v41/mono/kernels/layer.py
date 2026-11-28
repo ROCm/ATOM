@@ -81,7 +81,7 @@ from atom.models.deepseek_v41.mono.kernels.layer_post import (
     publish_x_tok_par,
     seam_dot_norm,
 )
-from atom.models.deepseek_v41.mono.kernels.mailbox import fresh_s32, fresh_s64
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, fresh_s32, fresh_s64
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -223,11 +223,11 @@ _K2 = k2.ABI.names[: k2.ABI.names.index("scratch")]
 # the compressor's (prefixed; its input is K1's ``normed``, its scratch, tag
 # and timeline the launch's): 0 where a build has none
 COMPRESS_ARGS = tuple(
-    f"c_{n}" for n in cp.ABI.names if n not in ("x", "scratch", "layer", "tl")
+    f"c_{n}" for n in cp.ABI.names if n not in ("x", "scratch", "layer", "tl", "epoch")
 )
 ABI = KernelAbi(
     (*_K1, *_K2, "kvrow", *COMPRESS_ARGS, "scratch", "numa_word", "sym", "peers",
-     "rank", "layer", "post_layer", "moe_layer", "tl")
+     "rank", "layer", "post_layer", "moe_layer", "tl", "epoch")
 )  # fmt: skip
 
 
@@ -438,7 +438,7 @@ def build_layer(key: LayerBuild):
         c_table_stride: Int32, c_per_page: Int32, c_wk: Int64, c_k_norm_w: Int64,
         c_ivals: Int64, c_iscales: Int64, c_latent: Int64, c_keys: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64,
+        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -451,6 +451,8 @@ def build_layer(key: LayerBuild):
         sym, peers, numa_word = fresh_s64(sym), fresh_s64(peers), fresh_s64(numa_word)
         rank, layer = fresh_s32(rank), fresh_s32(layer)
         post_layer, moe_layer = fresh_s32(post_layer), fresh_s32(moe_layer)
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         alloc = fx.SharedAllocator()
         tls = alloc.allocate(Stamps).peek().tls.ptr
         smem = alloc.allocate(Parts)
@@ -495,7 +497,7 @@ def build_layer(key: LayerBuild):
             queue_words,
         )  # fmt: skip
         args_1["numa_word"] = args_a["numa_word"] = args_b["numa_word"] = numa_word
-        mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1)
+        mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1, epoch=ep)
         c1, co1 = attn_pre_context(
             pre, lds, mb_1, layout_1, scratch, args_1, rank, sym, peers
         )
@@ -505,7 +507,7 @@ def build_layer(key: LayerBuild):
             # the compressor reads K1's normed rows in this launch
             c1["normed_cm"] = co1["normed_cm"] = CM_DEV
         ca = attn_post_context(
-            key_a, s, lds, mailbox(post_layer, scratch, post.diag_off, layout),
+            key_a, s, lds, mailbox(post_layer, scratch, post.diag_off, layout, epoch=ep),
             bases, layout_a, scratch, args_a, rank, sym,
         )  # fmt: skip
         ca["normed_cm"] = CM_DEV
@@ -525,7 +527,7 @@ def build_layer(key: LayerBuild):
             # past their CRDY (``attention._selected_row`` / ``await_selection``)
             ca["cp_ratio"], ca["cp_ncap"], ca["crdy"] = comp.ratio, c_ncap, c1["crdy"]
         cb = moe_context(
-            s, rs, lds["moe"], mailbox(moe_layer, scratch, post.diag_off, layout),
+            s, rs, lds["moe"], mailbox(moe_layer, scratch, post.diag_off, layout, epoch=ep),
             bases, layout_b, scratch, args_b, rank, sym, key_b.numa,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
@@ -647,7 +649,7 @@ def build_layer(key: LayerBuild):
         c_table_stride: Int32, c_per_page: Int32, c_wk: Int64, c_k_norm_w: Int64,
         c_ivals: Int64, c_iscales: Int64, c_latent: Int64, c_keys: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64,
+        layer: Int32, post_layer: Int32, moe_layer: Int32, tl: Int64, epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
@@ -672,7 +674,7 @@ def build_layer(key: LayerBuild):
             c_pages, c_page_stride, c_page_scale, c_scale_stride, c_tables,
             c_table_stride, c_per_page, c_wk, c_k_norm_w, c_ivals, c_iscales,
             c_latent, c_keys,
-            scratch, numa_word, sym, peers, rank, layer, post_layer, moe_layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, post_layer, moe_layer, tl, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(layer_kernel, launch)

@@ -109,17 +109,19 @@ class MonoCompressor:
             for ratio, (eps, k_eps) in self.eps.items()
         }
 
-    def launch(self, launchers, rows, spec, cache, step, rope, normed) -> bool:
+    def launch(self, launchers, rows, spec, cache, step, rope, normed, epoch) -> bool:
         """Layer ``spec``'s compressor for this step on ``launchers`` (ratio ->
         launcher, the step's ``builds``), True if it ran; False leaves it to
         the original path (a layer or a step the launch is not built for, or
-        a step with nothing to compress, which that path skips too)."""
+        a step with nothing to compress, which that path skips too).
+        ``epoch``: the runner's epoch word (``kernels.mailbox.epoch_of``)."""
         w = self.layers.get(spec.layer_id)
         if w is None or not step.plans or not step.requests:
             return False
         args = self._args(w, rows, spec, cache, step, rope, normed)
         if args is None:
             return False
+        args["epoch"] = epoch
         stream = torch.cuda.current_stream()
         _run_compiled(launchers[w.ratio], *cp.ABI.pack(args), stream)
         return True
@@ -144,7 +146,7 @@ class MonoCompressor:
         return {
             f"c_{name}": value
             for name, value in args.items()
-            if name not in ("x", "scratch", "layer", "tl")
+            if name not in ("x", "scratch", "layer", "tl", "epoch")
         }
 
     def _args(self, w, rows, spec, cache, step, rope, normed):

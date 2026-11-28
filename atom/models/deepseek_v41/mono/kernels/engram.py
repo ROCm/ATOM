@@ -43,7 +43,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     lds_row,
 )
 from atom.models.deepseek_v41.mono.kernels.dims import HC, HIDDEN, Dims
-from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, epoch_of, preg
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum
@@ -79,7 +79,7 @@ PREFETCH = 3  # row groups' weights in flight a CTA past the one it multiplies
 ABI = KernelAbi(
     (
         "res", "sub", "post", "comb", "emb", "w", "ws", "gate_w", "out", "parts",
-        "sym", "peers", "rank", "layer",
+        "sym", "peers", "rank", "layer", "epoch",
     )
 )  # fmt: skip
 
@@ -453,8 +453,10 @@ def build_engram(key: EngramBuild):
     def engram(
         res: Int64, sub: Int64, post: Int64, comb: Int64, emb: Int64, w: Int64,
         ws: Int64, gate_w: Int64, out: Int64, parts: Int64, sym: Int64,
-        peers: Int64, rank: Int32, layer: Int32,
+        peers: Int64, rank: Int32, layer: Int32, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek().words.ptr
         bases = peer_bases(peers, key.tp)
@@ -466,7 +468,7 @@ def build_engram(key: EngramBuild):
                 "res": res, "sub": sub, "post": post, "comb": comb, "emb": emb,
                 "w": w, "ws": ws, "gate_w": gate_w, "out": out, "parts": parts,
             },
-            "mb": Mailbox(layer),
+            "mb": Mailbox(layer, epoch=ep),
             "epf": preg(sym, peer["epf"], "epf"),
             "eng": preg(sym, peer["eng"], "eng"),
             "eng_fan": [preg(bases[r], peer["eng"], "eng") for r in range(key.ranks)],
@@ -481,13 +483,13 @@ def build_engram(key: EngramBuild):
     def launch(
         res: Int64, sub: Int64, post: Int64, comb: Int64, emb: Int64, w: Int64,
         ws: Int64, gate_w: Int64, out: Int64, parts: Int64, sym: Int64,
-        peers: Int64, rank: Int32, layer: Int32,
+        peers: Int64, rank: Int32, layer: Int32, epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         engram(
             res, sub, post, comb, emb, w, ws, gate_w, out, parts, sym, peers, rank,
-            layer,
+            layer, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(engram, launch)

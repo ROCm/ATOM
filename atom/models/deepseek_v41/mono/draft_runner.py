@@ -49,6 +49,11 @@ class DraftMonoRunner(V41MonoDecodeRunner):
     # the draft head (``_bind_head``), agreed on as the target's launches
     optional_launches = V41MonoDecodeRunner.optional_launches + ("heads",)
     heads = None
+    # a full beginning every pass, recording the target epoch it followed
+    # (``epoch_begin``: the target's slim condition)
+    always_full_begin = True
+    # () -> the target's runner or None (``dispatch.install_mono_decode``)
+    epoch_target = None
 
     def __init__(self, draft) -> None:
         config = draft.config
@@ -249,6 +254,13 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         requests = anchor_ids.numel()
         rows = requests * self.width
         self._use_rows(rows)
+        if self.mailboxes.link is None and self.epoch_target is not None:
+            # the target runner's mailboxes, once it exists: a pass recorded
+            # before then (a capture bakes no link) leaves the target's every
+            # beginning full -- never a slim one without the record
+            target = self.epoch_target()
+            if target is not None:
+                self.mailboxes.link = target.mailboxes
         self.mailboxes.begin_step(self._zero_extents(rows))
         # the requests' blocks as one step's rows, request after request
         if self.embed_peer is not None:

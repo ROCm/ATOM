@@ -110,7 +110,7 @@ from atom.models.deepseek_v41.mono.kernels.index_score import (
 from atom.models.deepseek_v41.mono.kernels.index_score import (
     scratch_pairs as index_pairs,
 )
-from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
@@ -256,7 +256,7 @@ ABI = KernelAbi(
         "woa", "woa_s", "wob", "wob_s",
         "res_in", "post_in", "comb_in", "pre_in", "hc_fn", "hc_scale", "hc_base",
         "ffn_w", "res_out", "post_out", "comb_out", "pre_out", "normed",
-        "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl",
+        "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl", "epoch",
     )
 )  # fmt: skip
 
@@ -1061,8 +1061,10 @@ def build_attn_post(key: AttnPostBuild):
         pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         normed: Int64, scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64,
-        rank: Int32, layer: Int32, tl: Int64,
+        rank: Int32, layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         smem = fx.SharedAllocator().allocate(Smem)
@@ -1078,7 +1080,7 @@ def build_attn_post(key: AttnPostBuild):
         )  # fmt: skip
         args["numa_word"] = numa_word
         c = attn_post_context(
-            key, s, lds, mailbox(layer, scratch, key.diag_off, layout),
+            key, s, lds, mailbox(layer, scratch, key.diag_off, layout, epoch=ep),
             peer_bases(peers, key.tp), layout, scratch, args,
             rank, sym,
         )  # fmt: skip
@@ -1105,7 +1107,7 @@ def build_attn_post(key: AttnPostBuild):
         pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         normed: Int64, scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64,
-        rank: Int32, layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        rank: Int32, layer: Int32, tl: Int64, epoch: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         attn_post(
@@ -1116,7 +1118,7 @@ def build_attn_post(key: AttnPostBuild):
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in,
             pre_in, hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out,
-            pre_out, normed, scratch, numa_word, sym, peers, rank, layer, tl,
+            pre_out, normed, scratch, numa_word, sym, peers, rank, layer, tl, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(attn_post, launch)

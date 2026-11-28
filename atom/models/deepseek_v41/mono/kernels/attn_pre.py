@@ -78,7 +78,7 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
     scratch_pairs as indexer_pairs,
 )
 from atom.models.deepseek_v41.mono.kernels.lds_rows import rows_to_lds_together
-from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.red import acc_sum, acc_word
@@ -338,7 +338,7 @@ ABI = KernelAbi(
         "wqb", "wqb_s", "cos", "sin", "pos", "ring", "ring_scale", "ring_rows", "ring_off",
         "res_out", "post_out", "comb_out", "pre_out", "q_out", "normed", "qr_out",
         "qrs_out", "aux", "iq_w", "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out",
-        "ibound", "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl",
+        "ibound", "scratch", "numa_word", "sym", "peers", "rank", "layer", "tl", "epoch",
     )
 )  # fmt: skip
 
@@ -2755,8 +2755,10 @@ def build_attn_pre(key: AttnPreBuild):
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
         iw_out: Int64, ibound: Int64, scratch: Int64, numa_word: Int64, sym: Int64,
         peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64,
+        layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         alloc = fx.SharedAllocator()
@@ -2772,7 +2774,7 @@ def build_attn_pre(key: AttnPreBuild):
         )  # fmt: skip
         args["numa_word"] = numa_word
         c, co = attn_pre_context(
-            key, lds, mailbox(layer, scratch, key.diag_off, layout),
+            key, lds, mailbox(layer, scratch, key.diag_off, layout, epoch=ep),
             layout, scratch, args, rank, sym, peers,
         )  # fmt: skip
         stamp_begin(key.timeline, tls, tid, TL_POINTS)
@@ -2791,7 +2793,7 @@ def build_attn_pre(key: AttnPreBuild):
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
         iw_out: Int64, ibound: Int64, scratch: Int64, numa_word: Int64, sym: Int64,
         peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        layer: Int32, tl: Int64, epoch: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         attn_pre(
@@ -2799,7 +2801,7 @@ def build_attn_pre(key: AttnPreBuild):
             wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_scale, ring_rows, ring_off,
             res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux,
             iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, ibound, scratch, numa_word,
-            sym, peers, rank, layer, tl,
+            sym, peers, rank, layer, tl, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(attn_pre, launch)

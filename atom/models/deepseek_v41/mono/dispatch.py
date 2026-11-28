@@ -198,6 +198,8 @@ class MonoDraftModel(nn.Module):
         # the target's mono context write (``MonoDecodeModel.write_context``),
         # set at install; None: the draft's own
         self.context_writer = None
+        # () -> the target's runner (``DraftMonoRunner.epoch_target``), set at install
+        self.epoch_target = None
 
     def write_context_kv(self, taps, positions, slot_mapping=None, **kw):
         """The target step's context KV into the draft's windows: on the
@@ -217,7 +219,9 @@ class MonoDraftModel(nn.Module):
             and self._mono.ready(requests * width)
         )
         if self._served:
-            return self._mono.runner.backbone(input_ids, positions)
+            runner = self._mono.runner
+            runner.epoch_target = self.epoch_target
+            return runner.backbone(input_ids, positions)
         return self.model.block_backbone(input_ids, positions, num_draft)
 
     def head_and_sample(self, out, anchor_ids, num_draft, *, greedy=False):
@@ -301,4 +305,8 @@ def install_mono_decode(
     )
     if draft is not None:
         draft.context_writer = decoder.write_context
+        # the draft runner records the target epoch each pass followed (``epoch_begin``)
+        draft.epoch_target = lambda: (
+            decoder._mono.runner if decoder._mono.enabled else None
+        )
     return decoder

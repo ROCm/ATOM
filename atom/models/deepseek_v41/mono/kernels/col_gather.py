@@ -35,7 +35,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.deepseek_v41.mono.kernels.dims import HC, HIDDEN, Dims
-from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, epoch_of, preg
 from atom.models.deepseek_v41.mono.kernels.mhc_cols import (
     collapsed8,
     seam_mixes,
@@ -68,7 +68,7 @@ GATHER_TAG = 200
 ABI = KernelAbi(
     (
         "res", "sub", "post", "comb", "pre", "out", "tap0", "tap1", "tap2", "tap3",
-        "call", "sym", "peers", "rank",
+        "call", "sym", "peers", "rank", "epoch",
     )
 )  # fmt: skip
 TAPS = ("tap0", "tap1", "tap2", "tap3")
@@ -250,15 +250,17 @@ def build_col_gather(key: ColGatherBuild):
     def col_gather(
         res: Int64, sub: Int64, post: Int64, comb: Int64, pre: Int64, out: Int64,
         tap0: Int64, tap1: Int64, tap2: Int64, tap3: Int64, call: Int32,
-        sym: Int64, peers: Int64, rank: Int32,
+        sym: Int64, peers: Int64, rank: Int32, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         bases = peer_bases(peers, key.tp)
         c = {
             "key": key, "rank": rank,
             "args": {"res": res, "sub": sub, "post": post, "comb": comb,
                      "pre": pre, "out": out, "tap0": tap0, "tap1": tap1,
                      "tap2": tap2, "tap3": tap3},
-            "mb": Mailbox(GATHER_TAG + call),
+            "mb": Mailbox(GATHER_TAG + call, epoch=ep),
             "cg": preg(sym, peer["cg"], "cg"), "cg_off": peer["cg"],
             "bases": [bases[r] for r in range(key.tp)],
         }  # fmt: skip
@@ -271,13 +273,13 @@ def build_col_gather(key: ColGatherBuild):
     def launch(
         res: Int64, sub: Int64, post: Int64, comb: Int64, pre: Int64, out: Int64,
         tap0: Int64, tap1: Int64, tap2: Int64, tap3: Int64, call: Int32,
-        sym: Int64, peers: Int64, rank: Int32,
+        sym: Int64, peers: Int64, rank: Int32, epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         col_gather(
             res, sub, post, comb, pre, out, tap0, tap1, tap2, tap3, call, sym,
-            peers, rank,
+            peers, rank, epoch,
         ).launch(grid=(key.ctas,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(col_gather, launch)

@@ -92,7 +92,7 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     SHARED_INTER,
     UG_PART,
 )
-from atom.models.deepseek_v41.mono.kernels.mailbox import preg, region_addrs
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, preg, region_addrs
 from atom.models.deepseek_v41.mono.kernels.moe_shape import (
     SORT_NETS,
     MoeBuild,
@@ -215,7 +215,7 @@ ABI = KernelAbi(
     (
         "x", "gate_w", "bias", "w13", "w13_s", "w2", "w2_s", "sgu", "sgu_s", "sw2",
         "sw2_s", "out", "queue_words", "scratch", "numa_word", "sym", "peers", "rank",
-        "layer", "tl",
+        "layer", "tl", "epoch",
     )
 )  # fmt: skip
 
@@ -2926,8 +2926,10 @@ def build_moe(key: MoeBuild):
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64,
+        layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
@@ -2948,7 +2950,7 @@ def build_moe(key: MoeBuild):
         )
         args["numa_word"] = numa_word
         c = moe_context(
-            s, rs, lds, mailbox(layer, scratch, key.diag_off, layout),
+            s, rs, lds, mailbox(layer, scratch, key.diag_off, layout, epoch=ep),
             peer_bases(peers, rs.dims.ranks), layout, scratch, args,
             rank, sym, key.numa,
         )  # fmt: skip
@@ -2964,13 +2966,13 @@ def build_moe(key: MoeBuild):
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        layer: Int32, tl: Int64, epoch: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         moe(
             x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
             queue_words,
-            scratch, numa_word, sym, peers, rank, layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, tl, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(moe, launch)

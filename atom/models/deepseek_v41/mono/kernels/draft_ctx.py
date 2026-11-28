@@ -45,7 +45,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     lds_row,
 )
 from atom.models.deepseek_v41.mono.kernels.dims import HIDDEN, KV_DIM, Dims
-from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, preg, sreg
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, epoch_of, preg, sreg
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.sources import SOURCES
@@ -93,7 +93,7 @@ ABI = KernelAbi(
         "kvn1", "kvn2", "pos", "pos_w", "ring_pos", "ring_pos_w", "batch",
         "cu", "slots", "cached", "cached_w", "wptrs", "layer0", "layer1",
         "layer2", "ring", "cos", "sin", "max_pos", "parts", "h8", "kvp",
-        "scratch", "sym", "peers", "rank",
+        "scratch", "sym", "peers", "rank", "epoch",
     )
 )  # fmt: skip
 
@@ -517,8 +517,10 @@ def build_draft_ctx(key: DraftCtxBuild):
         batch: Int64, cu: Int64, slots: Int64, cached: Int64, cached_w: Int32,
         wptrs: Int64, layer0: Int32, layer1: Int32, layer2: Int32, ring: Int32,
         cos: Int64, sin: Int64, max_pos: Int32, parts: Int64, h8: Int64,
-        kvp: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
+        kvp: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         smem = fx.SharedAllocator().allocate(Smem).peek()
         lds = smem.words.ptr
@@ -544,7 +546,7 @@ def build_draft_ctx(key: DraftCtxBuild):
                 "max_pos": max_pos,
             },
             "r_parts": rsrc(parts), "r_h8": rsrc(h8), "r_kvp": rsrc(kvp),
-            "mb": Mailbox(CTX_TAG - 1),
+            "mb": Mailbox(CTX_TAG - 1, epoch=ep),
             "pf": sreg(scratch, regions["pf"], "pf"),
             "hf": sreg(scratch, regions["hf"], "hf"),
             "wf": sreg(scratch, regions["wf"], "wf"),
@@ -577,7 +579,7 @@ def build_draft_ctx(key: DraftCtxBuild):
         batch: Int64, cu: Int64, slots: Int64, cached: Int64, cached_w: Int32,
         wptrs: Int64, layer0: Int32, layer1: Int32, layer2: Int32, ring: Int32,
         cos: Int64, sin: Int64, max_pos: Int32, parts: Int64, h8: Int64,
-        kvp: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
+        kvp: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32, epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
@@ -585,7 +587,7 @@ def build_draft_ctx(key: DraftCtxBuild):
             tap0, tap1, tap2, wp, wps, wk, wks, mnorm_w, kvn0, kvn1, kvn2, pos,
             pos_w, ring_pos, ring_pos_w, batch, cu, slots, cached, cached_w,
             wptrs, layer0, layer1, layer2, ring, cos, sin, max_pos, parts, h8,
-            kvp, scratch, sym, peers, rank,
+            kvp, scratch, sym, peers, rank, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(draft_ctx, launch)

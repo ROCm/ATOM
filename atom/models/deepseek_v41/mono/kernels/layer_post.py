@@ -53,7 +53,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import shard_seam
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
-from atom.models.deepseek_v41.mono.kernels.mailbox import preg
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, preg
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -195,7 +195,7 @@ _K2A = k2a.ABI.names[: k2a.ABI.names.index("scratch")]
 _K2B = [n for n in k2b.ABI.names[: k2b.ABI.names.index("scratch")] if n != "x"]
 ABI = KernelAbi(
     (*_K2A, *_K2B, "scratch", "numa_word", "sym", "peers", "rank", "layer",
-     "moe_layer", "tl")
+     "moe_layer", "tl", "epoch")
 )  # fmt: skip
 
 
@@ -347,8 +347,10 @@ def build_layer_post(key: LayerPostBuild):
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, moe_layer: Int32, tl: Int64,
+        layer: Int32, moe_layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         alloc = fx.SharedAllocator()
@@ -380,13 +382,13 @@ def build_layer_post(key: LayerPostBuild):
         )  # fmt: skip
         args_a["numa_word"] = args_b["numa_word"] = numa_word
         ca = attn_post_context(
-            key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout),
+            key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout, epoch=ep),
             bases_a, layout_a, scratch,
             args_a, rank_a, sym,
         )  # fmt: skip
         ca["normed_cm"] = CM_DEV
         cb = moe_context(
-            sm, rs, lds_b, mailbox(moe_layer, scratch, key.diag_off, layout),
+            sm, rs, lds_b, mailbox(moe_layer, scratch, key.diag_off, layout, epoch=ep),
             bases, layout_b, scratch,
             args_b, rank, sym, key_b.numa,
         )  # fmt: skip
@@ -443,7 +445,7 @@ def build_layer_post(key: LayerPostBuild):
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
         queue_words: Int64,
         scratch: Int64, numa_word: Int64, sym: Int64, peers: Int64, rank: Int32,
-        layer: Int32, moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
+        layer: Int32, moe_layer: Int32, tl: Int64, epoch: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         layer_post(
@@ -455,7 +457,7 @@ def build_layer_post(key: LayerPostBuild):
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
             gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, queue_words,
-            scratch, numa_word, sym, peers, rank, layer, moe_layer, tl,
+            scratch, numa_word, sym, peers, rank, layer, moe_layer, tl, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(layer_post, launch)

@@ -58,6 +58,7 @@ from atom.models.deepseek_v41.mono.compress_launch import MonoCompressor
 from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
 from atom.models.deepseek_v41.mono.draft_ctx_launch import MonoDraftContext
 from atom.models.deepseek_v41.mono.engram_launch import MonoEngram
+from atom.models.deepseek_v41.mono.epoch_begin import EpochMailboxes
 from atom.models.deepseek_v41.mono.head_launch import bind_lm_head
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
@@ -89,7 +90,6 @@ from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer
-from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.numa import scratch_word
 from atom.mono.runtime.step_begin import ZERO_ALIGN
 from atom.mono.runtime.timeline import LayerTimeline
@@ -118,6 +118,8 @@ INDEX_LAYER_BELOW = {4: 24, 8: 25}
 # K2a's and K2b's mailbox tags start past every layer's K1 and K2a
 POST_TAG0 = 64
 MOE_TAG0 = 128
+# the step's epoch word (an int64, padded to one 16-byte unit) before the queue words
+EPOCH_WORD_BYTES = 16
 # the step's row buffers, allocated for the widest step (``_allocate``,
 # ``_place_index_outputs``) and narrowed to a step's rows (``_use_rows``): each
 # with its row dim
@@ -254,6 +256,9 @@ class V41MonoDecodeRunner:
     routing, the K1 builds and where RoPE positions come from are the target's
     here; ``draft_runner.DraftMonoRunner`` sets its own."""
 
+    # the draft runner's: a full step beginning every step (``epoch_begin``)
+    always_full_begin = False
+
     max_rows = MAX_ROWS
     experts, topk = EXPERTS, TOPK
     ug_groups = 2
@@ -362,11 +367,17 @@ class V41MonoDecodeRunner:
         self._place_index_outputs(plain)
         self._bind_embedding(group)
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
-        self.mailboxes = StepMailboxes(
+        # the step's beginning (``epoch_begin``): the epoch-tagged hand-offs
+        # need no zeroing once a draft pass has run since the last step; a
+        # debug build (its wait records zeroed each step) and the draft
+        # runner (``always_full_begin``) take the full beginning every step
+        self.mailboxes = EpochMailboxes(
             self.peers,
             self.scratch,
             *(buf for buf, _ in self._launch_scratch()),
             debug=self.debug,
+            epoch_word=self.epoch_word,
+            always_full=self.debug or self.always_full_begin,
         )
         self.widths = WidthBuilds(
             self._rows_build, self._row_kernels, group, "V4.1 mono",
@@ -931,7 +942,7 @@ class V41MonoDecodeRunner:
             return False
         build = self.widths[positions.numel()]
         return self.draft_ctx.launch(
-            build.ctx, taps, positions, cache, step, self.peers.kernel_args()
+            build.ctx, taps, positions, cache, step, self._peer_args()
         )
 
     def _gathers(self, s: int) -> dict:
@@ -1180,6 +1191,9 @@ class V41MonoDecodeRunner:
         launches' queue words (``k2b.QUEUES``): outside every build's layout,
         which the step's layer builds lay out apart."""
         qbytes = k2b.QUEUE_BYTES
+        # the step's epoch word right before the queue words (``epoch_begin``
+        # stores each new epoch there; every launch reads it, ``epoch`` arg)
+        eb = EPOCH_WORD_BYTES
         start = -(-nbytes // NUMA_PAGE) * NUMA_PAGE
         self.numa_start = start
         widths = [w for w in range(1, self.max_rows + 1) if self._numa(w)]
@@ -1189,13 +1203,15 @@ class V41MonoDecodeRunner:
         )
         if not area:
             self.numa_start = -1
-            raw = uncached_bytes(qbytes + nbytes, dev)
-            self.queue_words, self.scratch = raw[:qbytes], raw[qbytes:]
+            raw = uncached_bytes(eb + qbytes + nbytes, dev)
+            self.epoch_word = raw[:eb]
+            self.queue_words, self.scratch = raw[eb : eb + qbytes], raw[eb + qbytes :]
             return
         # a page more: the regions from the first page boundary past the
         # queue words
-        raw = uncached_bytes(qbytes + start + area + NUMA_PAGE, dev)
-        shift = qbytes + -(raw.data_ptr() + qbytes) % NUMA_PAGE
+        raw = uncached_bytes(eb + qbytes + start + area + NUMA_PAGE, dev)
+        shift = eb + qbytes + -(raw.data_ptr() + eb + qbytes) % NUMA_PAGE
+        self.epoch_word = raw[shift - qbytes - eb : shift - qbytes]
         self.queue_words = raw[shift - qbytes : shift]
         self.scratch = raw[shift : shift + start + area]
         self.numa_word = scratch_word(self.scratch[start:], area, "V4.1 mono")
@@ -1222,7 +1238,9 @@ class V41MonoDecodeRunner:
         self._use_rows(rows)
         # the drafts the head's verdict checks (``head``)
         self.step_ids = input_ids
-        self.mailboxes.begin_step(self._zero_extents(rows))
+        self.mailboxes.begin_step(
+            self._zero_extents(rows), (self.queue_words.data_ptr(), k2b.QUEUE_BYTES)
+        )
         hidden = self._embed(model.embed, input_ids).view(1, rows, -1)
         model.begin_forward(hidden, None)
         # Engram staging's side-stream all-gather spins on CUs until every
@@ -1320,7 +1338,8 @@ class V41MonoDecodeRunner:
                 )
             if block.attn.indexer is not None:
                 if self.compressor is None or not self.compressor.launch(
-                    self.build.compress, rows, spec, cache, step, rope, self.normed
+                    self.build.compress, rows, spec, cache, step, rope, self.normed,
+                    self.epoch_word.data_ptr(),
                 ):
                     block.attn._compress_batch(self.normed, cache, step, rope)
                 if self.check:
@@ -1426,7 +1445,7 @@ class V41MonoDecodeRunner:
         how = None if self.engram is None else self._engram_rows(rows)
         if how is not None and self.engram.launch(
             self.build.engram, spec.layer_id, state, metadata,
-            self.peers.kernel_args(), t0=how[1], joined=joined,
+            self._peer_args(), t0=how[1], joined=joined,
             hosted=spec.layer_id in getattr(self, "_engram_hosted", ()),
         ):  # fmt: skip
             return SinglePassHCState(self.engram.gated(rows), state.pre_mix)
@@ -1469,12 +1488,13 @@ class V41MonoDecodeRunner:
         hidden state [1, rows, dim], the drafter's taps gathered with it.
         ``call``: this gather's place in the step (its pairs' tag)."""
         p = torch.Tensor.data_ptr
-        peers = self.peers.kernel_args()
+        peers = self._peer_args()
         args = {
             "res": p(state.residual), "sub": p(state.pending),
             "post": p(state.post_mix), "comb": p(state.combination),
             "pre": p(state.pre_mix), "out": p(self.hidden_out), "call": call,
             "sym": peers["sym"], "peers": peers["peers"], "rank": peers["rank"],
+            "epoch": peers["epoch"],
         }  # fmt: skip
         taps = self.aux.buffers if mode == cg.State.COLLAPSE else ()
         for k, name in enumerate(cg.TAPS):
@@ -1824,8 +1844,13 @@ class V41MonoDecodeRunner:
         return {
             "scratch": p(self.scratch),
             "numa_word": self.numa_word,
-            **self.peers.kernel_args(),
+            **self._peer_args(),
         }
+
+    def _peer_args(self) -> dict:
+        """The peer buffer's kernel arguments and the step's epoch word, which
+        every launch tagging its hand-offs reads (``kernels.mailbox.epoch_of``)."""
+        return {**self.peers.kernel_args(), "epoch": self.epoch_word.data_ptr()}
 
     def _queue_words(self, layer_id: int) -> int:
         """Layer ``layer_id``'s K2b queue words (``k2b.queue_offset``)."""

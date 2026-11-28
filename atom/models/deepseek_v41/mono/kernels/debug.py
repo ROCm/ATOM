@@ -16,13 +16,15 @@ from atom.mono.runtime.debug import region_ids, region_namer
 OTHER_REGIONS = (*PEER_REGIONS, "xrdy")
 
 
-def mailbox(layer, scratch, diag_off, regions) -> Mailbox:
+def mailbox(layer, scratch, diag_off, regions, epoch=None) -> Mailbox:
     """The kernel's mailbox for tag ``layer``: bounded waits recording into
-    ``scratch`` at ``diag_off`` in a debug build (``diag_off`` >= 0)."""
+    ``scratch`` at ``diag_off`` in a debug build (``diag_off`` >= 0);
+    ``epoch``: the step's epoch (``kernels.mailbox.epoch_of``), its tags epoch
+    tags."""
     if diag_off < 0:
-        return Mailbox(layer)
+        return Mailbox(layer, epoch=epoch)
     ids = region_ids((*regions, *OTHER_REGIONS))
-    return Mailbox(layer, scratch + fx.Int64(diag_off), ids)
+    return Mailbox(layer, scratch + fx.Int64(diag_off), ids, epoch=epoch)
 
 
 def region_names(regions):

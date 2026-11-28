@@ -180,6 +180,7 @@ class MonoEngram:
             "parts": (self.parts_of[layer_id] if hosted else self.parts).data_ptr(),
             "sym": peer_args["sym"],
             "peers": peer_args["peers"], "rank": peer_args["rank"], "layer": layer_id,
+            "epoch": peer_args["epoch"],
         }  # fmt: skip
         if hosted and self.check and not torch.cuda.is_current_stream_capturing():
             self._check(launcher, layer_id, args, rows)

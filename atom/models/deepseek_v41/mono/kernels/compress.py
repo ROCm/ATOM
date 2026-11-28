@@ -47,7 +47,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, HIDDEN, kvrow_scale0
 from atom.models.deepseek_v41.mono.kernels.index_query import FP4_MIN_AMAX, _e2m1
-from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, sreg
+from atom.models.deepseek_v41.mono.kernels.mailbox import Mailbox, epoch_of, sreg
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
@@ -96,7 +96,7 @@ ABI = KernelAbi(
         "score_state", "state_stride", "ring", "ape", "norm_w", "cos", "sin",
         "pages", "page_stride", "page_scale", "scale_stride", "tables",
         "table_stride", "per_page", "wk", "k_norm_w", "ivals", "iscales",
-        "latent", "keys", "scratch", "layer", "tl",
+        "latent", "keys", "scratch", "layer", "tl", "epoch",
     )
 )  # fmt: skip
 
@@ -702,8 +702,10 @@ def build_compress(key: CompressBuild):
         sin: Int64, pages: Int64, page_stride: Int64, page_scale: Int64,
         scale_stride: Int64, tables: Int64, table_stride: Int32, per_page: Int32,
         wk: Int64, k_norm_w: Int64, ivals: Int64, iscales: Int64, latent: Int64,
-        keys: Int64, scratch: Int64, layer: Int32, tl: Int64,
+        keys: Int64, scratch: Int64, layer: Int32, tl: Int64, epoch: Int64,
     ):  # fmt: skip
+        # the step's epoch: every hand-off of the launch tagged with it (``kernels.mailbox``)
+        ep = epoch_of(epoch)
         tid = fx.thread_idx.x
         smem = fx.SharedAllocator().allocate(Smem).peek()
         lds, tls = smem.words.ptr, smem.tls.ptr
@@ -724,7 +726,7 @@ def build_compress(key: CompressBuild):
             "r_w": rsrc(w, key.cols * HIDDEN * 2),
             "r_x": rsrc(x, key.rows * HIDDEN * 2),
             "r_parts": rsrc(parts, parts_bytes(key.rows)),
-            "mb": Mailbox(layer),
+            "mb": Mailbox(layer, epoch=ep),
             "cpf": sreg(scratch, regions["cpf"], "cpf"),
             "css": sreg(scratch, regions["css"], "css"),
             "ckp": sreg(scratch, regions["ckp"], "ckp"),
@@ -745,7 +747,7 @@ def build_compress(key: CompressBuild):
         sin: Int64, pages: Int64, page_stride: Int64, page_scale: Int64,
         scale_stride: Int64, tables: Int64, table_stride: Int32, per_page: Int32,
         wk: Int64, k_norm_w: Int64, ivals: Int64, iscales: Int64, latent: Int64,
-        keys: Int64, scratch: Int64, layer: Int32, tl: Int64,
+        keys: Int64, scratch: Int64, layer: Int32, tl: Int64, epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
@@ -753,7 +755,7 @@ def build_compress(key: CompressBuild):
             x, w, parts, cplan, ncap, wplan, nwcap, slots, kv_state, score_state,
             state_stride, ring, ape, norm_w, cos, sin, pages, page_stride,
             page_scale, scale_stride, tables, table_stride, per_page, wk, k_norm_w,
-            ivals, iscales, latent, keys, scratch, layer, tl,
+            ivals, iscales, latent, keys, scratch, layer, tl, epoch,
         ).launch(grid=(key.ctas,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(compress, launch)

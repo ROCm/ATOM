@@ -85,7 +85,7 @@ from atom.models.deepseek_v41.mono.kernels.layer_post import (
     publish_x_tok_par,
     seam_dot_norm,
 )
-from atom.models.deepseek_v41.mono.kernels.mailbox import fresh_s32, fresh_s64, sreg
+from atom.models.deepseek_v41.mono.kernels.mailbox import epoch_of, fresh_s32, fresh_s64, sreg
 from atom.models.deepseek_v41.mono.kernels.moe import (
     RED_COLS,
     moe_args,
@@ -104,11 +104,11 @@ from atom.mono.plan.layout import pair_layout
 from atom.mono.runtime.abi import KernelAbi
 
 _CURRENT_STREAM = fx.Stream(None)
-ABI = KernelAbi(("ltab", "nlay", 'scratch', 'numa_word', 'sym', 'peers', 'rank'))
+ABI = KernelAbi(("ltab", "nlay", 'scratch', 'numa_word', 'sym', 'peers', 'rank', 'epoch'))
 assert RED_COLS == k1.COLS
 # a layer's table row: every ``layer.ABI`` argument, int64 each
 RUN_ARGS = len(kl.ABI.names)
-assert RUN_ARGS == 148
+assert RUN_ARGS == 149
 RUN_ARG_NAMES = kl.ABI.names
 # the slot of the layer's MoE tag (the next iteration's PND tag)
 # hand-off rows this launch rereads (res_pair / gates_pair, res_attn / gates_attn)
@@ -275,7 +275,7 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
     warm = C["warm"]
     warm_iter = C["warm_iter"]
     late = C["late"]
-    scratch, numa_word, sym, peers, rank = tail
+    scratch, numa_word, sym, peers, rank, ep = tail
     it = fx.Int32(it)
     tab = LayerTable(ltab, it)
     k1_res_in = tab.i64(0)
@@ -457,7 +457,7 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
     # the previous launch's ``ffn_out``), loaded by the entry prefetch in
     # every iteration and selected (branch-free: need = i > 0)
     pnd = sreg(scratch, pnd_off, "pnd")
-    mb_p = mailbox(fresh_s32(prev_moe), scratch, pre.diag_off, layout_1)
+    mb_p = mailbox(fresh_s32(prev_moe), scratch, pre.diag_off, layout_1, epoch=ep)
     later = it > 0
     got_late = None
     if const_expr(late):
@@ -498,7 +498,7 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
         queue_words,
     )  # fmt: skip
     args_1["numa_word"] = args_a["numa_word"] = args_b["numa_word"] = numa_word
-    mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1)
+    mb_1 = mailbox(layer, scratch, pre.diag_off, layout_1, epoch=ep)
     c1, co1 = attn_pre_context(
         pre, lds, mb_1, layout_1, scratch, args_1, rank, sym, peers, bases=bases
     )
@@ -519,7 +519,7 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
         # the compressor reads K1's normed rows in this launch
         c1["normed_cm"] = co1["normed_cm"] = CM_DEV
     ca = attn_post_context(
-        key_a, s, lds, mailbox(post_layer, scratch, post.diag_off, layout),
+        key_a, s, lds, mailbox(post_layer, scratch, post.diag_off, layout, epoch=ep),
         bases, layout_a, scratch, args_a, rank, sym,
     )  # fmt: skip
     ca["normed_cm"] = CM_DEV
@@ -539,7 +539,7 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail, nlay):
         # past their CRDY (``attention._selected_row`` / ``await_selection``)
         ca["cp_ratio"], ca["cp_ncap"], ca["crdy"] = comp.ratio, c_ncap, c1["crdy"]
     cb = moe_context(
-        s, rs, lds["moe"], mailbox(moe_layer, scratch, post.diag_off, layout),
+        s, rs, lds["moe"], mailbox(moe_layer, scratch, post.diag_off, layout, epoch=ep),
         bases, layout_b, scratch, args_b, rank, sym, key_b.numa,
     )  # fmt: skip
     cb["x_cm"], cb["x_ready"] = CM_DEV, True
@@ -685,10 +685,10 @@ def _loop(C, ltab, nlay, tid, bid, lds, tls, pnd_off, shared, tail):
         assert THREADS & (THREADS - 1) == 0 and BLOCKS & (BLOCKS - 1) == 0
         t = fresh(tid) & (THREADS - 1)
         b = _volatile(bid, False) & (BLOCKS - 1)
-        scratch, numa_word, sym, peers, rank = tail
+        scratch, numa_word, sym, peers, rank, ep = tail
         tail_i = (
             _volatile(scratch, True), _volatile(numa_word, True), _volatile(sym, True),
-            _volatile(peers, True), _volatile(rank, False),
+            _volatile(peers, True), _volatile(rank, False), ep,
         )  # fmt: skip
         with _iter_ids(t, b):
             _iter(C, ltab, it, t, b, lds, tls, pnd_off, shared, tail_i, nlay)
@@ -742,6 +742,7 @@ def build_layer_run(rkey: RunBuild):
         sym: Int64,
         peers: Int64,
         rank: Int32,
+        epoch: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -761,7 +762,7 @@ def build_layer_run(rkey: RunBuild):
         x8b = _s_load(ptab, (first_task(bid, 0) // own) * 8, 2)
         _loop(
             C, ltab, nlay, tid, bid, lds, tls, pnd_off, (bases, x8b),
-            (scratch, numa_word, sym, peers, rank),
+            (scratch, numa_word, sym, peers, rank, epoch_of(epoch)),
         )  # fmt: skip
         _ = keyed
 
@@ -774,11 +775,12 @@ def build_layer_run(rkey: RunBuild):
         sym: Int64,
         peers: Int64,
         rank: Int32,
+        epoch: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         run_kernel(
-            ltab, nlay, scratch, numa_word, sym, peers, rank,
+            ltab, nlay, scratch, numa_word, sym, peers, rank, epoch,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(run_kernel, launch)
