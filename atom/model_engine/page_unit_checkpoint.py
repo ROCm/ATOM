@@ -55,12 +55,14 @@ class PagedStateCheckpointSpec:
     pipeline_op_bytes: int = 0
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("page_unit_bytes", self.page_unit_bytes),
-            ("slot_bytes", self.slot_bytes),
-            ("image_bytes", self.image_bytes),
+        # A PP stage holding none of a joint image has a 0-byte slot and image.
+        floor = 0 if self.pipeline_units else 1
+        for name, value, least in (
+            ("page_unit_bytes", self.page_unit_bytes, 1),
+            ("slot_bytes", self.slot_bytes, floor),
+            ("image_bytes", self.image_bytes, floor),
         ):
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if not isinstance(value, int) or isinstance(value, bool) or value < least:
                 raise ValueError(f"{name} must be a positive integer")
         if self.image_bytes > self.slot_bytes:
             raise ValueError(
@@ -1016,10 +1018,17 @@ class PagedStateCheckpointCoordinator:
         offload=None,
         readable_midstep: bool = False,
         decode_keep: str = KEEP_SETTLED,
+        rebuild_tokens: int = 0,
+        trailing_slack: int = 0,
+        hash_block_size: int = 1,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
         self.decode_keep = decode_keep
+        # `StateTransfer.rebuild_tokens` / `trailing_slack`; 0 for most state.
+        self.rebuild_tokens = int(rebuild_tokens)
+        self.trailing_slack = int(trailing_slack)
+        self.hash_block_size = int(hash_block_size)
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by
         # `attach_midstep_scratch`; a readable coordinator without them
@@ -1050,6 +1059,9 @@ class PagedStateCheckpointCoordinator:
         # Boundaries whose forward is in the batch being built, held back from
         # that batch's drain; see `checkpoint_when_scheduled`.
         self._staged: dict[tuple[int, int], tuple[Sequence, int, int, int]] = {}
+        # Boundaries the forward being built runs past; see
+        # `checkpoint_after_forward`.
+        self._after: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
@@ -1127,6 +1139,17 @@ class PagedStateCheckpointCoordinator:
         for slot, _pos, h in reservations:
             self._scratch_queued.append((h, slot))
 
+    def keep_slot(self, h: int, slot: int) -> bool:
+        """Store `slot` as `h`'s image, then give it back to the pool: a
+        finished request's state, handed over rather than freed. False when
+        `h` is already kept or there is nowhere to send the slot back."""
+        if self._scratch is None or self.store.contains_or_pending(h):
+            return False
+        if any(queued == h for queued, _slot in self._scratch_queued):
+            return False
+        self._scratch_queued.append((h, slot))
+        return True
+
     def cancel_midstep(self, reservations: list[tuple]) -> None:
         """Hand back scratch slots whose forward never ran."""
         for slot, _pos, _h in reservations:
@@ -1164,9 +1187,18 @@ class PagedStateCheckpointCoordinator:
         if not self.applies(seq):
             return hit
         for i in range(hit - 1, -1, -1):
+            if self.rebuilds(seq, (i + 1) * self.hash_block_size):
+                return i + 1
             if assume_checkpointed or self._reachable(block_hashes[i]):
                 return i + 1
         return 0
+
+    def rebuilds(self, seq: Sequence, boundary_tokens: int) -> bool:
+        """Whether a forward resuming at `boundary_tokens` rewrites every state
+        row `seq` reads, so it starts from a fresh slot."""
+        return bool(self.rebuild_tokens) and (
+            seq.num_tokens - boundary_tokens >= self.rebuild_tokens
+        )
 
     def _reachable(self, h: int) -> bool:
         """Whether `h`'s image can be *produced*, in HBM or from the CPU tier.
@@ -1248,6 +1280,31 @@ class PagedStateCheckpointCoordinator:
         """
         if self.applies(seq) and seq.state_slot >= 0:
             self._staged[(id(seq), h)] = (seq, h, -1, seq.num_forwards + 1)
+
+    def checkpoint_after_forward(self, seq: Sequence, h: int) -> None:
+        """File a boundary the forward in the batch being built runs past, for a
+        copy right after that forward (`take_after_forward_stores`). A trailing
+        image needs no later batch: on a P/D producer none may come before the
+        request is freed, and the next turn's lookup runs first anyway."""
+        if self.applies(seq) and seq.state_slot >= 0:
+            self._after[(id(seq), h)] = (seq, h)
+
+    def take_after_forward_stores(self) -> tuple[CheckpointStoreOp, ...]:
+        """Begin the stores `checkpoint_after_forward` filed for the batch being
+        built; READY at the next `complete_previous_batch`, ahead of the next
+        schedule's lookups."""
+        after, self._after = self._after, {}
+        ops = []
+        for seq, h in after.values():
+            if seq.state_slot < 0 or self.store.contains_or_pending(h):
+                continue
+            op = self.store.begin_store(h, seq.state_slot)
+            if op is None:
+                self.checkpoints_dropped += 1
+                continue
+            ops.append(op)
+            self.checkpoints_kept += 1
+        return tuple(ops)
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.

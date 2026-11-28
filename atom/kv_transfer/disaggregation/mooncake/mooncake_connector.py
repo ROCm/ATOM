@@ -368,6 +368,26 @@ class MooncakeAgentMetadata(
     slot_base_addrs: list[int] | None = None
     slot_bps: list[int] | None = None
     num_slots: int = 0
+    tp_size: int = 1
+
+
+def producer_slot_bps(
+    consumer_bps: list[int],
+    tp_segments: list | None,
+    tp_replicated: list[bool] | None,
+    consumer_tp: int,
+    producer_tp: int,
+) -> list[int]:
+    """The state slot widths a producer at `producer_tp` publishes for these
+    consumer slots: a region its TP segments cut by head is k times wider at
+    k times fewer ranks, a replicated one the same."""
+    ratio = consumer_tp // producer_tp if consumer_tp % producer_tp == 0 else 1
+    segments = tp_segments or [None] * len(consumer_bps)
+    replicated = tp_replicated or [False] * len(consumer_bps)
+    return [
+        bps * ratio if seg is not None and not rep else bps
+        for bps, seg, rep in zip(consumer_bps, segments, replicated)
+    ]
 
 
 # ===================================================================
@@ -1593,6 +1613,7 @@ class MooncakeConnector(KVConnectorBase):
                 slot_base_addrs=[b for b, _ in self._slot_regions],
                 slot_bps=[bps for _, bps in self._slot_regions],
                 num_slots=tt.num_slots,
+                tp_size=self.tp_size,
             )
         else:
             self._local_metadata = MooncakeAgentMetadata(
@@ -2235,10 +2256,18 @@ class MooncakeConnector(KVConnectorBase):
             # A different region count is a pipeline-parallel producer stage;
             # its mapping is the producer's to check.
             return
-        if theirs != mine:
+        expected = producer_slot_bps(
+            mine,
+            self._slot_region_tp_segments,
+            self._slot_region_tp_replicated,
+            self.tp_size,
+            meta.tp_size,
+        )
+        if theirs != expected:
             raise RuntimeError(
-                f"Mooncake producer at {addr} has state slots of {theirs} B, "
-                f"this consumer {mine} B; prefill and decode must run the same "
+                f"Mooncake producer at {addr} (TP {meta.tp_size}) has state "
+                f"slots of {theirs} B, this consumer (TP {self.tp_size}) "
+                f"expects {expected} B; prefill and decode must run the same "
                 "model and spec config"
             )
 
@@ -2682,6 +2711,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    kv_cache_ready_event=kv_cache_ready_event,
                     engine=engine,
                 )
             else:
@@ -2930,6 +2960,7 @@ class MooncakeConnector(KVConnectorBase):
                         chunk_dst_block_ids,
                         prefill_data,
                         req_id,
+                        kv_cache_ready_event=event,
                         engine=engine,
                         blocks_only=True,
                     )
@@ -3733,6 +3764,7 @@ class MooncakeConnector(KVConnectorBase):
         prefill_data: dict,
         req_id: str,
         *,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
         engine=None,
         blocks_only: bool = False,
     ) -> bool:
@@ -3856,11 +3888,22 @@ class MooncakeConnector(KVConnectorBase):
                 f"fp4={self._fp4_index_layout}, consumer fp4={consumer_is_fp4}"
             )
         plan = self._block_plan(request_data, n_consumer, req_id)
-        if plan.cuts is not None:
-            raise NotImplementedError(
-                f"Cutting KV heads between TP sizes for req {req_id} is not "
-                "supported with per-request state slots, which are TP-sharded"
-            )
+        if plan.cuts is not None and src_block_ids:
+            # PAGEs cut by head take the block-only path, staged where it can;
+            # the slots below move as they would at equal TP.
+            pages = {**request_data, "consumer_base_addrs": consumer_block_addrs}
+            if not self._execute_block_transfer(
+                pages,
+                target,
+                src_block_ids,
+                dst_block_ids,
+                req_id,
+                kv_cache_ready_event,
+                engine=engine,
+            ):
+                return False
+            if blocks_only:
+                return True
         block_cmap = plan.cmap
         if (
             self._fp4_index_layout
@@ -3918,7 +3961,9 @@ class MooncakeConnector(KVConnectorBase):
         )
         src_ids = np.asarray(src_block_ids, dtype=np.int64)
         dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
-        for region_idx, (src_base, bpb) in enumerate(self._block_regions):
+        # Whole PAGEs, unless they were cut by head above.
+        regions = self._block_regions if plan.cuts is None else ()
+        for region_idx, (src_base, bpb) in enumerate(regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
             if sharded_runs is None:

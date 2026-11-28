@@ -430,7 +430,17 @@ class BlockManager:
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
                 decode_keep=state_runtime.transfer.decode_keep,
+                rebuild_tokens=state_runtime.transfer.rebuild_tokens,
+                trailing_slack=state_runtime.transfer.trailing_slack,
+                hash_block_size=self.hash_block_size,
             )
+            if (
+                state_runtime.transfer.rebuild_tokens
+                and self.state_checkpoint_interval_tokens > 0
+            ):
+                # A rung only serves a request ending within `rebuild_tokens`
+                # past it; the anchor and the demand cover that case.
+                self.state_checkpoint_interval_tokens = -1
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
         # valid, so it holds no capacity of its own and never blocks admission.
@@ -640,14 +650,16 @@ class BlockManager:
     def take_state_maintenance_ops(self) -> StateMaintenanceOps:
         """Drain state maintenance for the batch being built."""
         relocations = self.state.take_relocations()
-        stores = restores = ()
+        stores = restores = after = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+            after = self.paged_state_checkpoints.take_after_forward_stores()
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
             block_copies=self.kv.take_block_copies(),
+            checkpoint_stores_after=after,
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -1738,7 +1750,11 @@ class BlockManager:
             else -1
         )
         h = self._state_resume_hash(
-            seq, decision.boundary_hash if joint else -1, hit_hash
+            seq,
+            decision.boundary_hash if joint else -1,
+            decision.boundary_tokens,
+            hit_hash,
+            num_cached_blocks * self.hash_block_size,
         )
         if h != -1 and not joint:
             in_hbm = (
@@ -1750,16 +1766,99 @@ class BlockManager:
                 return -1
         return h
 
-    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+    def _state_resume_hash(
+        self,
+        seq: Sequence,
+        joint_hash: int,
+        joint_tokens: int,
+        hit_hash: int,
+        hit_tokens: int,
+    ) -> int:
         """The hash whose state `seq` resumes from, or -1 for none.
 
         The joint boundary when there is one (above the HBM hit by
         construction), else the HBM hit's last block. A replay rebuilds the
-        state instead of restoring it, so it resumes from none.
+        state instead of restoring it, so it resumes from none, and so does a
+        boundary the forward rewrites every read row from (`_rebuilds_state`).
         """
         if joint_hash != -1:
-            return joint_hash
-        return -1 if self.tier_resume_replays(seq) else hit_hash
+            return -1 if self._rebuilds_state(seq, joint_tokens) else joint_hash
+        if self.tier_resume_replays(seq) or self._rebuilds_state(seq, hit_tokens):
+            return -1
+        return hit_hash
+
+    def keep_finished_state(self, seq: Sequence) -> None:
+        """Keep the state a finished request ends in as its last hashed
+        block's image, for a next turn that resumes past its prompt.
+
+        Only a state that trails its boundaries (`StateTransfer.
+        trailing_slack`): the slot still holds that block's state after the
+        last forward. The slot goes to the store and back to the pool once
+        copied, so `deallocate` no longer frees it.
+        """
+        coordinator = self.paged_state_checkpoints
+        if (
+            coordinator is None
+            or not coordinator.trailing_slack
+            or not coordinator.applies(seq)
+            or not self.enable_prefix_caching
+            or seq.state_slot < 0
+        ):
+            return
+        boundary = seq.num_hashed_tokens // self.hash_block_size
+        tokens = boundary * self.hash_block_size
+        filed = max(seq.last_checkpoint_pos, seq.scheduled_checkpoint_pos)
+        if tokens <= filed or seq.num_tokens - tokens > coordinator.trailing_slack:
+            return
+        chain = self._chain_to(seq, [], boundary)
+        if chain and coordinator.keep_slot(chain[-1], seq.state_slot):
+            seq.state_slots = seq.state_slots[1:]
+
+    def checkpoint_after_forward(self, seq: Sequence, pos: int) -> None:
+        """File the demand and prompt-end anchors a scheduled forward ending at
+        `pos` reaches or runs past (`StateTransfer.trailing_slack`), to be
+        copied right after it. Called once the batch's chunks are settled."""
+        coordinator = self.paged_state_checkpoints
+        if (
+            coordinator is None
+            or not coordinator.trailing_slack
+            or not self.enable_prefix_caching
+            or not coordinator.applies(seq)
+        ):
+            return
+        floor = max(seq.scheduled_checkpoint_pos, seq.last_checkpoint_pos)
+        for target in (seq.checkpoint_demand_pos, seq.checkpoint_end_pos):
+            if not floor < target <= pos <= target + coordinator.trailing_slack:
+                continue
+            if not self.checkpointers_at(seq, target):
+                continue
+            chain = self._chain_to(seq, [], target // self.hash_block_size)
+            coordinator.checkpoint_after_forward(
+                seq, chain[-1] if chain else seq.cache_seed
+            )
+            seq.last_checkpoint_pos = max(seq.last_checkpoint_pos, target)
+            seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
+
+    def _trailing_checkpoint_positions(self, seq: Sequence, pos: int) -> list[int]:
+        """The demand and prompt-end anchor a prefill forward ending at `pos`
+        holds the state of without ending on them (`StateTransfer.
+        trailing_slack`), not yet filed."""
+        coordinator = self.paged_state_checkpoints
+        if coordinator is None or not coordinator.applies(seq):
+            return []
+        slack = coordinator.trailing_slack
+        floor = max(seq.scheduled_checkpoint_pos, seq.last_checkpoint_pos)
+        return [
+            target
+            for target in (seq.checkpoint_demand_pos, seq.checkpoint_end_pos)
+            if slack and floor < target < pos <= target + slack
+        ]
+
+    def _rebuilds_state(self, seq: Sequence, boundary_tokens: int) -> bool:
+        """Whether a forward resuming at `boundary_tokens` rewrites every state
+        row `seq` will read (`StateTransfer.rebuild_tokens`)."""
+        coordinator = self.paged_state_checkpoints
+        return coordinator is not None and coordinator.rebuilds(seq, boundary_tokens)
 
     def lower_hit_to_chunk(
         self,
@@ -2055,7 +2154,13 @@ class BlockManager:
             # cover. Silent wrong output, no exception.
             state_holds = self._attach_state_slots(
                 seq,
-                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
+                self._state_resume_hash(
+                    seq,
+                    seq.offload_joint.boundary_hash,
+                    seq.offload_joint.boundary_tokens,
+                    hit_hash,
+                    num_cached_blocks * hbs,
+                ),
             )
         self.kv.prepare(self.num_pool_blocks(len(seq)) - len(seq.block_table))
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
@@ -2075,7 +2180,13 @@ class BlockManager:
             # `[hbm, num_prompt)` if anything goes wrong from here.
             state_holds = self._attach_state_slots(
                 seq,
-                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
+                self._state_resume_hash(
+                    seq,
+                    seq.offload_joint.boundary_hash,
+                    seq.offload_joint.boundary_tokens,
+                    hit_hash,
+                    num_cached_blocks * hbs,
+                ),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
@@ -2171,6 +2282,8 @@ class BlockManager:
             return True  # a CPU load is in flight for it
         if getattr(seq, "state_fork_src", -1) != -1:
             return True  # a fork checkpoint is its source
+        if self._rebuilds_state(seq, seq.offload_joint.boundary_tokens):
+            return True  # the forward rewrites every row it reads
         if self.paged_state_checkpoints is None:
             return False
         return self.paged_state_checkpoints.restore_queued_for(seq.state_slot)
@@ -2692,6 +2805,16 @@ class BlockManager:
             cache.checkpoint(seq, end, h, snapshot_step)
         if kept:
             seq.last_checkpoint_pos = pos
+        if aimed:
+            for target in self._trailing_checkpoint_positions(seq, pos):
+                if not self.checkpointers_at(seq, target):
+                    continue
+                blocks = target // hbs
+                chain = self._chain_to(seq, [], blocks)
+                self.paged_state_checkpoints.checkpoint(
+                    seq, blocks, chain[-1] if chain else seq.cache_seed, snapshot_step
+                )
+                seq.last_checkpoint_pos = max(seq.last_checkpoint_pos, target)
         # The midstep half of the same moment. Here rather than at each of the
         # three prefill call sites because this is what they have in common:
         # the forward for `[base, base + num_new_tokens)` has completed, which
@@ -2717,7 +2840,17 @@ class BlockManager:
         kept = self.checkpointers_at(seq, pos)
         if any(c is not self.paged_state_checkpoints for c in kept):
             return False
+        trailing = [
+            target
+            for target in self._trailing_checkpoint_positions(seq, pos)
+            if self.checkpointers_at(seq, target)
+        ]
         seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
+        for target in trailing:
+            chain = self._chain_to(seq, [], target // self.hash_block_size)
+            h = chain[-1] if chain else seq.cache_seed
+            self.paged_state_checkpoints.checkpoint_when_scheduled(seq, h)
+            seq.last_checkpoint_pos = max(seq.last_checkpoint_pos, target)
         if kept:
             chain = self._chain_to(seq, [], pos // self.hash_block_size)
             h = chain[-1] if chain else seq.cache_seed
@@ -3366,6 +3499,16 @@ class BlockManager:
         # climbs. Pinned by
         # `test_reuse_another_class_declines_is_not_charged_to_the_ladder`.
         candidates = [p for p in (rung, demand, anchor) if p and start < p <= end]
+        # A chunk ending within `trailing_slack` past a demand or the anchor
+        # already holds its state; cutting there would only add a forward.
+        slack = (
+            self.paged_state_checkpoints.trailing_slack
+            if self.paged_state_checkpoints is not None
+            and all(c is self.paged_state_checkpoints for c in applicable)
+            else 0
+        )
+        if slack:
+            candidates = [p for p in candidates if p == rung or end - p > slack]
         if not candidates:
             return 0
         target = min(candidates)
