@@ -1023,7 +1023,7 @@ def test_the_allocator_disables_huge_pages_only_around_the_allocation():
         return 0
 
     # Plain functions: the allocator sets `argtypes` on them, as on ctypes'.
-    libc = SimpleNamespace(prctl=prctl)
+    libc = SimpleNamespace(prctl=prctl, madvise=lambda *a: 0)
     hip = SimpleNamespace(hipHostMalloc=malloc, hipHostFree=lambda ptr: 0)
     alloc = hm._HipHostAllocator(hip, libc)
     assert alloc.alloc(1 << 20) == 4096
@@ -1032,6 +1032,32 @@ def test_the_allocator_disables_huge_pages_only_around_the_allocation():
     calls.clear()
     alloc.alloc(1 << 20)
     assert state["thp_off"] == 1 and (hm._PR_SET_THP_DISABLE, 0) not in calls
+
+
+def test_the_allocated_range_is_marked_nohugepage_from_its_page_start():
+    """khugepaged collapsing a range the GPU maps stalls the process's queues
+    while amdgpu revalidates it: the block is `MADV_NOHUGEPAGE` from the start of
+    its first page to its end, and a kernel that refuses changes nothing."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.engram import host_memory as hm
+
+    advised = []
+
+    def madvise(addr, length, advice):
+        advised.append((addr, length, advice))
+        return -1  # best effort: EINVAL without THP
+
+    def malloc(ptr, nbytes, flags):
+        ptr._obj.value = 5 * hm._PAGE + 100  # not page aligned
+        return 0
+
+    libc = SimpleNamespace(prctl=lambda op, *rest: 0, madvise=madvise)
+    hip = SimpleNamespace(hipHostMalloc=malloc, hipHostFree=lambda ptr: 0)
+    nbytes = 3 * hm._PAGE + 7
+    assert hm._HipHostAllocator(hip, libc).alloc(nbytes) == 5 * hm._PAGE + 100
+    assert advised == [(5 * hm._PAGE, nbytes + 100, hm._MADV_NOHUGEPAGE)]
+    assert hm._MADV_NOHUGEPAGE == 15
 
 
 def test_a_written_private_mapping_is_not_dropped(monkeypatch, tmp_path):
@@ -1395,7 +1421,7 @@ def test_failed_hip_allocations_and_frees_clear_the_hip_error(monkeypatch):
 
     hip = FakeHip()
     monkeypatch.setattr(hm, "_hip_runtime", lambda: hip)
-    libc = SimpleNamespace(prctl=lambda op, *rest: 0)
+    libc = SimpleNamespace(prctl=lambda op, *rest: 0, madvise=lambda *a: 0)
     fake = SimpleNamespace(
         hipHostMalloc=lambda ptr, nbytes, flags: 2,  # hipErrorOutOfMemory
         hipHostFree=lambda ptr: 1,
