@@ -106,6 +106,7 @@ PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
+ROUTER_KV_EVENTS="${ROUTER_KV_EVENTS:-false}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
@@ -130,6 +131,9 @@ ATOMESH_MOONCAKE_MASTER_PORT="${ATOMESH_MOONCAKE_MASTER_PORT:-26051}"
 ATOMESH_MOONCAKE_METADATA_PORT="${ATOMESH_MOONCAKE_METADATA_PORT:-26080}"
 ATOMESH_MOONCAKE_METRICS_PORT="${ATOMESH_MOONCAKE_METRICS_PORT:-26090}"
 ATOMESH_MOONCAKE_OWNER_PORT="${ATOMESH_MOONCAKE_OWNER_PORT:-26052}"
+# KV events (ROUTER_KV_EVENTS=true): prefill worker i of a node publishes from
+# the base + 32 * i plus its DP rank, and replays from 16 ports further.
+ATOMESH_KV_EVENTS_PORT="${ATOMESH_KV_EVENTS_PORT:-5557}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
@@ -156,6 +160,7 @@ ATOMESH_MOONCAKE_MASTER_PORT=$((ATOMESH_MOONCAKE_MASTER_PORT + ATOMESH_SERVICE_P
 ATOMESH_MOONCAKE_METADATA_PORT=$((ATOMESH_MOONCAKE_METADATA_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ATOMESH_MOONCAKE_METRICS_PORT=$((ATOMESH_MOONCAKE_METRICS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ATOMESH_MOONCAKE_OWNER_PORT=$((ATOMESH_MOONCAKE_OWNER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_KV_EVENTS_PORT=$((ATOMESH_KV_EVENTS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 validate_shifted_port() {
   local name="$1"
   local value="${!name}"
@@ -173,7 +178,8 @@ for shifted_port_name in \
   PREFILL_DP_MASTER_PORT \
   PREFILL_DP_BASE_PORT \
   DECODE_DP_MASTER_PORT \
-  DECODE_DP_BASE_PORT; do
+  DECODE_DP_BASE_PORT \
+  ATOMESH_KV_EVENTS_PORT; do
   validate_shifted_port "${shifted_port_name}"
 done
 # The Store's ports only bound the offset when it runs (mooncake_store_requested).
@@ -1059,6 +1065,10 @@ purge_lmcache_disk() {
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
 #    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_PAGE_CACHE_DROP_FOR (default 1800 s, 0 for none): how long
+#    the model's page cache keeps being dropped while the workers load. A node
+#    whose owners all pin before the workers start needs none, and the drops
+#    leave a TP decode to fault the checkpoint back from NFS.
 #  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
 #    compaction; a node that does not compact in time can leave an owner 4 KiB
 #    pages its NICs refuse to register.
@@ -1431,6 +1441,7 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROP_FOR 1800 integer
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1751,12 +1762,15 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s for 30 min while the workers load
-# weights, which would refill it; page cache is per file, so this serves every
-# node.
+# Drops the model's page cache every 45 s for MOONCAKE_STORE_PAGE_CACHE_DROP_FOR
+# while the workers load weights, which would refill it; page cache is per file,
+# so this serves every node.
 start_mooncake_page_cache_dropper() {
+  local drop_for
+  drop_for=$((10#$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_FOR 1800)))
+  ((drop_for > 0)) || return 0
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
-    --every 45 --for 1800 "${MODEL_PATH}" &
+    --every 45 --for "${drop_for}" "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
   # Until the child execs, its cmdline is this shell's, and a cleanup in that
   # window would take the dropper for another process and leave it running:
@@ -2052,6 +2066,16 @@ start_prefill() {
   fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
+  local -a prefill_kv_events_env=()
+  if [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]]; then
+    # The router reads a wildcard host as this worker's.
+    local kv_events_port=$((ATOMESH_KV_EVENTS_PORT + 32 * (server_port - PREFILL_PORT)))
+    prefill_kv_events_env=(
+      "ATOM_KV_EVENTS_ENABLE=1"
+      "ATOM_KV_EVENTS_ENDPOINT=tcp://*:${kv_events_port}"
+      "ATOM_KV_EVENTS_REPLAY_ENDPOINT=tcp://*:$((kv_events_port + 16))"
+    )
+  fi
   local -a prefill_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     prefill_dp_env=(
@@ -2075,8 +2099,8 @@ start_prefill() {
     "${prefill_profiler_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -2247,6 +2271,20 @@ start_router() {
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
+  local -a router_kv_events_args=()
+  if [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]]; then
+    # start_prefill turns the publishers on. A Mooncake Store answers on its
+    # master's metrics port (with per-NIC pools, only the first pool's).
+    # Routing by the events tokenizes every prompt: the opening burst of
+    # 1M-token sessions above --prepare-workers outlasts the 250 ms default
+    # queue wait. fastokens encodes them; its segment cache of a session's
+    # earlier turns takes about 0.6 GB for 72 sessions of up to 1M tokens.
+    router_kv_events_args=(
+      --kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}"
+      --prepare-queue-timeout-ms 5000
+      --fastokens-models '*' --fastokens-segment-cache-mb 1024
+    )
+  fi
   local -a router_cmd=(
     "${mesh_binary}" launch
     --host 0.0.0.0
@@ -2258,6 +2296,7 @@ start_router() {
     "${router_prefill_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
+    "${router_kv_events_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
@@ -2541,6 +2580,20 @@ save_router_metrics() {
   fi
 }
 
+# Saves the KV event and storage sources a router that routes by KV events
+# follows: trust, seq and block counts per rank. A failed request only warns.
+save_router_kv_sources() {
+  local prefix="$1" kind sources
+  [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]] || return 0
+  for kind in kv_events kv_storage; do
+    if sources="$(curl -sSf --max-time 10 "http://127.0.0.1:${ROUTER_PORT}/${kind}/sources")"; then
+      printf '%s\n' "${sources}" > "${prefix}-${kind}-sources.json"
+    else
+      echo "[aiperf] WARNING: router /${kind}/sources snapshot failed" >&2
+    fi
+  done
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_agentx_harness
 
@@ -2615,6 +2668,7 @@ run_aiperf_agentic_benchmark() {
     rm -f "${router_before}"
     if [[ "${AGGREGATED}" != "1" ]]; then
       save_router_metrics "${router_before}"
+      save_router_kv_sources "${out_dir}/router-before"
     fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
@@ -2664,9 +2718,11 @@ run_aiperf_agentic_benchmark() {
       local router_metrics="${out_dir}/metrics"
       mkdir -p "${router_metrics}"
       save_router_metrics "${router_metrics}/router-metrics.prom"
+      save_router_kv_sources "${router_metrics}/router-after"
       if [[ -f "${router_before}" ]]; then
         mv "${router_before}" "${router_metrics}/"
       fi
+      mv -f "${out_dir}"/router-before-*-sources.json "${router_metrics}/" 2>/dev/null || true
       python3 "${ATOMESH_SCRIPT_DIR}/observability/router_metrics_delta.py" \
         "${router_metrics}/router-metrics-before.prom" \
         "${router_metrics}/router-metrics.prom" \
