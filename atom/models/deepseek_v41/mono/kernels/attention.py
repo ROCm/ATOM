@@ -81,6 +81,9 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.sync import Quad
 from atom.mono.plan.execution import BLOCKS, THREADS
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.expr.typing import as_ir_value
 
 CH, CHUNKS = aplan.CH, aplan.CHUNKS  # keys a chunk, chunks a token
 BK = 16  # keys a score wave (an MFMA's 16 rows)
@@ -191,6 +194,37 @@ def _plane_ptr(c, row, scale=False):
     plane = a["kvrow"] + (kvrow_scale0(c["S"]) if scale else 0)
     step_row = plane + fx.Int64(-1 - row) * width
     return fx.Int64((row < 0).select(step_row, pool_row))
+
+
+def _step_cm(c):
+    """The cache policy of a key row read that may be one of this launch's
+    (``kvrow``): ``hand_cm`` (CM_DEV) where the launch rereads ``kvrow`` every
+    iteration -- the run kernel / pair (``hand_cm`` set) without KVT; else 0,
+    the default policy (the single-layer kernel reads it once past its launch's
+    invalidation; KVT builds read the window rows from their tagged pairs)."""
+    if const_expr(not c["fused"] or c.get("kvt_rows", False)):
+        return 0
+    return c["args"].get("hand_cm", 0)
+
+
+def _ld_step(addr, words, align):
+    """``words`` i32 (1, 2 or 4) at the 64-bit global address ``addr`` at device
+    scope: relaxed agent-scope atomic loads (gfx94x/95x: ``global_load`` sc1,
+    never a CU's resident line). Two words load as one i64; four as two (an
+    atomic access is at most 64 bits)."""
+    i32 = ir.IntegerType.get_signless(32)
+    if words == 4:
+        lo, hi = (fx.Vector(_ld_step(fx.Int64(addr) + 8 * h, 2, 8)) for h in range(2))
+        return fx.Vector.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int32)
+    ty = {1: i32, 2: ir.IntegerType.get_signless(64)}[words]
+    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr)))
+    v = llvm.LoadOp(
+        ty, ptr.result, alignment=align, ordering=llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+    ).result
+    if words == 2:
+        v = llvm.BitcastOp(ir.VectorType.get([2], i32), v).result
+    return v
 
 
 def _row_ptr(pool, row, byte, row_bytes):
@@ -438,29 +472,48 @@ def _rows_to_lds(c, pool, slot, kv):
     the compiler compute it there, on its lanes only)."""
     if const_expr(c["kv_fp8"]):
         data = _plane_ptr(c, slot)
+    # the run kernel / pair without KVT: its rows of this step at device scope
+    # (``_step_cm``; the DMA's aux), else as before
+    cm = _step_cm(c)
     for r in range_constexpr(BK):
         if const_expr(c["kv_fp8"]):
             row_data = readlane64(data, r)
             if c["lane"] < HEAD_DIM // 16:
+                if const_expr(cm):
+                    rocdl.raw_ptr_buffer_load_lds(
+                        rsrc(row_data, HEAD_DIM),
+                        fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                        16, c["lane"] * 16, 0, 0, cm,
+                    )  # fmt: skip
+                else:
+                    rocdl.buffer_load_to_lds(
+                        rsrc(row_data, HEAD_DIM),
+                        fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                        c["lane"] * 16,
+                        size_bytes=16,
+                    )
+        else:
+            row = readlane(slot, r)
+            if const_expr(cm):
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc(_key_base(c, pool, row, ROW_BYTES)),
+                    fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                    16, c["lane"] * 16, 0, 0, cm,
+                )  # fmt: skip
+            else:
                 rocdl.buffer_load_to_lds(
-                    rsrc(row_data, HEAD_DIM),
+                    rsrc(_key_base(c, pool, row, ROW_BYTES)),
                     fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
                     c["lane"] * 16,
                     size_bytes=16,
                 )
-        else:
-            row = readlane(slot, r)
-            rocdl.buffer_load_to_lds(
-                rsrc(_key_base(c, pool, row, ROW_BYTES)),
-                fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
-                c["lane"] * 16,
-                size_bytes=16,
-            )
 
 
 def _row_codes(c, slot):
     """FP8 row ``slot``'s 16 E8M0 codes (a word a K step of 128), straight
     into this lane's registers: lane l's row is l % 16 (``_rows_to_lds``)."""
+    if const_expr(_step_cm(c)):
+        return fx.Vector(_ld_step(_plane_ptr(c, slot, scale=True), 4, 16))
     ptr = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
         _plane_ptr(c, slot, scale=True),
@@ -519,6 +572,10 @@ def _ld_row4(c, pool, row, col):
     """Row ``row``'s 8 columns from ``col``, as loaded (``_tile_words`` turns
     them into bf16 pairs where they are used, so the loads stay in flight):
     a BF16 row's 16 B, or an FP8 row's 8 B (their scale: ``_ld_codes``)."""
+    if const_expr(_step_cm(c)):
+        if const_expr(not c["kv_fp8"]):
+            return fx.Vector(_ld_step(_key_base(c, pool, row, ROW_BYTES) + fx.Int64(col * 2), 4, 16))
+        return fx.Vector(_ld_step(_plane_ptr(c, row) + fx.Int64(col), 2, 8))
     if const_expr(not c["kv_fp8"]):
         ptr = fx.inttoptr(
             fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
@@ -535,6 +592,8 @@ def _ld_row4(c, pool, row, col):
 def _ld_codes(c, row, dc):
     """FP8 row ``row``'s E8M0 codes of column groups 4 (dc // 4) .. + 4, a byte
     each in one word: a PV task's consecutive groups take one load a row."""
+    if const_expr(_step_cm(c)):
+        return fx.Int32(_ld_step(_plane_ptr(c, row, scale=True) + fx.Int64(dc // 4 * 4), 1, 4))
     ptr = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
         _plane_ptr(c, row, scale=True) + fx.Int64(dc // 4 * 4),

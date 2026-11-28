@@ -563,12 +563,28 @@ PTB_OOB_WORD = (1 << 29) - 4  # an i32 / f32 element
 PTB_OOB_HALF = (1 << 30) - 8  # a bf16 element
 
 
-def _ld_live(ptr, nbytes, i, live, dtype, oob):
+def _ld_live(ptr, nbytes, i, live, dtype, oob, cm=0):
     """Element ``i`` of a ``nbytes`` buffer, at ``oob`` (out of range)
-    where ``live`` is false: ``ld_i32`` / ``ld_f32`` / ``ld_bf``'s load."""
+    where ``live`` is false: ``ld_i32`` / ``ld_f32`` / ``ld_bf``'s load
+    (``cm``: its cache policy; 0 the default)."""
+    if cm:
+        return bo.buffer_load(
+            rsrc(ptr, nbytes), live.select(i, fx.Int32(oob)), vec_width=1, dtype=dtype,
+            cache_modifier=cm,
+        )
     return bo.buffer_load(
         rsrc(ptr, nbytes), live.select(i, fx.Int32(oob)), vec_width=1, dtype=dtype
     )
+
+
+def _ld_hand(ptr, i, dtype, cm):
+    """Element ``i`` of a hand-off buffer: ``ld_i32`` / ``ld_f32``'s load at
+    cache policy ``cm`` (``hand_cm``: CM_DEV in a launch that rereads its own
+    hand-offs -- a CU's resident line of the previous iteration is never
+    returned; 0, the default policy, elsewhere)."""
+    if cm:
+        return bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=dtype, cache_modifier=cm)
+    return bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=dtype)
 
 
 def slice_direct_loads(c, c0, q):
@@ -576,19 +592,26 @@ def slice_direct_loads(c, c0, q):
     every stream's residual pair (a word); its own streams' comb columns,
     post and pre gates."""
     a = c["args"]
+    # the launch's own hand-off rows reread by the same CU (run kernel / pair):
+    # device scope (``hand_cm``); else the default policy
+    hcm = a.get("hand_cm", 0)
     split = slice_split(c["S"])
     g = q % split
     p = q // split
     t = p // (COLS // 2)
     col = c0 + 2 * (p % (COLS // 2))
-    res = [ld_i32(a["res_in"], ((t * HC + h) * HIDDEN + col) // 2) for h in range(HC)]
+    res = [
+        fx.Int32(_ld_hand(a["res_in"], ((t * HC + h) * HIDDEN + col) // 2, T.i32, hcm))
+        for h in range(HC)
+    ]  # fmt: skip
     own = range(HC // split)
     o = [g * (HC // split) + j for j in own]
     cm = [
-        [ld_f32(a["comb_in"], (t * HC + h) * HC + o[j]) for h in range(HC)] for j in own
-    ]
-    post = [ld_f32(a["post_in"], t * HC + o[j]) for j in own]
-    pre = [ld_f32(a["pre_in"], t * HC + o[j]) for j in own]
+        [fx.Float32(_ld_hand(a["comb_in"], (t * HC + h) * HC + o[j], T.f32, hcm)) for h in range(HC)]
+        for j in own
+    ]  # fmt: skip
+    post = [fx.Float32(_ld_hand(a["post_in"], t * HC + o[j], T.f32, hcm)) for j in own]
+    pre = [fx.Float32(_ld_hand(a["pre_in"], t * HC + o[j], T.f32, hcm)) for j in own]
     return res, cm, post, pre
 
 
@@ -608,11 +631,14 @@ def slice_direct_loads_live(c, c0, q, live, pend=None):
     col = c0 + 2 * (p % (COLS // 2))
     own = range(HC // split)
     o = [g * (HC // split) + j for j in own]
+    # the launch's own hand-off rows (``hand_cm``, run kernel / pair body b):
+    # device scope; pend (the previous launch's, or discarded) as before
+    hcm = a.get("hand_cm", 0)
     i32 = lambda name, i, n: fx.Int32(
-        _ld_live(a[name], n, i, live, T.i32, PTB_OOB_WORD)
+        _ld_live(a[name], n, i, live, T.i32, PTB_OOB_WORD, hcm)
     )
     f32 = lambda name, i, n: fx.Float32(
-        _ld_live(a[name], n, i, live, T.f32, PTB_OOB_WORD)
+        _ld_live(a[name], n, i, live, T.f32, PTB_OOB_WORD, hcm)
     )
     bf = lambda name, i, n: fx.Float32(
         fx.BFloat16(_ld_live(a[name], n, i, live, T.bf16, PTB_OOB_HALF))

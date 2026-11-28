@@ -114,6 +114,10 @@ assert RED_COLS == k1.COLS
 
 # widths the pair is built for: past 10 rows its body pair spills (11 / 12: 20 B scratch)
 PAIR_MAX_TOKENS = 10
+# hand-off rows this launch rereads (res_pair / gates_pair, res_attn / gates_attn)
+# loaded at device scope: a CU's resident line of an earlier iteration is never
+# returned (measured stale otherwise, cache_tb); ATOM_MONO_HANDCM=0: the old loads
+HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
 
 
 def pair_mode() -> int:
@@ -400,6 +404,9 @@ def _body(C, A, role, mode, tid, bid, lds, tls, pnd_off, pnd_tag, shared):
         pend_src = "late"
     if const_expr(prefetch):
         args_1 = k1_args()
+        if const_expr(HAND_CM and role == 1):
+            # body b reads body a's res_pair / gates_pair
+            args_1["hand_cm"] = HAND_CM
         entry_pre = k1.slice_entry_prefetch(
             args_1, s, pre.tp, bid, rank, pend=pend_src
         )
@@ -424,6 +431,9 @@ def _body(C, A, role, mode, tid, bid, lds, tls, pnd_off, pnd_tag, shared):
         normed,
     )  # fmt: skip
     args_a["kvrow"] = kvrow
+    if const_expr(HAND_CM):
+        # each body's seam F rereads res_attn / gates_attn
+        args_a["hand_cm"] = HAND_CM
     args_b = moe_args(
         normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
         queue_words,
@@ -571,7 +581,7 @@ def build_layer_pair(pkey: PairBuild):
         tls: fx.Array[fx.Int64, 1, 16]
 
     name = kernel_symbol(
-        "v41_lpair", s=s, m=mode, kv8=int(post.kv_fp8), sh=int(pre.shard),
+        "v41_lpair", s=s, m=mode, hc=int(HAND_CM != 0), kv8=int(post.kv_fp8), sh=int(pre.shard),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])

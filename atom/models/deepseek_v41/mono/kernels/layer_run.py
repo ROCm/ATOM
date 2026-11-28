@@ -110,6 +110,10 @@ RUN_ARGS = len(kl.ABI.names)
 assert RUN_ARGS == 148
 RUN_ARG_NAMES = kl.ABI.names
 # the slot of the layer's MoE tag (the next iteration's PND tag)
+# hand-off rows this launch rereads (res_pair / gates_pair, res_attn / gates_attn)
+# loaded at device scope: a CU's resident line of an earlier iteration is never
+# returned (measured stale otherwise, cache_tb); ATOM_MONO_HANDCM=0: the old loads
+HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
 K_MOE = 146
 assert RUN_ARG_NAMES[K_MOE] == "moe_layer"
 # CDNA buffer resource flags (DATA_FORMAT 32, NUM_FORMAT float: raw loads ignore them)
@@ -433,6 +437,8 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail):
         )  # fmt: skip
     if const_expr(prefetch):
         args_1 = k1_args()
+        if const_expr(HAND_CM):
+            args_1["hand_cm"] = HAND_CM
         entry_pre = k1.slice_entry_prefetch(args_1, s, pre.tp, bid, rank)
     # (run) the peer bases and X8G base, loaded once before the loop
     bases, x8b = shared
@@ -450,6 +456,8 @@ def _iter(C, ltab, it, tid, bid, lds, tls, pnd_off, shared, tail):
         normed,
     )  # fmt: skip
     args_a["kvrow"] = kvrow
+    if const_expr(HAND_CM):
+        args_a["hand_cm"] = HAND_CM
     args_b = moe_args(
         normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
         queue_words,
@@ -675,7 +683,7 @@ def build_layer_run(rkey: RunBuild):
         tls: fx.Array[fx.Int64, 1, 16]
 
     name = kernel_symbol(
-        "v41_lrun", s=s, w=int(warm_iter), l=int(late), kv8=int(post.kv_fp8), sh=int(pre.shard),
+        "v41_lrun", s=s, w=int(warm_iter), l=int(late), hc=int(HAND_CM != 0), kv8=int(post.kv_fp8), sh=int(pre.shard),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
