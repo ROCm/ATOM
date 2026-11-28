@@ -38,7 +38,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # Only the selected MoRI transport needs this switch; the TP fusion is a
     # different mechanism, and an explicitly selected RCCL/none backend must
     # not be inferred from the mere presence of the ``mori`` Python package.
-    # EPLB always fuses, otherwise the env decides.
+    # EPLB always fuses: its shared expert is an ordinary routed expert.
+    # Otherwise it is a LOCAL_REPLICA, fused when the env asks, except on
+    # MegaMoE's MoRI dispatch, which gives wrong output for its rows
+    # (ROCm/aiter#8734); the compact dispatch fuses it.
     requested_all2all = getattr(config, "moe_all2all_backend", "auto")
     mori_selected = (
         requested_all2all in {"auto", "mori"}
@@ -49,7 +52,9 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         dp_size > 1
         and mori_selected
         and config.enable_dp_attention
-        and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
+        and config.enable_expert_parallel
+        and not getattr(config, "eplb_enable", False)
+        and (not envs.ATOM_FUSE_SHARED_EXPERT or _on_mega_mori_dispatch())
     ):
         return False
 
@@ -103,6 +108,18 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             break
 
     return True
+
+
+def _on_mega_mori_dispatch() -> bool:
+    """MoRI v2 with MegaMoE dispatching on mori rather than its compact plan."""
+    if not envs.ATOM_MORI_V2:
+        return False
+    # Imported here: the module reads and checks the MegaMoE settings at import.
+    from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+        uses_compact_dispatch,
+    )
+
+    return not uses_compact_dispatch()
 
 
 @torch_compile_guard()

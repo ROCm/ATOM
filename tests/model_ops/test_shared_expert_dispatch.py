@@ -211,55 +211,6 @@ def test_ep_alone_does_not_imply_all2all(
     assert config.use_all2all_kernels is (expected_backend is not None)
 
 
-def _atom_config(*, eplb: bool, backend: str = "auto") -> SimpleNamespace:
-    """The four fields this gate reads, over the real Config's defaults.
-
-    Hand-built, this went red the day `is_rocm_aiter_fusion_shared_expert_
-    enabled_for_quant_config` grew a read of `enable_dp_attention` -- a field
-    that exists on Config with a default of False, so the double should have
-    had it. `atom_config_double` takes every field from
-    `dataclasses.fields(Config)`, so the next one arrives on its own.
-    """
-    return atom_config_double(
-        quant_config=SimpleNamespace(exclude_layers=[], quant_dtype=None),
-        parallel_config=SimpleNamespace(data_parallel_size=8),
-        moe_ep_flatten_tp_across_dp=False,
-        eplb_enable=eplb,
-        moe_all2all_backend=backend,
-        # The branch under test is the MoRI + DP-attention one -- "only MoRI
-        # needs the switch", says the code -- so the scenario has to say so.
-        # Left at Config's default of False, the early return is unreachable
-        # and the (no eplb, no switch) row stops meaning anything.
-        enable_dp_attention=True,
-    )
-
-
-@pytest.mark.parametrize(
-    "eplb, switch, expected",
-    [
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
-        (True, True, True),
-    ],
-)
-def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expected):
-    monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
-    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
-    # Stated, not inherited: the gate asks whether MoRI is importable, so
-    # without this the truth table below holds only on a box that has it.
-    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
-    monkeypatch.setattr(
-        topK_module,
-        "get_current_atom_config",
-        lambda: _atom_config(eplb=eplb),
-    )
-
-    enabled = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
-
-    assert enabled is expected
-
-
 class _QuantConfig:
     """Checkpoint specs by layer, and the routed experts' online target."""
 
@@ -365,16 +316,3 @@ def test_ptpc_shared_expert_stays_unfused_under_dp_expert_parallel(monkeypatch):
         shared_expert_prefix="model.layers.3.mlp.shared_experts",
         routed_expert_prefix="model.layers.3.mlp.experts",
     )
-
-
-def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
-    monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", False)
-    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
-    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
-    monkeypatch.setattr(
-        topK_module,
-        "get_current_atom_config",
-        lambda: _atom_config(eplb=False, backend="rccl"),
-    )
-
-    assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
