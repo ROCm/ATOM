@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2026 ATOM Project Contributors
-//! A `GenerationPayload` as ATOM's GenerateRequest: the sampling fields ATOM's
-//! HTTP routes read, stop strings and stop ids as token id sequences, and the
-//! worker's DP rank.
+//! A `GenerationPayload` as ATOM's GenerateRequest: the sampling fields ATOM's HTTP routes read,
+//! stop strings and stop ids as token id sequences, the worker's DP rank and a chat's
+//! StructuredOutput.
 
 use crate::atom_engine::{
-    grpc::GenerateRequest,
+    grpc::{self, GenerateRequest},
     wire::pb::{SamplingParams, TokenIds},
 };
 use crate::core::Worker;
 use crate::protocols::common::StringOrArray;
-use crate::routers::prepare::generation_payload::GenerationPayload;
+use crate::routers::prepare::generation_payload::{GenerationPayload, StructuredOutput};
 use crate::routers::token_handle::engine_error::EngineError;
 use crate::tokenizer::traits::Tokenizer;
 
@@ -63,10 +63,21 @@ pub(crate) fn generate_request(
         kv_transfer_params_json: None,
         data_parallel_rank: worker.dp_rank().map(|rank| rank as i32),
         stream: payload.stream,
-        structured_output: None,
+        structured_output: payload.structured_output.as_ref().map(structured_output),
         dp_session_id: payload.dp_session_id.clone(),
         dp_parent_session_id: payload.dp_parent_session_id.clone(),
     })
+}
+
+fn structured_output(carried: &StructuredOutput) -> grpc::StructuredOutput {
+    grpc::StructuredOutput {
+        tools_json: carried.tools_json.clone(),
+        tool_choice_json: carried.tool_choice_json.clone(),
+        response_format_json: carried.response_format_json.clone(),
+        chat_template_kwargs_json: carried.chat_template_kwargs_json.clone(),
+        prompt_opens_reasoning: carried.prompt_opens_reasoning,
+        message_tools_json: carried.message_tools_json.clone(),
+    }
 }
 
 /// Each stop string as ATOM encodes one, without special tokens, dropping a

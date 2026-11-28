@@ -10,10 +10,11 @@ use tracing::debug;
 use super::engine::atom::pair::AtomPairs;
 use super::{
     completion_adapter::{
-        completion_to_generate, wrap_generate_response_as_completion,
+        completion_to_generate, without_logprobs, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
+    router::{atom_chat_refusal, atom_serves, logprobs_refused, media_refused},
 };
 use crate::{
     app_context::AppContext,
@@ -26,7 +27,11 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
-    routers::{comm::error, prepare, RouterTrait, SentChatBody},
+    routers::{
+        comm::error,
+        prepare::{self, inference::ParsedInference},
+        RouterTrait, SentChatBody,
+    },
 };
 
 #[derive(Clone)]
@@ -219,6 +224,14 @@ impl RouterTrait for GrpcPDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::generate_carries_media(body) {
+                return media_refused();
+            }
+            if body.return_logprob == Some(true) {
+                return logprobs_refused();
+            }
+        }
         self.route_generate_impl(headers, body, model_id).await
     }
 
@@ -237,6 +250,9 @@ impl RouterTrait for GrpcPDRouter {
         sent: Option<SentChatBody>,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
         self.route_chat_impl(headers, body, model_id, sent).await
     }
 
@@ -246,6 +262,9 @@ impl RouterTrait for GrpcPDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
         self.route_chat_impl(headers, body, model_id, None).await
     }
 
@@ -256,6 +275,7 @@ impl RouterTrait for GrpcPDRouter {
         model_id: Option<&str>,
     ) -> Response {
         let synthetic = match completion_to_generate(body) {
+            Ok(g) if atom_serves(&self.worker_registry, model_id) => without_logprobs(g),
             Ok(g) => g,
             Err(msg) => return error::bad_request("completion_unsupported_field", msg),
         };

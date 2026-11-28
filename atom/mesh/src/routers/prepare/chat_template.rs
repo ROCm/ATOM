@@ -1,11 +1,17 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde_json::{json, Value};
 
-use super::fast_tokenizer::FastTokenizer;
+use super::{
+    fast_tokenizer::FastTokenizer,
+    message_tools::{qualified_name, MessageTools},
+};
 use crate::{
     core::{worker::RuntimeType, Worker},
     protocols::{
@@ -86,84 +92,16 @@ pub fn process_chat_messages(
         &request.messages,
         tokenizer,
         &template_kwargs(request),
+        None,
     )
 }
 
-/// The label with an ATOM worker's reasoning toggle, `[name, off value, on value]`:
-/// GetModelInfo's `reasoning_toggle_json`.
-const REASONING_TOGGLE_LABEL: &str = "reasoning_toggle_json";
-
-/// What an ATOM model's chat renders its reasoning controls with: its toggle, if any.
-pub(crate) struct AtomChat {
-    pub toggle: Option<(String, Value, Value)>,
-}
-
-impl AtomChat {
-    /// The model's, from the first of its `workers` with the toggle label.
-    pub(crate) fn of(workers: &[Arc<dyn Worker>]) -> Result<Self, String> {
-        let toggle = workers
-            .iter()
-            .find_map(|worker| worker.metadata().labels.get(REASONING_TOGGLE_LABEL))
-            .map(|json| {
-                serde_json::from_str(json)
-                    .map_err(|e| format!("Invalid {REASONING_TOGGLE_LABEL} label {json}: {e}"))
-            })
-            .transpose()?;
-        Ok(Self { toggle })
-    }
-}
-
-/// The efforts ATOM's chat templates read (`VALID_TEMPLATE_EFFORTS` in
-/// atom/entrypoints/openai/reasoning.py); ATOM's HTTP chat drops any other.
-const ATOM_TEMPLATE_EFFORTS: [&str; 3] = ["low", "high", "max"];
-
-/// As `process_chat_messages`, with the request's template kwargs over `default_kwargs`;
-/// for an ATOM model (`atom`), its reasoning effort then over both as ATOM's HTTP chat
-/// applies it (`apply_reasoning_controls`): "none" switches the toggle off, an effort
-/// its templates read becomes `thinking_effort`.
-pub fn process_chat_messages_with_defaults(
+/// The kwargs a chat renders with: `default_kwargs`, then its reasoning effort and its own.
+pub(crate) fn merged_template_kwargs(
     request: &ChatCompletionRequest,
-    tokenizer: &dyn Tokenizer,
     default_kwargs: Option<&HashMap<String, Value>>,
-    atom: Option<&AtomChat>,
-) -> Result<ProcessedMessages, String> {
+) -> HashMap<String, Value> {
     let mut combined_template_kwargs = default_kwargs.cloned().unwrap_or_default();
-
-    if let (None, Some(reasoning_effort)) = (atom, &request.reasoning_effort) {
-        combined_template_kwargs.insert(
-            "reasoning_effort".to_string(),
-            Value::String(reasoning_effort.clone()),
-        );
-    }
-
-    if let Some(template_kwargs) = &request.chat_template_kwargs {
-        for (key, value) in template_kwargs {
-            combined_template_kwargs.insert(key.clone(), value.clone());
-        }
-    }
-    let effort = request.reasoning_effort.as_deref();
-    if let (Some(atom), Some(effort)) = (atom, effort) {
-        if let (Some((name, off, _)), "none") = (&atom.toggle, effort) {
-            combined_template_kwargs.insert(name.clone(), off.clone());
-        }
-        if ATOM_TEMPLATE_EFFORTS.contains(&effort) {
-            let effort = Value::String(effort.to_string());
-            combined_template_kwargs.insert("thinking_effort".to_string(), effort);
-        }
-    }
-
-    render_chat_messages(
-        request,
-        &request.messages,
-        tokenizer,
-        &combined_template_kwargs,
-    )
-}
-
-/// The template kwargs `process_chat_messages` renders `request` with.
-pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
     if let Some(reasoning_effort) = &request.reasoning_effort {
         combined_template_kwargs.insert(
@@ -177,17 +115,45 @@ pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
             combined_template_kwargs.insert(key.clone(), value.clone());
         }
     }
-
     combined_template_kwargs
 }
 
-/// `process_chat_messages` with `messages` in place of the request's own and
-/// `template_kwargs` as the template kwargs.
+/// The function name a tool declares as sent.
+fn sent_name(tool: &Value) -> Option<&str> {
+    tool.get("function")?.get("name")?.as_str()
+}
+
+/// As `process_chat_messages`, rendered with `template_kwargs`, the merged kwargs, and
+/// each message given its own `message_tools`, as ATOM's HTTP chat renders them.
+pub fn process_chat_messages_with_kwargs(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    template_kwargs: &HashMap<String, Value>,
+    message_tools: Option<&MessageTools>,
+) -> Result<ProcessedMessages, String> {
+    render_chat_messages(
+        request,
+        &request.messages,
+        tokenizer,
+        template_kwargs,
+        message_tools,
+    )
+}
+
+/// The template kwargs `process_chat_messages` renders `request` with.
+pub(crate) fn template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    merged_template_kwargs(request, None)
+}
+
+/// `process_chat_messages` with `messages` in place of the request's own,
+/// `template_kwargs` as the template kwargs, and each message given its own
+/// `message_tools`.
 pub(crate) fn render_chat_messages(
     request: &ChatCompletionRequest,
     messages: &[ChatMessage],
     tokenizer: &dyn Tokenizer,
     template_kwargs: &HashMap<String, Value>,
+    message_tools: Option<&MessageTools>,
 ) -> Result<ProcessedMessages, String> {
     let any = tokenizer.as_any();
     let hf_tokenizer = any.downcast_ref::<HuggingFaceTokenizer>().or_else(|| {
@@ -208,6 +174,14 @@ pub(crate) fn render_chat_messages(
     let mut transformed_messages = process_content_format(messages, content_format)?;
 
     process_tool_call_arguments(&mut transformed_messages)?;
+    if let Some(declared) = message_tools {
+        for (message, tools) in transformed_messages.iter_mut().zip(declared.0.iter()) {
+            if let (Some(message), Some(tools)) = (message.as_object_mut(), tools) {
+                let tools = serde_json::to_value(tools).map_err(|e| e.to_string())?;
+                message.insert("tools".to_string(), tools);
+            }
+        }
+    }
 
     let tools_json: Option<Vec<Value>> = request
         .tools
@@ -220,6 +194,28 @@ pub(crate) fn render_chat_messages(
         })
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {}", e))?;
+    // Namespaced top-level tools render as sent, those `request` keeps by name, or the
+    // one a namespaced named choice qualifies.
+    let sent = message_tools.and_then(|declared| declared.1.as_deref());
+    let choice = message_tools
+        .and_then(MessageTools::qualified_choice)
+        .and_then(Result::ok);
+    let tools_json = match (tools_json, sent) {
+        (Some(_), Some(sent)) => {
+            let kept: HashSet<&str> = request
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            let kept = sent.iter().filter(|tool| match &choice {
+                Some(choice) => qualified_name(tool).as_ref() == Some(choice),
+                None => sent_name(tool).is_some_and(|n| kept.contains(n)),
+            });
+            Some(kept.cloned().collect())
+        }
+        (typed, _) => typed,
+    };
 
     let params = ChatTemplateParams {
         add_generation_prompt: true,

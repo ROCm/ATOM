@@ -21,11 +21,27 @@ pub struct GenerationPayload {
     /// REST surface; chat path leaves at `false` to match the upstream chat
     /// builder which does not touch this field).
     pub log_metrics: bool,
+    /// ATOM only: a chat's input to ATOM's structured-output derivation.
+    pub structured_output: Option<StructuredOutput>,
     /// ATOM only: the request's DP session and its parent, from its headers.
     pub dp_session_id: Option<String>,
     pub dp_parent_session_id: Option<String>,
     /// A chat's prompt, rendered here: the template it rendered with.
     pub chat_template: Option<RenderedTemplate>,
+}
+
+/// What ATOM's HTTP chat route derives a chat's structured output from: the
+/// request's fields as JSON, and how atomesh rendered its prompt.
+pub struct StructuredOutput {
+    pub tools_json: Option<String>,
+    pub tool_choice_json: Option<String>,
+    pub response_format_json: Option<String>,
+    /// One item per message, its own tools or null; None when no message has any.
+    pub message_tools_json: Option<String>,
+    /// The merged template kwargs the prompt was rendered with, a JSON object.
+    pub chat_template_kwargs_json: String,
+    /// The prompt ends, trailing whitespace aside, in a marker the worker lists.
+    pub prompt_opens_reasoning: bool,
 }
 
 pub struct SamplingParams {

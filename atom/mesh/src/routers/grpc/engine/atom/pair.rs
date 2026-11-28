@@ -29,7 +29,11 @@ use crate::core::placement::backend::BackendAdapter;
 use crate::core::placement::PlacementPlan;
 use crate::core::worker::RuntimeType;
 use crate::core::{Worker, WorkerLoadGuard, WorkerRegistry};
-use crate::observability::events::{Event, RequestPDSentEvent};
+use crate::observability::{
+    events::{Event, RequestPDSentEvent},
+    metrics::metrics_labels,
+    route_trace,
+};
 use crate::routers::grpc::engine::worker_client_cache::{get_grpc_client_from_worker, GrpcClient};
 use crate::routers::prepare::generation_payload::GenerationPayload;
 use crate::routers::token_handle::engine_error::EngineError;
@@ -243,6 +247,7 @@ impl AtomPairs {
         let started = Instant::now();
         let prefill =
             apply_atom_pd_rank_mapping_policy(self.mapping, &self.workers, prefill.clone(), decode);
+        route_trace::keep_estimate_for(metrics_labels::WORKER_PREFILL, &prefill);
         let prefill_load = WorkerLoadGuard::new(prefill.clone(), None);
         let decode_load = WorkerLoadGuard::new(decode.clone(), None);
         RequestPDSentEvent {

@@ -22,7 +22,10 @@ use crate::{
         generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
         sampling_params::SamplingParams,
     },
-    routers::comm::error,
+    routers::{
+        comm::error,
+        render::atom_usage::{self, AtomUsage},
+    },
 };
 
 /// Build a synthetic SGLang `GenerateRequest` from an OpenAI `CompletionRequest`.
@@ -117,6 +120,16 @@ pub(crate) fn completion_to_generate(c: &CompletionRequest) -> Result<GenerateRe
     })
 }
 
+/// `generate` without the logprobs its completion asked for: ATOM's HTTP /v1/completions
+/// answers logprobs null, and its gRPC workers refuse a request for them.
+pub(crate) fn without_logprobs(generate: GenerateRequest) -> GenerateRequest {
+    GenerateRequest {
+        return_logprob: Some(false),
+        top_logprobs_num: None,
+        ..generate
+    }
+}
+
 /// Convert a list of native `GenerateResponse`s into an OpenAI `CompletionResponse`.
 fn build_completion_response(gens: Vec<GenerateResponse>, model: String) -> CompletionResponse {
     let id = gens
@@ -204,8 +217,18 @@ pub(crate) async fn wrap_generate_response_as_completion(
         }
     };
 
+    // An ATOM worker's sequences carry their timing, which its usage reports.
+    let meta_infos = meta_infos(&bytes);
+    let atom = AtomUsage::of_meta_infos(&meta_infos.iter().collect::<Vec<_>>());
+
     let completion = build_completion_response(gens, model);
-    let json = match serde_json::to_vec(&completion) {
+    let json = match atom {
+        None => serde_json::to_vec(&completion),
+        Some(atom) => atom
+            .extend_response(&completion, atom_usage::COMPLETION)
+            .and_then(|value| serde_json::to_vec(&value)),
+    };
+    let json = match json {
         Ok(v) => v,
         Err(e) => {
             return error::internal_error(
@@ -222,6 +245,18 @@ pub(crate) async fn wrap_generate_response_as_completion(
     );
     new.headers_mut().remove(header::CONTENT_LENGTH);
     new
+}
+
+/// A generate response's `meta_info` alone; its text, ids and logprobs are skipped.
+#[derive(serde::Deserialize)]
+struct MetaInfoOnly {
+    meta_info: Option<Value>,
+}
+
+/// Each response's `meta_info` in a `/generate` body, read without decoding the rest.
+fn meta_infos(body: &[u8]) -> Vec<Value> {
+    let responses: Vec<MetaInfoOnly> = serde_json::from_slice(body).unwrap_or_default();
+    responses.into_iter().filter_map(|r| r.meta_info).collect()
 }
 
 /// Map a generate `finish_reason` Value (the raw JSON form, since streaming
@@ -456,4 +491,20 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod meta_info_tests {
+    use super::*;
+
+    #[test]
+    fn meta_infos_are_read_alone_and_responses_without_one_are_skipped() {
+        let body = json!([
+            {"text": "a long reply", "output_ids": [1, 2], "meta_info": {"ttft": 0.5}},
+            {"text": "no meta"},
+        ]);
+        let read = meta_infos(&serde_json::to_vec(&body).unwrap());
+        assert_eq!(read, [json!({"ttft": 0.5})]);
+        assert!(meta_infos(b"not json").is_empty());
+    }
 }

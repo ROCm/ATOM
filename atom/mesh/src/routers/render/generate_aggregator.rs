@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
@@ -12,7 +13,10 @@ use crate::{
     routers::{
         comm::error,
         prepare::response_context::{ProtocolRequest, ResponseContext},
-        render::logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        render::{
+            atom_usage::MetaInfoTiming,
+            logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
+        },
         token_handle::{
             engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
@@ -47,6 +51,7 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
 
     let mut stop_decoder = ctx.stop_decoder;
     let mut result_array = Vec::with_capacity(completes.len());
+    let mut metas = Vec::with_capacity(completes.len());
 
     for complete in &completes {
         let (token_ids, finish_reason, matched_stop, usage, meta, output_lp, input_lp) =
@@ -113,6 +118,7 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
             (None, None)
         };
 
+        metas.push(meta);
         result_array.push(GenerateResponse {
             text: decoded_text,
             output_ids: token_ids.clone(),
@@ -134,7 +140,37 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
         });
     }
 
-    axum::Json(result_array).into_response()
+    if metas.iter().all(|meta| meta.timing.is_none()) {
+        return axum::Json(result_array).into_response();
+    }
+    // An ATOM worker's: each sequence's timing, which /v1/completions reports.
+    let timed: Vec<_> = (result_array.iter().zip(metas))
+        .map(|(response, meta)| TimedResponse {
+            text: &response.text,
+            output_ids: &response.output_ids,
+            meta_info: TimedMetaInfo {
+                info: &response.meta_info,
+                timing: meta.timing.map(MetaInfoTiming::from),
+            },
+        })
+        .collect();
+    axum::Json(timed).into_response()
+}
+
+/// A `GenerateResponse` serialized with its sequence's timing added to `meta_info`.
+#[derive(Serialize)]
+struct TimedResponse<'a> {
+    text: &'a str,
+    output_ids: &'a [u32],
+    meta_info: TimedMetaInfo<'a>,
+}
+
+#[derive(Serialize)]
+struct TimedMetaInfo<'a> {
+    #[serde(flatten)]
+    info: &'a GenerateMetaInfo,
+    #[serde(flatten)]
+    timing: Option<MetaInfoTiming>,
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {

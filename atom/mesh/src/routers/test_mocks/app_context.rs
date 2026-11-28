@@ -65,3 +65,11 @@ fn app_context_configured(
         .expect("test AppContext must build");
     Arc::new(ctx)
 }
+
+/// Records that `model`'s tokenizer was loaded with an ATOM worker's `template`, as
+/// registration does, so its chats pass the readiness check.
+pub(crate) fn loaded_with_worker_template(ctx: &AppContext, model: &str, template: &str) {
+    let id = ctx.tokenizer_registry.get_by_name(model).unwrap().id;
+    let templates = &ctx.tokenizer_inline_templates;
+    templates.write().insert(id, template.to_string());
+}

@@ -11,7 +11,7 @@ use tracing::error;
 use crate::{
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{FunctionCallResponse, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+        common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage},
     },
     reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult},
     routers::{
@@ -40,7 +40,7 @@ use crate::{
         traits::Tokenizer,
     },
     tool_parser::{
-        registry::{check_tool_parser_availability, get_tool_parser},
+        registry::{check_tool_parser_availability, create_reply_tool_parser, get_tool_parser},
         ParserFactory as ToolParserFactory,
     },
 };
@@ -50,7 +50,7 @@ pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
         Ok((resp, None)) => axum::Json(resp).into_response(),
         Ok((resp, Some(atom))) => match atom.extend_response(&resp, atom_usage::CHAT) {
             Ok(value) => axum::Json(value).into_response(),
-            Err(e) => error::internal_error("serialize_failed", e.to_string()),
+            Err(e) => error::internal_error("serialization_failed", e.to_string()),
         },
         Err(resp) => resp,
     }
@@ -60,10 +60,10 @@ pub async fn process_typed(
     stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
-    aggregate(stream, ctx).await.map(|(resp, _)| resp)
+    Ok(aggregate(stream, ctx).await?.0)
 }
 
-/// The response, and ATOM's usage additions where the backend has them.
+/// The response, and ATOM's usage additions where an ATOM worker answered.
 async fn aggregate(
     stream: TokenHandle,
     ctx: ResponseContext,
@@ -136,6 +136,7 @@ async fn aggregate(
             ctx.configured_tool_parser.as_deref(),
             ctx.configured_reasoning_parser.as_deref(),
             ctx.prompt_opener.as_deref(),
+            ctx.reads_as_atom,
         )
         .await;
         match res {
@@ -195,6 +196,7 @@ async fn process_choice(
     configured_tool_parser: Option<&str>,
     configured_reasoning_parser: Option<&str>,
     prompt_opener: Option<&str>,
+    reads_as_atom: bool,
 ) -> Result<ChatChoice, String> {
     let (token_ids, finish_reason, matched_stop, logprobs) = match complete {
         TokenChunk::Complete {
@@ -259,12 +261,14 @@ async fn process_choice(
     );
 
     if tool_choice_enabled && chat_request.tools.is_some() {
-        let used_json_schema = match &chat_request.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        };
+        // ATOM derives a forced choice's format itself: the model's own tool syntax.
+        let used_json_schema = !reads_as_atom
+            && match &chat_request.tool_choice {
+                Some(ToolChoice::Function { .. }) => true,
+                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+                _ => false,
+            };
 
         if used_json_schema {
             (tool_calls, processed_text) = parse_json_schema_response(
@@ -275,14 +279,41 @@ async fn process_choice(
             );
         } else if tool_available {
             if let Some(factory) = tool_parser_factory {
-                (tool_calls, processed_text) = parse_tool_calls(
-                    factory,
-                    configured_tool_parser,
-                    &processed_text,
-                    &chat_request.model,
-                    history_tool_calls_count,
-                )
-                .await;
+                let tools = chat_request.tools.as_deref().unwrap_or_default();
+                // An ATOM reply cut off inside a native call is read with the call closed.
+                let closers = match reads_as_atom {
+                    true => {
+                        let model = &chat_request.model;
+                        let (text, configured) = (&processed_text, configured_tool_parser);
+                        cut_off_call_closers(factory, configured, model, text, tools).await
+                    }
+                    false => None,
+                };
+                let closed = closers.map(|closers| format!("{processed_text}{closers}"));
+                let parse = |text: String| {
+                    let model = &chat_request.model;
+                    async move {
+                        let parsed = parse_tool_calls(
+                            factory,
+                            configured_tool_parser,
+                            &text,
+                            tools,
+                            model,
+                            history_tool_calls_count,
+                            reads_as_atom,
+                        )
+                        .await;
+                        parsed
+                    }
+                };
+                let mut parsed = None;
+                if let Some(closed) = closed {
+                    parsed = Some(parse(closed).await).filter(|(calls, _)| calls.is_some());
+                }
+                (tool_calls, processed_text) = match parsed {
+                    Some(parsed) => parsed,
+                    None => parse(std::mem::take(&mut processed_text)).await,
+                };
             }
         }
     }
@@ -307,11 +338,8 @@ async fn process_choice(
         index,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: if processed_text.is_empty() {
-                None
-            } else {
-                Some(processed_text)
-            },
+            // ATOM's HTTP chat answers "" when empty; None leaves the key out.
+            content: (reads_as_atom || !processed_text.is_empty()).then_some(processed_text),
             tool_calls,
             reasoning_content: reasoning_text,
         },
@@ -326,13 +354,11 @@ async fn process_choice(
 /// refuses a longer text outright.
 const ONE_SHOT_MAX_BYTES: usize = 65536;
 
-/// A whole reply (`text`, decoded as `pieces`) split into content and
-/// reasoning; `opener`, the prompt's own, is read before it.
-///
-/// A reply the one-shot parse would refuse goes through a fresh parser's
-/// streaming path a piece at a time, as a streamed reply does, so its buffer
-/// holds only what one piece leaves pending; the result is trimmed as the
-/// one-shot parse trims it.
+/// Fed last to the piece-by-piece parse: no reasoning delimiter starts with it.
+pub(super) const RELEASE: &str = "\0";
+
+/// A whole reply (`text`, decoded as `pieces`) split into content and reasoning, the
+/// prompt's `opener` read first; one over the one-shot limit is parsed piece by piece.
 async fn split_reasoning(
     factory: &ReasoningParserFactory,
     configured: Option<&str>,
@@ -355,7 +381,9 @@ async fn split_reasoning(
     let Some(mut parser) = create_reasoning_parser(factory, configured, model) else {
         return Ok(ParserResult::normal(text.to_string()));
     };
-    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), false);
+    // A parser that starts inside reasoning (deepseek_r1) has entered it before any piece.
+    let entered = parser.is_in_reasoning();
+    let (mut normal, mut reasoning, mut entered) = (String::new(), String::new(), entered);
     for piece in opener.into_iter().chain(pieces.iter().map(String::as_str)) {
         let result = parser
             .parse_reasoning_streaming_incremental(piece)
@@ -364,33 +392,55 @@ async fn split_reasoning(
         normal.push_str(&result.normal_text);
         reasoning.push_str(&result.reasoning_text);
     }
+    // A last piece that could start a delimiter ("<", "</") is held back; a character
+    // no delimiter starts with releases it, and is dropped again.
+    let held = parser
+        .parse_reasoning_streaming_incremental(RELEASE)
+        .map_err(|e| e.to_string())?;
+    normal.push_str(held.normal_text.trim_end_matches(RELEASE));
+    reasoning.push_str(held.reasoning_text.trim_end_matches(RELEASE));
     if !entered {
         // The one-shot parse hands back a reply without reasoning untouched.
         return Ok(ParserResult::normal(text.to_string()));
     }
-    // It trims the text after the opener, and then what follows the closer.
-    let reasoning = if parser.is_in_reasoning() {
-        reasoning.trim()
-    } else {
-        reasoning.trim_start()
-    };
-    Ok(ParserResult::new(
-        normal.trim().to_string(),
-        reasoning.to_string(),
-    ))
+    // Byte for byte what the model wrote minus the delimiters, as ATOM's HTTP chat
+    // splits it, and as the streamed reply carries it.
+    Ok(ParserResult::new(normal, reasoning))
+}
+
+/// The markup that closes the call `text` was cut off in, as the reply's own tool parser
+/// reads one at end of input (`ToolParser::end_of_input_closers`), when there is one.
+async fn cut_off_call_closers(
+    factory: &ToolParserFactory,
+    configured: Option<&str>,
+    model: &str,
+    text: &str,
+    tools: &[Tool],
+) -> Option<String> {
+    let mut parser = create_reply_tool_parser(factory, configured, model, true)?;
+    parser.parse_incremental(text, tools).await.ok()?;
+    parser.end_of_input_closers(tools)
 }
 
 async fn parse_tool_calls(
     factory: &ToolParserFactory,
     configured: Option<&str>,
     text: &str,
+    tools: &[Tool],
     model: &str,
     history_tool_calls_count: usize,
+    reads_as_atom: bool,
 ) -> (Option<Vec<ToolCall>>, String) {
-    let pooled = get_tool_parser(factory, configured, model);
+    // An ATOM worker's reply is read by a parser of its own, set to read it as ATOM's.
+    let own = reads_as_atom.then(|| create_reply_tool_parser(factory, configured, model, true));
+    let pooled = match own.flatten() {
+        Some(parser) => Arc::new(tokio::sync::Mutex::new(parser)),
+        None => get_tool_parser(factory, configured, model),
+    };
     let result = {
         let parser = pooled.lock().await;
-        parser.parse_complete(text).await
+        // The declared schemas type each argument, as the streamed reply's parser has them.
+        parser.parse_complete_with_tools(text, tools).await
     };
     match result {
         Ok((normal_text, parsed)) => {
@@ -503,11 +553,26 @@ mod split_reasoning_tests {
     }
 
     async fn split(parts: &[&str], opener: Option<&str>) -> ParserResult {
+        split_by("qwen3", parts, opener).await
+    }
+
+    async fn split_by(parser: &str, parts: &[&str], opener: Option<&str>) -> ParserResult {
         let factory = ReasoningParserFactory::new();
         let text = parts.concat();
-        split_reasoning(&factory, Some("qwen3"), "m", &pieces(parts), &text, opener)
+        split_reasoning(&factory, Some(parser), "m", &pieces(parts), &text, opener)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_closing_an_empty_implicit_reasoning_block_drops_the_marker() {
+        // deepseek_r1 starts inside reasoning: its first piece closes an empty block.
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let answer = "a".repeat(len);
+            let result = split_by("deepseek_r1", &["</think>", &answer], None).await;
+            assert!(result.reasoning_text.is_empty(), "len {len}");
+            assert_eq!(result.normal_text, answer, "len {len}");
+        }
     }
 
     #[tokio::test]
@@ -531,5 +596,27 @@ mod split_reasoning_tests {
         // Without the opener the same reply has no reasoning to find.
         let result = split(&["plain", "</think>", "Done."], None).await;
         assert!(result.reasoning_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_keeps_its_answer_s_whitespace() {
+        let thought = "z".repeat(ONE_SHOT_MAX_BYTES + 1000);
+        let result = split(&["<think>", &thought, "</think>", "    print(1)\n"], None).await;
+        assert_eq!(result.reasoning_text, thought);
+        assert_eq!(result.normal_text, "    print(1)\n");
+    }
+
+    #[tokio::test]
+    async fn a_reply_ending_in_a_delimiter_s_first_characters_keeps_them() {
+        for len in [100, ONE_SHOT_MAX_BYTES + 1000] {
+            let thought = "z".repeat(len);
+            // Generation ended inside reasoning, then after it, on a lone "<" or "</".
+            let result = split(&["<think>", &thought, "<"], None).await;
+            assert_eq!(result.reasoning_text, format!("{thought}<"), "len {len}");
+            assert!(result.normal_text.is_empty(), "len {len}");
+            let result = split(&["<think>", &thought, "</think>", "3 ", "</"], None).await;
+            assert_eq!(result.reasoning_text, thought, "len {len}");
+            assert_eq!(result.normal_text, "3 </", "len {len}");
+        }
     }
 }

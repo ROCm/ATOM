@@ -8,7 +8,7 @@ use tracing::debug;
 
 use super::{
     completion_adapter::{
-        completion_to_generate, wrap_generate_response_as_completion,
+        completion_to_generate, without_logprobs, wrap_generate_response_as_completion,
         wrap_streaming_generate_as_completion,
     },
     pipeline::Pipeline,
@@ -16,7 +16,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
+    core::{is_retryable_status, RetryExecutor, RuntimeType, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, MeshMetrics},
     protocols::{
         chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -29,7 +29,8 @@ use crate::{
             handlers as responses_handlers,
             retrieve::{cancel_response_impl, get_response_impl},
         },
-        prepare, RouterTrait, SentChatBody,
+        prepare::{self, inference::ParsedInference},
+        RouterTrait, SentChatBody,
     },
 };
 
@@ -51,25 +52,28 @@ impl GrpcRouter {
             return Err("gRPC router requires tool parser factory".to_string());
         }
 
-        let worker_registry = ctx.worker_registry.clone();
-        let pipeline = Pipeline::new_regular(worker_registry.clone(), ctx.policy_registry.clone());
-        let app_context = ctx.clone();
+        let pipeline =
+            Pipeline::new_regular(ctx.worker_registry.clone(), ctx.policy_registry.clone());
+        Ok(Self::with_pipeline(ctx, pipeline))
+    }
 
+    /// The router over `pipeline`; `new` gives it the pipeline over `ctx`'s registries.
+    pub(super) fn with_pipeline(ctx: &Arc<AppContext>, pipeline: Pipeline) -> Self {
         let responses_context = ResponsesContext::new(
             Arc::new(pipeline.clone()),
-            app_context.clone(),
+            ctx.clone(),
             ctx.response_storage.clone(),
             ctx.conversation_storage.clone(),
             ctx.conversation_item_storage.clone(),
         );
 
-        Ok(GrpcRouter {
-            worker_registry,
+        GrpcRouter {
+            worker_registry: ctx.worker_registry.clone(),
             pipeline,
-            app_context,
+            app_context: ctx.clone(),
             responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
-        })
+        }
     }
 
     /// Route a chat, its prompt rendered from its body as `sent` where the
@@ -189,6 +193,49 @@ impl GrpcRouter {
     }
 }
 
+/// Whether `model_id` has an ATOM gRPC worker; those serve neither media nor Responses.
+pub(super) fn atom_serves(workers: &WorkerRegistry, model_id: Option<&str>) -> bool {
+    model_id.is_some_and(|model| {
+        let workers = workers.get_by_model(model);
+        workers
+            .iter()
+            .any(|worker| worker.metadata().runtime_type == RuntimeType::Atom)
+    })
+}
+
+/// Why an ATOM gRPC worker of `model_id` cannot serve the chat `body`, if it cannot.
+pub(super) fn atom_chat_refusal(
+    workers: &WorkerRegistry,
+    body: &ChatCompletionRequest,
+    model_id: Option<&str>,
+) -> Option<Response> {
+    if !atom_serves(workers, model_id) {
+        return None;
+    }
+    if ParsedInference::chat_carries_media(body) {
+        return Some(media_refused());
+    }
+    // top_logprobs needs logprobs
+    body.logprobs.then(logprobs_refused)
+}
+
+/// ATOM gRPC workers take token ids alone, so a request's media would be dropped.
+pub(super) fn media_refused() -> Response {
+    error::bad_request(
+        "unsupported_media",
+        "ATOM gRPC workers serve no image, video, audio or embedding input",
+    )
+}
+
+/// ATOM gRPC workers return no logprobs yet; /v1/completions keeps its null, as
+/// ATOM's HTTP route answers it.
+pub(super) fn logprobs_refused() -> Response {
+    error::bad_request(
+        "unsupported_logprobs",
+        "ATOM gRPC workers return no logprobs",
+    )
+}
+
 impl std::fmt::Debug for GrpcRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stats = self.worker_registry.stats();
@@ -210,6 +257,14 @@ impl RouterTrait for GrpcRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if atom_serves(&self.worker_registry, model_id) {
+            if ParsedInference::generate_carries_media(body) {
+                return media_refused();
+            }
+            if body.return_logprob == Some(true) {
+                return logprobs_refused();
+            }
+        }
         self.route_generate_impl(headers, body, model_id).await
     }
 
@@ -228,6 +283,9 @@ impl RouterTrait for GrpcRouter {
         sent: Option<SentChatBody>,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
         self.route_chat_impl(headers, body, model_id, sent).await
     }
 
@@ -237,6 +295,9 @@ impl RouterTrait for GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if let Some(refused) = atom_chat_refusal(&self.worker_registry, body, model_id) {
+            return refused;
+        }
         self.route_chat_impl(headers, body, model_id, None).await
     }
 
@@ -247,6 +308,7 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         let synthetic = match completion_to_generate(body) {
+            Ok(g) if atom_serves(&self.worker_registry, model_id) => without_logprobs(g),
             Ok(g) => g,
             Err(msg) => return error::bad_request("completion_unsupported_field", msg),
         };
@@ -275,6 +337,12 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        if atom_serves(&self.worker_registry, model_id) {
+            return error::not_implemented(
+                "unsupported_api",
+                "Responses requires an HTTP backend for ATOM workers",
+            );
+        }
         self.route_responses_impl(headers, body, model_id).await
     }
 

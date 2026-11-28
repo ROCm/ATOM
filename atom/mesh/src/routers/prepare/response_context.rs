@@ -42,23 +42,28 @@ pub struct ResponseContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub configured_tool_parser: Option<String>,
     pub configured_reasoning_parser: Option<String>,
-    /// The channel opener the rendered prompt ends on (see
-    /// [`prompt_opener`]): the reply starts inside that block, with no opener
-    /// of its own, so the reasoning parser reads this one before the reply.
-    /// `<think>`, or a model's own when its prompt is rendered outside the
-    /// router (Kimi-K3's `<|open|>think<|sep|>` / `<|open|>response<|sep|>`).
+    /// The channel opener the rendered prompt ends on (see [`prompt_opener`]), or the one
+    /// the model's replies start after unprompted (DeepSeek-R1's): the reply starts inside
+    /// that block, with no opener of its own, so the reasoning parser reads this one before
+    /// the reply. Kept only for a reply read as ATOM's.
     pub prompt_opener: Option<String>,
+    /// The reply is ATOM's (`AtomOutput`), and takes the shape ATOM's HTTP chat gives
+    /// it: content "" when empty, and a stream opened by an empty assistant delta.
+    pub reads_as_atom: bool,
+    /// ATOM puts this model's streamed usage on the finish chunk, not a usage-only chunk
+    /// after it (GetModelInfo's `usage_on_finish`).
+    pub usage_on_finish: bool,
 }
 
 /// The opener a `<think>` template's generation prompt can end on.
 pub const THINK_OPEN: &str = "<think>";
 
-/// The Python server's `prompt_starts_in_reasoning` for the `<think>`
-/// dialect: the opener, when the prompt (trailing whitespace aside) ends
-/// with it.
-pub fn prompt_opener(prompt: &str) -> Option<String> {
-    prompt
-        .trim_end()
-        .ends_with(THINK_OPEN)
-        .then(|| THINK_OPEN.to_string())
+/// ATOM's `prompt_starts_in_reasoning`: the marker among `markers` (GetModelInfo's
+/// `reasoning_open_markers`) that the prompt, trailing whitespace aside, ends with.
+pub fn prompt_opener(prompt: &str, markers: &[String]) -> Option<String> {
+    let prompt = prompt.trim_end();
+    markers
+        .iter()
+        .find(|marker| !marker.is_empty() && prompt.ends_with(marker.as_str()))
+        .cloned()
 }

@@ -18,7 +18,7 @@ use crate::{
     routers::{
         prepare::response_context::{ProtocolRequest, ResponseContext},
         render::{
-            chat_streaming::process_chunk_tokens,
+            chat_streaming::{process_chunk_tokens, unstreamed},
             logprob_conversion::{input_logprobs_to_generate, output_logprobs_to_generate},
         },
         token_handle::{
@@ -99,9 +99,12 @@ async fn run_generate_stream(
     let mut weight_version: Option<String> = None;
     let mut prompt_tokens_seen: u32 = 0;
     let mut accumulated_output_logprobs: Option<Vec<Vec<Option<f64>>>> = None;
+    let mut consumed = 0;
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
+        // A Complete's ids past the partials' (SGLang's and vLLM's carries them all).
+        let rest = unstreamed(&chunk, consumed, usize::MAX);
         match chunk {
             TokenChunk::Partial {
                 token_ids,
@@ -111,9 +114,9 @@ async fn run_generate_stream(
                     first_token_time = Some(Instant::now());
                 }
                 completion_tokens += token_ids.len() as u32;
+                consumed += token_ids.len();
 
-                // Decoded across chunks, as the unstreamed text is: a character
-                // split between two steps comes out whole.
+                // Decoded across chunks, as the unary text is, so a chunk boundary loses no text.
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
                 accumulated_text.push_str(&chunk_text);
 
@@ -144,7 +147,6 @@ async fn run_generate_stream(
                     .map_err(|_| "send chunk".to_string())?;
             }
             TokenChunk::Complete {
-                token_ids,
                 finish_reason,
                 usage,
                 meta,
@@ -152,10 +154,15 @@ async fn run_generate_stream(
                 input_logprobs,
                 ..
             } => {
+                let rest = rest.unwrap_or_default();
+                let (text, _stopped) = process_chunk_tokens(&mut stop_decoder, &rest);
+                accumulated_text.push_str(&text);
                 if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
                     accumulated_text.push_str(&text);
                 }
                 prompt_tokens_seen = usage.prompt_tokens;
+                // The terminal count covers the ids the Complete carried past the partials.
+                completion_tokens = usage.completion_tokens;
                 if weight_version.is_none() {
                     weight_version = meta.weight_version.clone();
                 }
@@ -176,15 +183,9 @@ async fn run_generate_stream(
                 let e2e_latency = start_time.elapsed().as_secs_f64();
                 let fr = finish_reason_to_generate(&finish_reason, usage.completion_tokens);
 
-                let last = token_ids
-                    .last()
-                    .copied()
-                    .map(|t| vec![t])
-                    .unwrap_or_default();
-
                 let response = json!({
                     "text": accumulated_text.clone(),
-                    "output_ids": last,
+                    "output_ids": rest,
                     "meta_info": {
                         "id": index_id,
                         "finish_reason": fr,

@@ -142,6 +142,23 @@ pub(crate) async fn estimated<F: Future>(attempts: F) -> (F::Output, Option<f64>
         .await
 }
 
+/// Drops the estimate of `pool`'s selection unless the request is sent to the selected
+/// `worker`: DP ranks keep separate KV caches, so a remapped request loses it.
+pub(crate) fn keep_estimate_for(pool: &'static str, worker: &Arc<dyn Worker>) {
+    if !computes_prompt(pool) {
+        return;
+    }
+    let _ = ESTIMATE.try_with(|estimate| {
+        let mut estimate = estimate.borrow_mut();
+        if estimate
+            .as_ref()
+            .is_some_and(|e| e.worker.url() != worker.url())
+        {
+            *estimate = None;
+        }
+    });
+}
+
 fn computes_prompt(pool: &'static str) -> bool {
     matches!(
         pool,
@@ -170,18 +187,7 @@ pub(crate) fn record_estimate(
 /// Records the worker a request is sent to after rank mapping.
 pub(crate) fn record_dispatch(pool: &'static str, worker: &Arc<dyn Worker>) {
     MeshMetrics::record_selected_dp_rank(pool, worker.base_url(), worker.dp_rank());
-    if computes_prompt(pool) {
-        let _ = ESTIMATE.try_with(|estimate| {
-            let mut estimate = estimate.borrow_mut();
-            // DP ranks keep separate KV caches, so a remapped request loses the estimate.
-            if estimate
-                .as_ref()
-                .is_some_and(|e| e.worker.url() != worker.url())
-            {
-                *estimate = None;
-            }
-        });
-    }
+    keep_estimate_for(pool, worker);
     let _ = TRACE.try_with(|trace| {
         let selections = trace.selections.borrow();
         let selection = selections.iter().find(|selection| selection.pool == pool);

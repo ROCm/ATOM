@@ -964,9 +964,15 @@ impl IngressRouting {
     ) -> Result<String, IngressError> {
         let Some(controls) = self.chat_controls.read().get(&entry.id).copied() else {
             let messages = routed.map_or(&chat.messages, |routed| &routed.messages);
-            return render_chat_messages(chat, messages, &*entry.tokenizer, &template_kwargs(chat))
-                .map(|rendered| rendered.text)
-                .map_err(IngressError::invalid);
+            return render_chat_messages(
+                chat,
+                messages,
+                &*entry.tokenizer,
+                &template_kwargs(chat),
+                None,
+            )
+            .map(|rendered| rendered.text)
+            .map_err(IngressError::invalid);
         };
         let mut sent: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(body).map_err(|e| IngressError::invalid(e.to_string()))?;

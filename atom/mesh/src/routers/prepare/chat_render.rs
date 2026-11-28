@@ -322,7 +322,7 @@ pub(crate) fn render_chat(
 ) -> Result<(String, Option<String>), String> {
     let Some(controls) = controls else {
         let text = process_chat_messages(chat, tokenizer)?.text;
-        let opener = prompt_opener(&text);
+        let opener = prompt_opener(&text, &[THINK_OPEN.to_string()]);
         return Ok((text, opener));
     };
     let typed;

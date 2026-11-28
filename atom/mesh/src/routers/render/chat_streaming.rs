@@ -3,6 +3,7 @@
 
 use std::{io, sync::Arc, time::Instant};
 
+use super::chat_aggregator::RELEASE;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -18,7 +19,9 @@ use crate::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
         common::{FunctionCallDelta, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage},
     },
-    reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
+    reasoning_parser::{
+        ParseError, ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser,
+    },
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
@@ -31,13 +34,13 @@ use crate::{
         },
         token_handle::{
             engine_error::EngineError,
-            token_chunk::{FinishReason, MatchedStop, TokenChunk},
+            token_chunk::{FinishReason, MatchedStop, TokenChunk, TokenLogprobs},
             token_handle::TokenHandle,
         },
     },
     tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
     tool_parser::{
-        registry::{check_tool_parser_availability, create_tool_parser},
+        registry::{check_tool_parser_availability, create_reply_tool_parser},
         ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
     },
 };
@@ -111,13 +114,16 @@ async fn run_chat_stream(
             })
             .unwrap_or(false);
 
-    let used_json_schema = match tool_choice {
-        Some(ToolChoice::Function { .. }) => true,
-        Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-        Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-        _ => false,
-    };
-    let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+    // ATOM derives a forced choice's format itself: the model's own tool syntax.
+    let used_json_schema = !ctx.reads_as_atom
+        && match tool_choice {
+            Some(ToolChoice::Function { .. }) => true,
+            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
+            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
+            _ => false,
+        };
+    let is_specific_function =
+        used_json_schema && matches!(tool_choice, Some(ToolChoice::Function { .. }));
 
     let tool_parser_available = tools.is_some()
         && ctx
@@ -141,8 +147,14 @@ async fn run_chat_stream(
     let mut matched_stop_value: Option<Value> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
-    let mut atom_extras: Option<AtomUsage> = None;
+    let mut atom_usage: Option<AtomUsage> = None;
     let mut has_tool_call = false;
+    let include_usage = stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage.unwrap_or(false));
+    // As ATOM's HTTP chat_finish_frames: on the finish chunk, or a usage-only chunk after it.
+    let usage_on_finish = ctx.usage_on_finish;
+    let null_usage = usage_on_finish && include_usage;
 
     let mut stop_decoder = ctx.stop_decoder;
 
@@ -150,8 +162,43 @@ async fn run_chat_stream(
     let mut tool_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>> = None;
     let mut sse_buffer = Vec::with_capacity(512);
 
-    while let Some(item) = stream.next().await {
-        let chunk = item.map_err(engine_error_to_string)?;
+    let mut consumed = 0;
+    let mut held: Option<TokenChunk> = None;
+    loop {
+        let chunk = match held.take() {
+            Some(chunk) => chunk,
+            None => match stream.next().await {
+                Some(item) => item.map_err(engine_error_to_string)?,
+                None => break,
+            },
+        };
+        // A Complete's ids past the partials' are streamed first, as one more partial.
+        // In pieces, so no delta outgrows the reasoning and tool parsers' buffers.
+        let chunk = match unstreamed(&chunk, consumed, SUFFIX_PIECE) {
+            Some(rest) => {
+                let logprobs = unstreamed_logprobs(&chunk, consumed, rest.len());
+                held = Some(chunk);
+                TokenChunk::Partial {
+                    token_ids: rest,
+                    logprobs,
+                }
+            }
+            None => chunk,
+        };
+        if let TokenChunk::Partial { token_ids, .. } = &chunk {
+            consumed += token_ids.len();
+        }
+        if is_first && ctx.reads_as_atom {
+            // On the engine's first message, text or not, as ATOM's HTTP chat opens its stream.
+            let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content(INDEX, "assistant", "")
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &first_chunk, null_usage);
+            send_bytes(tx, &sse_buffer, "first chunk")?;
+            is_first = false;
+        }
         match chunk {
             TokenChunk::Partial {
                 token_ids,
@@ -162,7 +209,8 @@ async fn run_chat_stream(
                 }
                 completion_tokens += token_ids.len() as u32;
 
-                let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
+                let (pieces, _stopped) = process_chunk_pieces(&mut stop_decoder, &token_ids);
+                let chunk_text = pieces.concat();
                 if chunk_text.is_empty() {
                     continue;
                 }
@@ -173,7 +221,7 @@ async fn run_chat_stream(
                         .add_choice_role(INDEX, "assistant")
                         .maybe_system_fingerprint(system_fingerprint.clone())
                         .build();
-                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                    format_sse_chunk_into(&mut sse_buffer, &first_chunk, null_usage);
                     send_bytes(tx, &sse_buffer, "first chunk")?;
                     is_first = false;
                 }
@@ -182,7 +230,7 @@ async fn run_chat_stream(
 
                 let in_reasoning = if reasoning_parser_available {
                     let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
-                        &delta,
+                        &pieces,
                         &mut reasoning_parser,
                         ctx.reasoning_parser_factory.as_ref(),
                         ctx.configured_reasoning_parser.as_deref(),
@@ -194,7 +242,7 @@ async fn run_chat_stream(
                     )
                     .await;
                     if let Some(c) = reasoning_chunk {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
                         send_bytes(tx, &sse_buffer, "reasoning chunk")?;
                     }
                     delta = normal_text;
@@ -235,12 +283,13 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            ctx.reads_as_atom,
                         )
                         .await
                     };
 
                     for c in tool_chunks {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
                         send_bytes(tx, &sse_buffer, "tool call chunk")?;
                     }
                     continue;
@@ -255,7 +304,7 @@ async fn run_chat_stream(
                         .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
                         .maybe_system_fingerprint(system_fingerprint.clone())
                         .build();
-                    format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+                    format_sse_chunk_into(&mut sse_buffer, &content_chunk, null_usage);
                     send_bytes(tx, &sse_buffer, "content chunk")?;
                 }
             }
@@ -266,21 +315,84 @@ async fn run_chat_stream(
                 meta,
                 ..
             } => {
-                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                    if !text.is_empty() {
-                        let chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                            .created(created)
-                            .add_choice_content(INDEX, "assistant", text)
-                            .maybe_system_fingerprint(system_fingerprint.clone())
-                            .build();
-                        format_sse_chunk_into(&mut sse_buffer, &chunk);
-                        send_bytes(tx, &sse_buffer, "flushed content")?;
+                let mut text = match stop_decoder.flush() {
+                    SequenceDecoderOutput::Text(text) => text,
+                    _ => String::new(),
+                };
+                // The reasoning parser holds a last "<" or "</"; RELEASE frees it.
+                if let Some(parser) = &reasoning_parser {
+                    let released = parser
+                        .lock()
+                        .await
+                        .parse_reasoning_streaming_incremental(&format!("{text}{RELEASE}"));
+                    if let Ok(released) = released {
+                        let reasoning = released.reasoning_text.trim_end_matches(RELEASE);
+                        if !reasoning.is_empty() {
+                            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                                .created(created)
+                                .add_choice_reasoning(INDEX, reasoning.to_string())
+                                .maybe_system_fingerprint(system_fingerprint.clone())
+                                .build();
+                            format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                            send_bytes(tx, &sse_buffer, "released reasoning")?;
+                        }
+                        text = released.normal_text.trim_end_matches(RELEASE).to_string();
                     }
+                }
+                let tool_choice_enabled =
+                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
+                // Read as a partial's text is: it may end a tool call.
+                if !text.is_empty()
+                    && tool_choice_enabled
+                    && tools.is_some()
+                    && (tool_parser_available || used_json_schema)
+                {
+                    let tool_chunks = if is_specific_function {
+                        process_specific_function_stream(
+                            &text,
+                            &mut has_tool_call,
+                            tool_choice,
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                        )
+                    } else {
+                        process_tool_calls_stream(
+                            &text,
+                            &mut tool_parser,
+                            &mut has_tool_call,
+                            tools.as_ref().unwrap(),
+                            ctx.tool_parser_factory.as_ref(),
+                            ctx.configured_tool_parser.as_deref(),
+                            request_id,
+                            model,
+                            created,
+                            system_fingerprint.as_deref(),
+                            history_tool_calls_count,
+                            used_json_schema,
+                            ctx.reads_as_atom,
+                        )
+                        .await
+                    };
+                    for c in tool_chunks {
+                        format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
+                        send_bytes(tx, &sse_buffer, "flushed tool call chunk")?;
+                    }
+                } else if !text.is_empty() {
+                    let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                        .created(created)
+                        .add_choice_content(INDEX, "assistant", text)
+                        .maybe_system_fingerprint(system_fingerprint.clone())
+                        .build();
+                    format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                    send_bytes(tx, &sse_buffer, "flushed content")?;
                 }
 
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
-                atom_extras = AtomUsage::of([&meta]);
+                atom_usage = AtomUsage::of([&meta]);
                 finish_reason_str = Some(finish_reason_to_string(&finish_reason));
                 matched_stop_value = matched_stop.map(|ms| match ms {
                     MatchedStop::Str(s) => Value::String(s),
@@ -293,6 +405,47 @@ async fn run_chat_stream(
         }
     }
 
+    // An ATOM reply cut off inside a native call has the call closed, as its parser
+    // reads one at end of input.
+    if let (Some(parser), Some(tools), true) = (&tool_parser, tools.as_ref(), ctx.reads_as_atom) {
+        let closers = parser.lock().await.end_of_input_closers(tools);
+        if let Some(closers) = closers {
+            let chunks = process_tool_calls_stream(
+                &closers,
+                &mut tool_parser,
+                &mut has_tool_call,
+                tools,
+                ctx.tool_parser_factory.as_ref(),
+                ctx.configured_tool_parser.as_deref(),
+                request_id,
+                model,
+                created,
+                system_fingerprint.as_deref(),
+                history_tool_calls_count,
+                used_json_schema,
+                ctx.reads_as_atom,
+            )
+            .await;
+            for c in chunks {
+                format_sse_chunk_into(&mut sse_buffer, &c, null_usage);
+                send_bytes(tx, &sse_buffer, "cut-off tool call")?;
+            }
+        }
+        // What it held as the start of a call that never came is text.
+        let held = match &tool_parser {
+            Some(parser) => parser.lock().await.end_of_input_text(),
+            None => String::new(),
+        };
+        if !held.is_empty() {
+            let chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content(INDEX, "assistant", held)
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+            send_bytes(tx, &sse_buffer, "held text")?;
+        }
+    }
     if let Some(parser) = &tool_parser {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {
@@ -315,14 +468,25 @@ async fn run_chat_stream(
                     .add_choice_tool_call_delta(INDEX, delta)
                     .maybe_system_fingerprint(system_fingerprint.clone())
                     .build();
-                let s = serde_json::to_string(&chunk)
-                    .map_err(|e| format!("Failed to serialize tool chunk: {}", e))?;
-                tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
-                    .map_err(|_| "send unstreamed".to_string())?;
+                format_sse_chunk_into(&mut sse_buffer, &chunk, null_usage);
+                send_bytes(tx, &sse_buffer, "unstreamed tool args")?;
             }
         }
     }
 
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        completion_tokens_details: None,
+    };
+    // The chunk that carries the usage, with ATOM's fields (the cached tokens) for ATOM's.
+    let with_usage = |chunk: &ChatCompletionStreamResponse| match &atom_usage {
+        None => serde_json::to_string(chunk),
+        Some(atom) => atom
+            .extend_response(chunk, atom_usage::CHAT_STREAM)
+            .map(|v| v.to_string()),
+    };
     if let Some(fr) = finish_reason_str {
         let final_fr = if has_tool_call && fr == "stop" {
             "tool_calls".to_string()
@@ -333,35 +497,26 @@ async fn run_chat_stream(
             .created(created)
             .add_choice_finish_reason(INDEX, final_fr, matched_stop_value)
             .maybe_system_fingerprint(system_fingerprint.clone())
+            .maybe_usage(usage_on_finish.then(|| usage.clone()))
             .build();
-        let s = serde_json::to_string(&chunk)
-            .map_err(|e| format!("Failed to serialize finish chunk: {}", e))?;
+        let s =
+            with_usage(&chunk).map_err(|e| format!("Failed to serialize finish chunk: {}", e))?;
         tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
             .map_err(|_| "send finish".to_string())?;
     }
 
-    if let Some(opts) = stream_options {
-        if opts.include_usage.unwrap_or(false) {
-            let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                .created(created)
-                .usage(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    completion_tokens_details: None,
-                })
-                .maybe_system_fingerprint(system_fingerprint.clone())
-                .build();
-            let s = match &atom_extras {
-                None => serde_json::to_string(&usage_chunk),
-                Some(atom) => atom
-                    .extend_response(&usage_chunk, atom_usage::CHAT_STREAM)
-                    .map(|v| v.to_string()),
-            }
+    // ATOM's HTTP chat ends every stream with its usage chunk unless the finish chunk
+    // carries it (`chat_finish_frames`); SGLang's and vLLM's only under include_usage.
+    if !usage_on_finish && (include_usage || atom_usage.is_some()) {
+        let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+            .created(created)
+            .usage(usage)
+            .maybe_system_fingerprint(system_fingerprint.clone())
+            .build();
+        let s = with_usage(&usage_chunk)
             .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
-            tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
-                .map_err(|_| "send usage".to_string())?;
-        }
+        tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
+            .map_err(|_| "send usage".to_string())?;
     }
 
     stream.mark_completed();
@@ -380,11 +535,70 @@ async fn run_chat_stream(
     Ok(())
 }
 
+/// The most ids of a Complete's unstreamed suffix sent as one delta.
+const SUFFIX_PIECE: usize = 256;
+
+/// The first `limit` ids of a Complete past the `consumed` its partials streamed:
+/// SGLang's and vLLM's carry every output id, ATOM's streamed one none.
+pub(super) fn unstreamed(chunk: &TokenChunk, consumed: usize, limit: usize) -> Option<Vec<u32>> {
+    match chunk {
+        TokenChunk::Complete { token_ids, .. } => token_ids
+            .get(consumed..)
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| rest[..rest.len().min(limit)].to_vec()),
+        TokenChunk::Partial { .. } => None,
+    }
+}
+
+/// The logprobs of those ids, where the Complete's cover every id it carries.
+pub(super) fn unstreamed_logprobs(
+    chunk: &TokenChunk,
+    consumed: usize,
+    limit: usize,
+) -> Option<TokenLogprobs> {
+    match chunk {
+        TokenChunk::Complete {
+            token_ids,
+            logprobs: Some(logprobs),
+            ..
+        } if logprobs.items.len() == token_ids.len() => Some(TokenLogprobs {
+            items: logprobs
+                .items
+                .get(consumed..)?
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect(),
+        }),
+        _ => None,
+    }
+}
+
 pub(super) fn process_chunk_tokens(
     stop_decoder: &mut StopSequenceDecoder,
     token_ids: &[u32],
 ) -> (String, bool) {
-    let mut chunk_text = String::new();
+    let mut text = String::new();
+    let stopped = decode_chunk(stop_decoder, token_ids, |piece| text.push_str(&piece));
+    (text, stopped)
+}
+
+/// `process_chunk_tokens`, the text in the pieces the decoder wrote it in.
+fn process_chunk_pieces(
+    stop_decoder: &mut StopSequenceDecoder,
+    token_ids: &[u32],
+) -> (Vec<String>, bool) {
+    let mut pieces = Vec::new();
+    let stopped = decode_chunk(stop_decoder, token_ids, |piece| pieces.push(piece));
+    (pieces, stopped)
+}
+
+/// Decodes `token_ids`, handing each piece of text to `write`; whether a stop was hit.
+fn decode_chunk(
+    stop_decoder: &mut StopSequenceDecoder,
+    token_ids: &[u32],
+    mut write: impl FnMut(String),
+) -> bool {
     for &token_id in token_ids {
         match stop_decoder.process_token(token_id).unwrap_or_else(|e| {
             debug!(
@@ -393,21 +607,21 @@ pub(super) fn process_chunk_tokens(
             );
             SequenceDecoderOutput::Held
         }) {
-            SequenceDecoderOutput::Text(t) => chunk_text.push_str(&t),
+            SequenceDecoderOutput::Text(t) => write(t),
             SequenceDecoderOutput::StoppedWithText(t) => {
-                chunk_text.push_str(&t);
-                return (chunk_text, true);
+                write(t);
+                return true;
             }
-            SequenceDecoderOutput::Stopped => return (chunk_text, true),
+            SequenceDecoderOutput::Stopped => return true,
             SequenceDecoderOutput::Held => {}
         }
     }
-    (chunk_text, false)
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn process_reasoning_stream(
-    delta: &str,
+    pieces: &[String],
     reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
     factory: Option<&ReasoningParserFactory>,
     configured: Option<&str>,
@@ -420,7 +634,7 @@ async fn process_reasoning_stream(
     if reasoning_parser.is_none() {
         let factory = match factory {
             Some(f) => f,
-            None => return (delta.to_string(), None, false),
+            None => return (pieces.concat(), None, false),
         };
         match create_reasoning_parser(factory, configured, model) {
             Some(mut p) => {
@@ -431,17 +645,26 @@ async fn process_reasoning_stream(
                 }
                 *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
             }
-            None => return (delta.to_string(), None, false),
+            None => return (pieces.concat(), None, false),
         }
     }
 
     let parser_arc = match reasoning_parser {
         Some(p) => p.clone(),
-        None => return (delta.to_string(), None, false),
+        None => return (pieces.concat(), None, false),
     };
     let (parse_result, in_reasoning) = {
         let mut parser = parser_arc.lock().await;
-        let result = parser.parse_reasoning_streaming_incremental(delta);
+        // Piece by piece, as the decoder wrote them: the parser holds a delimiter's start
+        // only when that is all it is given, so a piece of ids may end inside one.
+        let result = pieces
+            .iter()
+            .try_fold(ParserResult::default(), |mut read, piece| {
+                let piece = parser.parse_reasoning_streaming_incremental(piece)?;
+                read.normal_text.push_str(&piece.normal_text);
+                read.reasoning_text.push_str(&piece.reasoning_text);
+                Ok::<_, ParseError>(read)
+            });
         let in_reasoning = parser.is_in_reasoning();
         (result, in_reasoning)
     };
@@ -465,7 +688,7 @@ async fn process_reasoning_stream(
         }
         Err(e) => {
             warn!("Reasoning parsing error: {}", e);
-            (delta.to_string(), None, false)
+            (pieces.concat(), None, false)
         }
     }
 }
@@ -521,6 +744,7 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    reads_as_atom: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -533,7 +757,7 @@ async fn process_tool_calls_stream(
         } else {
             configured
         };
-        match create_tool_parser(factory, configured, model) {
+        match create_reply_tool_parser(factory, configured, model, reads_as_atom) {
             Some(p) => *tool_parser = Some(Arc::new(tokio::sync::Mutex::new(p))),
             None => return chunks,
         }
@@ -592,10 +816,23 @@ async fn process_tool_calls_stream(
 }
 
 #[inline]
-fn format_sse_chunk_into(buffer: &mut Vec<u8>, chunk: &ChatCompletionStreamResponse) {
+fn format_sse_chunk_into(
+    buffer: &mut Vec<u8>,
+    chunk: &ChatCompletionStreamResponse,
+    null_usage: bool,
+) {
     buffer.clear();
     buffer.extend_from_slice(b"data: ");
-    if let Err(e) = serde_json::to_writer(&mut *buffer, chunk) {
+    let written = if null_usage && chunk.usage.is_none() {
+        // ATOM's `usage: null` on each chunk before the one carrying the usage.
+        serde_json::to_value(chunk).and_then(|mut value| {
+            value["usage"] = Value::Null;
+            serde_json::to_writer(&mut *buffer, &value)
+        })
+    } else {
+        serde_json::to_writer(&mut *buffer, chunk)
+    };
+    if let Err(e) = written {
         error!("Failed to serialize SSE chunk: {}", e);
         buffer.clear();
         buffer.extend_from_slice(b"data: ");
