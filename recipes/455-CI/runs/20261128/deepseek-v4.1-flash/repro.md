@@ -30,5 +30,5 @@
   if m == 0:
       return _into(out, inp_view.new_empty((*A.shape[:-1], n), dtype=otype))
   ```
-  With it mounted into this image: GSM8K completes and MLPerf Endpoint c64 reaches 2270.56 tok/s/GPU, 10962/10962 samples successful (verification only, not in perf.csv). An aiter PR with this change and an `op_tests/test_gemm_a16w16.py -t zero` case is prepared, not opened yet.
+  With it mounted into this image: GSM8K completes and MLPerf Endpoint c64 reaches 2270.56 tok/s/GPU, 10962/10962 samples successful (verification only, not in perf.csv). Fix PR: https://github.com/ROCm/aiter/pull/8879 (this change and an `op_tests/test_gemm_a16w16.py -t zero` case).
 - PRs searched (ROCm/aiter): `hgemm M=0`, `TDM empty`, `tdm hgemm`, `zero rows gemm`; none about this.
