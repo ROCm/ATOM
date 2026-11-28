@@ -56,6 +56,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     _request_meta_type = LMCacheReqMeta
     _step_meta_type = LMCacheOffloadMetadata
 
+    # The tier hit the last admission spent, `(sid, tier-hit memo entry)`: a
+    # take-back (`cancel_preadmission`) gives it back. A class default, as the
+    # memo's: hand-built schedulers reach the admission without `__init__`.
+    _admission_spent_hit: tuple | None = None
+
     def __init__(
         self,
         config,
@@ -529,9 +534,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         connector like a normal admission, then hands the request back to
         `waiting` when the outcome is not a load it can park for. Cancel its
         pending load -- which also gives the lookup's read locks back
-        (`_clear_pending_load`) -- and drop the held answer, so the next
-        admission asks the tier again instead of reusing an answer nothing pins
-        (`_ensure_lookup_pin` trusts a held answer).
+        (`_clear_pending_load`) -- and drop the held answer, which
+        `_ensure_lookup_pin` trusts as pinned and nothing pins now.
+
+        The tier hit the admission spent is given back, as an unpinned memo
+        (`_restore_spent_tier_hit`): the next admission answers from it, and
+        `_ensure_lookup_pin` asks the tier again before anything is read. A
+        fresh lookup there would still be in flight when the request reaches
+        its turn: it would be admitted with no hit, and save again the whole
+        prefix the tier holds.
         """
         sid = str(seq.id)
         self._undo_admission_save_frontier(seq, sid)
@@ -540,6 +551,21 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
+        self._restore_spent_tier_hit(seq, sid)
+
+    def _restore_spent_tier_hit(self, seq, sid: str) -> None:
+        """Put back the tier hit the withdrawn admission of `seq` spent
+        (`update_state_after_alloc`), with the memo budget it had left. A
+        non-answer is not put back: the next admission asks again, as before."""
+        spent, self._admission_spent_hit = self._admission_spent_hit, None
+        if spent is None or spent[0] != sid:
+            return
+        ref, hit, budget = spent[1]
+        if hit is None or ref() is not seq:
+            return
+        if self._tier_hit_memo is None:
+            self._tier_hit_memo = {}
+        self._tier_hit_memo[sid] = (ref, hit, budget)
 
     def _undo_admission_save_frontier(self, seq, sid: str) -> None:
         """Give the save tracker back what `update_state_after_alloc` set for an
@@ -665,7 +691,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
         # Admitted: the frontier moves and the load spec is dispatched, so a
-        # remembered hit has been spent. A preempted request asks again.
+        # remembered hit has been spent. A preempted request asks again; a
+        # take-back gets it back (`cancel_preadmission`).
+        spent = (self._tier_hit_memo or {}).get(sid)
+        self._admission_spent_hit = None if spent is None else (sid, spent)
         self._forget_tier_hit(sid)
         ls = self._load_specs.get(sid) if self._do_load else None
         logger.debug(

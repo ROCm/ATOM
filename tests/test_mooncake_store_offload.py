@@ -2381,6 +2381,45 @@ def test_a_fresh_hit_is_loaded_in_the_same_build_with_async_renewal(
         scheduler.close()
 
 
+@pytest.mark.parametrize("hbm", [40, 0], ids=["hbm-holds-it", "hbm-lost-it"])
+def test_a_taken_back_admission_leaves_its_store_hit_to_the_next(
+    cluster, scheduler_clock, hbm
+):
+    """An early load admits a request once its lookup answers, and takes the
+    admission back when HBM already holds the hit. At its turn the request is
+    admitted while a lookup asked then would still be in flight: it answers
+    from the hit the early admission spent, so the prefix the Store holds is
+    not saved again, and a part HBM no longer holds is loaded once the Store
+    is asked again before the get (jgong5/ATOM#3854)."""
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 0
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = _seq(61, 41)
+    # The early load: answered, admitted, and HBM turns out to hold the hit.
+    assert _completed_match(scheduler, seq) == (40, True)
+    seq.num_cached_tokens = 40
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq) is False
+    scheduler.cancel_preadmission(seq)
+    seq.num_cached_tokens = 0
+    # Its turn, with no lookup able to answer.
+    [store] = cluster.stores
+    asked = sum(1 for call in store.calls if call[0] == "exists")
+    pool = scheduler._lookup_client.backend._pools[0]
+    pool.paused_until = scheduler_clock.now + 10.0
+    assert scheduler.get_num_new_matched_tokens(seq) == (40, True)
+    pool.paused_until = 0.0
+    seq.num_cached_tokens = hbm
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler._save_tracker["61"][1] == 40
+    parks = scheduler.should_park_for_load_after_alloc(seq)
+    loads = [r for r in scheduler.build_connector_meta().requests if r.load_spec]
+    assert parks is (hbm == 0)
+    assert [r.load_spec.lmcache_cached_tokens for r in loads] == ([] if hbm else [40])
+    again = sum(1 for call in store.calls if call[0] == "exists") - asked
+    assert again == (0 if hbm else 1)
+
+
 def _await_store_lookup(offload, seq):
     """Establish an actual asynchronous answer before testing load/forward work."""
     offload.offer_lookups([seq])
