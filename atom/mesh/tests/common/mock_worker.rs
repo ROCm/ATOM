@@ -1307,3 +1307,117 @@ impl Default for MockWorkerConfig {
         }
     }
 }
+
+// --- ATOM servers in their E/P/D roles ---
+
+/// What a stub ATOM encode server answers to a chat request.
+#[derive(Clone, Copy, Debug)]
+pub enum EncodeReply {
+    /// A choice-less completion carrying `ec_transfer_params`.
+    Params,
+    /// This status alone, as when E's embedding pool is full.
+    Status(u16),
+    /// `Params`, after this many milliseconds.
+    DelayMs(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AtomRole {
+    Prefill,
+    Decode,
+    Encode(EncodeReply),
+}
+
+/// The `ec_transfer_params` a stub encode server answers with: an
+/// `atom.ec_transfer` handle, which ATOMesh forwards without reading.
+pub fn stub_ec_transfer_params() -> serde_json::Value {
+    json!({"transport": "mooncake", "key": 42, "rows": 16, "dtype": "bfloat16",
+           "mooncake": {"session": "e0:17001", "address": 4096, "length": 2048,
+                        "generation": 3, "slot": 1024}})
+}
+
+/// The `cache_seed` a stub prefill server returns in its `kv_transfer_params`.
+pub const STUB_PREFILL_CACHE_SEED: u64 = 7;
+
+/// A stub ATOM server in one role, recording every chat body it receives.
+pub struct AtomRoleStub {
+    pub url: String,
+    pub chat_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AtomRoleStub {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+pub async fn start_atom_role(role: AtomRole) -> AtomRoleStub {
+    let chat_bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorder = chat_bodies.clone();
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"object": "list", "data": [{"id": "test-model"}]})) }),
+        )
+        .route(
+            "/kv_transfer_info",
+            get(|| async { Json(json!({"tp_size": 1, "kv_role": "kv_producer"})) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    let stream = body["stream"] == true;
+                    recorder.lock().unwrap().push(body);
+                    atom_role_reply(role, stream).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    AtomRoleStub {
+        url,
+        chat_bodies,
+        server,
+    }
+}
+
+async fn atom_role_reply(role: AtomRole, stream: bool) -> Response {
+    let message = json!({"index": 0, "message": {"role": "assistant", "content": "red"},
+                         "finish_reason": "stop"});
+    let mut completion = json!({"id": "chatcmpl-stub", "object": "chat.completion",
+                                "model": "test-model", "choices": [message]});
+    match role {
+        AtomRole::Encode(EncodeReply::Status(code)) => {
+            StatusCode::from_u16(code).unwrap().into_response()
+        }
+        AtomRole::Encode(reply) => {
+            if let EncodeReply::DelayMs(ms) = reply {
+                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+            }
+            completion["choices"] = json!([]);
+            completion["ec_transfer_params"] = stub_ec_transfer_params();
+            Json(completion).into_response()
+        }
+        AtomRole::Prefill => {
+            completion["kv_transfer_params"] = json!({"do_remote_decode": true,
+                "cache_seed": STUB_PREFILL_CACHE_SEED, "mrope_position_delta": 0});
+            completion["prompt_token_ids"] = json!([1, 2, 3]);
+            Json(completion).into_response()
+        }
+        AtomRole::Decode if stream => {
+            let chunk = json!({"id": "chatcmpl-stub", "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": "red"}}]});
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        }
+        AtomRole::Decode => Json(completion).into_response(),
+    }
+}

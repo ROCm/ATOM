@@ -327,6 +327,10 @@ pub struct CliArgs {
     )]
     pub encode_policy: Option<String>,
 
+    /// Seconds to wait for an encode worker before prefill encodes the media itself
+    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
+    pub encode_timeout_secs: u64,
+
     /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks; idx2idx
     /// selects decode first and prefill among the workers on its rank
     #[arg(long, default_value = "none", value_parser = ["none", "idx2idx"], help_heading = "PD Disaggregation")]
@@ -676,6 +680,7 @@ impl CliArgs {
             .mode(mode)
             .encode_urls(self.encode.clone())
             .encode_policy(self.encode_policy.as_ref().map(|p| self.parse_policy(p)))
+            .encode_timeout_secs(self.encode_timeout_secs)
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .atom_pd_concurrent(self.atom_pd_concurrent)
@@ -1012,6 +1017,8 @@ mod tests {
             "http://encode2:8000",
             "--encode-policy",
             "round_robin",
+            "--encode-timeout-secs",
+            "7",
         ])
         .expect("--encode and --encode-policy should parse");
         let args = match cli.command {
@@ -1029,6 +1036,7 @@ mod tests {
             config.encode_policy,
             Some(PolicyConfig::RoundRobin)
         ));
+        assert_eq!(config.encode_timeout_secs, 7);
 
         let regular = CliArgs {
             encode: vec!["http://encode1:8000".to_string()],
@@ -1067,6 +1075,7 @@ impl Default for CliArgs {
             decode_policy: None,
             encode: Vec::new(),
             encode_policy: None,
+            encode_timeout_secs: 30,
             atom_pd_rank_mapping_policy: "none".to_string(),
             atom_pd_concurrent: false,
             worker_startup_timeout_secs: 1800,

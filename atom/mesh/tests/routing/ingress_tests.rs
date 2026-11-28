@@ -503,6 +503,47 @@ async fn idx2idx_planners_select_prefill_on_the_decode_rank() {
 }
 
 #[tokio::test]
+async fn pd_candidates_exclude_encode_workers() {
+    let (_pool, app, _router) =
+        preparation_test_router(true, crate::config::PolicyConfig::RoundRobin).await;
+    for (port, worker_type) in [
+        (
+            1,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ),
+        (2, WorkerType::Decode),
+        (3, WorkerType::Encode),
+    ] {
+        app.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                .model_id("m")
+                .worker_type(worker_type)
+                .build(),
+        ));
+    }
+    let body = json!({"model":"m","messages":[{"role":"user","content":"test"}]});
+    let request = InferenceEnvelope::parse(
+        "/v1/chat/completions".parse().unwrap(),
+        json_headers(),
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        &app,
+    )
+    .await
+    .unwrap();
+    let candidates = IngressRouting::new(&app)
+        .candidates(&request.metadata, false)
+        .unwrap();
+    let mut types: Vec<_> = candidates
+        .iter()
+        .map(|w| w.worker_type().as_metric_label())
+        .collect();
+    types.sort();
+    assert_eq!(types, ["decode", "prefill"]);
+}
+
+#[tokio::test]
 async fn regular_cached_tokens_are_reconciled_against_the_estimate() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();

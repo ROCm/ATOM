@@ -237,6 +237,9 @@ pick their policy with `--encode-policy` (defaults to `--policy`):
 Startup waits for encode workers like prefill and decode, and `/workers`
 counts them as `encode_count`.
 
+For an image chat request, prefill waits at most `--encode-timeout-secs`
+(default 30) for an encode worker, then encodes the media itself.
+
 With `--backend atom`, `--atom-pd-concurrent` (default off) sends a relay-mode
 `/v1/chat/completions` request to decode while prefill runs, as a two-line body
 on `/v1/pd/late_kv/chat/completions`: the request, then prefill's

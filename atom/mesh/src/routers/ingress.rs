@@ -848,7 +848,13 @@ impl IngressRouting {
         workers.retain(|w| matches!(w.connection_mode(), ConnectionMode::Http));
         let configured = !workers.is_empty();
         workers.retain(|w| {
-            endpoint.supports(w.as_ref()) && matches!(w.worker_type(), WorkerType::Regular) != pd
+            let in_topology = match w.worker_type() {
+                WorkerType::Regular => !pd,
+                WorkerType::Prefill { .. } | WorkerType::Decode => pd,
+                // Encode workers serve only the encode step, never a request
+                WorkerType::Encode => false,
+            };
+            in_topology && endpoint.supports(w.as_ref())
         });
         if configured && workers.is_empty() {
             return Err(IngressError::new(

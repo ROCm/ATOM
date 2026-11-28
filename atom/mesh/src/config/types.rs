@@ -78,6 +78,9 @@ pub struct RouterConfig {
     /// Encode worker policy (falls back to `policy` when unset)
     #[serde(default)]
     pub encode_policy: Option<PolicyConfig>,
+    /// How long P waits for E before encoding the media itself
+    #[serde(default = "default_encode_timeout_secs")]
+    pub encode_timeout_secs: u64,
     /// ATOM PD relay: open D's leg together with P's and send P's KV metadata
     /// late (`--atom-pd-concurrent`; D needs `ATOM_PD_LATE_KV=1`).
     #[serde(default)]
@@ -517,6 +520,10 @@ fn default_mooncake_admin_port() -> u16 {
     9003
 }
 
+fn default_encode_timeout_secs() -> u64 {
+    30
+}
+
 fn default_kv_storage_deadline_ms() -> u64 {
     3
 }
@@ -562,6 +569,7 @@ impl Default for RouterConfig {
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             encode_urls: vec![],
+            encode_timeout_secs: default_encode_timeout_secs(),
             encode_policy: None,
             atom_pd_concurrent: false,
             model_path: None,
