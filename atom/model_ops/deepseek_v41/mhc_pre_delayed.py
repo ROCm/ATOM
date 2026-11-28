@@ -30,6 +30,7 @@ from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
 
+from atom.model_ops.deepseek_v41 import mhc_rows_gfx942
 from atom.utils import envs
 
 # Archs with HIP Mega-MHC kernels.
@@ -203,6 +204,32 @@ def v41_mhc_pre_delayed(
     *outer, hc_mult, hidden = residual.shape
     rows = residual.numel() // (hc_mult * hidden)
     with_post = sublayer_output is not None
+    if mhc_rows_gfx942.applies(
+        residual, hc_fn, norm_weight, sublayer_output, w_preshuffle_bf16, fuse_quant
+    ):
+        new_residual, normed, pre, post, comb = mhc_rows_gfx942.pre_delayed_rows(
+            residual,
+            pre_mix,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            post_mult=post_mult,
+            norm_eps=norm_eps,
+            sublayer_output=sublayer_output,
+            post_mix=post_mix,
+            combination=combination,
+        )
+        outputs = [
+            normed.view(*outer, hidden),
+            pre.view(*outer, hc_mult),
+            post.view(*outer, hc_mult),
+            comb.view(*outer, hc_mult, hc_mult),
+        ]
+        return [new_residual, *outputs] if with_post else outputs
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
     if fuse_quant and not w_preshuffle_bf16:

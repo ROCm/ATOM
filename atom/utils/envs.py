@@ -529,6 +529,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
+    # gfx942 delayed mHC at prefill row counts on a row kernel, a hipBLASLt GEMM
+    # and a gates kernel (mhc_rows_gfx942.py); 0 keeps the backend above, and
+    # ATOM_DSV41_MHC_BACKEND=triton turns it off too.
+    "ATOM_DSV41_MHC_ROWS": lambda: os.getenv("ATOM_DSV41_MHC_ROWS", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
