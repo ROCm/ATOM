@@ -220,7 +220,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # metadata it cannot serve and no model needs a per-deployment opt-out.
     # P then answers at DP dispatch with chunked-transfer metadata (line 1 of
     # an NDJSON body) and ends the body when the prefill ends (line 2), so the
-    # router keeps P's load guard for the whole prefill. Default 1: a pair the
+    # router keeps P's load guard for the whole prefill. A request dispatched
+    # to a DP rank with more than EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS
+    # (engine_core_mgr) queued is answered after its prefill instead.
+    # Default 1: a pair the
     # router does not ask for keeps the legacy relay on its own; 0 = never
     # offer (legacy relay for every pair).
     "ATOM_PD_EARLY_HANDOFF": lambda: _flag_env("ATOM_PD_EARLY_HANDOFF", "1"),

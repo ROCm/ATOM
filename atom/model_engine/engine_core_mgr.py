@@ -299,6 +299,20 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
     return pickle.dumps(frame)
 
 
+# ATOM_PD_EARLY_HANDOFF: an early request dispatched to a DP rank that already
+# has more prompt tokens than this queued for prefill (`_rank_tokens`, as the
+# dispatch log's `queued_prefill_tokens` shows them: whole prompts, cached
+# prefix included) is answered after its prefill instead (the legacy relay).
+# Once P answers early, D reserves pages and sends its write request at once,
+# and P fails the request if it then waits past the chunked admission
+# deadline (300 s) or, unregistered, past the worker's lookup timeout (60 s).
+# Measured on DeepSeek-V4.1-Flash, P DEP4 (c768/c1024, 1P1D and 2P1D): the
+# measured windows peak at 1.2-3.5M per rank (P99 0.5-1.9M), a cold-start
+# flood at 26-51M; a cold P prefills about 40-170K of these tokens per second
+# per rank, so 6M waits at most about 150 s, half the admission deadline.
+EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS = 6_000_000
+
+
 class CoreManager:
     # Class-level defaults so bare instances built via ``__new__`` (the DP
     # load-balance unit tests) and any subclass that skips ``_init_shared_state``
@@ -318,6 +332,9 @@ class CoreManager:
     # `add_request` records the dispatched DP rank on each request
     # (`Sequence.pd_routed_dp_rank`), which ATOM_PD_EARLY_HANDOFF relies on.
     reports_dp_rank = True
+    # DP ranks on which early handoff currently falls back to the legacy relay
+    # (`_settle_early_handoff`), for its log line.
+    _early_declining_ranks: frozenset[int] = frozenset()
 
     def _init_shared_state(
         self,
@@ -1207,6 +1224,8 @@ class CoreManager:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+            for seq in seqs:
+                self._settle_early_handoff(seq, 0, None)
             self._send_request(0, _add_frame(seqs))
             # The pipeline is one DP rank; D reaches every stage through
             # `remote_pp_size` (ATOM_PD_EARLY_HANDOFF).
@@ -1215,11 +1234,48 @@ class CoreManager:
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
+            for seq in seqs:
+                self._settle_early_handoff(seq, 0, None)
             self._send_request(0, _add_frame(seqs))
             for seq in seqs:
                 seq.pd_routed_dp_rank = 0
         else:
             self._dispatch_to_dp_ranks(seqs)
+
+    def _settle_early_handoff(
+        self, seq: Sequence, dp_rank: int, queued_tokens: int | None
+    ) -> None:
+        """ATOM_PD_EARLY_HANDOFF, before `seq` is pickled for `dp_rank`.
+
+        An early request (the API server gave it legacy parameters to fall
+        back on, `Sequence.pd_legacy_kv_transfer_params`) takes them when the
+        rank already has more than EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS
+        queued for prefill: P answers it after its prefill, exactly as with
+        the flag off, and D reserves nothing while it waits. `queued_tokens`
+        None (no per-rank load is tracked here) keeps the early answer.
+        """
+        # Popped either way: the engine's copy never carries it.
+        legacy = vars(seq).pop("pd_legacy_kv_transfer_params", None)
+        if legacy is None or queued_tokens is None:
+            return
+        declined = queued_tokens > EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS
+        if declined:
+            seq.kv_transfer_params = legacy
+        if declined != (dp_rank in self._early_declining_ranks):
+            self._early_declining_ranks = (
+                self._early_declining_ranks | {dp_rank}
+                if declined
+                else self._early_declining_ranks - {dp_rank}
+            )
+            logger.info(
+                "%s: P/D early handoff on DP rank %d %s (%d prompt tokens queued "
+                "for prefill, limit %d)",
+                self.label,
+                dp_rank,
+                "falls back to the legacy relay" if declined else "answers early again",
+                queued_tokens,
+                EARLY_HANDOFF_MAX_QUEUED_PREFILL_TOKENS,
+            )
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
         """The `prefix_spread` or `share_cache` router, or None.
@@ -1359,6 +1415,10 @@ class CoreManager:
             for seq, hint in zip(seqs, hints):
                 route = self._select_dp_rank_for_seq_locked(seq, hint)
                 dp_rank = route.rank
+                # What the rank has queued ahead of this request.
+                self._settle_early_handoff(
+                    seq, dp_rank, self._rank_tokens[dp_rank] if track_load else None
+                )
                 if track_load:
                     self._charge_seq_load_locked(seq, dp_rank, credit=route.credit)
                     if self._backlog is not None:

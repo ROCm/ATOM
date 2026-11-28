@@ -933,7 +933,9 @@ async def _submit_engine_requests(seqs):
 # answers at DP dispatch: an NDJSON body whose line 1 is the usual prefill
 # response with chunked-transfer metadata and whose line 2 is written when the
 # prefill ends, so the router holds P's load for the whole prefill and sees a
-# P failure after the early answer.
+# P failure after the early answer. A request dispatched to a rank whose
+# prefill queue is too long (`CoreManager._settle_early_handoff`) is answered
+# after its prefill instead, as with the flag off.
 EARLY_HANDOFF_HEADER = "x-atom-pd-early-handoff"
 EARLY_HANDOFF_DONE_KEY = "atom_pd_prefill_done"
 # Wire version of `early_handoff` / `chunked_receive`.
@@ -1186,7 +1188,13 @@ async def generate_async(
         )
 
     early_params = _early_handoff_params(kv_transfer_params)
+    legacy_params = None
     if early_params is not None:
+        # What this leg carries with the flag off (the router asked for early
+        # handoff only through `early_handoff`).
+        legacy_params = {
+            k: v for k, v in kv_transfer_params.items() if k != "early_handoff"
+        }
         kv_transfer_params = early_params
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1195,7 +1203,21 @@ async def generate_async(
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
+    if early_params is not None:
+        # The dispatch swaps these in when the chosen rank's prefill queue is
+        # too long (`CoreManager._settle_early_handoff`).
+        seq.pd_legacy_kv_transfer_params = legacy_params
     await _submit_engine_requests([seq])
+
+    if early_params is not None and (
+        getattr(seq, "kv_transfer_params", None) is legacy_params
+    ):
+        # Declined at dispatch: the legacy relay, answered after the prefill.
+        logger.debug(
+            "PD early handoff: request %s answers after its prefill (queue)",
+            request_id,
+        )
+        early_params = None
 
     if early_params is not None:
         dp_rank = seq.pd_routed_dp_rank
