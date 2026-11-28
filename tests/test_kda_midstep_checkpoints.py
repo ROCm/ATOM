@@ -573,6 +573,7 @@ def test_a_head_ends_on_the_state_a_forward_ending_there_would(k3_modules, heads
         _kda_gate_lower_bound=-5.0,
     )
     stub._run_kda = attn._run_kda.__get__(stub)
+    stub._chunk_kda = attn._chunk_kda.__get__(stub)
 
     def bf16(*shape):
         return torch.randn(1, t, *shape, device=dev, dtype=torch.bfloat16)
