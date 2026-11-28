@@ -10,6 +10,10 @@
       "kimi_k3_runtime": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.93 --disable-radix-cache",
       "glm52_mtp3_runtime": "--enable-return-hidden-states --max-running-requests 256 --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-decode 256 --speculative-algorithm EAGLE --speculative-draft-attention-backend aiter --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
       "minimax_m3_eagle3_runtime": "--trust-remote-code --random-seed 0 --tensor-parallel-size 4 --attention-backend aiter --mem-fraction-static 0.75 --page-size 128 --context-length 32768 --max-running-requests 128 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"vision_tower\",\"multi_modal_projector\",\"patch_merge_mlp\",\"*block_sparse_moe\"]}}' --json-model-override-args '{\"use_index_cache\":true,\"index_topk_freq\":4}' --speculative-algorithm EAGLE3 --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 --speculative-num-steps 3 --speculative-eagle-topk 1 --kv-cache-dtype fp8_e4m3 --disable-radix-cache --decode-log-interval 1",
+      "qwen35_ptpc_common_args": "--trust-remote-code --reasoning-parser qwen3 --tool-call-parser qwen3_coder --chunked-prefill-size 32768 --max-prefill-tokens 32768 --attention-backend aiter --kv-cache-dtype fp8_e4m3",
+      "qwen35_dflash_runtime": "--speculative-algorithm DFLASH --speculative-num-draft-tokens 16 --speculative-draft-attention-backend triton",
+      "qwen38_flash_next_ptpc_runtime": "--trust-remote-code --tensor-parallel-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --max-running-requests 32 --chunked-prefill-size 16384 --mamba-ssm-dtype float32 --watchdog-timeout 1200 --disable-radix-cache --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32",
+      "qwen38_flash_next_mtp3_runtime": "--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
       "qwen38_flash_next_runtime": "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32"
     },
     "env_vars": {
@@ -19,6 +23,8 @@
       "glm52_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nTORCHINDUCTOR_COMPILE_THREADS=128",
       "kimi_k3_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nATOM_LOADER_NUM_THREADS=16\nATOM_SYNC_AFTER_LOAD=1\nATOM_DIST_TIMEOUT_SECONDS=3600\nATOM_USE_TRITON_GEMM=1\nAITER_USE_GROUPED_GEMM=0\nATOM_USE_TRITON_MOE=0\nAITER_FLYDSL_FORCE=1\nAITER_FORCE_GFX1250=0\nATOM_MLA_PAGE_SIZE=1\nATOM_USE_UNIFIED_ATTN=1\nATOM_FORCE_ATTN_TRITON=1",
       "qwen_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+      "qwen35_ptpc_env": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nSGLANG_USE_AITER=1\nAITER_MOE_PADDING_SIZE=64\nSGLANG_USE_IPC_POOL_HANDLE_CACHE=1\nTVM_FFI_DISABLE_TORCH_C_DLPACK=1",
+      "qwen38_flash_next_ptpc_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=64\nATOM_QWEN4_EXP_SP_SDMA=1\nLD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1",
       "qwen38_flash_next_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nSGLANG_USE_AITER=1\nSGLANG_AITER_KV_CACHE_LAYOUT=nhd\nAITER_LOG_LEVEL=WARNING\nAITER_MOE_PADDING_SIZE=128",
       "minimax_m3_common": "SGLANG_DEFAULT_SERVER_ARGS=\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models",
       "minimax_m3_eagle3_common": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST=1"
@@ -296,6 +302,114 @@
         "8192x1024": [4, 8, 16, 32]
       },
       "env_vars": "qwen38_flash_next_common"
+    },
+    {
+      "display": "Qwen3.8-Flash-Next-PTPC-FP8 TP2 MI308",
+      "dashboard_model": "Qwen3.8-Flash-Next-PTPC-FP8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "prefix": "qwen3-8-flash-next-ptpc-fp8-tp2-mi308",
+      "extra_args": "qwen38_flash_next_ptpc_runtime",
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "12000,350,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["12000x350"],
+      "supported_concurrency_values_by_pair": {
+        "12000x350": [1]
+      },
+      "env_vars": "qwen38_flash_next_ptpc_common"
+    },
+    {
+      "display": "Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3 MI308",
+      "dashboard_model": "Qwen3.8-Flash-Next-PTPC-FP8-MTP3 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "path": "sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "prefix": "qwen3-8-flash-next-ptpc-fp8-tp2-mtp3-mi308",
+      "extra_args": ["qwen38_flash_next_ptpc_runtime", "qwen38_flash_next_mtp3_runtime"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "12000,350,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["12000x350"],
+      "supported_concurrency_values_by_pair": {
+        "12000x350": [1]
+      },
+      "env_vars": "qwen38_flash_next_ptpc_common"
+    },
+    {
+      "display": "Qwen3.5-35B-A3B-PTPC-FP8 TP4 MI308",
+      "dashboard_model": "Qwen3.5-35B-A3B-PTPC-FP8-tp4 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
+      "path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
+      "prefix": "qwen3-5-35b-a3b-ptpc-fp8-tp4-mi308",
+      "extra_args": ["qwen35_ptpc_common_args", "--tensor-parallel-size 4 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --disable-radix-cache --enable-strict-thinking"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "8000,500,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["8000x500"],
+      "supported_concurrency_values_by_pair": {
+        "8000x500": [1]
+      },
+      "env_vars": ["qwen35_ptpc_env", "AITER_BYPASS_TUNE_CONFIG=1"]
+    },
+    {
+      "display": "Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash MI308",
+      "dashboard_model": "Qwen3.5-35B-A3B-PTPC-FP8-DFlash MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
+      "path": "sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8",
+      "prefix": "qwen3-5-35b-a3b-ptpc-fp8-tp1-dflash-mi308",
+      "extra_args": ["qwen35_ptpc_common_args", "--tensor-parallel-size 1 --mem-fraction-static 0.7 --max-running-requests 32 --cuda-graph-max-bs-decode 32 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64", "qwen35_dflash_runtime", "--speculative-draft-model-path z-lab/Qwen3.5-35B-A3B-DFlash"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "8000,500,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["8000x500"],
+      "supported_concurrency_values_by_pair": {
+        "8000x500": [1]
+      },
+      "env_vars": ["qwen35_ptpc_env", "AITER_BYPASS_TUNE_CONFIG=1", "SGLANG_USE_AITER_UNIFIED_ATTN=1"]
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-PTPC-FP8 TP8 MI308",
+      "dashboard_model": "Qwen3.5-397B-A17B-PTPC-FP8-tp8 MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
+      "path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
+      "prefix": "qwen3-5-397b-a17b-ptpc-fp8-tp8-mi308",
+      "extra_args": ["qwen35_ptpc_common_args", "--tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 3600 --disable-radix-cache"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "8000,500,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["8000x500"],
+      "supported_concurrency_values_by_pair": {
+        "8000x500": [1]
+      },
+      "env_vars": ["qwen35_ptpc_env"]
+    },
+    {
+      "display": "Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash MI308",
+      "dashboard_model": "Qwen3.5-397B-A17B-PTPC-FP8-DFlash MI308",
+      "workload_label": "SGLang-OOB",
+      "source_path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
+      "path": "sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8",
+      "prefix": "qwen3-5-397b-a17b-ptpc-fp8-tp8-dflash-mi308",
+      "extra_args": ["qwen35_ptpc_common_args", "--tensor-parallel-size 8 --mem-fraction-static 0.9 --max-running-requests 128 --cuda-graph-max-bs-decode 128 --watchdog-timeout 1200 --mamba-radix-cache-strategy extra_buffer --page-size 64", "qwen35_dflash_runtime", "--speculative-draft-model-path z-lab/Qwen3.5-397B-A17B-DFlash"],
+      "bench_args": "--num-prompts=128 --num-warmups=10",
+      "nightly_param_lists": "8000,500,1,1.0",
+      "runner": "atom-mi308-8gpu-plugins-benchmark",
+      "nightly_group": "B",
+      "supported_input_output_pairs": ["8000x500"],
+      "supported_concurrency_values_by_pair": {
+        "8000x500": [1]
+      },
+      "env_vars": ["qwen35_ptpc_env", "SGLANG_USE_AITER_UNIFIED_ATTN=1"]
     }
   ]
 }

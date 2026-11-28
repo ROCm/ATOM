@@ -524,6 +524,7 @@ jobs:
           LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions || '0' }}
           LM_EVAL_BATCH_SIZE: ${{ matrix.lm_eval_batch_size || 65 }}
           LM_EVAL_GEN_KWARGS: ${{ matrix.lm_eval_gen_kwargs || '' }}
+          LM_EVAL_LIMIT: ${{ matrix.lm_eval_limit || '' }}
         run: |
           set -euo pipefail
 
@@ -555,6 +556,7 @@ jobs:
             -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
             -e LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
             -e LM_EVAL_GEN_KWARGS="${LM_EVAL_GEN_KWARGS}" \
+            -e LM_EVAL_LIMIT="${LM_EVAL_LIMIT}" \
             "$CONTAINER_NAME" bash -lc '
               (
                 set +e

@@ -62,6 +62,12 @@ on:
           - MI308 Qwen3.5-35B-A3B-FP8 TP1
           - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1
           - MI308 Qwen3.8-Flash-Next-FP8 TP2
+          - MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2
+          - MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3
+          - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP4
+          - MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash
+          - MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8
+          - MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash
           - MI308 DeepSeek-V4-Flash
       docker_image:
         description: "Optional Docker image override."
@@ -686,6 +692,12 @@ jobs:
               "MI308 Qwen3.5-35B-A3B-FP8 TP1": "qwen3-5-35b-a3b-fp8-tp1-mi308",
               "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1": "qwen3-5-35b-a3b-ptpc-fp8-tp1-mi308",
               "MI308 Qwen3.8-Flash-Next-FP8 TP2": "qwen3-8-flash-next-fp8-tp2-mi308",
+              "MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2": "qwen3-8-flash-next-ptpc-fp8-tp2-mi308",
+              "MI308 Qwen3.8-Flash-Next-PTPC-FP8 TP2 MTP3": "qwen3-8-flash-next-ptpc-fp8-tp2-mtp3-mi308",
+              "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP4": "qwen3-5-35b-a3b-ptpc-fp8-tp4-mi308",
+              "MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 DFlash": "qwen3-5-35b-a3b-ptpc-fp8-tp1-dflash-mi308",
+              "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8": "qwen3-5-397b-a17b-ptpc-fp8-tp8-mi308",
+              "MI308 Qwen3.5-397B-A17B-PTPC-FP8 TP8 DFlash": "qwen3-5-397b-a17b-ptpc-fp8-tp8-dflash-mi308",
               "MI308 DeepSeek-V4-Flash": "deepseek-v4-flash-fp8-mi308",
           }
 
@@ -855,6 +867,7 @@ jobs:
         env:
           MODELS_JSON: ${{ needs.load-models.outputs.models_json }}
           PARAMS_JSON: ${{ needs.parse-param-lists.outputs.matrix_json }}
+          INPUT_PARAM_LISTS: ${{ inputs.param_lists || '' }}
         run: |
           python3 - <<'PY'
           import json
@@ -863,6 +876,25 @@ jobs:
 
           models = json.loads(os.environ["MODELS_JSON"])
           params = json.loads(os.environ["PARAMS_JSON"])
+          manual_param_lists = bool(os.environ.get("INPUT_PARAM_LISTS", "").strip())
+
+          def parse_param_lists(text):
+              # Same "isl,osl,concurrency,random_range_ratio;..." format as the
+              # param_lists input.
+              parsed = []
+              for item in text.split(";"):
+                  if not item.strip():
+                      continue
+                  isl, osl, conc, ratio = (field.strip() for field in item.split(","))
+                  parsed.append(
+                      {
+                          "input_length": int(isl),
+                          "output_length": int(osl),
+                          "concurrency": int(conc),
+                          "random_range_ratio": float(ratio),
+                      }
+                  )
+              return parsed
 
           include = []
           for model in models:
@@ -878,7 +910,13 @@ jobs:
               model_params = []
               seen = set()
 
-              for param in params:
+              # A model may pin its own parameter lists for runs without a manual
+              # param_lists input, instead of the shared workload defaults.
+              base_params = params
+              if model.get("nightly_param_lists") and not manual_param_lists:
+                  base_params = parse_param_lists(model["nightly_param_lists"])
+
+              for param in base_params:
                   variants = [param]
 
                   for variant in variants:

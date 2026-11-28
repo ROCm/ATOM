@@ -36,6 +36,7 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 #   LM_EVAL_USE_CHAT_COMPLETIONS
 #   LM_EVAL_BATCH_SIZE
 #   LM_EVAL_GEN_KWARGS
+#   LM_EVAL_LIMIT
 
 TYPE=${1:-launch}
 if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
@@ -62,6 +63,8 @@ LM_EVAL_REQUEST_TIMEOUT=${LM_EVAL_REQUEST_TIMEOUT:-1800}
 LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
 LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
+# Optional: score only the first N examples of the task (lm_eval --limit).
+LM_EVAL_LIMIT=${LM_EVAL_LIMIT:-}
 # Ceiling for the supervised lm_eval run; below the workflow step's 120 min.
 ACCURACY_MAX_MINUTES=${ACCURACY_MAX_MINUTES:-110}
 
@@ -367,6 +370,9 @@ run_accuracy() {
   fi
   if [[ -n "${LM_EVAL_GEN_KWARGS}" ]]; then
     lm_eval_extra_args+=(--gen_kwargs "${LM_EVAL_GEN_KWARGS}")
+  fi
+  if [[ -n "${LM_EVAL_LIMIT}" ]]; then
+    lm_eval_extra_args+=(--limit "${LM_EVAL_LIMIT}")
   fi
 
   # supervise_client.sh stops lm_eval as soon as the server hangs or faults
