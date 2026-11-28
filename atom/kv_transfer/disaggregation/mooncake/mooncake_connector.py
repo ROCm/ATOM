@@ -936,6 +936,8 @@ class _PendingHandoff:
     landing_nonce: int | None = None
     expected: int = 0
     stages: set[int] = field(default_factory=set)
+    # A failure report had started writing, even one a stage check dropped.
+    failed_after_write: bool = False
 
     def fold(self, req_id: ReqId, success: bool, handoff: dict | None) -> bool:
         """Fold one stage's result in; returns whether the receive still holds."""
@@ -1217,7 +1219,8 @@ class MooncakeConnector(KVConnectorBase):
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._chunked_prefills: dict[ReqId, ChunkedPrefill] = {}
         self._chunked_local_ids: dict[ReqId, ReqId] = {}
-        self._retired_chunked_transfers: OrderedDict[ReqId, None] = OrderedDict()
+        # Retired transfer -> whether a reader may have posted a write.
+        self._retired_chunked_transfers: OrderedDict[ReqId, bool] = OrderedDict()
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
         self._pending_handoffs: dict[ReqId, _PendingHandoff] = {}
@@ -1244,8 +1247,10 @@ class MooncakeConnector(KVConnectorBase):
         # producers are never cancelled, so a rank still running (or not yet
         # dispatched) may write the request's pages after the scheduler reuses
         # them. A rank that acknowledged but never answers is bounded by its
-        # write window (see _expire_pending_recvs).
-        self._pending_recv_failed: set[ReqId] = set()
+        # write window (see _expire_pending_recvs). Each maps to whether a
+        # failed rank had started writing: only then, or if a rank went silent
+        # past its window, is the failure held (_complete_recv).
+        self._pending_recv_failed: dict[ReqId, bool] = {}
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
         # Producer ranks that acknowledged a request, and when each one's write
@@ -1852,8 +1857,14 @@ class MooncakeConnector(KVConnectorBase):
                             continue  # A rejected ID reuse cannot cancel its owner.
                         if state is None and meta.prefill_aborted:
                             # Cancellation before admission owns no source blocks.
-                            self._retire_chunked_transfer(meta.transfer_id)
-                            self._chunked_local_ids.pop(req_id, None)
+                            # Registered here, it provably never had one; else unknown.
+                            registered = (
+                                self._chunked_local_ids.pop(req_id, None)
+                                == meta.transfer_id
+                            )
+                            self._retire_chunked_transfer(
+                                meta.transfer_id, started_writes=not registered
+                            )
                             continue
                         if state is None:
                             state = ChunkedPrefill(
@@ -2299,7 +2310,9 @@ class MooncakeConnector(KVConnectorBase):
                         ConnectorCompletion("pd_source_safe", state.req_id, True)
                     )
                     state.cancel()  # Late holders of the object cannot acquire it.
-                    self._retire_chunked_transfer(transfer_id)
+                    self._retire_chunked_transfer(
+                        transfer_id, started_writes=state.started_writes
+                    )
                     del self._chunked_prefills[transfer_id]
                     self._chunked_local_ids.pop(state.req_id, None)
                     self._kv_cache_ready_events.pop(state.req_id, None)
@@ -2778,9 +2791,11 @@ class MooncakeConnector(KVConnectorBase):
             expected_readers=num_consumers_per_producer_rank,
         )
 
-    def _retire_chunked_transfer(self, transfer_id: TransferId) -> None:
+    def _retire_chunked_transfer(
+        self, transfer_id: TransferId, *, started_writes: bool
+    ) -> None:
         """Remember a terminal ID without retaining blocks; caller holds the lock."""
-        self._retired_chunked_transfers[transfer_id] = None
+        self._retired_chunked_transfers[transfer_id] = started_writes
         if len(self._retired_chunked_transfers) > CHUNKED_RETIRED_TRANSFER_LIMIT:
             self._retired_chunked_transfers.popitem(last=False)
 
@@ -2829,8 +2844,11 @@ class MooncakeConnector(KVConnectorBase):
             registered = set(self._chunked_local_ids.values())
             pending = []
             for data, queued_at in self._pending_chunked_requests:
-                if data["transfer_id"] in self._retired_chunked_transfers:
-                    failures.append(data)
+                wrote = self._retired_chunked_transfers.get(data["transfer_id"])
+                if wrote is not None:
+                    # Any request for a retired source, e.g. another D rank's
+                    # first, reports whether any reader of the source wrote.
+                    failures.append((data, wrote))
                     continue
                 state = self._chunked_prefills.get(data["transfer_id"])
                 if state is None or not (state.num_ready_blocks or state.cancelled):
@@ -2842,20 +2860,27 @@ class MooncakeConnector(KVConnectorBase):
                     else:
                         # Only an orphan with no logical P request expires.
                         # Retire it before D can free the advertised allocation.
-                        self._retire_chunked_transfer(data["transfer_id"])
-                        failures.append(data)
+                        self._retire_chunked_transfer(
+                            data["transfer_id"], started_writes=True
+                        )
+                        # A source whose retirement record was evicted looks
+                        # the same, so an unknown history counts as written.
+                        failures.append((data, True))
                     continue
                 try:
                     acquired = self._acquire_chunked_reader(state, data)
                 except (RuntimeError, ValueError):
-                    failures.append(data)
+                    failures.append((data, False))  # Refused: it started no reader.
                 else:
                     if acquired:
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
-        for data in failures:
+        for data, started_writes in failures:
             self._send_executor.submit(
-                self._notify_transfer_result, data, success=False
+                self._notify_transfer_result,
+                data,
+                success=False,
+                started_writes=started_writes,
             )
         for data, state in submissions:
             self._send_executor.submit(self._execute_chunked_transfer, data, state)
@@ -2864,6 +2889,7 @@ class MooncakeConnector(KVConnectorBase):
         self, request_data: dict, state: ChunkedPrefill
     ) -> None:
         """Send an already-claimed source; only the dispatcher admits readers."""
+        started_writes = False
         try:
             # The admission deadline covers waiting for P capacity. Start the
             # write window only once a send worker actually starts this reader.
@@ -2922,6 +2948,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_offset : dst_block_offset + num_chunk_dst_blocks
                 ]
                 request_data["_transfer_dst_offset"] = dst_block_offset
+                started_writes = True
                 if has_slots:
                     ok = self._execute_block_slot_transfer(
                         request_data,
@@ -2955,6 +2982,7 @@ class MooncakeConnector(KVConnectorBase):
                 }
                 # Mutable recurrent/SWA state is sent exactly once, after the
                 # final forward and sampling, including all local PP layers.
+                started_writes = True
                 if not self._execute_block_slot_transfer(
                     request_data,
                     target,
@@ -2971,9 +2999,12 @@ class MooncakeConnector(KVConnectorBase):
             logger.exception(
                 "Chunked KV transfer failed for %s", request_data.get("transfer_id")
             )
-            self._notify_transfer_result(request_data, success=False)
+            self._notify_transfer_result(
+                request_data, success=False, started_writes=started_writes
+            )
         finally:
-            state.release()
+            # Kept past retirement for every later request to this source.
+            state.release(started_writes=started_writes)
 
     def _consumer_region_map(
         self,
@@ -4184,7 +4215,9 @@ class MooncakeConnector(KVConnectorBase):
                 sock.close()
                 raise
 
-    def _notify_transfer_result(self, request_data: dict, *, success: bool) -> None:
+    def _notify_transfer_result(
+        self, request_data: dict, *, success: bool, started_writes: bool = True
+    ) -> None:
         host = request_data.get("notify_host")
         port = request_data.get("notify_port")
         req_id = request_data.get("request_id")
@@ -4197,6 +4230,7 @@ class MooncakeConnector(KVConnectorBase):
             self.pp_rank,
             request_data.get("write_nonce", 0),
             success=success,
+            started_writes=started_writes,
             # None unless the consumer offered landing slots and this stage
             # can land (it has a KV staging pool), so the consumer can tell
             # "landed none" from "cannot land" and take a partition back.
@@ -4218,6 +4252,7 @@ class MooncakeConnector(KVConnectorBase):
         write_nonce: int = 0,
         *,
         success: bool = True,
+        started_writes: bool,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
     ) -> None:
@@ -4228,21 +4263,25 @@ class MooncakeConnector(KVConnectorBase):
         echoed from the write request. The consumer dedups by distinct
         producer rank and validates the nonce, so duplicates are harmless
         (see _record_write_done). ``success=False`` unblocks the consumer
-        without treating the KV as ready.
+        without treating the KV as ready; only a failure carries
+        ``started_writes``, and with False this rank wrote nothing the consumer
+        must wait out.
         """
         path = make_zmq_path("tcp", host, port)
-        notification = msgpack.dumps(
-            {
-                "request_id": req_id,
-                "pp_rank": pp_rank,
-                "tp_rank": self.tp_rank,
-                "write_nonce": write_nonce,
-                "success": success,
-                "landed_slots": landed_slots,
-                "prefill_handoff": handoff,
-            }
+        notification = {
+            "request_id": req_id,
+            "pp_rank": pp_rank,
+            "tp_rank": self.tp_rank,
+            "write_nonce": write_nonce,
+            "success": success,
+            "landed_slots": landed_slots,
+            "prefill_handoff": handoff,
+        }
+        if not success:
+            notification["started_writes"] = started_writes
+        self._send_on_socket(
+            path, [MSG_WRITE_DONE, msgpack.dumps(notification)], repeat=3
         )
-        self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
         logger.debug(
             "[PRODUCER] write-done sent for req %s success=%s", req_id, success
         )
@@ -4272,12 +4311,15 @@ class MooncakeConnector(KVConnectorBase):
                     if msg_type == MSG_WRITE_DONE:
                         try:
                             data = msgpack.loads(parts[2])
+                            success = data.get("success", True)
                             self._record_write_done(
                                 data["request_id"],
                                 data.get("pp_rank", 0),
                                 data.get("tp_rank", 0),
                                 data.get("write_nonce", 0),
-                                success=data.get("success", True),
+                                success=success,
+                                # Only a failure carries it; one without it is dropped.
+                                started_writes=not success and data["started_writes"],
                                 landed_slots=data.get("landed_slots"),
                                 handoff=data.get("prefill_handoff"),
                             )
@@ -4328,6 +4370,7 @@ class MooncakeConnector(KVConnectorBase):
         write_nonce: int = 0,
         *,
         success: bool = True,
+        started_writes: bool,
         landed_slots: list[int] | None = None,
         handoff: dict | None = None,
     ) -> bool:
@@ -4344,13 +4387,15 @@ class MooncakeConnector(KVConnectorBase):
         slot scatter / block fence and marks the request done, or failed if
         any rank reported a failure: an earlier failure would let the
         scheduler reuse pages a rank still running then writes. Returns True
-        when this was that final message.
+        when this was that final message. A failure is held (``_complete_recv``)
+        only if a failed rank reported ``started_writes``, or a rank went silent
+        (below).
 
         A request with MLA landing slots settles in ``LandingReceiver``
         instead: it completes only once its landed slots are scattered too,
         and fails only once every stage ended (``_complete_recv``). Either
         way, ranks that acknowledged and then stay silent past their write
-        window fail it (``_expire_pending_recvs``).
+        window fail it, and that failure is held (``_expire_pending_recvs``).
         """
         landing = self._landing
         if landing is not None:
@@ -4359,16 +4404,23 @@ class MooncakeConnector(KVConnectorBase):
                 if pending is not None and pending.landing_nonce is not None:
                     # Fold the handoff in before the receiver hears of the
                     # stage: a misrouted or repeated one must not count.
-                    if (
-                        pending.landing_nonce != write_nonce
-                        or not 0 <= pp_rank < pending.expected
-                        or pp_rank in pending.stages
-                    ):
+                    if pending.landing_nonce != write_nonce:
+                        return False
+                    # The producer's own report decides the hold: the fold may
+                    # fail a success, and a report dropped below keeps its claim.
+                    started_writes = started_writes and not success
+                    pending.failed_after_write |= started_writes
+                    if not 0 <= pp_rank < pending.expected or pp_rank in pending.stages:
                         return False
                     pending.stages.add(pp_rank)
                     success = pending.fold(req_id, success, handoff)
         if landing is not None and landing.stage_done(
-            req_id, pp_rank, write_nonce, success, landed_slots
+            req_id,
+            pp_rank,
+            write_nonce,
+            success,
+            landed_slots,
+            started_writes=started_writes,
         ):
             return False
         with self._completion_lock:
@@ -4387,6 +4439,9 @@ class MooncakeConnector(KVConnectorBase):
                 return False
             pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
+                if not success and started_writes:
+                    # Kept even if the per-stage dedup below drops this report.
+                    pending_handoff.failed_after_write = True
                 stages = self._pending_recv_stages.setdefault(req_id, set())
                 if not 0 <= pp_rank < expected or any(
                     rank[0] == pp_rank for rank in stages
@@ -4400,7 +4455,11 @@ class MooncakeConnector(KVConnectorBase):
                     return False
                 success = not pending_handoff.failed
             if not success:
-                self._pending_recv_failed.add(req_id)
+                if pending_handoff is not None:
+                    started_writes = pending_handoff.failed_after_write
+                # Non-chunked ranks always claim a write, and a chunked receive
+                # gets here only on its last report, with every claim folded in.
+                self._pending_recv_failed[req_id] = started_writes
             stages = self._pending_recv_stages.setdefault(req_id, set())
             stages.add((pp_rank, tp_rank))
             if len(stages) < expected:
@@ -4420,9 +4479,9 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_acks.pop(req_id, None)
             self._pending_recv_stall_watch.pop(req_id, None)
             failed = req_id in self._pending_recv_failed
-            self._pending_recv_failed.discard(req_id)
+            failed_after_write = failed and self._pending_recv_failed.pop(req_id)
 
-        self._complete_recv(req_id, failed)
+        self._complete_recv(req_id, failed, failed_after_write)
         return True
 
     def _record_write_ack(self, data: dict) -> None:
@@ -4504,7 +4563,7 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected.pop(req_id, None)
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
-                self._pending_recv_failed.discard(req_id)
+                self._pending_recv_failed.pop(req_id, None)
                 self._pending_recv_stall_watch.pop(req_id, None)
         for req_id, waited, reported, expected, unacked in stalled:
             (logger.error if unacked > 0 else logger.warning)(
@@ -4530,25 +4589,27 @@ class MooncakeConnector(KVConnectorBase):
                 reported,
             )
             try:
-                self._complete_recv(req_id, failed=True)
+                # A write the silent rank posted may still land.
+                self._complete_recv(req_id, failed=True, failed_after_write=True)
             except Exception:
                 # The other expired requests still have to be reported.
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
-    def _complete_recv(self, req_id: str, failed: bool) -> None:
+    def _complete_recv(
+        self, req_id: str, failed: bool, failed_after_write: bool = True
+    ) -> None:
         """Publish a finished receive and let stage-0 free its page table.
 
-        A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
-        (``_report_held_failures``): Mooncake gives up on a sync write without
-        cancelling the work it posted, so a failed write may still land in
-        the request's pages, which the scheduler frees once it hears of the
-        failure (it aborts the request). The staging row and stage-0's page
-        table stay held as long.
+        A failure is reported at once, or ``ATOM_PD_FAILED_WRITE_HOLD_S`` later,
+        its pages held, if a failed write may still land (``failed_after_write``).
         """
         with self._completion_lock:
             pending_handoff = self._pending_handoffs.pop(req_id, None)
         if failed:
-            hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
+            if pending_handoff is not None and pending_handoff.failed_after_write:
+                # Also the claim of a report that never reached LandingReceiver.
+                failed_after_write = True
+            hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S if failed_after_write else 0
             if hold_s > 0:
                 with self._completion_lock:
                     self._held_failures[req_id] = time.monotonic() + hold_s

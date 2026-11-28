@@ -271,6 +271,9 @@ class _Request:
     # may yet report holds slots, so its late messages return them.
     reported: bool = False
     stall_logged: bool = False
+    # A failed stage had started writing, or a stage went silent: a write may
+    # still land, so the connector holds the failure (ATOM_PD_FAILED_WRITE_HOLD_S).
+    failed_after_write: bool = False
 
 
 @dataclass
@@ -311,8 +314,8 @@ class LandingReceiver:
     """A decode rank's landing pool, request bookkeeping and scatter thread.
 
     ``send(addr, parts)`` sends a ZMQ message to a prefill stage endpoint;
-    ``finish(req_id, failed)`` reports a request to the connector. Both are
-    called without this object's lock held.
+    ``finish(req_id, failed, failed_after_write=...)`` reports a request to the
+    connector. Both are called without this object's lock held.
     """
 
     def __init__(
@@ -327,7 +330,7 @@ class LandingReceiver:
         region_block_bytes: list[int],
         region_indices: list[int],
         send: Callable[[str, list], None],
-        finish: Callable[[str, bool], None],
+        finish: Callable[..., None],
         table_segments: int,
     ) -> None:
         if not region_indices:
@@ -615,9 +618,11 @@ class LandingReceiver:
         nonce: int,
         success: bool,
         landed_slots: list[int] | None,
+        started_writes: bool,
     ) -> bool:
         """Record a stage's write-done; False if this request is not tracked.
 
+        A failure with ``started_writes`` False wrote nothing that may land.
         ``landed_slots`` lists the slot of every READY the stage sent, by
         ``seq``. A READY that never arrived fails the request, and its slot
         goes back to the stage: the RDMA write finished before the write-done
@@ -639,6 +644,9 @@ class LandingReceiver:
                     "[PD-LANDING] write-done nonce mismatch for req %s", req_id
                 )
                 return True
+            if not success and started_writes:
+                # Kept even if the stage checks below drop this report.
+                request.failed_after_write = True
             stage = request.stages.get(pp_rank)
             if stage is None or stage.done:
                 return True
@@ -709,7 +717,7 @@ class LandingReceiver:
         if lost:
             self._send_credits(stage.stage_addr, list(lost.values()))
         if outcome is not None:
-            self._finish(req_id, outcome)
+            self._finish(req_id, outcome, failed_after_write=request.failed_after_write)
         return True
 
     # -- sweep (main thread) ----------------------------------------------------
@@ -727,7 +735,7 @@ class LandingReceiver:
         stalled: list[tuple[str, float, list[int], list[int]]] = []
         expired: list[tuple[str, list[int]]] = []
         abandoned: list[tuple[str, list[int]]] = []
-        outcomes: list[tuple[str, bool]] = []
+        outcomes: list[tuple[str, bool, bool]] = []
         with self._lock:
             for req_id, request in list(self._requests.items()):
                 if request.expired:
@@ -751,11 +759,12 @@ class LandingReceiver:
                     for s in silent.values()
                 ):
                     request.expired, request.expired_at = True, now
+                    request.failed_after_write = True
                     self._fail_locked(request)
                     expired.append((req_id, list(silent)))
                     outcome = self._settle_locked(req_id, request)
                     if outcome is not None:
-                        outcomes.append((req_id, outcome))
+                        outcomes.append((req_id, outcome, request.failed_after_write))
                 elif (
                     not request.stall_logged and now - request.started_at > _STALL_LOG_S
                 ):
@@ -807,9 +816,9 @@ class LandingReceiver:
                 req_id,
                 silent,
             )
-        for req_id, failed in outcomes:
+        for req_id, failed, held in outcomes:
             try:
-                self._finish(req_id, failed)
+                self._finish(req_id, failed, failed_after_write=held)
             except Exception:
                 # The other requests still have to be reported.
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
@@ -973,7 +982,7 @@ class LandingReceiver:
     def _complete(self, tasks: list[_Task], failed_ids: set[str]) -> None:
         """Release the tasks' pending counts and credits; settle requests."""
         credits: dict[str, list[int]] = {}
-        outcomes: list[tuple[str, bool]] = []
+        outcomes: list[tuple[str, bool, bool]] = []
         with self._lock:
             touched: dict[str, _Request] = {}
             for task in tasks:
@@ -989,12 +998,12 @@ class LandingReceiver:
             for req_id, request in touched.items():
                 outcome = self._settle_locked(req_id, request)
                 if outcome is not None:
-                    outcomes.append((req_id, outcome))
+                    outcomes.append((req_id, outcome, request.failed_after_write))
         for addr, slots in credits.items():
             self._send_credits(addr, slots)
-        for req_id, failed in outcomes:
+        for req_id, failed, held in outcomes:
             try:
-                self._finish(req_id, failed)
+                self._finish(req_id, failed, failed_after_write=held)
             except Exception:
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
 

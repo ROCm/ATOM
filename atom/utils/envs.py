@@ -232,8 +232,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MINIMAX_LANDING": lambda: _flag_env("ATOM_PD_MINIMAX_LANDING", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
-    # failure; a Mooncake prefill keeps a landing slot whose write failed out
-    # of use this long. 0 = release at once.
+    # failure (Mooncake: only if a failed rank started writing, as a
+    # non-chunked rank always reports, or a rank went silent); a Mooncake
+    # prefill keeps a landing slot whose write failed out of use this long.
+    # 0 = release at once.
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),

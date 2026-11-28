@@ -1170,7 +1170,7 @@ def _make_connector(**overrides):
     conn._chunked_local_ids = {}
     conn._received_handoffs = {}
     conn._pending_recv_stages = {}
-    conn._pending_recv_failed = set()
+    conn._pending_recv_failed = {}
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
     conn._pending_recv_stall_watch = {}
@@ -1306,7 +1306,7 @@ def test_write_done_correct_nonce_accepted():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_nonce["r1"] = 4242
-    assert conn._record_write_done("r1", 0, 0, 4242)
+    assert conn._record_write_done("r1", 0, 0, 4242, started_writes=False)
     assert "r1" in conn.done_recving
 
 
@@ -1314,7 +1314,7 @@ def test_write_done_wrong_nonce_rejected():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_nonce["r1"] = 12345
-    assert not conn._record_write_done("r1", 0, 0, 99999)
+    assert not conn._record_write_done("r1", 0, 0, 99999, started_writes=False)
     assert "r1" not in conn.done_recving
     assert "r1" in conn._pending_recv_expected
 
@@ -1324,7 +1324,7 @@ def test_write_done_zero_nonce_skips_validation():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_nonce["r1"] = 0
-    assert conn._record_write_done("r1", 0, 0, 0)
+    assert conn._record_write_done("r1", 0, 0, 0, started_writes=False)
     assert "r1" in conn.done_recving
 
 
@@ -1333,7 +1333,7 @@ def test_write_done_missing_nonce_from_old_producer_rejected():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_nonce["r1"] = 42
-    assert not conn._record_write_done("r1", 0, 0, 0)
+    assert not conn._record_write_done("r1", 0, 0, 0, started_writes=False)
     assert "r1" not in conn.done_recving
 
 
@@ -1341,7 +1341,7 @@ def test_write_done_nonce_cleaned_up_on_completion():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_nonce["r1"] = 777
-    conn._record_write_done("r1", 0, 0, 777)
+    conn._record_write_done("r1", 0, 0, 777, started_writes=False)
     assert "r1" not in conn._pending_recv_nonce
 
 
@@ -1364,7 +1364,7 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_slots["r1"] = (7, 3)
 
-    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert conn._record_write_done("r1", 0, 0, 0, success=False, started_writes=True)
 
     assert conn._staging_slots.free == [3], "staging row was not returned to the pool"
     assert not scattered, "a failed transfer must not scatter its staging row"
@@ -1379,7 +1379,7 @@ def test_failed_write_done_without_a_staging_row_is_a_noop():
     )
     conn = _make_connector(_staging_slots=mc.SlotPool())
     conn._pending_recv_expected["r1"] = 1
-    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert conn._record_write_done("r1", 0, 0, 0, success=False, started_writes=True)
     assert conn._staging_slots.free == []
     assert "r1" in conn.failed_recving
 
@@ -1399,10 +1399,12 @@ def test_failed_write_done_waits_for_every_producer_rank():
         _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
     )
     conn._pending_recv_expected["r1"] = 2
-    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
-    assert not conn._record_write_done("r1", 0, 0, 0, success=False)  # resend
+    for _ in range(2):  # a resend
+        assert not conn._record_write_done(
+            "r1", 0, 0, 0, success=False, started_writes=True
+        )
     assert conn.failed_recving == set() and sent == []
-    assert conn._record_write_done("r1", 1, 0, 0)
+    assert conn._record_write_done("r1", 1, 0, 0, started_writes=False)
     assert conn.failed_recving == {"r1"} and conn.done_recving == set()
     assert sent == [("stage0", mc.MSG_RELEASE)]
     assert not conn._pending_recv_failed
@@ -1426,7 +1428,9 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     for req_id in ("old", "new"):
         conn._pending_recv_expected[req_id] = 2
         conn._pending_recv.add(req_id)
-    assert not conn._record_write_done("old", 1, 0, 0, success=False)
+    assert not conn._record_write_done(
+        "old", 1, 0, 0, success=False, started_writes=True
+    )
     ack = {"request_id": "old", "pp_rank": 0, "tp_rank": 0, "write_window_s": 60}
     conn._record_write_ack(ack)
     conn._record_write_ack({**ack, "request_id": "new"})
@@ -1441,8 +1445,30 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     assert conn._pending_recv == {"new"}
     assert not conn._pending_recv_failed and "old" not in conn._pending_recv_stages
     # The dead stage's write-done, should it ever come, changes nothing.
-    assert not conn._record_write_done("old", 0, 0, 0)
+    assert not conn._record_write_done("old", 0, 0, 0, started_writes=False)
     assert conn.done_recving == set()
+
+
+def test_a_silent_rank_holds_a_failure_no_failed_rank_wrote(monkeypatch):
+    """A write the silent rank posted may still land."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    conn = _make_connector(_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv.add("r1")
+    conn._pending_handoffs["r1"] = mc._PendingHandoff()  # chunked
+    assert not conn._record_write_done(
+        "r1", 0, 0, 0, success=False, started_writes=False
+    )
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 1, "tp_rank": 0, "write_window_s": 60}
+    )
+    conn._pending_recv_acks["r1"][(1, 0)] = time.monotonic() - 1
+    conn._expire_pending_recvs()
+    assert set(conn._held_failures) == {"r1"} and conn.failed_recving == set()
+    assert "r1" in conn._pending_recv and not conn._pending_handoffs
 
 
 def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
@@ -1451,7 +1477,9 @@ def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
     conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv.add("r1")
-    assert not conn._record_write_done("r1", 1, 0, 0, success=False)
+    assert not conn._record_write_done(
+        "r1", 1, 0, 0, success=False, started_writes=True
+    )
     conn._record_write_ack(
         {"request_id": "r1", "pp_rank": 1, "tp_rank": 0, "write_window_s": 1}
     )
@@ -1535,7 +1563,7 @@ def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
     conn._pending_recv.add("r1")
     conn._pending_recv_slots["r1"] = (7, 3)
 
-    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert conn._record_write_done("r1", 0, 0, 0, success=False, started_writes=True)
     conn._report_held_failures()
     assert conn.failed_recving == set() and conn._staging_slots.free == []
     assert "r1" in conn._pending_recv
@@ -1556,7 +1584,9 @@ def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
     conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv_stall_watch["r1"] = time.monotonic()
-    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert not conn._record_write_done(
+        "r1", 0, 0, 0, success=False, started_writes=True
+    )
     if acked:
         conn._pending_recv_acks["r1"] = {(1, 0): time.monotonic() + 600}
     conn._expire_pending_recvs()  # too early to log
@@ -1578,8 +1608,8 @@ def test_write_done_pp_only_dedup():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 4
     for pp in range(3):
-        assert not conn._record_write_done("r1", pp, 0, 0)
-    assert conn._record_write_done("r1", 3, 0, 0)
+        assert not conn._record_write_done("r1", pp, 0, 0, started_writes=False)
+    assert conn._record_write_done("r1", 3, 0, 0, started_writes=False)
     assert "r1" in conn.done_recving
 
 
@@ -1587,39 +1617,39 @@ def test_write_done_duplicate_pp_rank_ignored():
     """Same pp_rank resent (reliability) is not double-counted."""
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 2
-    assert not conn._record_write_done("r1", 0, 0, 0)
-    assert not conn._record_write_done("r1", 0, 0, 0)
-    assert conn._record_write_done("r1", 1, 0, 0)
+    assert not conn._record_write_done("r1", 0, 0, 0, started_writes=False)
+    assert not conn._record_write_done("r1", 0, 0, 0, started_writes=False)
+    assert conn._record_write_done("r1", 1, 0, 0, started_writes=False)
 
 
 def test_write_done_tp_asymmetric_dedup():
     """PP2 x TP fan-in 2: 4 distinct (pp, tp) pairs needed."""
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 4
-    assert not conn._record_write_done("r1", 0, 0, 0)
-    assert not conn._record_write_done("r1", 0, 1, 0)
-    assert not conn._record_write_done("r1", 1, 0, 0)
-    assert conn._record_write_done("r1", 1, 1, 0)
+    assert not conn._record_write_done("r1", 0, 0, 0, started_writes=False)
+    assert not conn._record_write_done("r1", 0, 1, 0, started_writes=False)
+    assert not conn._record_write_done("r1", 1, 0, 0, started_writes=False)
+    assert conn._record_write_done("r1", 1, 1, 0, started_writes=False)
     assert "r1" in conn.done_recving
 
 
 def test_write_done_unknown_request_ignored():
     conn = _make_connector()
-    assert not conn._record_write_done("unknown", 0, 0, 0)
+    assert not conn._record_write_done("unknown", 0, 0, 0, started_writes=False)
 
 
 def test_write_done_late_duplicate_after_completion_ignored():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
-    assert conn._record_write_done("r1", 0, 0, 0)
-    assert not conn._record_write_done("r1", 0, 0, 0)
+    assert conn._record_write_done("r1", 0, 0, 0, started_writes=False)
+    assert not conn._record_write_done("r1", 0, 0, 0, started_writes=False)
 
 
 def test_write_done_blocks_fenced_on_completion():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv_blocks["r1"] = [10, 20, 30]
-    conn._record_write_done("r1", 0, 0, 0)
+    conn._record_write_done("r1", 0, 0, 0, started_writes=False)
     assert conn._blocks_pending_fence == [10, 20, 30]
 
 

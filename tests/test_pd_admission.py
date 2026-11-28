@@ -783,12 +783,14 @@ def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, o
             last = stage == rank == 3
             if last and outcome == "bad_handoff":
                 handoff = {"first_token_id": -1}
+            failed = stage == rank == 0 and outcome == "failed_stage"
             worker._record_write_done(
                 a.id,
                 stage,
                 0,
                 worker._pending_recv_nonce[a.id],
-                success=not (stage == rank == 0 and outcome == "failed_stage"),
+                success=not failed,
+                started_writes=failed,
                 handoff=handoff,
             )
             sched._update_from_kv_xfer_finished(

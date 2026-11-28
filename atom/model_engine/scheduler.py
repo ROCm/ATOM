@@ -3884,8 +3884,9 @@ class Scheduler:
         Decode is sized and compiled for decode, so a failed P/D transfer must
         not turn into a potentially unbounded local prefill. This also applies
         to chunked admission timeouts. The connector reports failure only after
-        all expected writers finish and the failed-write safety hold elapses
-        (``ATOM_PD_FAILED_WRITE_HOLD_S``), so the reservation can now be freed.
+        all expected writers finish, and after the failed-write hold
+        (``ATOM_PD_FAILED_WRITE_HOLD_S``) if a failed write may still land, so
+        the reservation can now be freed.
         Offload load failures (``failed_loading``) still resume local prefill.
         """
         seq = next(
