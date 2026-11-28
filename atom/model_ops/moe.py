@@ -1639,6 +1639,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 int(self.use_triton_ep),
             )
 
+    def routed_quant_mode(self) -> str:
+        """The routed experts' activation format on this call: "fp8" (MXFP8,
+        fp8_activations, unless ATOM_MOE_A8W4_PREFILL_A4W4 keeps this prefill
+        step on A4W4) or "fp4" (MXFP4). The folded router kernel quantizes to it."""
+        return (
+            "fp8" if self.fp8_activations and not _a8w4_prefill_keeps_a4w4() else "fp4"
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2418,7 +2426,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
-        if self.fp8_activations and not _a8w4_prefill_keeps_a4w4():
+        if self.routed_quant_mode() == "fp8":
             moe_extra_args["quant_dtype_a"] = dtypes.fp8
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)

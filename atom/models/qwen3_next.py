@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import os
 from typing import ClassVar
 
 import torch
@@ -464,16 +463,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 type(m).__name__,
                 getattr(m, "fp8_activations", None),
             )
-            asked = [
-                f
-                for f in ("ATOM_FOLD_TOPK_ROUTER", "ATOM_FOLD_POSTNORM")
-                if os.environ.get(f, "0") == "1"
-            ]
-            if asked:
-                logger.warning(
-                    "ATOM_QWEN_MOE_A8W4: %s set but off (the folds hand MXFP4 rows to the experts)",
-                    " / ".join(asked),
-                )
         # ATOM_QWEN_FHMOE (gfx1250, TP1): decode-size steps run the shared expert
         # inside the routed grouped MoE (see `fhmoe_forward`); the experts' quant
         # method builds its operands at load from the shared expert handed here.
@@ -629,7 +618,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """ATOM_FOLD_TOPK_ROUTER: (router logits, shared expert output) from the
         router + shared expert kernel that also computes this block's MoE top-k,
-        routing and MXFP4 activation quant, handed to the experts' deferred top-k
+        routing and activation quant (MXFP4, or MXFP8 for A8W4 experts: the v2
+        kernel only), handed to the experts' deferred top-k
         (the grouped MoE then skips moe_topk_route_quant). None where it does not
         apply: then the plain kernel runs, and the routing as usual. The geometry
         of the routing is aiter's, learned from an unfused call at this row count
@@ -656,7 +646,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             or self.n_routed_experts != 256
         ):
             return None
-        geometry = topk_route_quant_decode_geometry(m, k, 8)
+        # the experts' activation format on this step (MXFP8 under ATOM_QWEN_MOE_A8W4)
+        quant_mode = getattr(
+            self.experts.quant_method, "routed_quant_mode", lambda: "fp4"
+        )()
+        geometry = topk_route_quant_decode_geometry(m, k, 8, quant_mode)
         mlp = self.shared_expert
         if envs.ATOM_ROUTER_SHARED_V2 and geometry is not None:
             # the decode rewrite of the same kernel (bitwise the same outputs), where it applies
@@ -684,29 +678,32 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 fused_gemm_a16w16_router_shared_expert_topk_supported = (
                     fused_gemm_a16w16_router_shared_expert_topk_v2_supported
                 )
-        prenorm_kw = {}
+        is_v2 = (
+            fused_gemm_a16w16_router_shared_expert_topk.__name__
+            == "fused_gemm_a16w16_router_shared_expert_topk_v2"
+        )
+        kernel_kw = {}
+        if quant_mode != "fp4":
+            # only the v2 kernel writes MXFP8 rows
+            if not is_v2:
+                return None
+            kernel_kw["quant_mode"] = quant_mode
         w_gate_up = mlp.gate_up_proj.weight
         if prenorm is not None:
             # ATOM_FOLD_POSTNORM: only the v2 kernel's narrow variant takes the norm
             from atom.model_ops import fold_postnorm
 
-            if (
-                fused_gemm_a16w16_router_shared_expert_topk.__name__
-                != "fused_gemm_a16w16_router_shared_expert_topk_v2"
-                or m > 16
-            ):
+            if not is_v2 or m > 16:
                 return None
             pw = fold_postnorm.prescaled(self, prenorm.norm)
             if pw is None:
                 return None
             w_router_padded, w_gate_up = pw
-            prenorm_kw = {
-                "prenorm": (
-                    prenorm.ssq,
-                    prenorm.norm.weight,
-                    prenorm.norm.variance_epsilon,
-                )
-            }
+            kernel_kw["prenorm"] = (
+                prenorm.ssq,
+                prenorm.norm.weight,
+                prenorm.norm.variance_epsilon,
+            )
         if geometry is None or not fused_gemm_a16w16_router_shared_expert_topk_supported(
             hidden_states,
             w_router_padded,
@@ -727,7 +724,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             contiguous_m=geometry[1],
             wmma_rep=geometry[2],
             num_valid_rows=nvr,
-            **prenorm_kw,
+            **kernel_kw,
         )
         set_prepared_routing(logits, geometry, routed, nvr, required=prenorm is not None)
         return logits, shared
@@ -756,7 +753,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         fold_postnorm._stats["folded"] += 1
         logits, shared_output = fused
         router_logits = logits[:, : self.n_routed_experts]
-        # x is not the experts' input: the routing prepared above (MXFP4 rows of the normalized x) must be the
+        # x is not the experts' input: the routing prepared above (quantized rows of the normalized x) must be the
         # one consumed (try_defer_topk_route_quant raises otherwise)
         if self.defer_gather and not torch.compiler.is_compiling():
             routed_output = self._experts_deferred_gather(x, router_logits)
