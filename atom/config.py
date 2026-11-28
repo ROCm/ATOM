@@ -3671,13 +3671,24 @@ class Config:
             )
 
     def _check_pp_support(self) -> None:
-        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
-        an architecture does not declare in ``pp_speculative_methods`` (a P/D
-        producer does not speculate); anything else fails mid-serving or drafts
-        from zero buffers.
+        """Refuse what PP does not wire yet: DeepSeek-V4, TBO, P/D consumers, and
+        speculation an architecture does not declare in ``pp_speculative_methods``
+        (a P/D producer does not speculate); anything else fails mid-serving or
+        drafts from zero buffers.
         """
         if self.pipeline_parallel_size <= 1:
             return
+        # DeepseekV4Model builds and runs every decoder layer on every stage, and
+        # its attention backend sizes the pools over every layer. Refused here,
+        # before a worker loads the whole model only for KV sizing to refuse it.
+        if "DeepseekV4ForCausalLM" in (
+            getattr(self.hf_config, "architectures", None) or ()
+        ):
+            raise ValueError(
+                "DeepSeek-V4 (DeepseekV4ForCausalLM) does not support "
+                "pipeline_parallel_size > 1: every stage would build all of its "
+                "layers."
+            )
         # UBatchWrapper.forward takes no intermediate_tensors.
         if self.enable_tbo:
             raise ValueError(

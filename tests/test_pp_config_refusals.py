@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""What `Config` refuses under PP: TBO, P/D consumers, and speculation an
-architecture does not declare in `registry.pp_speculative_methods`."""
+"""What `Config` refuses under PP: DeepSeek-V4, TBO, P/D consumers, and
+speculation an architecture does not declare in
+`registry.pp_speculative_methods`."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -80,3 +81,13 @@ def test_kv_producer_under_pp_drafts_with_any_method():
     # producer never speculates, so the Kimi-K3 + DSpark gate does not apply.
     kv = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     _check(_cfg(arch="Glm5ForCausalLM", method="mtp", kv=kv))
+
+
+def test_deepseek_v4_under_pp_is_refused_by_name():
+    # jgong5/ATOM#2370: every stage would build and load all of its layers.
+    with pytest.raises(ValueError, match=r"DeepSeek-V4 \(DeepseekV4ForCausalLM\)"):
+        _check(_cfg(arch="DeepseekV4ForCausalLM", spec=None))
+
+
+def test_deepseek_v4_without_pp_is_not_refused():
+    _check(_cfg(pp=1, arch="DeepseekV4ForCausalLM", spec=None))
