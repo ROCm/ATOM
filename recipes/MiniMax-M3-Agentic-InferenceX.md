@@ -1,5 +1,7 @@
 # MiniMax-M3 — Agentic serving recipe (InferenceX)
 
+MiniMax-M3.1-Flash (TP4 + DSpark) has its own section: [MiniMax-M3.1-Flash — TP4 + DSpark](#minimax-m31-flash--tp4--dspark).
+
 TP4 + EAGLE3, MXFP4 weights, concurrency 1–48. This is the configuration the SemiAnalysis InferenceX reference benchmarks for this model (`configs/amd-master.yaml`: `{tp: 4, spec-decoding: mtp}`); CONC 40/48 add the LMCache CPU tier.
 
 MiniMax-M3's KV is **uncompressed** — 22.9 KB per token per rank — so the GPU pool stops holding reusable prefixes well before it runs out of room. Throughput flattens at CONC=32 while interactivity keeps falling; 40c is the best point on the ladder, and 48c buys 3.9% more throughput for 38.5% less interactivity. See [Measured](#measured).
@@ -198,6 +200,114 @@ Peak throughput is at 48c, but 40c is the point worth quoting: **+18.6% throughp
 > **Read the last column, not `engine hit`.** The engine's `Prefix cache hit rate` counts the GPU tier only, so a chunk served from LMCache scores as a miss — which is why it appears to collapse to 70.2% at 48c. `realised hit` is derived independently, from the prompt tokens the server actually ran prefill on (`Avg prompt throughput` integrated over the profiling window). Without offload the two agree within 0.5–2.2 pp; with offload they diverge by 14–25 pp, and that divergence *is* the CPU tier's contribution.
 
 The 1c–32c ladder this file carried until 2026-09-17 has been removed rather than re-labelled. Those numbers were taken with `--hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'`, which reuses the previous layer's top-k on 42 of the 57 sparse layers; the flag was dropped from the command on 2026-09-10 (`e885fc6f4`) but the table was never re-measured, so it reported a configuration this recipe no longer runs and read roughly 14% fast. Re-run the low-concurrency points on the current command if you need them.
+
+## MiniMax-M3.1-Flash — TP4 + DSpark
+
+MiniMax-M3.1-Flash runs a different configuration from the M3 recipe above:
+- DSpark K=7 instead of EAGLE3;
+- every one of the 60 layers is sparse attention with its own indexer;
+- the quantized checkpoint is Quark MXFP4.
+
+This section is the configuration of the InferenceX ATOM submission `minimaxm31flash-fp4-mi355x-atom-agentic-dspark` (SemiAnalysisAI/InferenceX#5157): TP4, DSpark K=7.
+
+Everything below is on `main`. It needs:
+- #3310: the NVFP4 KV and index caches;
+- #3308: mono decode with the MXFP8 shared expert;
+- #3576 with ROCm/aiter#8285: indexer CP over the NVFP4 caches;
+- #3591: LMCache offload with an NVFP4 KV and a DSpark draft of its own dtype.
+
+Every concurrency runs:
+- **NVFP4 KV and NVFP4 index cache.** The checkpoint is QAT-trained for an NVFP4 KV cache. A 128-token block is 1,986,560 bytes per rank (target KV, index cache and the draft's pool). At `--gpu-memory-utilization 0.85` that gives 86,765–88,732 blocks, 11.1–11.4M tokens. The FP8 caches held 7.3M tokens at 0.9.
+- **The checkpoint as shipped:**
+  - no `--online_quant_config`, so attention and the dense MLPs stay MXFP8;
+  - the MXFP8 shared expert stays its own MLP (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` unset);
+  - no quick-allreduce quantization (`AITER_QUICK_REDUCE_QUANTIZATION` unset).
+- **The DSpark draft as shipped.** Its weights stay MXFP8, and its KV, in a pool of its own, is ATOM's default beside an NVFP4 target: BF16 (`--spec-decode-kv-cache-dtype` unset). InferenceX does not allow a draft KV below the framework default.
+
+What changes with concurrency:
+
+| CONC | `--max-num-seqs` | decode | indexer CP | prefill delayer | LMCache |
+| ---: | ---: | --- | --- | --- | --- |
+| 1, 2, 4, 8 | 2 × CONC | Mono up to 16 rows | off | off | off |
+| 16 | 32 | production | on | off | off |
+| 32 | 64 | production | on | on, `--max-num-batched-tokens 16384` | off |
+| 48 | 96 | production | on | off | 200 GiB / rank, chunk 256 |
+
+- **Mono decode.** `ATOM_MONO_ENABLE` defaults to 1, so it is not set. Mono builds 8- and 16-row kernels, so it covers decode steps of one or two requests at DSpark 7 (8 rows each); wider steps run the production path. It declines indexer CP over the NVFP4 caches, so from CONC 16 every step runs the production path.
+- **Indexer CP** (`ATOM_M3_INDEXER_CP=1`) from CONC 16. Each rank logs a traceback at startup ending in `candidate mailbox: hipIpc of cached memory needs ROCm 7.14 or later`. It is not an error: CP falls back to the collective candidate exchange.
+- **Prefill delayer** at CONC 32: `ATOM_PREFILL_DECODE_INTERVAL=8 ATOM_PREFILL_DELAYER_TARGET_FILL=0.05 ATOM_PREFILL_DELAYER_STALL_TICKS=2`. After a prefill step, the next 8 scheduler passes are decode only. After that, a waiting prefill runs once the queued prompt tokens reach 5% of `--max-num-batched-tokens`, or after 2 passes with no new work and no new arrival.
+
+```bash
+MODEL=/shared/data/amd_int/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4   # draft at $MODEL/dspark
+CONC=1      # then 2, 4, 8, 16, 32, 48
+```
+
+Capture every batch size up to 8, then in steps of 2 / 4 / 8 / 16 up to `--max-num-seqs`.
+
+```bash
+SEQS=$((2 * CONC > 2 ? 2 * CONC : 2))
+CAPTURE=$(python3 -c "print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s<=$SEQS])")
+EXTRA_ENV=""
+BATCHED=32768
+[ "$CONC" -ge 16 ] && EXTRA_ENV="ATOM_M3_INDEXER_CP=1"
+if [ "$CONC" -eq 32 ]; then
+  EXTRA_ENV+=" ATOM_PREFILL_DECODE_INTERVAL=8 ATOM_PREFILL_DELAYER_TARGET_FILL=0.05 ATOM_PREFILL_DELAYER_STALL_TICKS=2"
+  BATCHED=16384
+fi
+if [ "$CONC" -ge 48 ]; then
+  EXTRA_ENV+=" ATOM_KV_OFFLOAD=lmcache LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto"
+  EXTRA_ENV+=" LMCACHE_MAX_LOCAL_CPU_SIZE=200 LMCACHE_CHUNK_SIZE=256"
+fi
+
+env -u AITER_QUICK_REDUCE_QUANTIZATION -u ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 $EXTRA_ENV \
+  AITER_LOG_LEVEL=WARNING PYTHONHASHSEED=0 \
+  python3 -u -m atom.entrypoints.openai_server \
+    --model "$MODEL" --served-model-name amd/MiniMax-M3.1-Flash-Quark-MXFP4 \
+    --tensor-parallel-size 4 --host 0.0.0.0 --port 8006 --server-port 8000 \
+    --trust-remote-code --kv_cache_dtype nvfp4 --index-cache-dtype nvfp4 \
+    --block-size 128 --max-model-len 1048576 --max-num-seqs $SEQS \
+    --max-num-batched-tokens $BATCHED --gpu-memory-utilization 0.85 \
+    --enable-prefix-caching --timeout-keep-alive 1800 \
+    --cudagraph-capture-sizes "$CAPTURE" \
+    --method dspark --draft-model "$MODEL/dspark" --num-speculative-tokens 7 \
+    --spec-decode-acceptance-length 4.04 \
+  > server_c${CONC}.log 2>&1 &
+```
+
+- `--spec-decode-acceptance-length 4.04` is InferenceX's golden accepted length for this draft at K=7 (`minimax-m3.1-flash__dspark__native__probabilistic-block`), applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
+- `PYTHONHASHSEED=0` keeps the ranks' prefix and LMCache keys equal; without it the LMCache points never hit.
+- `ATOM_KV_OFFLOAD=lmcache` is the env form of `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`, which the InferenceX recipe passes as `extra-kv-connectors`.
+- Check the startup lines:
+  - `block_bytes=1986560`;
+  - from CONC 16, `MiniMax-M3 mono decode off: indexer context parallelism with NVFP4 caches`;
+  - at CONC 32, `PrefillDelayer initialized: ... max_num_batched_tokens=16384 target_fill=0.05 ... stall_ticks=2`;
+  - at CONC 48, `LMCache M3 PAGE offload worker rank=N: page_regions=130 bytes_per_block=1986560 chunk=256`.
+
+Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
+
+```bash
+export AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+agentx profile \
+  --url http://127.0.0.1:8000 --model amd/MiniMax-M3.1-Flash-Quark-MXFP4 --tokenizer "$MODEL" \
+  --tokenizer-trust-remote-code \
+  --concurrency $CONC --benchmark-duration 3600 \
+  --server-metrics http://127.0.0.1:8000/metrics \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir ./results_m31/c${CONC}
+```
+
+### Measured (M3.1)
+
+InferenceX CI ran this configuration in [run-sweep 44987957118](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/44987957118) ([performance](https://inferencex.semianalysis.com/inference?unofficialRun=44987957118), [accuracy](https://inferencex.semianalysis.com/evaluation?unofficialRun=44987957118)); all seven points passed. Its CONC 48 point still had an FP8 draft KV; it needs a rerun with the BF16 default above.
+
+gsm8k, the InferenceX CI method: its `infx/evals/gsm8k.yaml` (5-shot, chat template), temperature 0, `max_tokens` 16384, all 1319 samples, real acceptance (no `--spec-decode-acceptance-length`). strict-match:
+
+| config | InferenceX CI (run 44987957118) | local |
+|---|---|---|
+| CONC 8 command | 0.9644 | |
+| CONC 16 command (indexer CP) | 0.9682 | |
+| CONC 32 command (indexer CP + delayer) | 0.9613 | 0.9636 ± 0.0052 |
+| CONC 48 command (indexer CP + LMCache) | 0.9598, with an FP8 draft KV | 0.9682 ± 0.0048 |
 
 ## Notes
 
