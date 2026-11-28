@@ -800,6 +800,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # MiniMax-M3: the MoE op hands the shared expert its MXFP8 input (aiter
+    # fused_moe `mxfp8_copy_out`) and the shared gate_up skips its own quant.
+    # A launch is saved only where aiter folds the copy into the routed A1
+    # quant (gfx1250 grouped MXFP4); elsewhere the one quant runs in the MoE op
+    # instead. The same bytes for finite inputs; default off.
+    "ATOM_MINIMAX_M3_MOE_QUANT_SHARED": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_QUANT_SHARED"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
