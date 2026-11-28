@@ -22,6 +22,7 @@ Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
   - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
+  - torch.ops.aiter.v4_shared_gate_up_silu_quant — V4 shared expert gate_up
 """
 
 import torch
@@ -279,5 +280,58 @@ direct_register_custom_op(
     op_func=tbo_all_reduce,
     mutates_args=(),
     fake_impl=_tbo_all_reduce_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# V4 shared expert: gate_up + SwiGLU + w2's MXFP8 input quant (gfx1250)
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the `Expert` looked up by `layer_name`):
+#   - `gate_up_silu_quant(x) -> (act e4m3 [m, inter], act_scale E8M0
+#     [m, inter / 32])`
+#   - the op also takes `gate_up_proj.weight` ([2 * inter, dim]), which only
+#     sets the output shape for tracing
+#
+# The op body runs eagerly with the real row count, so the fused-or-unfused
+# choice and the GEMM tile follow every call's m; a compiled forward replayed
+# for other row counts without guard checks keeps both right. Functional
+# (`mutates_args=()`): it allocates and returns both outputs, since an E8M0
+# tensor written through a mutated argument leaves an auto_functionalized_v2
+# Inductor does not remove.
+
+
+def v4_shared_gate_up_silu_quant(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # `gate_up_weight` only gives the fake its output width.
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self.gate_up_silu_quant(x)
+
+
+def _v4_shared_gate_up_silu_quant_fake(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inter = gate_up_weight.shape[0] // 2
+    return (
+        torch.empty((x.shape[0], inter), dtype=torch.float8_e4m3fn, device=x.device),
+        torch.empty(
+            (x.shape[0], inter // 32), dtype=torch.float8_e8m0fnu, device=x.device
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="v4_shared_gate_up_silu_quant",
+    op_func=v4_shared_gate_up_silu_quant,
+    mutates_args=(),
+    fake_impl=_v4_shared_gate_up_silu_quant_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
