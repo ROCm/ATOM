@@ -45,7 +45,12 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import (
+    swiglu_oai_mxfp8_arch_supported,
+    swiglu_oai_mxfp8_supported,
+    swiglu_oai_split,
+    swiglu_oai_split_mxfp8,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -160,6 +165,19 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     )
 
 
+def _linear_consumes_native_mxfp8(linear: nn.Module) -> bool:
+    """Return whether ``linear`` accepts row-major native MXFP8 activations."""
+    quant_type = getattr(linear, "quant_type", None)
+    quant_type_value = getattr(quant_type, "value", quant_type)
+    return (
+        quant_type_value == QuantType.per_1x32.value
+        and getattr(linear, "params_dtype", None) == dtypes.fp8
+        # validated for 1x32 groups only
+        and getattr(linear, "native_a8_group_rows", None) == 1
+        and not getattr(linear, "runs_bf16", False)
+    )
+
+
 def _minimax_m3_cos_sin_cache(
     rotary_emb: nn.Module,
     query: torch.Tensor,
@@ -271,11 +289,25 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # Resolved here, not in forward: the arch probe must stay out of the graph.
+        self.fuse_swiglu_mxfp8 = swiglu_oai_mxfp8_arch_supported()
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        if (
+            self.fuse_swiglu_mxfp8
+            and _linear_consumes_native_mxfp8(self.down_proj)
+            and swiglu_oai_mxfp8_supported(gate_up)
+        ):
+            activated, activated_scale = swiglu_oai_split_mxfp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(activated, x_scale=activated_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
