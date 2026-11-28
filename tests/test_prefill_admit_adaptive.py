@@ -2,16 +2,20 @@
 
 Single-rank (dp_size=1, no group) with an injected clock; a small plant model
 drives the delayer so the fitted step costs and the resulting cycle length can
-be checked against the closed-form EOQ optimum. No GPU / distributed group.
+be checked against the closed-form EOQ optimum. The initial-ramp tests at the
+end also run a two-rank group through a mocked all_reduce. No GPU /
+distributed group.
 """
 
 import math
 import random
+from unittest import mock
 
 import pytest
 
 from atom.model_engine.prefill_delayer import (
     _FIXED_SLOTS,
+    _MIN_TICKS,
     PrefillDelayer,
     _EwFit,
 )
@@ -174,3 +178,136 @@ def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
     k_eoq = math.sqrt(2 * a * 300 / (lam * t0))
     assert 4 < k_eoq < d._adapt_max_ticks(t0, True)
     assert 0.7 * k_eoq < cyc < 1.4 * k_eoq, (cyc, k_eoq)
+
+
+# ---- initial ramp (ATOM_PREFILL_INITIAL_RAMP) under the adaptive policy ----
+# reduce-buffer slots: the ranks whose free seq slots fill target_fill of a chunk,
+# and (no cost slots) the first adaptive one, the requests a FIRE could admit
+_PREFILL_BUDGET = 12
+_FULL_CHUNK = 13
+_ADMITTABLE = _FIXED_SLOTS
+
+
+class _Rank0Group:
+    def rank(self):
+        return 0
+
+
+def _adaptive_delayer(dp_size=1, prefill_ramp=True, clock=None):
+    return PrefillDelayer(
+        dp_size=dp_size,
+        cpu_group=_Rank0Group() if dp_size > 1 else None,
+        max_num_batched_tokens=16384,
+        prefill_ramp=prefill_ramp,
+        clock=clock or _Clock(),
+        admit_policy="adaptive",
+    )
+
+
+def _sibling(full=True, running=10):
+    """The other rank of a two-rank group: a whole chunk pending, 5 admittable
+    requests, `running` decode seqs; `full`: its free slots fill a chunk."""
+    slots = {0: 1, 1: 16384, 2: running, _ADMITTABLE: 5, _PREFILL_BUDGET: 16384}
+    if full:
+        slots[_FULL_CHUNK] = 1
+    return slots
+
+
+def _tick(d, full=True, running=10, kv_usage=0.5, sibling=None):
+    """One decision of a rank with a whole chunk pending and 5 admittable
+    requests; `sibling` adds the other rank's reduce slots."""
+
+    def all_reduce(tensor, op=None, group=None):
+        for slot, value in (sibling or {}).items():
+            tensor[slot] += value
+
+    with mock.patch("torch.distributed.all_reduce", all_reduce):
+        return d.should_allow_prefill(
+            prefillable=True,
+            pending_tokens=16384,
+            running_decode_batch=running,
+            kv_usage=kv_usage,
+            waiting_requests=5,
+            admittable_requests=5,
+            full_chunk=full,
+            prefill_budget=16384,
+        ).allow
+
+
+def _rent_or_buy_cycle(d, **kw):
+    # Cold start: the regret reaches A*B within two ticks, so the FIRE waits
+    # for the _MIN_TICKS floor.
+    got = [_tick(d, **kw) for _ in range(_MIN_TICKS)]
+    assert got == [False] * (_MIN_TICKS - 1) + [True]
+
+
+def test_initial_ramp_fires_before_min_ticks():
+    clk = _Clock()
+    d = _adaptive_delayer(clock=clk)
+    assert _tick(d)  # first call: warmup seed
+    # Every rank fills target_fill of a chunk: release at once, every tick.
+    for _ in range(_MIN_TICKS - 1):
+        d.notify_prefill_executed(8000)
+        clk.t += 0.05
+        assert _tick(d)
+    assert d.ramp_active
+    assert d._stat_fire_ramp == _MIN_TICKS - 1
+    assert d._stat_fire_adaptive == d._stat_fire_adaptcap == 0
+    assert d._stat_adapt_hold_ticks == 0
+    # the fits still learn from the ramp's prefill steps
+    assert d._adapt_pf_fit.n == _MIN_TICKS - 1
+
+
+def test_initial_ramp_ends_when_a_rank_cannot_fill():
+    d = _adaptive_delayer(dp_size=2)
+    full = _sibling()
+    assert _tick(d, sibling=full)  # warmup seed
+    assert _tick(d, sibling=full)
+    assert d._stat_fire_ramp == 1
+    # The sibling's free slots no longer fill a chunk: the ramp ends for the
+    # group and rent-or-buy decides, from this tick on.
+    assert not _tick(d, sibling=_sibling(full=False))
+    assert not d.ramp_active
+    got = [_tick(d, sibling=full) for _ in range(_MIN_TICKS - 1)]
+    assert got == [False] * (_MIN_TICKS - 2) + [True]
+    # Every rank full again, or one rank without decode, does not reopen it.
+    _rent_or_buy_cycle(d, sibling=full)
+    _rent_or_buy_cycle(d, running=0, sibling=full)
+    assert d._stat_fire_ramp == 1 and d._stat_fire_adaptive == 3
+    # The whole group runs out of decode: the ramp re-arms for the next burst
+    # and releases at once, ahead of the no-decode bound.
+    assert _tick(d, running=0, sibling=_sibling(running=0))
+    assert d._stat_fire_ramp == 2 and d.ramp_active
+    assert d._stat_fire_nodecode == 0
+    assert _tick(d, sibling=full)
+    assert d._stat_fire_ramp == 3
+
+
+def test_initial_ramp_ends_on_kv_high():
+    d = _adaptive_delayer()
+    assert _tick(d)  # warmup seed
+    assert _tick(d)
+    assert d._stat_fire_ramp == 1
+    # KV runs high: the KV bound releases and the ramp ends.
+    assert _tick(d, kv_usage=0.95)
+    assert d._stat_fire_kv == 1 and not d.ramp_active
+    _rent_or_buy_cycle(d)
+    assert d._stat_fire_ramp == 1 and d._stat_fire_adaptive == 1
+
+
+def test_ramp_off_ignores_full_chunk():
+    # Without the ramp full_chunk changes nothing: rent-or-buy as before.
+    with_full = _adaptive_delayer(prefill_ramp=False)
+    without = _adaptive_delayer(prefill_ramp=False)
+    running = [10] * 9 + [0] + [10] * 5
+    got = [_tick(with_full, running=r) for r in running]
+    assert got == [_tick(without, full=False, running=r) for r in running]
+    cycle = [False] * (_MIN_TICKS - 1) + [True]
+    # warmup seed, two cycles, no decode, a cycle, one held tick
+    assert got == [True] + cycle * 2 + [True] + cycle + [False]
+    stats = [s for s in PrefillDelayer.__slots__ if s.startswith("_stat_")]
+    assert [getattr(with_full, s) for s in stats] == [
+        getattr(without, s) for s in stats
+    ]
+    assert with_full._stat_fire_ramp == 0 and not with_full.ramp_active
+    assert with_full._stat_fire_adaptive == 3

@@ -1460,6 +1460,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Initial ramp, armed only with a positive ATOM_PREFILL_DECODE_INTERVAL or the
+    # adaptive admit policy (off by default, "1" enables): while admission's
+    # own probe on every DP rank counts a fresh request into a free seq slot and
+    # fills target_fill of a prefill chunk (or the batch budget cannot take the
+    # next request), prefill is released at once, ahead of the interval and the
+    # adaptive rule. It ends when a rank cannot (or KV runs high) and re-arms
+    # once the group has no decode. A release whose forward also decodes (mixed
+    # batching) arms no interval, as no mixed forward does: intended.
+    "ATOM_PREFILL_INITIAL_RAMP": lambda: _flag_env("ATOM_PREFILL_INITIAL_RAMP"),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.

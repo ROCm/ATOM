@@ -9,6 +9,7 @@ import pytest
 # All ATOM_* env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
     "ATOM_ENABLE_OTEL_TRACE",
+    "ATOM_PREFILL_INITIAL_RAMP",
     "ATOM_TRACE_VERSION",
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
@@ -97,6 +98,17 @@ def test_dp_sync_interval_env(monkeypatch, raw, expected):
 
 class TestEnvsDefaults:
     """Test default values when env vars are NOT set."""
+
+    def test_initial_ramp_default(self):
+        assert _get_envs().ATOM_PREFILL_INITIAL_RAMP is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [("1", True), ("true", True), ("TRUE", True), ("0", False), ("false", False)],
+    )
+    def test_initial_ramp_boolean(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_PREFILL_INITIAL_RAMP", value)
+        assert _get_envs().ATOM_PREFILL_INITIAL_RAMP is expected
 
     def test_dp_rank_default(self):
         assert _get_envs().ATOM_DP_RANK == 0

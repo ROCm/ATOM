@@ -802,7 +802,11 @@ class EngineArgs:
             "'adaptive' fires once the held requests' accumulated cost reaches "
             "the fixed prefill cost times the decode batch, fitted from measured "
             "step times; on DP=1, PP=1 it enables the delayer as a positive "
-            "interval does.",
+            "interval does. With a positive interval or 'adaptive', "
+            "ATOM_PREFILL_INITIAL_RAMP=1 (off by default) releases prefill while "
+            "every rank fills a chunk with fresh requests into free seq slots, "
+            "until a rank cannot or KV reaches the high watermark, and re-arms "
+            "once the group has no decode.",
         )
         parser.add_argument(
             "--mark-trace",

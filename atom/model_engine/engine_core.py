@@ -352,6 +352,7 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                prefill_ramp=envs.ATOM_PREFILL_INITIAL_RAMP,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
                 admit_policy=config.prefill_admit_policy,

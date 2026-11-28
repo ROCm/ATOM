@@ -1216,6 +1216,8 @@ class _EarlyDelayer:
     max_queue_ms = None
     kv_high_watermark = 0.9
     rank_prefill_costs = []  # noqa: RUF012
+    prefill_ramp = False
+    ramp_active = False
 
     def __init__(self):
         self.allow = False
