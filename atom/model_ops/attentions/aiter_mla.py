@@ -79,6 +79,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
     packed_concat_rows,
 )
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE, fp4_scale_byte
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.indexer.workspace import (
     ConcatKeyWorkspace,
@@ -1971,15 +1972,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_cu,
                 g_lens,
                 var[f"{prefix}block_tables"].np[:bs],
+                self.model_runner.config.index_cache_layout,
             )
 
     def _build_dcp_indexer_fp4_prefill_meta(
-        self, attn_metadata, bs: int, lpad, cu_pad, g_cu, g_lens, block_tables
+        self,
+        attn_metadata,
+        bs: int,
+        lpad,
+        cu_pad,
+        g_cu,
+        g_lens,
+        block_tables,
+        layout=PRESHUFFLE,
     ):
         """Where FP4 staging reads this rank's shard and where it lays the
         gathered keys out: each request's from a page of its own, so a
         request's row of `dcp_indexer_fp4_block_tables` pages its keys as its
         own block table does and the scorer's columns are the request's own.
+
+        `layout` selects PRESHUFFLE page/row/scale-row indices or MFMA int64
+        page/row indices and full-plane offsets for each row's four scale bytes.
+        Both read and stage metadata are shared by all indexer layers.
 
         The read formula must track `cp_gather_indexer_k_quant_cache`, the FP8
         plane's gather, which the FP4 planes have no equivalent of. Its padded
@@ -1997,8 +2011,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         stage = np.repeat(first_page[:bs] * block - g_cu[:bs], g_lens) + np.arange(
             int(g_cu[bs]), dtype=np.int64
         )
-        # Page / row / e8m0 row of both slot lists, built once per forward, not
-        # per layer: one upload, one launch.
+        # Upload both slot lists together; derive the layout-specific metadata
+        # once per forward, rather than rebuilding it in every layer.
         slots = upload_numpy(
             np.concatenate([read, stage]).astype(np.int32), self.device
         )
@@ -2009,11 +2023,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Torch fallback (CPU / test builders); also the kernel's reference.
             page, row = slots // block, slots % block
             parts = (page, row, fp4_index_scale_rows(row, block))
+        names = ("page", "row", "scale_row")
+        if layout == MFMA:
+            # Publish full-plane byte offsets and int64 indices once per forward.
+            chunk = torch.arange(4, device=slots.device)
+            parts = (
+                parts[0].long(),
+                parts[1].long(),
+                fp4_scale_byte(slots.long()[:, None], chunk),
+            )
+            names = ("page", "row", "scale_at")
         for side, cut in (
             ("read", slice(0, len(read))),
             ("stage", slice(len(read), None)),
         ):
-            for part, tensor in zip(("page", "row", "scale_row"), parts):
+            for part, tensor in zip(names, parts):
                 setattr(attn_metadata, f"dcp_indexer_fp4_{side}_{part}", tensor[cut])
         attn_metadata.dcp_indexer_fp4_stage_pages = int(first_page[bs])
 
