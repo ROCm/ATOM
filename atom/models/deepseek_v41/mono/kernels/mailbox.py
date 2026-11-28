@@ -23,8 +23,14 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from atom.models.deepseek_v41.mono.epoch_policy import (
+    CODED_TAG_BITS,
+    CODED_TAG_MASK,
+    EPOCH_MASK,
+    TAG_BITS,
+)
 from atom.mono.device.numa import local_copy, xcc_id
-from atom.mono.device.ops import rsrc, traced
+from atom.mono.device.ops import rsrc, traced, uniform
 from atom.mono.device.sync import (
     _SCOPE_CM,
     POLL_MAX,
@@ -229,16 +235,66 @@ def _batch_values(specs, kind):
     return out
 
 
+# Epoch tags (``Mailbox(..., epoch=)``): a pair's tag is (epoch << TAG_BITS) | (layer + 1), so a pair a previous step
+# left never carries a live tag and nothing need zero a mailbox between steps (the target runner's slim step begin,
+# ``epoch_begin``). Every V4.1 launch tag (layer + 1, POST_TAG0 / MOE_TAG0 + layer + 1, HEAD_TAG, GATHER_TAG + call,
+# CTX_TAG) is below 1 << TAG_BITS, so the low byte of a live tag is never 0 (zeroed memory never matches). A coded pair
+# keeps the tag's low CODED_TAG_BITS (16 epoch bits: a stale coded tag repeats only 65536 epochs later, and the step
+# begin's periodic full zero comes first) and its 8-bit code above them (``epoch_policy``).
+
+
+@traced
+def epoch_of(epoch_ptr):
+    """The step's epoch, read at a launch's start from the runner's epoch word
+    (``epoch_begin.EpochMailboxes``: its begin stores each new epoch there):
+    its low 32 bits only (a tag keeps ``EPOCH_MASK`` of them), made wave-uniform
+    (``uniform``: an SGPR). The vector load's own result, a 64-bit epoch in two
+    VGPRs, and every tag made from it would be held to the launch's last
+    hand-off, in VGPRs the largest layer kernels (indexing and compressing)
+    cannot spare."""
+    return uniform(
+        bo.buffer_load(rsrc(fresh_s64(epoch_ptr)), 0, vec_width=1, dtype=T.i32)
+    )
+
+
 class Mailbox(SharedMailbox):
     """``sync.Mailbox`` over ``FreshAddr`` regions, with the waits only the
-    V4.1 kernels use (module docstring); its puts are the shared class's."""
+    V4.1 kernels use (module docstring); its puts are the shared class's.
+    ``epoch``: the step's epoch (a traced Int32, the low half of the runner's
+    epoch word read at the launch's start, ``epoch_of``): the tags are epoch
+    tags (above), else ``layer + 1``."""
+
+    def __init__(self, layer, diag=None, region_ids=None, epoch=None):
+        super().__init__(layer, diag, region_ids)
+        self.epoch_tags = epoch is not None
+        if self.epoch_tags:
+            # a launch tag below 1 << TAG_BITS (a traced one, the layer kernels' ``layer`` argument + 1, is the
+            # runner's: its CPU test checks every value it passes)
+            assert (
+                not isinstance(self.tag, int) or 0 < self.tag < 1 << TAG_BITS
+            ), self.tag
+            self.tag = fx.Int32((epoch & EPOCH_MASK) << TAG_BITS) | self.tag
+
+    def _coded_mask(self):
+        return CODED_TAG_MASK if self.epoch_tags else 0xFFFF
+
+    def _code_of(self, w):
+        return (w >> CODED_TAG_BITS) & 0xFF if self.epoch_tags else w >> 16
 
     def put_coded(self, a, i, word, code):
         """Raw 32-bit ``word`` at pair i as (word, tag | code << 16): a 16-bit
         ``code`` in the tag's high half, taken with the word by one
         ``poll_coded`` (no second pair, no second wait). The tag must fit 16
-        bits: a layer's (``layer + 1``), not a launch counter's."""
-        vals = [fx.Int32(word), fx.Int32(self.tag) | (code << 16)]
+        bits: a layer's (``layer + 1``), not a launch counter's. With epoch
+        tags: (word, tag's low CODED_TAG_BITS | code << CODED_TAG_BITS), an
+        8-bit code."""
+        if self.epoch_tags:
+            vals = [
+                fx.Int32(word),
+                (fx.Int32(self.tag) & CODED_TAG_MASK) | (code << CODED_TAG_BITS),
+            ]
+        else:
+            vals = [fx.Int32(word), fx.Int32(self.tag) | (code << 16)]
         self._store(a, _word(a, i, 1), fx.Vector.from_elements(vals, fx.Int32))
 
     def poll_coded(self, specs):
@@ -272,14 +328,14 @@ class Mailbox(SharedMailbox):
             acc = v[1] ^ tag
             for e in range_constexpr(3, nw, 2):
                 acc = acc | (v[e] ^ tag)
-            return (acc & 0xFFFF) != 0
+            return (acc & self._coded_mask()) != 0
 
         first = specs[0][1]
         first = first.q * 2 if isinstance(first, Quad) else first
         v = self.spin(specs[0][0], first, load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
-            outs.append(([v[e + 2 * q] for q in range(n)], v[e + 1] >> 16))
+            outs.append(([v[e + 2 * q] for q in range(n)], self._code_of(v[e + 1])))
             e += 2 * n
         return outs
 
@@ -321,7 +377,7 @@ class Mailbox(SharedMailbox):
                 acc = v[e0 + 1] ^ tag
                 for q in range_constexpr(1, specs[k][2]):
                     acc = acc | (v[e0 + 2 * q + 1] ^ tag)
-                stale = ((acc & 0xFFFF) if coded else acc) != 0
+                stale = ((acc & self._coded_mask()) if coded else acc) != 0
                 bad = need[k] & stale if bad is None else bad | (need[k] & stale)
             return bad
 
@@ -332,7 +388,7 @@ class Mailbox(SharedMailbox):
         for k in range_constexpr(len(specs)):
             e0 = ends[k] - 2 * specs[k][2]
             words = [v[e0 + 2 * q] for q in range(specs[k][2])]
-            outs.append((words, v[e0 + 1] >> 16) if coded else words)
+            outs.append((words, self._code_of(v[e0 + 1])) if coded else words)
         return outs
 
     def spin(self, a, index, load_all, pending, between=None):
