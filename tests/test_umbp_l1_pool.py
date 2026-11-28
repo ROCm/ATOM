@@ -674,6 +674,65 @@ class TestThroughBlockManager:
             assert rank1.kv.is_used(block_id)
             assert rank1.kv.block(block_id).hash != -1
 
+    def test_a_copied_prefix_is_told_to_the_event_stream(
+        self, l1, monkeypatch, seq_factory
+    ):
+        """A rank reports the blocks it copied in as stored, like those it
+        computed: a consumer of its events (the Atomesh router) then knows it
+        holds them, and can place the blocks it computes after them."""
+        from types import SimpleNamespace
+
+        from atom.distributed.kv_events import BlockStored
+
+        cfg = MockConfig(
+            num_kvcache_blocks=32,
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+            kv_events_config=SimpleNamespace(enable=True),
+        )
+        made = iter(range(8))
+
+        def make(config, num_blocks, *, on_evict=None, on_remap=None, **_):
+            return make_pool(
+                l1, f"ev{next(made)}", num_blocks, on_evict=on_evict, on_remap=on_remap
+            )
+
+        monkeypatch.setattr(bm_module, "make_block_pool", make)
+        rank0, rank1 = BlockManager(cfg), BlockManager(cfg)
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        rank0.allocate(first, 0)
+        rank0.hash_blocks(first, len(tokens))
+        settle(rank0.kv)
+        computed = [
+            h
+            for event in rank0._event_log
+            if isinstance(event, BlockStored)
+            for h in event.block_hashes
+        ]
+        assert len(computed) == 5
+
+        second = seq_factory(tokens + [100, 101])
+        assert rank1._event_log == []
+        if rank1.kv.async_fetch:
+            assert rank1.shared_prefix_pending(second)
+            deadline = time.monotonic() + 10
+            while rank1.kv.fetch_pending(second.id):
+                assert time.monotonic() < deadline, "background fetch never landed"
+                time.sleep(0.001)
+                rank1.poll_shared_fetches()
+        assert rank1.can_allocate(second) == 5
+        (event,) = rank1._event_log
+        assert isinstance(event, BlockStored)
+        # The five blocks in one event, from the start of the prompt, under the
+        # hashes rank 0 stored them by.
+        assert event.block_hashes == computed
+        assert (event.parent_block_hash, event.token_offset) == (None, 0)
+        assert (event.block_size, event.medium) == (4, "GPU")
+        # Nothing is left to report for a copy that has landed.
+        rank1.poll_shared_fetches()
+        assert len(rank1._event_log) == 1
+
     def test_the_pool_is_asked_once_per_sequence(self, ranks, seq_factory):
         _, rank1 = ranks
         calls = []

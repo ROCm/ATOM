@@ -907,6 +907,8 @@ def _kv_events_engine(
         hf_config=SimpleNamespace(num_hidden_layers=4, model_type="glm_moe_dsa"),
         model="test-model",
         kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
+        quant_config=SimpleNamespace(online_quant_config_raw=None),
         speculative_config=None,
     )
     config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
@@ -1074,6 +1076,36 @@ def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
             "world": 1,
             "min_load_tokens": reported,
             "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
+        }
+    assert asyncio.run(api_server.kv_event_sources()) == expected
+
+
+def test_kv_event_sources_reports_the_pool_as_its_connector_shares_it(monkeypatch):
+    from atom.kv_transfer.pool.umbp.pool import share_group_for
+    from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
+
+    address = "unix:///tmp/umbp-l1/server.sock"
+    pool = {
+        "kv_connector": "umbp_pool",
+        "kv_connector_extra_config": {"address": address, "share_ratio": 0.5},
+    }
+    config = _kv_events_engine(
+        monkeypatch,
+        kv_transfer_config=pool,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    # Every rank reports the pool alike, under the group its pool attaches to.
+    settings = UmbpPoolSettings.from_transfer_config(pool)
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    for source in expected.values():
+        source["kv_pool"] = {
+            "backend": "umbp_pool",
+            "address": address,
+            "group": share_group_for(config, settings),
+            "share_ratio": 0.5,
+            "fetch": True,
         }
     assert asyncio.run(api_server.kv_event_sources()) == expected
 

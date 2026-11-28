@@ -16,7 +16,7 @@ mod tests;
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-pub(crate) use partition::{match_lanes, Holder, Lane, Partition, Predictor};
+pub(crate) use partition::{match_groups, match_lanes, Holder, Lane, Partition, Predictor};
 
 use crate::core::Worker;
 

@@ -313,6 +313,9 @@ class BlockManager:
         self._shared_prefix_asked: WeakKeyDictionary[Sequence, int] = (
             WeakKeyDictionary()
         )
+        # The background copies to tell the event stream of once they land:
+        # by owner, the sequence, the first block it asked for and its chain.
+        self._shared_fetches: dict[Any, tuple[Sequence, int, list[int]]] = {}
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -1519,9 +1522,47 @@ class BlockManager:
         if self.kv.async_fetch:
             # Copied in the background; the scheduler holds the sequence back
             # while it is in flight (`shared_prefix_pending`).
-            self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            started = self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            if started and self._events_enabled:
+                self._shared_fetches[seq.id] = (seq, local, chain)
             return
-        self.kv.fetch(chain[local:], tokens_of)
+        landed = self.kv.fetch(chain[local:], tokens_of)
+        if landed and self._events_enabled:
+            self._record_fetched(seq, local, chain, range(landed))
+
+    def poll_shared_fetches(self) -> None:
+        """Index what finished background copies brought in, and report those
+        blocks to the event stream. A consumer of the events otherwise never
+        learns that this rank holds them, and cannot place the blocks the rank
+        then computes after them, whose parent it has not seen stored here."""
+        for owner, indexed in self.kv.poll_fetches() or ():
+            entry = self._shared_fetches.pop(owner, None)
+            if entry is not None and indexed:
+                self._record_fetched(*entry, indexed)
+
+    def _record_fetched(
+        self, seq: Sequence, first: int, chain: list[int], indexed
+    ) -> None:
+        """One BlockStored for each run of blocks a copy from other pools
+        indexed in a row, as `hash_blocks` reports a forward's: `indexed` are
+        their positions past block `first` of `seq`'s `chain`, in order."""
+        hbs = self.hash_block_size
+        run: list[int] = []
+        for i in (*indexed, None):
+            if run and (i is None or i != run[-1] + 1):
+                start = first + run[0]
+                self.record_remote_store(
+                    block_hashes=[chain[first + j] for j in run],
+                    token_ids=list(
+                        seq.token_ids[start * hbs : (start + len(run)) * hbs]
+                    ),
+                    parent_block_hash=chain[start - 1] if start else None,
+                    token_offset=start * hbs,
+                    cache_seed=seq.cache_seed,
+                )
+                run = []
+            if i is not None:
+                run.append(i)
 
     def shared_prefix_pending(self, seq: Sequence) -> bool:
         """Whether `seq` should wait for its prefix to arrive from other pools.
@@ -4053,8 +4094,10 @@ class BlockManager:
         """Emit a BlockStored for blocks received from a remote KV transfer
         producer (Mooncake/MoriIO decode side). Called by the KVConnector
         worker once the transfer completes so external KV-cache consumers
-        (LMCache, etc.) can track them. The KV now sits in this engine's HBM,
-        so the medium is GPU like any block computed here.
+        (LMCache, etc.) can track them, and for each run of blocks a copy from
+        the pools of this rank's share group indexed (`_record_fetched`). The
+        KV now sits in this engine's HBM, so the medium is GPU like any block
+        computed here.
 
         `token_offset` is the sequence position of the first remote block;
         `cache_seed` is the seq's (see `_make_block_stored`)."""
