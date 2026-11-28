@@ -613,7 +613,16 @@ class DSparkDraftModel(nn.Module):
         if pcp_num_tokens is not None:
             self.write_split_context_kv(taps, positions, pcp_num_tokens, slot_mapping)
             return
-        ctx_hidden = self.project_context(taps)
+        self.write_context_rows(self.project_context(taps), positions, slot_mapping)
+
+    def write_context_rows(
+        self,
+        ctx_hidden: torch.Tensor,  # [N, hidden] the projected context
+        positions: torch.Tensor,  # [N] absolute positions
+        slot_mapping: torch.Tensor | None,  # [N] paged-pool slots
+    ) -> None:
+        """Every context layer's K/V rows of one projected context, layer by
+        layer; a flavor that can write them together overrides this."""
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions, slot_mapping)
 
