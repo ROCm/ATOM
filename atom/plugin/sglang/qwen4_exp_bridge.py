@@ -38,7 +38,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer, envs, upload_numpy
+from atom.utils import CpuGpuBuffer, upload_numpy
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -1233,10 +1233,10 @@ def _flydsl_layout_needed(
     the predicate the layer's fallback uses, on the per-rank head shape of
     this model's config and the KV dtype of the pool the QSA caches are bound
     from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
-    detect it; a pool whose dtype cannot be read keeps the native kernel. With
-    the flag on, each reason is logged once."""
-    if not envs.ATOM_QSA_FLYDSL_ATTN:
-        return False  # flag off: keep the bridge free of the layer module
+    detect it; a pool whose dtype cannot be read keeps the native kernel. The
+    kernel is gfx942's, which `flydsl_fallback_reason` checks last: a model
+    the kernel cannot serve for its own reasons says so before the GPU does.
+    Each reason is logged once."""
     from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 
     from atom.model_ops.qwen4_exp import qsa_attention

@@ -432,14 +432,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
-    # with aiter's FlyDSL kernel (BF16 D256, one KV head per rank) instead of
-    # qsa_sparse_paged_gqa, where aiter reports it runs
-    # (aiter.ops.qsa.qsa_sparse_prefill_widths()). Other steps keep the native
-    # kernel. On by default; 0 / false / off disables. qsa_attention imports
-    # aiter's queries at module level, so aiter with ROCm/aiter#8083 is needed
-    # whether the flag is on or off.
-    "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + SiLU, because it

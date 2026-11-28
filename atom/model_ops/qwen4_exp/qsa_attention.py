@@ -34,6 +34,7 @@ raw index keys so pooling can read them back.
 
 import functools
 import logging
+import os
 from types import SimpleNamespace
 
 import aiter
@@ -75,10 +76,30 @@ from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     qsa_row_space,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_removed_attn_env() -> None:
+    """Warn if the removed ATOM_QSA_FLYDSL_ATTN is still set.
+
+    It used to turn the FlyDSL prefill off, so a leftover `0` reads as "keep
+    the native kernel". It cannot: the arch and shape gates decide now, and a
+    run that silently ignored the setting would look like the flag still
+    worked. Called once at import, as `base_attention` does for its own
+    removed flag.
+    """
+    if "ATOM_QSA_FLYDSL_ATTN" in os.environ:
+        logger.warning(
+            "ATOM_QSA_FLYDSL_ATTN is no longer used and is ignored; QSA eager "
+            "prefill runs the aiter FlyDSL attention wherever it is supported "
+            "(gfx942, BF16 KV, D256 with 12/6/3 q heads per rank) and the "
+            "native kernel everywhere else."
+        )
+
+
+_warn_removed_attn_env()
 
 
 def qsa_rank_heads(
@@ -97,6 +118,27 @@ def qsa_rank_heads(
     return num_attention_heads // tp_size, 1
 
 
+def flydsl_arch_reason() -> str | None:
+    """Why the live GPU cannot run the aiter FlyDSL QSA prefill, or None when
+    it is gfx942 -- the one arch aiter builds that kernel for.
+
+    Its `flydsl_qsa_sparse_prefill_available()` answers the same question, and
+    the call raises `ValueError` off gfx942, but ATOM decides the layer's path
+    before building the selection: an unguarded miss would pay the host layout,
+    the selection and its expansion on a GPU that then refuses the attention.
+
+    `flydsl_fallback_reason` folds this in as the last gate, so the SGLang
+    bridge reaches it through that one predicate rather than calling this
+    directly: off gfx942 the callers take the native kernel either way.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    # lru_cached in aiter, so a call per layer and per forward costs a lookup.
+    if get_gfx_runtime() != "gfx942":
+        return "the GPU is not gfx942"
+    return None
+
+
 def flydsl_fallback_reason(
     compress_ratio: int,
     token_topk: int,
@@ -113,29 +155,36 @@ def flydsl_fallback_reason(
     its selection would give wrong output. The one authority for the layer's
     fallback and the SGLang bridge's layout build; the per-call conditions
     (host layout, selection byte span, graph capture, query dtype) stay with
-    the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
+    the layer. The arch comes last, so a model this kernel cannot serve for
+    its own reasons is reported as such before the GPU is blamed."""
     if not kv_bf16:
         return "the KV cache is not BF16"
-    widths = qsa_sparse_prefill_widths()
-    if not widths:
-        return "aiter's FlyDSL QSA prefill does not run on this GPU"
-    if compress_ratio != 4 or token_topk + 3 not in widths:
-        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
         return (
             f"per-rank head shape {num_heads} q / {num_kv_heads} kv heads "
             f"x {head_dim} (needs 12, 6 or 3 q / 1 kv x 256)"
         )
+    # The kernel is gfx942's alone: aiter builds it for that arch and raises
+    # on any other.
+    arch_reason = flydsl_arch_reason()
+    if arch_reason is not None:
+        return arch_reason
+    # aiter reports no widths off gfx942 too, so this is only worth saying
+    # once the arch is known to be able to run the kernel at all.
+    widths = qsa_sparse_prefill_widths()
+    if not widths:
+        return "this aiter has no FlyDSL QSA prefill"
+    if compress_ratio != 4 or token_topk + 3 not in widths:
+        return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     return None
 
 
 @functools.cache
 def log_flydsl_fallback(reason: str) -> None:
-    """Warn once per distinct reason, so a server with the FlyDSL QSA attention
-    enabled shows whether, and why, QSA attention stays on the native kernel."""
+    """Warn once per distinct reason, so a server shows whether, and why, QSA
+    attention stays on the native kernel."""
     logger.warning(
-        "FlyDSL QSA prefill attention is enabled, but QSA attention uses the "
-        "native kernel: %s",
+        "QSA attention uses the native kernel instead of the FlyDSL one: %s",
         reason,
     )
 
@@ -194,8 +243,6 @@ class _FlyDSLPrefill:
         self.laid_out = False
         self.reason = self.width = self.query_lens = self.prefix_lens = None
         self.indices = None
-        if not envs.ATOM_QSA_FLYDSL_ATTN:
-            return
         # The prefixed path reads raw cache rows; the kernel takes BF16 only.
         reason = flydsl_fallback_reason(
             ratio, topk, heads, kv_heads, head_dim, kv_bf16=kv_bf16
@@ -725,8 +772,8 @@ class Qwen4ExpAttention(nn.Module):
     def _flydsl_attention(self, query, key, value, plan, qsa):
         """aiter FlyDSL sparse attention for an eager prefill, or None for the
         native kernel. `plan` is the forward's layout; when it is ready the
-        selection was written into `plan.indices`. With the flag on, the first
-        FlyDSL call and each distinct fallback reason are logged once."""
+        selection was written into `plan.indices`. The first FlyDSL call and
+        each distinct fallback reason are logged once."""
         if not plan.laid_out:
             return None
         if plan.reason is not None:
