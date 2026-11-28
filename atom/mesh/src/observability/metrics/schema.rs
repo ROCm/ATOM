@@ -264,6 +264,7 @@ pub mod names {
     pub const MANUAL_POLICY_CACHE_ENTRIES: &str = "mesh_manual_policy_cache_entries";
     pub const MANUAL_POLICY_BRANCH_TOTAL: &str = "mesh_manual_policy_branch_total";
     pub const PREFIX_HASH_POLICY_BRANCH_TOTAL: &str = "mesh_prefix_hash_policy_branch_total";
+    pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
     pub const SESSION_AFFINITY_ENTRIES: &str = "mesh_session_affinity_entries";
     pub const SESSION_AFFINITY_EVICTED_TOTAL: &str = "mesh_session_affinity_evicted_total";
     pub const WORKER_ROUTING_KEYS_ACTIVE: &str = "mesh_worker_routing_keys_active";
@@ -477,6 +478,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
         help: "Deprecated, use mesh_route_branch_total{policy=\"prefix_hash\"}. Prefix hash policy execution branches by branch",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::SESSION_AFFINITY_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Session affinity decisions by result (hit, new, rebind, expired) and scope (regular, prefill, decode)",
         status: MetricStatus::Active,
     },
     MetricSpec {

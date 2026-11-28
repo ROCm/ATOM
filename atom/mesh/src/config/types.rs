@@ -65,6 +65,40 @@ pub const DEFAULT_SESSION_ID_HEADERS: &str =
 /// such as a per-request value, would otherwise grow the table for a whole TTL.
 pub const DEFAULT_SESSION_AFFINITY_MAX_ENTRIES: usize = 1_000_000;
 
+/// `hard` keeps the bound worker. `soft` keeps it too, unless the inner policy
+/// opts in and chooses another worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAffinityMode {
+    #[default]
+    Hard,
+    Soft,
+}
+
+/// A pool whose policy, other than `dp_sticky`, gets the session table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAffinityPool {
+    Regular,
+    Prefill,
+    Decode,
+}
+
+impl std::str::FromStr for SessionAffinityPool {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "regular" => Ok(Self::Regular),
+            "prefill" => Ok(Self::Prefill),
+            "decode" => Ok(Self::Decode),
+            other => Err(format!(
+                "unknown pool {other}; expected regular, prefill or decode"
+            )),
+        }
+    }
+}
+
 /// `independent` gives each session its own binding. `group` binds requests
 /// that carry a parent session id under one shared key; the parent session
 /// itself keeps its own binding.
@@ -80,11 +114,16 @@ pub enum SessionParentMode {
 #[serde(default)]
 pub struct SessionAffinityConfig {
     /// Headers checked in order for a session key. An empty list turns session
-    /// affinity off: `dp_sticky` then keys on `x-session-id` only.
+    /// affinity off for every policy but `dp_sticky`, which then keys on
+    /// `x-session-id` only.
     pub session_id_headers: Vec<String>,
     pub ttl_secs: u64,
     pub max_entries: usize,
+    pub mode: SessionAffinityMode,
     pub parent_mode: SessionParentMode,
+    /// Pools whose policy, other than `dp_sticky`, also gets the session table.
+    /// Empty by default, so those policies route as without session affinity.
+    pub pools: Vec<SessionAffinityPool>,
 }
 
 impl Default for SessionAffinityConfig {
@@ -96,7 +135,9 @@ impl Default for SessionAffinityConfig {
                 .collect(),
             ttl_secs: DEFAULT_SESSION_AFFINITY_TTL_SECS,
             max_entries: DEFAULT_SESSION_AFFINITY_MAX_ENTRIES,
+            mode: SessionAffinityMode::Hard,
             parent_mode: SessionParentMode::Independent,
+            pools: Vec::new(),
         }
     }
 }
@@ -104,6 +145,11 @@ impl Default for SessionAffinityConfig {
 impl SessionAffinityConfig {
     pub fn is_enabled(&self) -> bool {
         !self.session_id_headers.is_empty()
+    }
+
+    /// Whether a policy other than `dp_sticky` in `pool` gets the session table.
+    pub fn wraps(&self, pool: SessionAffinityPool) -> bool {
+        self.is_enabled() && self.pools.contains(&pool)
     }
 
     /// Reject settings that would expire every request, bound nothing, or name a
@@ -163,7 +209,7 @@ pub struct RouterConfig {
     pub atom_pd_concurrent: bool,
 
     pub policy: PolicyConfig,
-    /// Session table settings for `dp_sticky`. Prefill and decode each get a table.
+    /// Session table layered on every policy. Prefill and decode each get a table.
     #[serde(default)]
     pub session_affinity: SessionAffinityConfig,
     pub host: String,

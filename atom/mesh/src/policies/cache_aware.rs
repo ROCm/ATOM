@@ -436,6 +436,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
+        // Soft session affinity: keep the session's worker unless it alone is over
+        // the balance thresholds against the least-loaded worker. Then the pool is
+        // imbalanced too, and the session moves to the least-loaded worker below.
+        if let Some(preferred) = info
+            .preferred_worker
+            .filter(|index| healthy_indices.contains(index))
+        {
+            let load = workers[preferred].load();
+            let overloaded = load.saturating_sub(min_load) > self.config.balance_abs_threshold
+                && (load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+            if !overloaded {
+                let tree = self.trees.get(&model_id).map(|entry| entry.value().clone());
+                if let (Some(text), Some(tree)) = (request_text, tree) {
+                    tree.insert(text, workers[preferred].url());
+                }
+                workers[preferred].increment_processed();
+                return (Some(preferred), RouteDecision::branch("session_preferred"));
+            }
+        }
+
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
@@ -553,6 +573,28 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn wants_tokens(&self) -> bool {
         self.kv_events.get().is_some()
+    }
+
+    /// Under soft affinity, moves a session off a worker over the balance thresholds.
+    fn overrides_session_affinity(&self) -> bool {
+        true
+    }
+
+    /// A pinned turn grows the session's prefix on its worker; the tree learns it
+    /// as it would from its own placement.
+    fn on_session_hit(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        index: usize,
+    ) {
+        let Some(text) = info.request_text else {
+            return;
+        };
+        let model_id = tree_key_for_worker(workers[index].as_ref());
+        if let Some(tree) = self.trees.get(&model_id).map(|entry| entry.value().clone()) {
+            tree.insert(text, workers[index].url());
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
