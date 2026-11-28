@@ -279,6 +279,71 @@ jobs:
         run: |
           docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
 
+  fused-attention-test:
+    name: V4.1 fused attention (gfx950)
+    needs: [ci-gate, download_aiter_wheel]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' }}
+    runs-on: linux-atom-mi35x-1
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CONTAINER_NAME: atom_fused_attention_${{ github.run_id }}_${{ github.run_attempt }}
+      AITER_WHL_DIR: /tmp/fused-attention-aiter-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Download AITER wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: aiter-whl
+          path: ${{ env.AITER_WHL_DIR }}
+
+      - name: Docker Login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Start CI container
+        uses: ./.github/actions/setup-gpu-container
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: ${{ env.ATOM_BASE_IMAGE }}
+          runner: linux-atom-mi35x-1
+
+      - name: Install AITER wheel
+        run: bash .github/scripts/install_aiter_wheel.sh
+
+      - name: Install ATOM and pytest
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            python3 -m pip install -e . pytest
+          '
+
+      - name: Run required fused attention tests
+        run: |
+          docker exec -e ATOM_REQUIRE_FUSED_ATTENTION_TESTS=1 "$CONTAINER_NAME" \
+            python3 -m pytest -q tests/models/deepseek_v41/test_fused_fp8_attention.py \
+            tests/models/deepseek_v41/test_attention_streams.py \
+            --junitxml=/workspace/fused-attention-results.xml -o junit_family=legacy
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fused-attention-results
+          path: fused-attention-results.xml
+          if-no-files-found: warn
+
+      - name: Clean up test container
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
+
   atom-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
     name: Accuracy
@@ -845,6 +910,7 @@ jobs:
       - download_aiter_wheel
       - load-test-models
       - offline-smoke-test
+      - fused-attention-test
       - atom-test
     steps:
       - name: Checkout ATOM repo
@@ -865,6 +931,7 @@ jobs:
             check-signal=${{ needs.check-signal.result }}
             download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
             load-test-models=${{ needs.load-test-models.result }}
+            fused-attention-test=${{ needs.fused-attention-test.result }}
             atom-test=${{ needs.atom-test.result }}
 
   # ---------- Push accuracy data to benchmark dashboard ----------

@@ -103,7 +103,9 @@ def unallocated_moe(monkeypatch):
     monkeypatch.setattr(model.Block, "attention_cls", UnallocatedModule)
     monkeypatch.setattr(dspark.DraftBlock, "attention_cls", UnallocatedModule)
 
-    def capture_v4(self, layer_id, args, prefix="", alt_stream=None):
+    def capture_v4(
+        self, layer_id, args, prefix="", alt_stream=None, *, enable_eplb=True
+    ):
         nn.Module.__init__(self)
         self.gate = nn.Module()
         self.experts = nn.Module()

@@ -1,8 +1,14 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. With `--kv_cache_dtype fp8`, AITER's `mla_sparse_prefill_v41`
-attends over contiguous MXFP8 data and scale planes. With FP4 KV,
+usable. With `--kv_cache_dtype fp8`, eligible layers use AITER's
+`fused_norm_rope_attn_rope_cast` by default over contiguous MXFP8 data and
+scale planes. Its public `is_fused_norm_rope_attn_rope_cast_supported` query
+owns device, shape and RoPE support; ATOM additionally requires MXFP8 Q
+latents, eight-head output groups and a quantized `wo_a`. Other FP8 layers,
+including FP4PTPC and BF16 projection configurations, retain
+`mla_sparse_prefill_v41`. See the [execution details](../docs/deepseek_v41_performance.md#cache-format-and-attention-boundary).
+With FP4 KV,
 `ATOM_DSV41_A8W4_ATTN=auto` (the default) uses native A8W4 on supported
 gfx950 configurations, as selected by AITER's V4.1 capability API. Setting
 `ATOM_DSV41_A8W4_ATTN=off`, or using a query/backend that cannot run A8W4,
