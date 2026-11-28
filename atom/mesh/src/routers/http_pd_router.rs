@@ -220,6 +220,11 @@ impl Drop for WorkerOutcome {
     }
 }
 
+/// A server error, or no response (`None`): the session may be placed again.
+fn dispatch_failed(status: Option<StatusCode>) -> bool {
+    status.is_none_or(|status| status.is_server_error())
+}
+
 struct WorkerResponse {
     inner: reqwest::Response,
     outcome: WorkerOutcome,
@@ -1193,7 +1198,7 @@ impl PDRouter {
         let kv_params = match self
             .atom_prefill_kv(
                 prefill_post,
-                &prefill,
+                &placement,
                 prefill_guard,
                 headers,
                 &ctx,
@@ -1261,14 +1266,15 @@ impl PDRouter {
     async fn atom_prefill_kv(
         &self,
         prefill_post: reqwest::RequestBuilder,
-        prefill: &Arc<dyn Worker>,
+        placement: &ReservedPair,
         prefill_guard: WorkerLoadGuard,
         headers: Option<&HeaderMap>,
         ctx: &PairCtx,
         request_id: &str,
     ) -> Result<Value, Response> {
+        let prefill = &placement.prefill;
         let prefill_resp = self
-            .send_worker(prefill_post, prefill.clone(), headers)
+            .send_prefill(prefill_post, placement, headers)
             .await
             .map_err(|e| {
                 error!(
@@ -1454,11 +1460,12 @@ impl PDRouter {
         let decode_policy = self.dispatch(&decode, headers);
 
         let flow_request_id = request_id.clone();
+        let flow_pair = Arc::clone(&placement);
         let mut prefill_flow = Box::pin(async move {
             let line = match self
                 .atom_prefill_kv(
                     prefill_post,
-                    &prefill,
+                    &flow_pair,
                     prefill_guard,
                     headers,
                     &ctx,
@@ -1482,7 +1489,7 @@ impl PDRouter {
             }
             line
         });
-        let decode_send = Self::send(late_post, decode.clone(), decode_policy.clone());
+        let decode_send = Self::send(late_post, decode.clone(), decode_policy.clone(), headers);
         let mut decode_send = std::pin::pin!(decode_send);
 
         // A P failure ends the request at once; D's body is aborted above.
@@ -1549,7 +1556,7 @@ impl PDRouter {
             .headers(decode_headers)
             .header(CONTENT_TYPE, "application/json")
             .body(body);
-        let res = match Self::send(relay_post, decode.clone(), decode_policy).await {
+        let res = match Self::send(relay_post, decode.clone(), decode_policy, headers).await {
             Ok(r) => r,
             Err(e) => {
                 error!(
@@ -1623,7 +1630,7 @@ impl PDRouter {
         let results = tokio::try_join!(
             async {
                 let response = self
-                    .send_worker(p, prefill.clone(), headers)
+                    .send_prefill(p, &placement, headers)
                     .await
                     .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
                 if !response.status().is_success() {
@@ -2137,7 +2144,29 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
         let policy = self.dispatch(&worker, headers);
-        Self::send(request, worker, policy).await
+        Self::send(request, worker, policy, headers).await
+    }
+
+    /// Sends an ATOM prefill. Under idx2idx the prefill rank follows the decode
+    /// rank, so a failed prefill also releases the decode binding; otherwise
+    /// every retry maps back to the same prefill rank.
+    async fn send_prefill(
+        &self,
+        request: reqwest::RequestBuilder,
+        placement: &ReservedPair,
+        headers: Option<&HeaderMap>,
+    ) -> Result<WorkerResponse, reqwest::Error> {
+        let (prefill, decode) = (&placement.prefill, &placement.decode);
+        let follows_decode = self.atom_pd_rank_mapping_policy == AtomPdRankMappingPolicy::Idx2Idx
+            && prefill.dp_rank().is_some()
+            && prefill.dp_rank() == decode.dp_rank();
+        let response = self.send_worker(request, prefill.clone(), headers).await;
+        if follows_decode && dispatch_failed(response.as_ref().ok().map(WorkerResponse::status)) {
+            self.policy_registry
+                .get_decode_policy()
+                .on_dispatch_failed(headers, decode);
+        }
+        response
     }
 
     /// Runs the dispatch hooks right before the request is sent to `worker`,
@@ -2167,17 +2196,22 @@ impl PDRouter {
         request: reqwest::RequestBuilder,
         worker: Arc<dyn Worker>,
         policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+        headers: Option<&HeaderMap>,
     ) -> Result<WorkerResponse, reqwest::Error> {
         let mut outcome = WorkerOutcome {
             worker: Some(worker),
             policy,
             status: None,
         };
-        match request.send().await {
-            Ok(inner) => {
-                outcome.status = Some(inner.status());
-                Ok(WorkerResponse { inner, outcome })
+        let response = request.send().await;
+        outcome.status = response.as_ref().ok().map(reqwest::Response::status);
+        if dispatch_failed(outcome.status) {
+            if let Some(worker) = &outcome.worker {
+                outcome.policy.on_dispatch_failed(headers, worker);
             }
+        }
+        match response {
+            Ok(inner) => Ok(WorkerResponse { inner, outcome }),
             Err(error) => {
                 outcome.finish(false);
                 Err(error)
@@ -3616,7 +3650,8 @@ mod tests {
 
         // The session stays pinned to prefill rank 2; idx2idx runs it on the decode rank.
         for decode_rank in [5, 5, 2] {
-            assert_eq!(prefill_policy.select_worker(&prefill, &info).await, Some(0));
+            let (selected, _) = prefill_policy.select_with_decision(&prefill, &info).await;
+            assert_eq!(selected, Some(0));
             let decode =
                 create_test_dp_worker("http://decode", decode_rank, 8, WorkerType::Decode, true);
             let pair = router
@@ -3650,6 +3685,121 @@ mod tests {
             changes(),
             [r#"mesh_session_worker_change_total{pool="prefill",reason="rank_mapping"} 1"#]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_transport_error_releases_the_session_binding() {
+        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let router = create_test_pd_router();
+        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        router
+            .policy_registry
+            .set_decode_policy(decode_policy.clone());
+        let decode: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|rank| create_test_dp_worker("http://decode", rank, 2, WorkerType::Decode, true))
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let (selected, _) = decode_policy.select_with_decision(&decode, &info).await;
+        assert_eq!(selected, Some(0));
+        let result = router
+            .send_worker(
+                router.client.get(&closed),
+                decode[0].clone(),
+                Some(&headers),
+            )
+            .await;
+        assert!(result.is_err());
+        let (selected, decision) = decode_policy.select_with_decision(&decode, &info).await;
+        assert_eq!((selected, decision.branch), (Some(1), "rebind"));
+    }
+
+    #[tokio::test]
+    async fn test_idx2idx_prefill_failure_releases_the_decode_binding() {
+        use crate::policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let failing = || async { (StatusCode::SERVICE_UNAVAILABLE, "{}") };
+            axum::serve(listener, axum::Router::new().fallback(failing))
+                .await
+                .unwrap();
+        });
+        let decode: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|rank| create_test_dp_worker("http://decode", rank, 2, WorkerType::Decode, true))
+            .collect();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("session-1"));
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        for (mapping, released) in [
+            (AtomPdRankMappingPolicy::Idx2Idx, true),
+            (AtomPdRankMappingPolicy::None, false),
+        ] {
+            let mut router = create_test_pd_router();
+            router.backend = BackendType::Atom;
+            router.atom_pd_rank_mapping_policy = mapping;
+            let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+            router
+                .policy_registry
+                .set_decode_policy(decode_policy.clone());
+            let (selected, _) = decode_policy.select_with_decision(&decode, &info).await;
+            assert_eq!(selected, Some(0));
+
+            // The prefill runs on decode's rank 0 and fails.
+            let prefill = create_test_dp_worker(
+                "http://prefill",
+                0,
+                2,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            );
+            let pair = router
+                .reserve_pair(
+                    PlacementPlan::Pair {
+                        prefill,
+                        decode: decode[0].clone(),
+                        prefill_policy: "round_robin",
+                        decode_policy: "dp_sticky",
+                        prefill_tokens: 0,
+                    },
+                    Some(&headers),
+                )
+                .unwrap();
+            let response = router
+                .send_prefill(router.client.get(&url), &pair, Some(&headers))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            drop(response);
+
+            let (selected, decision) = decode_policy.select_with_decision(&decode, &info).await;
+            let expected = if released {
+                (Some(1), "rebind")
+            } else {
+                (Some(0), "hit")
+            };
+            assert_eq!((selected, decision.branch), expected, "{mapping:?}");
+        }
         server.abort();
     }
 

@@ -106,6 +106,23 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that do not track sessions
     }
 
+    /// Called when a request sent to `worker` fails with a server error or
+    /// never gets a response. Client errors are not failures. The HTTP and PD
+    /// routers and the ext_proc ingress report it; the gRPC routers do not.
+    /// `worker` is the worker the request was sent to, after DP rank mapping.
+    /// Under ATOM PD idx2idx rank mapping, a failed prefill is also reported to
+    /// the decode policy for the decode worker, although the decode was never
+    /// sent.
+    ///
+    /// A response body that breaks after a successful status is not reported by
+    /// the HTTP and PD routers. The worker still records that failure for its
+    /// circuit breaker, and a worker that died fails the session's next
+    /// request, which is reported. The ext_proc ingress also reports an
+    /// upstream reset or timeout after the response started.
+    fn on_dispatch_failed(&self, _headers: Option<&http::HeaderMap>, _worker: &Arc<dyn Worker>) {
+        // Default: no-op for policies that do not track sessions
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

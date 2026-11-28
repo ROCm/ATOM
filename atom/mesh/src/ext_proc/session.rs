@@ -486,7 +486,7 @@ impl Session {
         let PreparedRequest {
             mut request,
             admission,
-            decision,
+            mut decision,
             trailers,
             observation,
         } = prepared;
@@ -500,6 +500,10 @@ impl Session {
             &request.path,
         );
         self.lifecycle.admit(admission);
+        // A failed mutation (a bad worker key) is never sent to the worker.
+        if headers.is_ok() {
+            decision.target.dispatched(&mut request.headers);
+        }
         self.lifecycle.bind(decision);
         self.phase = Phase::Dispatching;
         let output = self.output.clone();

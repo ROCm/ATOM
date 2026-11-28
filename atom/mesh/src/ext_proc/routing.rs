@@ -10,6 +10,7 @@ use crate::{
         },
         Worker, WorkerLoadGuard,
     },
+    observability::metrics::metrics_labels::WORKER_REGULAR,
     policies::LoadBalancingPolicy,
     routers::ingress::{dp_ranked_body, IngressRouting},
 };
@@ -30,6 +31,9 @@ pub(super) enum ExecutionTarget {
     Single {
         worker: Arc<dyn Worker>,
         policy: Arc<dyn LoadBalancingPolicy>,
+        /// The request's headers, moved in at dispatch, for the policy's
+        /// failure hook.
+        headers: http::HeaderMap,
         _load: WorkerLoadGuard,
     },
     Pair(ExecutionLease),
@@ -43,12 +47,38 @@ impl ExecutionTarget {
         }
     }
 
+    /// Envoy sends a single-worker request itself; mesh reports it to the
+    /// policy when it hands the route to Envoy, and keeps the request's headers.
+    pub fn dispatched(&mut self, request_headers: &mut http::HeaderMap) {
+        if let Self::Single {
+            worker,
+            policy,
+            headers,
+            ..
+        } = self
+        {
+            *headers = std::mem::take(request_headers);
+            policy.on_dispatch(WORKER_REGULAR, Some(headers), worker);
+        }
+    }
+
     pub fn complete(&self, health: Option<bool>, success: bool) {
-        if let Self::Single { worker, policy, .. } = self {
+        if let Self::Single {
+            worker,
+            policy,
+            headers,
+            ..
+        } = self
+        {
             if let Some(health) = health {
                 worker.record_outcome(health);
             }
             policy.on_request_complete(worker.url(), success);
+            // An unhealthy outcome is a 5xx from the worker, no response, or an
+            // upstream reset or timeout, even after the response started.
+            if health == Some(false) {
+                policy.on_dispatch_failed(Some(headers), worker);
+            }
         }
         // PD worker outcomes belong to the individual HTTP attempts. A pair's
         // aggregate status must not charge a decode error to the prefill worker.
@@ -168,6 +198,7 @@ impl EndpointRouter {
                 worker,
                 _load: load,
                 policy: self.policies.regular_policy(model),
+                headers: http::HeaderMap::new(),
             },
             address,
             api_key,

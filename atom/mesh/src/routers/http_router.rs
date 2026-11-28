@@ -154,11 +154,15 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
         let response = match upstream {
             Ok(response) => {
+                if response.status().is_server_error() {
+                    policy.on_dispatch_failed(Some(&request.headers), &worker);
+                }
                 super::comm::proxy_body::ProxyBody::response(response, worker, policy, load)
             }
             Err(err) => {
                 worker.record_outcome(false);
                 policy.on_request_complete(worker.url(), false);
+                policy.on_dispatch_failed(Some(&request.headers), &worker);
                 convert_reqwest_error(err)
             }
         };

@@ -173,6 +173,7 @@ mod tests {
                 _load: WorkerLoadGuard::new(worker.clone(), None),
                 worker: worker.clone(),
                 policy: Arc::new(crate::policies::RoundRobinPolicy::new()),
+                headers: http::HeaderMap::new(),
             },
         });
         (lifecycle, worker)

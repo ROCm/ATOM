@@ -967,6 +967,40 @@ mod d_pd_planning {
         );
     }
 
+    /// Under idx2idx, decode is selected first and is the bound worker: a failure on it
+    /// moves the session's decode, and the prefill follows to the new rank.
+    #[tokio::test]
+    async fn test_idx2idx_decode_failure_moves_the_prefill_with_it() {
+        let decode_policy = Arc::new(crate::policies::DpStickyPolicy::new());
+        let source = [
+            dp_worker("http://p", 0, prefill()),
+            dp_worker("http://p", 1, prefill()),
+            dp_worker("http://d", 0, WorkerType::Decode),
+            dp_worker("http://d", 1, WorkerType::Decode),
+        ]
+        .into_iter()
+        .fold(MockWorkerSource::new(), MockWorkerSource::add_worker);
+        let policies = MockPolicySource::new()
+            .with_prefill(Arc::new(crate::policies::DpStickyPolicy::new()))
+            .with_decode(decode_policy.clone());
+        let planner = make_planner(source, policies).with_prefill_on_decode_rank(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
+        let descriptor = make_descriptor(Some("m"), None, None, Some(&headers));
+        let PlacementPlan::Pair { decode, .. } = planner.plan(&descriptor).await.unwrap() else {
+            panic!("expected Pair");
+        };
+        assert_eq!(decode.url(), "http://d@0");
+        decode_policy.on_dispatch_failed(Some(&headers), &decode);
+        let PlacementPlan::Pair {
+            prefill, decode, ..
+        } = planner.plan(&descriptor).await.unwrap()
+        else {
+            panic!("expected Pair");
+        };
+        assert_eq!((prefill.url(), decode.url()), ("http://p@1", "http://d@1"));
+    }
+
     #[tokio::test]
     async fn test_pair_charges_the_prefill_worker_whether_or_not_streaming() {
         let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());

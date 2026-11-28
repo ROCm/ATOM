@@ -555,6 +555,76 @@ async fn regular_cached_tokens_are_reconciled_against_the_estimate() {
     server.abort();
 }
 
+/// Routes one request of `session-1` and returns its status.
+async fn session_request(
+    app: &Arc<AppContext>,
+    router: &Arc<dyn crate::routers::RouterTrait>,
+) -> http::StatusCode {
+    let mut headers = json_headers();
+    headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
+    let request = InferenceEnvelope::parse(
+        "/v1/completions".parse().unwrap(),
+        headers,
+        Bytes::from_static(br#"{"model":"m","prompt":"test"}"#),
+        app,
+    )
+    .await
+    .unwrap();
+    router.route_inference(request, app).await.status()
+}
+
+#[tokio::test]
+async fn a_regular_server_or_transport_error_releases_the_session_binding() {
+    async fn engine(status: http::StatusCode) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let engine = Router::new().fallback(move || async move {
+            (
+                status,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                "{}",
+            )
+        });
+        tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+        url
+    }
+    // Bound but never listening: connects are refused, and the port stays
+    // taken for the whole test, so no engine below can be handed it.
+    let closed_socket = tokio::net::TcpSocket::new_v4().unwrap();
+    closed_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = format!("http://{}", closed_socket.local_addr().unwrap());
+    for (bound, next) in [
+        (
+            engine(http::StatusCode::BAD_REQUEST).await,
+            http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            engine(http::StatusCode::SERVICE_UNAVAILABLE).await,
+            http::StatusCode::OK,
+        ),
+        (closed, http::StatusCode::OK),
+    ] {
+        let (_pool, app, router) =
+            preparation_test_router(false, crate::config::PolicyConfig::DpSticky).await;
+        let register = |url: &str| {
+            app.worker_registry
+                .register(Arc::new(BasicWorkerBuilder::new(url).model_id("m").build()));
+            app.policy_registry.on_worker_added("m", None);
+        };
+        register(&bound);
+        let first = session_request(&app, &router).await;
+        assert_ne!(first, http::StatusCode::OK);
+        register(&engine(http::StatusCode::OK).await);
+        // A 5xx or a lost connection placed the session again, on the new
+        // worker; a 4xx kept it on the worker that answered.
+        assert_eq!(
+            session_request(&app, &router).await,
+            next,
+            "{bound}: {first}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sequential_prepare_preserves_deadline_and_body() {
     let raw = Bytes::from_static(br#"{ "model": "m", "text": "test", "extension": [1, 2] }"#);

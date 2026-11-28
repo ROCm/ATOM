@@ -145,22 +145,35 @@ workers, and on `affinity` that cache hits queue behind other requests.
 `dp_sticky` pins a session, identified by a non-empty `x-session-id` header,
 to a worker (URL and DP rank) in router memory:
 
-- `hit`: the pinned worker is healthy and its circuit breaker admits requests;
+- `hit`: the pinned worker is healthy and its circuit breaker admits requests,
+  and no request of the session has failed since it was last placed;
 - `new`: first request of the session; it goes to the worker with the fewest
   live sessions, ties broken by load;
 - `rebind`: the pinned worker is unhealthy, removed or circuit-open, or under
-  idx2idx not among the prefill candidates the decode's rank leaves, so the
-  session is reassigned like a new one;
-- `expired`: the session was idle for more than 120 minutes and is reassigned.
+  idx2idx not among the prefill candidates the decode's rank leaves, or a
+  request of the session failed on the pinned worker with a server error or got
+  no response, so the session's next request (a retry included) is placed again
+  like a new one, away from every worker it failed on since its last hit while
+  another one is healthy. A late failure on a worker the session has left does
+  not count; one from an older placement on the worker the session is pinned to
+  again does, and places it once more. Under `--atom-pd-rank-mapping-policy
+  idx2idx`, a failed prefill also releases the decode pin, although the decode
+  was never sent. HTTP, PD and ext_proc routing report failures; gRPC does not.
+  For HTTP and PD routing a body that breaks after a successful status is not a
+  failure; ext_proc also reports an upstream reset or timeout after the response
+  started;
+- `expired`: the session was idle for more than 120 minutes and is reassigned,
+  still away from the workers it failed on since its last hit.
 
 With N turns per session and stable workers, the hit rate approaches
-(N - 1) / N, and `rebind` points at worker churn. Under idx2idx a prefill pin
-holds only while decode lands on its rank: with a decode policy that does not
-follow the session, about (D - 1) / D of turns rebind, D being the decode's DP
-size. A rebind picks the prefill with the fewest live sessions on the decode's
-rank, which can be another instance than the old pin's, where `main` kept the
-instance and remapped only the rank. A router restart makes every session `new`
-again. Each pool that runs `dp_sticky` records its own branches.
+(N - 1) / N, and `rebind` points at worker churn or failing requests. Under
+idx2idx a prefill pin holds only while decode lands on its rank: with a decode
+policy that does not follow the session, about (D - 1) / D of turns rebind, D
+being the decode's DP size. A rebind picks the prefill with the fewest live
+sessions on the decode's rank, which can be another instance than the old
+pin's, where `main` kept the instance and remapped only the rank. A router
+restart makes every session `new` again. Each pool that runs `dp_sticky`
+records its own branches.
 
 ### Worker changes
 
@@ -184,9 +197,10 @@ the decode's rank is unavailable; a remap therefore takes a health or
 membership change between planning and reservation. Two in-flight requests of
 one session also record `rank_mapping` without a remap when either of them
 rebinds the pin: the one dispatched second finds the reassignment taken. A
-session that moves leaves its KV
-cache on the old worker. The HTTP routers and the external-processing PD
-executor record it; gRPC routers do not.
+session that moves leaves its KV cache on the old worker. The HTTP routers and the
+external-processing PD executor record it when they send the request, and
+external-processing single-worker routes when they hand the route to Envoy;
+gRPC routers do not.
 
 ### DP ranks
 
