@@ -779,6 +779,12 @@ class _SequenceParallel:
     replace. Rows are padded to a multiple of the TP size; padded rows are
     zero streams and are dropped on gather.
 
+    Without SDMA, both collectives use the group's custom path when
+    `ATOM_USE_CUSTOM_ALL_GATHER` is enabled and its custom communicator is
+    available and aiter's per-tensor eligibility query accepts the input.
+    The queries see contiguous tensors, including the padded rows for
+    reduce-scatter. Ineligible tensors use the group's direct NCCL path.
+
     With `sdma` (`sp_sdma.SdmaCollectives`), the decoder's reduce-scatters
     and all-gathers run on the copy engines, overlapped with the
     hyper-connections between them (`mix_gather`).
@@ -790,6 +796,13 @@ class _SequenceParallel:
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
+        dc = self.group.device_communicator
+        self.ca = dc.ca_comm if dc is not None else None
+        self.use_custom = (
+            envs.ATOM_USE_CUSTOM_ALL_GATHER
+            and self.ca is not None
+            and not self.ca.disabled
+        )
         self.sdma = sdma if sdma is not None and sdma.fits(self.chunk) else None
         if self.sdma is not None:
             self.sdma_chunks = chunk_count(self.chunk)
@@ -803,7 +816,10 @@ class _SequenceParallel:
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
-        out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
+        x = x.contiguous()
+        out = self.group.all_gather(
+            x, use_custom=self.use_custom and self.ca.should_custom_ag(x), dim=0
+        )
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> "torch.Tensor | PendingReduceScatter":
@@ -811,8 +827,9 @@ class _SequenceParallel:
         over SDMA a `PendingReduceScatter`, consumed by `mix_gather`."""
         if self.sdma is not None:
             return self.sdma.reduce_scatter(x, self.chunk, self.sdma_chunks)
+        x = _pad_rows(x.contiguous(), self.pad)
         return self.group.reduce_scatter_tensor(
-            _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
+            x, use_custom=self.use_custom and self.ca.should_custom_rs(x, 0), dim=0
         )
 
     @staticmethod

@@ -1,6 +1,7 @@
 """SGLang-ATOM Flash MTP wiring: draft rewrite, HC flatten, QSA pool mapping."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -392,6 +393,54 @@ def test_qwen4_gfx950_bf16_hipblaslt_falls_back_to_torch():
         bf16_config_avoiding_gfx950_hipblaslt(flydsl, qwen4=True, gfx="gfx950")
         is flydsl
     )
+
+
+def test_qwen4_gfx950_bf16_bypass_reads_the_gpu_arch_once(monkeypatch):
+    """The installed config hook runs on every BF16 GEMM. It queries the device
+    properties once per process and still rewrites each hipBLASLt row."""
+    arch = {"name": "gfx950:sramecc+:xnack-"}
+    queries = []
+
+    def device_properties(index):
+        queries.append(index)
+        return SimpleNamespace(gcnArchName=arch["name"])
+
+    tuned = {"libtype": "hipblaslt", "solidx": 21738, "kernelName": ""}
+    tuned_gemm = SimpleNamespace(get_GEMM_A16W16_config=lambda **kwargs: tuned)
+    fake_aiter = ModuleType("aiter")
+    fake_aiter.tuned_gemm = tuned_gemm
+    monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
+    monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties)
+    monkeypatch.setattr(rocm_patch, "_qwen4_exp_hip", True)
+    rocm_patch._live_gfx.cache_clear()
+    try:
+        rocm_patch._install_gfx950_bf16_hipblaslt_bypass()
+        lookup = tuned_gemm.get_GEMM_A16W16_config
+        for _ in range(5):
+            assert lookup(M=1056, N=324, K=10240) == {
+                "libtype": "torch",
+                "solidx": 0,
+                "kernelName": "",
+            }
+        assert queries == [0]
+        assert tuned["libtype"] == "hipblaslt"
+
+        # Other models keep their hipBLASLt rows; no further device query.
+        monkeypatch.setattr(rocm_patch, "_qwen4_exp_hip", False)
+        assert lookup(M=1056, N=324, K=10240) is tuned
+        assert queries == [0]
+
+        # A gfx942 process (fresh cache) keeps the row.
+        monkeypatch.setattr(rocm_patch, "_qwen4_exp_hip", True)
+        arch["name"] = "gfx942:sramecc+:xnack-"
+        rocm_patch._live_gfx.cache_clear()
+        assert lookup(M=1056, N=324, K=10240) is tuned
+        assert lookup(M=2112, N=513, K=2560) is tuned
+        assert queries == [0, 0]
+    finally:
+        rocm_patch._live_gfx.cache_clear()
 
 
 def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():

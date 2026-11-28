@@ -1226,6 +1226,7 @@ def _intake(hf_config=None, *, num_draft_tokens=0, rapidserve=False):
         _external_to_internal={},
         _internal_to_external={},
         prefix_hash_block_size=0,
+        _greedy_ids_only=False,
     )
     return processor
 

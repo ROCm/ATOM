@@ -9,11 +9,19 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("triton")
-pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+qwen4_exp = qwen4_exp_mtp = None
 
-from atom.models import qwen4_exp, qwen4_exp_mtp
+
+@pytest.fixture(scope="module", autouse=True)
+def _qwen_models():
+    """Use real model code on the CPU lane, stubbing only AITER / Triton."""
+    global qwen4_exp, qwen4_exp_mtp
+    with atom_without_aiter() as load:
+        qwen4_exp = load("atom.models.qwen4_exp")
+        qwen4_exp_mtp = load("atom.models.qwen4_exp_mtp")
+        yield
 
 
 class _Collectives:
@@ -32,17 +40,28 @@ class _Collectives:
         return inputs
 
     def group(self, rank: int):
+        """aiter's GroupCoordinator for `rank`; SP must ask for its custom
+        collectives."""
+
         def all_gather(x, use_custom=False, dim=0):
-            assert dim == 0
+            assert use_custom and dim == 0 and x.is_contiguous()
             return torch.cat(self._exchange(rank, x))
 
-        def reduce_scatter_tensor(x, use_custom=False, dim=0):
-            assert dim == 0 and x.shape[0] % self.world == 0
+        def reduce_scatter_tensor(x, use_custom=True, dim=0):
+            assert use_custom and dim == 0 and x.shape[0] % self.world == 0
             total = torch.stack(self._exchange(rank, x)).sum(0)
             return total.chunk(self.world)[rank].clone()
 
         return SimpleNamespace(
-            all_gather=all_gather, reduce_scatter_tensor=reduce_scatter_tensor
+            all_gather=all_gather,
+            reduce_scatter_tensor=reduce_scatter_tensor,
+            device_communicator=SimpleNamespace(
+                ca_comm=SimpleNamespace(
+                    disabled=False,
+                    should_custom_ag=lambda x: True,
+                    should_custom_rs=lambda x, dim: True,
+                )
+            ),
         )
 
 
@@ -50,6 +69,7 @@ class _Collectives:
 def ranks(monkeypatch):
     """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
     `ranks` the TP world size is 1."""
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     local = threading.local()
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
@@ -116,15 +136,186 @@ def test_scatter_sums_partials_into_local_rows(ranks, world, tokens, trailing):
         torch.testing.assert_close(gathered, total)
 
 
-class _FakePendingReduceScatter(qwen4_exp.PendingReduceScatter):
-    """A reduce-scatter handed out chunk by chunk, as it lands over SDMA."""
+class _RecordingCustomCommunicator:
+    """Shape-only eligibility stand-in; records the exact dispatched tensor."""
 
-    def __init__(self, summed, bounds):
-        self.bounds, self._summed = bounds, summed
+    def __init__(self, ag_max_size=256 * 1024**2, rs_max_size=64 * 1024**2):
+        self.disabled = False
+        self.ag_max_size = ag_max_size
+        self.rs_max_size = rs_max_size
+        self.queries = []
 
-    def chunks(self):
-        for r0, r1 in itertools.pairwise(self.bounds):
-            yield r0, r1, self._summed[r0:r1]
+    def should_custom_ag(self, x):
+        assert not self.disabled and x.is_contiguous()
+        self.queries.append(("all_gather", x, 0))
+        return 0 < x.numel() * x.element_size() <= self.ag_max_size
+
+    def should_custom_rs(self, x, dim):
+        assert not self.disabled and x.is_contiguous() and dim == 0
+        assert x.shape[0] % 2 == 0
+        self.queries.append(("reduce_scatter", x, dim))
+        return 0 < x.numel() * x.element_size() <= self.rs_max_size
+
+
+class _RecordingGroup:
+    """One TP rank of two whose peer holds the same rows; records each
+    collective it is asked for."""
+
+    def __init__(self):
+        self.calls = []
+        self.inputs = []
+        self.device_communicator = SimpleNamespace(
+            ca_comm=_RecordingCustomCommunicator()
+        )
+
+    def all_gather(self, x, use_custom=False, dim=0):
+        self.calls.append(("all_gather", x.dtype, use_custom, dim))
+        self.inputs.append(x)
+        return torch.cat([x, x])
+
+    def reduce_scatter_tensor(self, x, use_custom=True, dim=0):
+        self.calls.append(("reduce_scatter", x.dtype, use_custom, dim))
+        self.inputs.append(x)
+        return 2 * x[: x.shape[0] // 2]
+
+
+@pytest.mark.parametrize(
+    "enabled,communicator,use_custom",
+    [
+        (True, "enabled", True),
+        (False, "enabled", False),
+        (True, "no_device", False),
+        (True, "no_custom", False),
+        (True, "disabled", False),
+    ],
+)
+def test_collectives_honor_custom_availability(
+    monkeypatch, enabled, communicator, use_custom
+):
+    """BF16 streams, int32 QSA groups and BF16 partial sums share one gate,
+    including the operator's opt-out and unavailable custom communicators."""
+    group = _RecordingGroup()
+    if communicator == "no_device":
+        group.device_communicator = None
+    elif communicator == "no_custom":
+        group.device_communicator.ca_comm = None
+    elif communicator == "disabled":
+        group.device_communicator.ca_comm.disabled = True
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", str(int(enabled)))
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(7, 2, 0)
+    # The per-forward object binds availability once, before tensor queries.
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", str(int(not enabled)))
+    mixed = torch.randn(4, 3, dtype=torch.bfloat16)
+    assert torch.equal(sp.gather(mixed), torch.cat([mixed, mixed])[:7])
+    groups = torch.arange(4, dtype=torch.int32)
+    assert torch.equal(sp.gather(groups), torch.cat([groups, groups])[:7])
+    partial = torch.ones(7, 2, dtype=torch.bfloat16)
+    assert torch.equal(sp.scatter(partial), torch.full_like(partial[:4], 2.0))
+    assert group.calls == [
+        ("all_gather", torch.bfloat16, use_custom, 0),
+        ("all_gather", torch.int32, use_custom, 0),
+        ("reduce_scatter", torch.bfloat16, use_custom, 0),
+    ]
+
+
+def test_collectives_query_each_contiguous_tensor(monkeypatch):
+    group = _RecordingGroup()
+    ca = group.device_communicator.ca_comm
+    ca.ag_max_size = ca.rs_max_size = 32
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(7, 2, 0)
+    for dtype in (torch.bfloat16, torch.int32):
+        local = torch.arange(32, dtype=dtype).view(4, 8)[:, ::2]
+        assert not local.is_contiguous()
+        assert torch.equal(sp.gather(local), torch.cat([local, local])[:7])
+    for width in (2, 3):
+        partial = torch.ones(7, width * 2, dtype=torch.bfloat16)[:, ::2]
+        assert torch.equal(sp.scatter(partial), 2 * partial[:4])
+    assert [call[2] for call in group.calls] == [True, False, True, False]
+    assert len(ca.queries) == 4
+    for (name, queried, dim), dispatched, call in zip(
+        ca.queries, group.inputs, group.calls, strict=True
+    ):
+        assert queried is dispatched and queried.is_contiguous()
+        assert name == call[0] and dim == 0
+    assert all(x.shape[0] == 8 and not x[-1].any() for x in group.inputs[2:])
+
+
+@pytest.mark.parametrize(
+    "rows,max_size,use_custom",
+    [(13107, 256 * 1024**2, True), (13108, 256 * 1024**2, False), (1, 0, False)],
+)
+def test_all_gather_size_cutoff(monkeypatch, rows, max_size, use_custom):
+    """HC-width shapes around a 256 MiB per-rank cap, including AG disabled.
+
+    Meta tensors test routing without allocating a large registered buffer.
+    """
+    group = _RecordingGroup()
+    ca = group.device_communicator.ca_comm
+    ca.ag_max_size = max_size
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(2 * rows, 2, 0)
+    local = torch.empty(rows, 10240, dtype=torch.bfloat16, device="meta")
+    assert sp.gather(local).shape == (2 * rows, 10240)
+    assert group.calls == [("all_gather", torch.bfloat16, use_custom, 0)]
+    assert ca.queries == [("all_gather", local, 0)]
+
+
+@pytest.mark.parametrize(
+    "tokens,use_custom", [(13106, True), (13107, False), (13108, False)]
+)
+def test_reduce_scatter_size_cutoff_includes_padding(monkeypatch, tokens, use_custom):
+    """At width 2560, raw T=13107 fits 64 MiB but padded T=13108 does not."""
+    group = _RecordingGroup()
+    ca = group.device_communicator.ca_comm
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(tokens, 2, 0)
+    partial = torch.empty(tokens, 2560, dtype=torch.bfloat16, device="meta")
+    assert sp.scatter(partial).shape == (sp.chunk, 2560)
+    assert group.calls == [("reduce_scatter", torch.bfloat16, use_custom, 0)]
+    assert len(ca.queries) == 1
+    name, queried, dim = ca.queries[0]
+    assert name == "reduce_scatter" and dim == 0
+    assert queried is group.inputs[0] and queried.shape == (2 * sp.chunk, 2560)
+
+
+def test_collectives_keep_simulated_tp_shims(monkeypatch):
+    """A single physical rank has no communicator; the real simulated-TP
+    methods must still zero-fill absent ranks and return the local sum."""
+    from atom.distributed.simulated_tp import _patch_group
+
+    group = _RecordingGroup()
+    group.device_communicator = None
+    group.device_group = None
+    group.rank_in_group = 0
+    _patch_group(group, logical=4, physical=1)
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(7, 4, 0)
+    local = torch.arange(6, dtype=torch.int32).view(2, 3)
+    expected = torch.cat([local, torch.zeros(5, 3, dtype=torch.int32)])
+    assert torch.equal(sp.gather(local), expected)
+    partial = torch.arange(21, dtype=torch.float32).view(7, 3)
+    assert torch.equal(sp.scatter(partial), partial[:2])
+    assert group.calls == []
+
+
+def _fake_pending_reduce_scatter(summed, bounds):
+    """Build the real subtype after the CPU fixture has imported the models."""
+
+    class _FakePendingReduceScatter(qwen4_exp.PendingReduceScatter):
+        def __init__(self, summed, bounds):
+            self.bounds, self._summed = bounds, summed
+
+        def chunks(self):
+            for r0, r1 in itertools.pairwise(self.bounds):
+                yield r0, r1, self._summed[r0:r1]
+
+    return _FakePendingReduceScatter(summed, bounds)
 
 
 class _FakeAllGatherWriter:
@@ -145,7 +336,10 @@ class _FakeAllGatherWriter:
         assert all(a < b for a, b in self.pushed)
         assert all(b0 == a1 for (_, b0), (a1, _) in itertools.pairwise(self.pushed))
         assert self.pushed[0][0] == 0 and self.pushed[-1][1] == self.buf.shape[0]
-        return qwen4_exp.get_tp_group().all_gather(self.buf)[: self.num_tokens]
+        # The fake SDMA writer reuses the CPU collective transport.
+        return qwen4_exp.get_tp_group().all_gather(self.buf, use_custom=True)[
+            : self.num_tokens
+        ]
 
 
 class _FakeSdma:
@@ -161,7 +355,7 @@ class _FakeSdma:
         padded = qwen4_exp._pad_rows(x, self.world * local_rows - x.shape[0])
         summed = qwen4_exp.get_tp_group().reduce_scatter_tensor(padded)
         bounds = [local_rows * j // chunks for j in range(chunks + 1)]
-        return _FakePendingReduceScatter(summed, bounds)
+        return _fake_pending_reduce_scatter(summed, bounds)
 
     def all_gather(self, local_rows, num_tokens, pushes):
         return _FakeAllGatherWriter(local_rows, num_tokens, pushes, self.hidden)
