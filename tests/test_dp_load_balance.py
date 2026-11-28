@@ -571,7 +571,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
 
     mgr = _make_mgr(1, strategy="share_cache")
 
-    mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
+    mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True))
     first_sent, second_started = Event(), Event()
     order = []
 
@@ -2296,7 +2296,7 @@ def test_share_cache_explicit_rank_records_completed_prefix():
     from atom.model_engine.dp_routing.policies import ShareCachePolicy
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
+    router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True))
     policy = ShareCachePolicy(
         router, lambda: [0, 0], lambda: [0, 0], lambda r: 0, lambda: 0
     )
@@ -2340,7 +2340,7 @@ def test_late_reuse_miss_splits_a_merged_placement_credit_boundary():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 64)
+    router = ShareCacheRouter(OffloadTierProfile(True, 0, 1))
     a, b, c = (_chain_seq(11, 1280), _chain_seq(12, 1408), _chain_seq(13, 1408))
     for item in (a,):
         route = router.place(item, 0, 2)
@@ -2360,7 +2360,7 @@ def test_share_cache_completed_hit_is_not_a_producing_source():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(OffloadTierProfile(True, 128, 256, True), 100)
+    router = ShareCacheRouter(OffloadTierProfile(True, 128, 256, True))
     first = _chain_seq(21, 768)
     route = router.select(first, [0, 0], [0, 0], None, None)
     router.charge(first.id, route.credit)
