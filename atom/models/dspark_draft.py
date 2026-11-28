@@ -435,16 +435,13 @@ class AllocationCap:
         # nothing to wait for.
         self._alloc_copied = torch.cuda.Event()
 
-    def apply(
+    def upload(
         self,
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
-        block_positions: torch.Tensor,  # [running_bs, T]
-        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
-        unit: int,  # tokens one allocated page id spans
+        running_bs: int,
     ) -> torch.Tensor:
-        """Mask ``slots`` past each row's allocation; return it in tokens."""
-        running_bs = block_positions.shape[0]
+        """Each row's allocation in pages, on the device (1 on pad rows)."""
         # The host can run a step ahead of the device: the previous copy must
         # have read the pinned buffer before it is rewritten.
         self._alloc_copied.synchronize()
@@ -458,6 +455,19 @@ class AllocationCap:
         alloc = self._alloc[:running_bs]
         alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
         self._alloc_copied.record()
+        return alloc
+
+    def apply(
+        self,
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
+        unit: int,  # tokens one allocated page id spans
+    ) -> torch.Tensor:
+        """Mask ``slots`` past each row's allocation; return it in tokens."""
+        running_bs = block_positions.shape[0]
+        alloc = self.upload(allocated_pages, scheduled_bs, running_bs)
         alloc.mul_(unit)
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         return alloc
@@ -700,16 +710,25 @@ class DSparkDraftModel(nn.Module):
         (dflash.py's standalone ``spec_generate`` demo slices
         ``[:, -block_size+1:]`` instead; no production implementation does.)
         """
-        bs = input_ids.shape[0]
-        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
+        hidden = self.embed_block(input_ids, num_draft)
         positions = self.rope_positions(positions)
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
         hidden, _ = self.final_norm(hidden, residual)
         return hidden
+
+    def fused_block_metadata_ok(self) -> bool:
+        """Whether ``build_block_metadata`` serves this draft's block."""
+        return False
+
+    def embed_block(self, input_ids: torch.Tensor, num_draft: int) -> torch.Tensor:
+        """The default ``block_backbone``'s embedded block: ``[anchor, MASK,
+        ...]`` of width ``num_draft`` per request, ``[B*T, hidden]``."""
+        bs = input_ids.shape[0]
+        draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
+        draft_ids[:, 0] = input_ids
+        return self.embed_tokens(draft_ids.view(-1))
 
     def rope_positions(self, positions: torch.Tensor) -> torch.Tensor:
         """The positions the default ``block_backbone``'s layers rope at: the
