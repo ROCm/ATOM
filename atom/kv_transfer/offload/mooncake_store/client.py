@@ -27,12 +27,15 @@ Mooncake facts this wrapper is shaped by (v0.3.14):
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from collections import Counter
 from typing import Any
 
-from atom.kv_transfer.offload.kv_store.client import CallRefused
+from atom.kv_transfer.offload.kv_store.client import (
+    CallRefused,
+    CallStats,
+    require_answer_per_key,
+    require_unique_keys,
+)
 
 logger = logging.getLogger("atom")
 
@@ -70,6 +73,8 @@ BATCH_WAIT_S = 60.0
 
 # Most keys one `batch_is_exist` call carries.
 _LOOKUP_BATCH_KEYS = 8192
+# Why a batch must not name a key twice.
+_DUPLICATE_KEYS = "a duplicate collapses onto one buffer while both report success"
 
 # Failures after which Mooncake has no transfer outstanding on the key's
 # buffer, however long the call took: it never issued one (no space, missing
@@ -175,9 +180,7 @@ class MooncakeStoreClient:
     ) -> None:
         self.master_server_addr = master_server_addr
         self.rdma_devices = rdma_devices
-        self._stats_lock = threading.Lock()
-        self._counts: Counter[str] = Counter()
-        self._failures: Counter[str] = Counter()
+        self._calls = CallStats()
         store = _new_distributed_store()
         # Positional: pybind requires all seven. global_segment_size=0 mounts
         # no segment, local_buffer_size=0 skips the copy-API staging buffer.
@@ -247,7 +250,7 @@ class MooncakeStoreClient:
         for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
             batch = keys[start : start + _LOOKUP_BATCH_KEYS]
             codes = list(self._store.batch_is_exist(batch))
-            self._check_length("batch_is_exist", codes, batch)
+            require_answer_per_key("Mooncake Store", "batch_is_exist", codes, batch)
             results.extend(int(code) for code in codes)
             self._count("exists", batch, None, codes, failed=lambda code: code < 0)
         return results
@@ -271,7 +274,7 @@ class MooncakeStoreClient:
             Whatever ``batch_put_from`` raises, after which a transfer may
                 still be.
         """
-        self._check_unique(keys)
+        require_unique_keys(keys, "Mooncake Store", _DUPLICATE_KEYS)
         args: list[Any] = [list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]]
         if group_ids is not None:
             try:
@@ -281,7 +284,7 @@ class MooncakeStoreClient:
                     f"Mooncake Store could not group a put's keys: {exc!r}"
                 ) from exc
         codes = [int(code) for code in self._store.batch_put_from(*args)]
-        self._check_length("batch_put_from", codes, keys)
+        require_answer_per_key("Mooncake Store", "batch_put_from", codes, keys)
         stored = sum(int(s) for s, code in zip(sizes, codes) if code == 0)
         self._count("put", keys, stored, codes, failed=lambda code: code != 0)
         return codes
@@ -295,14 +298,14 @@ class MooncakeStoreClient:
             Whatever ``batch_get_into`` raises, after which a transfer may
                 still be.
         """
-        self._check_unique(keys)
+        require_unique_keys(keys, "Mooncake Store", _DUPLICATE_KEYS)
         codes = [
             int(code)
             for code in self._store.batch_get_into(
                 list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]
             )
         ]
-        self._check_length("batch_get_into", codes, keys)
+        require_answer_per_key("Mooncake Store", "batch_get_into", codes, keys)
         read = sum(code for code in codes if code > 0)
         self._count("get", keys, read, codes, failed=lambda code: code < 0)
         return codes
@@ -342,8 +345,7 @@ class MooncakeStoreClient:
     # -- accounting ------------------------------------------------------
     def stats(self) -> dict[str, Any]:
         """Cumulative calls, keys, bytes and failures by code, per operation."""
-        with self._stats_lock:
-            return {"counts": dict(self._counts), "failures": dict(self._failures)}
+        return self._calls.snapshot()
 
     def _count(self, op, keys, nbytes, codes, *, failed) -> None:
         """Tally one call; ``nbytes`` is what it moved, None for a lookup.
@@ -352,27 +354,6 @@ class MooncakeStoreClient:
         answers 0 for a key it already had, without moving its bytes, and the
         answer does not tell the two apart.
         """
-        bad = [code for code in codes if failed(int(code))]
-        with self._stats_lock:
-            self._counts[f"{op}_calls"] += 1
-            self._counts[f"{op}_keys"] += len(keys)
-            if nbytes is not None:
-                self._counts[f"{op}_bytes"] += int(nbytes)
-            for code in bad:
-                self._failures[f"{op}:{describe(code)}"] += 1
-
-    @staticmethod
-    def _check_unique(keys: list[str]) -> None:
-        if len(set(keys)) != len(keys):
-            raise CallRefused(
-                "Mooncake Store batch keys must be unique; a duplicate collapses "
-                "onto one buffer while both report success"
-            )
-
-    @staticmethod
-    def _check_length(call: str, codes: list, keys: list[str]) -> None:
-        if len(codes) != len(keys):
-            raise RuntimeError(
-                f"Mooncake Store {call} returned {len(codes)} results for "
-                f"{len(keys)} keys"
-            )
+        self._calls.count(
+            op, keys, nbytes, [describe(code) for code in codes if failed(int(code))]
+        )

@@ -11,13 +11,12 @@ same dict, so both sides agree on the chunk size and on the Store they address.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from numbers import Real
 from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.kv_store.layouts import check_store_engine
 from atom.kv_transfer.offload.mooncake_store.layouts import require_mooncake_layout
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
@@ -147,7 +146,7 @@ def parse_mooncake_store_config(
                 "mooncake_store.metadata, or mooncake_store.pools"
             )
         master = _address("mooncake_store.master", master)
-        metadata = _text("mooncake_store.metadata", metadata)
+        metadata = offcfg._strict_text("mooncake_store.metadata", metadata)
 
     local_hostname = values.get("local_hostname")
     if local_hostname is None:
@@ -166,7 +165,9 @@ def parse_mooncake_store_config(
             "mooncake_store.rdma_devices", values.get("rdma_devices", "")
         ),
         protocol=protocol,
-        local_hostname=_text("mooncake_store.local_hostname", local_hostname),
+        local_hostname=offcfg._strict_text(
+            "mooncake_store.local_hostname", local_hostname
+        ),
         chunk_tokens=offcfg.connector_integer(
             extra, "mooncake_store.chunk_tokens", 256
         ),
@@ -176,7 +177,7 @@ def parse_mooncake_store_config(
         save_pool_mib=offcfg._strict_integer(
             "mooncake_store.save_pool_mib", values.get("save_pool_mib", 256), minimum=1
         ),
-        save_abandon_timeout_s=_positive_seconds(
+        save_abandon_timeout_s=offcfg._positive_seconds(
             "mooncake_store.save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
         ),
@@ -198,20 +199,12 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
             chunk is not a whole number of KV blocks.
     """
     require_mooncake_layout(offcfg.select_offload_layout(config))
-    dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
-    if dcp > 1:
-        raise ValueError(
-            "the Mooncake Store offload does not support decode context "
-            f"parallelism (decode_context_parallel_size={dcp})"
-        )
-    block_size = offcfg._strict_integer(
-        "KV cache block size", config.kv_cache_block_size, minimum=1
+    check_store_engine(
+        config,
+        cfg.chunk_tokens,
+        offload="the Mooncake Store offload",
+        chunk_setting="mooncake_store.chunk_tokens",
     )
-    if cfg.chunk_tokens % block_size:
-        raise ValueError(
-            f"mooncake_store.chunk_tokens={cfg.chunk_tokens} must be a multiple "
-            f"of the KV cache block size {block_size}"
-        )
 
 
 # Every bad setting is a ValueError, whatever is wrong with it, as
@@ -219,15 +212,9 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
 # should not need to know which of them were type errors.
 
 
-def _text(name: str, value: Any) -> str:
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ValueError(f"{name} must be a non-empty string without spaces")
-    return value
-
-
 def _address(name: str, value: Any) -> str:
     """A ``host:port`` RPC address."""
-    text = _text(name, value)
+    text = offcfg._strict_text(name, value)
     host, _, port = text.rpartition(":")
     if not host or not port.isdigit() or not 0 < int(port) < 65536:
         raise ValueError(f"{name} must be host:port, got {value!r}")
@@ -255,9 +242,9 @@ def _pools(value: Any) -> dict[str, StorePool]:
             raise ValueError(  # noqa: TRY004
                 f'{name} must be {{"master": "host:port", "metadata": "<url>"}}'
             )
-        pools[_text(name, device)] = StorePool(
+        pools[offcfg._strict_text(name, device)] = StorePool(
             _address(f"{name}.master", pool.get("master")),
-            _text(f"{name}.metadata", pool.get("metadata")),
+            offcfg._strict_text(f"{name}.metadata", pool.get("metadata")),
         )
     return pools
 
@@ -266,13 +253,3 @@ def _choice(name: str, value: Any, choices: tuple[str, ...]) -> str:
     if value not in choices:
         raise ValueError(f"{name} must be one of {list(choices)}, got {value!r}")
     return value
-
-
-def _positive_seconds(name: str, value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a number of seconds")  # noqa: TRY004
-    seconds = float(value)
-    # 0 would switch off every leak reclaimer of the engine, not just this one.
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
-    return seconds

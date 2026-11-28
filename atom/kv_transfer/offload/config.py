@@ -19,7 +19,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from math import isfinite
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any
 
 import torch
@@ -89,6 +89,26 @@ def _strict_integer(name: str, value: object, *, minimum: int = 0) -> int:
         relation = "positive" if minimum == 1 else f">= {minimum}"
         raise ValueError(f"{name} must be {relation}")
     return normalized
+
+
+def _strict_text(name: str, value: object) -> str:
+    """A non-empty string setting without leading or trailing whitespace."""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(
+            f"{name} must be a non-empty string without leading or trailing spaces"
+        )
+    return value
+
+
+def _positive_seconds(name: str, value: object) -> float:
+    """A finite, positive number of seconds."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a number of seconds")  # noqa: TRY004
+    seconds = float(value)
+    # 0 would switch off every leak reclaimer of the engine, not just this one.
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+    return seconds
 
 
 def _is_minimax_m3(hf_config) -> bool:

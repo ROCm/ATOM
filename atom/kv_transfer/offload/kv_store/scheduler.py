@@ -51,6 +51,49 @@ _SAVE_RETRY_MAX_S = 30.0
 # Names the boot a CLOCK_MONOTONIC reading is from; see `monotonic_clock_id`.
 _BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
+# Seconds lookups do not ask a store the scheduler could not reach.
+# Connecting blocks the scheduler thread, so a missing store must not cost
+# that on every step.
+LOOKUP_RECONNECT_INTERVAL_S = 30.0
+# The same for a store whose lookup failed.
+LOOKUP_BACKOFF_S = 10.0
+# Either pause lasts at least this many times as long as the failed call
+# blocked the scheduler thread (`pause_lookups`).
+LOOKUP_BACKOFF_FACTOR = 10.0
+# Seconds between two warnings about one store's failing lookups.
+LOOKUP_WARNING_INTERVAL_S = 60.0
+
+
+def pause_lookups(target: Any, floor_s: float, since: float) -> float:
+    """Pause lookups to ``target`` after a failed call that started at ``since``.
+
+    Sets ``target.paused_until``: for ``floor_s`` or `LOOKUP_BACKOFF_FACTOR`
+    times as long as the call blocked, whichever is longer, counted from now.
+    A failed setup can return minutes after it started, and a pause counted
+    from before it would already be over. Returns the seconds paused.
+    """
+    now = time.monotonic()
+    pause = max(floor_s, LOOKUP_BACKOFF_FACTOR * (now - since))
+    target.paused_until = now + pause
+    return pause
+
+
+class LookupWarnings:
+    """At most one warning per store and `LOOKUP_WARNING_INTERVAL_S`; the
+    rest go to the debug log. ``label`` prefixes every message."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._next_at: dict[str, float] = {}
+
+    def warn(self, store: str, message: str, *args: Any, exc_info: Any = None) -> None:
+        now = time.monotonic()
+        if now < self._next_at.get(store, 0.0):
+            logger.debug(f"{self._label}: " + message, *args)
+            return
+        self._next_at[store] = now + LOOKUP_WARNING_INTERVAL_S
+        logger.warning(f"{self._label}: " + message, *args, exc_info=exc_info)
+
 
 @functools.cache
 def monotonic_clock_id() -> str | None:

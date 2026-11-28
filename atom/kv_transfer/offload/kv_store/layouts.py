@@ -136,10 +136,39 @@ class StoreLayouts:
         )
 
 
+def check_store_engine(
+    config: Any, chunk_tokens: int, *, offload: str, chunk_setting: str
+) -> None:
+    """Refuse DCP and a chunk that is not a whole number of KV blocks.
+
+    A DCP rank's pages cover a virtual block that the chunk keys do not name.
+    ``offload`` names the backend in the errors ("the Mooncake Store
+    offload"), ``chunk_setting`` its chunk setting.
+
+    Raises:
+        ValueError: DCP > 1, or the chunk is not a whole number of KV blocks.
+    """
+    dcp = int(config.decode_context_parallel_size or 1)
+    if dcp > 1:
+        raise ValueError(
+            f"{offload} does not support decode context parallelism "
+            f"(decode_context_parallel_size={dcp})"
+        )
+    block_size = offcfg._strict_integer(
+        "KV cache block size", config.kv_cache_block_size, minimum=1
+    )
+    if chunk_tokens % block_size:
+        raise ValueError(
+            f"{chunk_setting}={chunk_tokens} must be a multiple "
+            f"of the KV cache block size {block_size}"
+        )
+
+
 __all__ = [
     "DENSE_CODEC_ID",
     "REPLAY_PAGE_CODEC_ID",
     "STORE_LAYOUTS",
     "StoreLayout",
     "StoreLayouts",
+    "check_store_engine",
 ]

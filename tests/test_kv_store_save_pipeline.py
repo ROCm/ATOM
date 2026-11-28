@@ -9,6 +9,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import kv_store_test_support
 import pytest
 import test_mooncake_store_offload as offload
 
@@ -35,8 +36,11 @@ def _hung(*_):
 
 @pytest.fixture(autouse=True)
 def pipeline_chunks(monkeypatch):
-    monkeypatch.setattr(offload, "CHUNK", KEYS)
-    monkeypatch.setattr(offload, "CHUNK_BYTES", 1024)
+    # The mooncake_store test module's own settings and the shared helpers
+    # its requests and completions come from (`kv_store_test_support`).
+    for module in (offload, kv_store_test_support):
+        monkeypatch.setattr(module, "CHUNK", KEYS)
+        monkeypatch.setattr(module, "CHUNK_BYTES", 1024)
     monkeypatch.setenv("ATOM_STORE_SAVE_BATCH_CHUNKS", "1")
     previous = signal.signal(signal.SIGALRM, _hung)
     signal.alarm(20)
