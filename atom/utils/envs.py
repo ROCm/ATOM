@@ -204,6 +204,36 @@ def _dp_sync_interval_env() -> int | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", 0
+    ),
+    "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS", 8
+    ),
+    "ATOM_PREFILL_COST_CEIL": lambda: (
+        os.getenv("ATOM_PREFILL_COST_CEIL", "0").lower() in ("1", "true")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY", "0")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY", "0")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_ROWS", "0")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_LONG_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_LONG_ROWS", "4096")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS", "32")
+    ),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},

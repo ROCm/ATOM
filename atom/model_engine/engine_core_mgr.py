@@ -108,6 +108,23 @@ DP_LB_STRATEGIES = (
 )
 DP_LB_DEFAULT = "least_requests"
 
+# Counters of ATOM_DP_SESSION_PREFIX_OWNER_TOKENS, kept (and exported, and
+# logged: `_log_prefix_owner_locked`) only with the switch set. A new session
+# whose prefix sits on another rank than the lightest one follows it (the
+# first: its routing decision) or is refused by the token threshold or by the
+# load guard; the last is the prefix the followers gained over the lightest
+# rank, in tokens.
+PREFIX_OWNER_COUNTERS = (
+    "affinity_new_prefix_owner_total",
+    "affinity_prefix_owner_refused_threshold_total",
+    "affinity_prefix_owner_refused_guard_total",
+    "affinity_prefix_owner_gained_tokens_total",
+)
+# A log line of them this often: seconds, or new sessions if that comes first.
+PREFIX_OWNER_LOG_S = 60.0
+PREFIX_OWNER_LOG_SESSIONS = 256
+
+
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
 # must derive identical TCP ports without negotiating. Both compute this plan
 # from the shared master port.
@@ -316,6 +333,13 @@ class CoreManager:
     _input_send_lock = Lock()
     _dispatch_send_lock = Lock()
 
+    # ATOM_DP_SESSION_PREFIX_OWNER_TOKENS (`_build_session_prefix_index`): off.
+    _session_prefix_index = None
+    _session_prefix_owner_tokens = 0
+    _session_prefix_owner_extra_reqs = 0
+    _prefix_owner_logged_at = 0.0
+    _prefix_owner_unlogged_sessions = 0
+
     def _init_shared_state(
         self,
         config: Config,
@@ -459,6 +483,15 @@ class CoreManager:
                     PrefixSpreadRouter.DECISIONS + (PrefixSpreadRouter.MOVED_TOKENS,), 0
                 )
             )
+        # Session affinity with ATOM_DP_SESSION_PREFIX_OWNER_TOKENS: the same
+        # prefix index, read only where a new session is placed.
+        self._session_prefix_index = self._build_session_prefix_index(config)
+        if self._session_prefix_index is not None:
+            self._session_prefix_owner_tokens = envs.ATOM_DP_SESSION_PREFIX_OWNER_TOKENS
+            self._session_prefix_owner_extra_reqs = (
+                envs.ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS
+            )
+            self._dp_route_counters.update(dict.fromkeys(PREFIX_OWNER_COUNTERS, 0))
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
         # finish/abort; token count is queued/in-flight PREFILL work and is
@@ -1269,6 +1302,40 @@ class CoreManager:
             )
         return ShareCacheRouter(tier, self._dp_lb_req_equiv)
 
+    def _build_session_prefix_index(self, config) -> PrefixSpreadRouter | None:
+        """The prefix index behind ATOM_DP_SESSION_PREFIX_OWNER_TOKENS, or None.
+
+        Session affinity places a new session by load alone. With the switch
+        set, `SessionPolicy` records every request in this index and sends a
+        new session to the rank that holds its prompt's prefix. None when the
+        switch is off, without session affinity, and where there is nothing to
+        route between (one rank, pipeline parallelism, RapidServe).
+        """
+        if (
+            not envs.ATOM_DP_SESSION_PREFIX_OWNER_TOKENS
+            or not self._dp_session_affinity_enabled
+            or self._prefix_router is not None
+            or self._routable_engine_count <= 1
+            or int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1
+            or getattr(config, "enable_rapidserve", False)
+        ):
+            return None
+        if not (
+            getattr(config, "enable_prefix_caching", False)
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+        ):
+            # No prompt hash chain reaches the router: the rule would never
+            # find a prefix.
+            raise ValueError(
+                "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS needs --enable_prefix_caching "
+                "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+            )
+        return PrefixSpreadRouter(
+            envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+            KVConnectorFactory.offload_tier(config),
+            config.max_num_seqs,
+        )
+
     @property
     def _routable_engine_count(self) -> int:
         """How many engine ranks this manager may route to.
@@ -1764,6 +1831,11 @@ class CoreManager:
                     self._dp_session_prompt_tokens,
                     self._routable_engine_count,
                     self._record_ignored_parent,
+                    prefix_index=self._session_prefix_index,
+                    owner_tokens=self._session_prefix_owner_tokens,
+                    owner_extra_reqs=self._session_prefix_owner_extra_reqs,
+                    load_reqs=lambda: self._rank_reqs,
+                    prefix_owner_seen=self._record_prefix_owner,
                     rank_reqs=(lambda: self._rank_reqs) if migrate else None,
                     margin=margin if migrate else 0.1,
                 )
@@ -1775,6 +1847,46 @@ class CoreManager:
     def _record_ignored_parent(self) -> None:
         self._dp_route_counters["affinity_parent_ignored_total"] += 1
 
+    def _record_prefix_owner(self, outcome: str, gained: int) -> None:
+        """A new session whose prefix sits on another rank than the lightest:
+        what ATOM_DP_SESSION_PREFIX_OWNER_TOKENS did with it (`follow`, or
+        refused by the `threshold` or the `guard`) and the prefix tokens that
+        rank holds more than the lightest. The follow itself is counted as the
+        session's routing decision."""
+        counters = self._dp_route_counters
+        if outcome == "follow":
+            counters["affinity_prefix_owner_gained_tokens_total"] += gained
+        else:
+            counters[f"affinity_prefix_owner_refused_{outcome}_total"] += 1
+
+    def _log_prefix_owner_locked(self) -> None:
+        """The rule's counters since start, one line every `PREFIX_OWNER_LOG_S`
+        seconds or `PREFIX_OWNER_LOG_SESSIONS` new sessions (and at the first
+        one): the server log alone says what the rule did. Called per new
+        session, so a server that places none logs none."""
+        self._prefix_owner_unlogged_sessions += 1
+        now = time.monotonic()
+        if (
+            self._prefix_owner_unlogged_sessions < PREFIX_OWNER_LOG_SESSIONS
+            and now - self._prefix_owner_logged_at < PREFIX_OWNER_LOG_S
+        ):
+            return
+        self._prefix_owner_unlogged_sessions = 0
+        self._prefix_owner_logged_at = now
+        counters = self._dp_route_counters
+        follows = counters["affinity_new_prefix_owner_total"]
+        logger.info(
+            "%s: dp prefix owner: new_sessions=%d follows=%d refused_threshold=%d "
+            "refused_guard=%d gained_tokens=%d index_tokens=%d",
+            self.label,
+            counters["affinity_new_total"] + follows,
+            follows,
+            counters["affinity_prefix_owner_refused_threshold_total"],
+            counters["affinity_prefix_owner_refused_guard_total"],
+            counters["affinity_prefix_owner_gained_tokens_total"],
+            self._session_prefix_index.indexed_tokens,
+        )
+
     def _select_dp_rank_for_seq_locked(
         self, seq: Sequence, explicit_rank: int | None
     ) -> Route:
@@ -1783,6 +1895,11 @@ class CoreManager:
         if PREFIX_MOVED_TOKENS in self._dp_route_counters:
             self._dp_route_counters[PREFIX_MOVED_TOKENS] += route.moved_tokens
         self._record_dp_route_locked(route.decision, route.rank)
+        if self._session_prefix_index is not None and route.decision in (
+            "affinity_new_total",
+            "affinity_new_prefix_owner_total",
+        ):
+            self._log_prefix_owner_locked()
         return route
 
     def get_dp_router_statistics(self) -> dict:
@@ -1802,6 +1919,8 @@ class CoreManager:
             }
             if self._prefix_router is not None:
                 snapshot["prefix_index"] = self._prefix_router.index_counters()
+            elif self._session_prefix_index is not None:
+                snapshot["prefix_index"] = self._session_prefix_index.index_counters()
             if PREFIX_OWNER in self._dp_route_counters:
                 snapshot["prefix_route"] = {
                     label: self._dp_route_counters[name]
@@ -2646,6 +2765,9 @@ class DisaggCoreManager(CoreManager):
 
     def _build_prefix_router(self, config) -> None:
         """The prefill/decode pair fans out requests; neither engine is a DP target."""
+
+    def _build_session_prefix_index(self, config) -> None:
+        """Nor is there a rank for a session's prefix to be on."""
 
     def __init__(self, config: Config):
         import copy
