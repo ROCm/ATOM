@@ -943,7 +943,7 @@ mod d_pd_planning {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        let dp_sticky = Arc::new(crate::policies::DpStickyPolicy::new());
+        let dp_sticky = Arc::new(crate::policies::SessionAffinityPolicy::dp_sticky());
         let cluster = Idx2IdxCluster::new(dp_sticky.clone());
         let mut headers = HeaderMap::new();
         headers.insert("x-session-id", http::HeaderValue::from_static("session-1"));
@@ -971,7 +971,7 @@ mod d_pd_planning {
     /// moves the session's decode, and the prefill follows to the new rank.
     #[tokio::test]
     async fn test_idx2idx_decode_failure_moves_the_prefill_with_it() {
-        let decode_policy = Arc::new(crate::policies::DpStickyPolicy::new());
+        let decode_policy = Arc::new(crate::policies::SessionAffinityPolicy::dp_sticky());
         let source = [
             dp_worker("http://p", 0, prefill()),
             dp_worker("http://p", 1, prefill()),
@@ -981,7 +981,7 @@ mod d_pd_planning {
         .into_iter()
         .fold(MockWorkerSource::new(), MockWorkerSource::add_worker);
         let policies = MockPolicySource::new()
-            .with_prefill(Arc::new(crate::policies::DpStickyPolicy::new()))
+            .with_prefill(Arc::new(crate::policies::SessionAffinityPolicy::dp_sticky()))
             .with_decode(decode_policy.clone());
         let planner = make_planner(source, policies).with_prefill_on_decode_rank(true);
         let mut headers = HeaderMap::new();

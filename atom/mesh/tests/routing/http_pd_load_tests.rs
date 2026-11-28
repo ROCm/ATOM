@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
-    policies::{DpStickyPolicy, LoadBalancingPolicy, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, SelectWorkerInfo, SessionAffinityPolicy},
 };
 use axum::{routing::post, Router};
 use bytes::Bytes;
@@ -784,7 +784,7 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
             .sum()
     };
-    let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+    let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(SessionAffinityPolicy::dp_sticky());
     let mut a = GatedServer::start(WorkerType::Decode).await;
     let mut b = GatedServer::start(WorkerType::Decode).await;
     let decode = [a.worker.clone(), b.worker.clone()];
@@ -874,7 +874,7 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
             (StatusCode::BAD_REQUEST, true),
             (StatusCode::SERVICE_UNAVAILABLE, false),
         ] {
-            let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+            let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(SessionAffinityPolicy::dp_sticky());
             let (mut p, mut a) = servers().await;
             let b = GatedServer::start(WorkerType::Decode).await;
             let decode = [a.worker.clone(), b.worker.clone()];
@@ -918,8 +918,10 @@ async fn a_decode_server_error_releases_the_session_binding_and_a_client_error_d
 #[tokio::test]
 async fn a_prefill_server_error_releases_only_the_prefill_binding() {
     for kind in KINDS {
-        let prefill_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
-        let decode_policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(SessionAffinityPolicy::dp_sticky());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(SessionAffinityPolicy::dp_sticky());
         let (mut p, mut d) = servers().await;
         let other_prefill = GatedServer::start(WorkerType::Prefill {
             bootstrap_port: None,
@@ -972,7 +974,7 @@ async fn an_idx2idx_prefill_server_error_places_the_decode_session_again() {
         DispatchKind::AtomChunked,
         DispatchKind::AtomConcurrent,
     ] {
-        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(DpStickyPolicy::new());
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(SessionAffinityPolicy::dp_sticky());
         let (mut p, mut d) = servers().await;
         let dp_worker = |server: &GatedServer, rank, role| -> Arc<dyn Worker> {
             let url = server.worker.url().to_string();

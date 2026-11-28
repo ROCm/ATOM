@@ -18,6 +18,7 @@ pub async fn apply_policy(
         request_text: descriptor.text,
         tokens: descriptor.tokens,
         headers: descriptor.headers,
+        session_counts: None,
         hash_ring,
         carries_media: descriptor.carries_media(),
     };

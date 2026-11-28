@@ -1,305 +1,56 @@
 //! Data-parallel worker routing with session affinity.
 //!
-//! Requests carrying `X-Session-ID` are pinned to the first healthy worker
-//! selected for that session. A new session goes to the worker holding the
-//! fewest live sessions (load breaks ties); requests without a session ID use
-//! minimum-load balancing. A stale mapping is replaced when its worker is no
-//! longer healthy or a candidate (another DP rank under idx2idx), the session
-//! has been idle for too long, or a request of the session failed with a server
-//! error or got no response on its bound worker. Under ATOM PD idx2idx rank
-//! mapping, a failed prefill also releases the decode binding, although the
-//! decode was never sent.
+//! `dp_sticky` is the session table in [`super::session_affinity`] around
+//! [`LeastSessionsPolicy`]. Requests carrying `X-Session-ID` are pinned to the
+//! worker picked for the session's first request: the healthy worker holding
+//! the fewest live sessions (load breaks ties). Requests without a session ID
+//! use minimum-load balancing. A stale mapping is replaced when its worker is
+//! no longer healthy or a candidate (another DP rank under idx2idx), the
+//! session has been idle for too long, or a request of the session failed with
+//! a server error or got no response.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 
 use super::{
     get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
     NO_HEALTHY_WORKERS,
 };
-use crate::{
-    core::Worker,
-    observability::metrics::{
-        metrics_labels::{
-            AFFINITY_EXPIRED, AFFINITY_HIT, AFFINITY_NEW, AFFINITY_REBIND,
-            WORKER_CHANGE_RANK_MAPPING,
-        },
-        MeshMetrics,
-    },
-    routers::comm::header_utils::extract_sticky_routing_key,
-};
+use crate::core::Worker;
 
-const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 const NO_SESSION: &str = "no_session";
+const LEAST_SESSIONS: &str = "least_sessions";
 
-#[derive(Debug)]
-struct StickyAssignment {
-    worker: WorkerIdentity,
-    last_access: Instant,
-    /// Where the session's last request was sent, after DP rank mapping.
-    dispatched: Option<WorkerIdentity>,
-    /// Why the session was last reassigned, until a request is sent.
-    reassigned: Option<&'static str>,
-    /// A request of the session failed on its bound worker, so the next
-    /// request, a retry included, is placed again.
-    failed: bool,
-    /// Workers the session's requests failed on since its last hit. Placing
-    /// it again leaves them out while another worker is healthy.
-    avoid: Vec<WorkerIdentity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct WorkerIdentity {
-    url: String,
-    dp_rank: Option<usize>,
-}
-
-#[derive(Debug)]
-pub struct DpStickyPolicy {
-    /// Session ID -> worker identity. The DP rank distinguishes logical workers
-    /// that share a common endpoint URL.
-    assignments: DashMap<String, StickyAssignment>,
-    /// Serializes count -> choose -> insert for new sessions so a burst cannot
-    /// pin every session to the same DP rank. Established sessions use the
-    /// lock-free assignment lookup above.
-    assign_lock: Mutex<()>,
-}
-
-impl DpStickyPolicy {
-    pub fn new() -> Self {
-        Self {
-            assignments: DashMap::new(),
-            assign_lock: Mutex::new(()),
-        }
-    }
-
-    fn worker_identity(worker: &Arc<dyn Worker>) -> WorkerIdentity {
-        WorkerIdentity {
-            url: worker.url().to_string(),
-            dp_rank: worker.dp_rank(),
-        }
-    }
-
-    fn healthy_worker_for_identity(
-        workers: &[Arc<dyn Worker>],
-        identity: &WorkerIdentity,
-    ) -> Option<usize> {
-        workers
-            .iter()
-            .enumerate()
-            .find(|(_, worker)| {
-                worker.url() == identity.url
-                    && worker.dp_rank() == identity.dp_rank
-                    && worker.is_healthy()
-                    && worker.circuit_breaker().can_execute()
-            })
-            .map(|(index, _)| index)
-    }
-
-    /// Select the healthy worker with the smallest current request load.
-    fn select_low_load_worker(workers: &[Arc<dyn Worker>]) -> Option<usize> {
-        get_healthy_worker_indices(workers)
-            .into_iter()
-            .min_by_key(|&index| workers[index].load())
-    }
-
-    /// Select the healthy worker holding the fewest non-expired assignments,
-    /// tie-broken by current request load, other than the workers in `avoid`
-    /// unless every healthy worker is in it. Caller must hold `assign_lock`.
-    fn select_new_session_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        now: Instant,
-        avoid: &[WorkerIdentity],
-    ) -> Option<usize> {
-        let mut live_sessions: HashMap<WorkerIdentity, usize> = HashMap::new();
-        for entry in self.assignments.iter() {
-            if now.saturating_duration_since(entry.last_access) <= SESSION_REASSIGNMENT_IDLE_TIMEOUT
-            {
-                *live_sessions.entry(entry.worker.clone()).or_insert(0) += 1;
-            }
-        }
-
-        let mut candidates = get_healthy_worker_indices(workers);
-        if !avoid.is_empty() {
-            let others: Vec<usize> = candidates
-                .iter()
-                .copied()
-                .filter(|&index| !avoid.contains(&Self::worker_identity(&workers[index])))
-                .collect();
-            if !others.is_empty() {
-                candidates = others;
-            }
-        }
-        candidates.into_iter().min_by_key(|&index| {
-            let identity = Self::worker_identity(&workers[index]);
-            (
-                live_sessions.get(&identity).copied().unwrap_or(0),
-                workers[index].load(),
-            )
-        })
-    }
-
-    fn is_expired(assignment: &StickyAssignment, now: Instant) -> bool {
-        now.saturating_duration_since(assignment.last_access) > SESSION_REASSIGNMENT_IDLE_TIMEOUT
-    }
-
-    /// The bound worker's index when the session hits: not idle for too long,
-    /// no request failed since it was placed, and its worker is healthy. A hit
-    /// clears the workers the session failed on.
-    fn hit(
-        workers: &[Arc<dyn Worker>],
-        assignment: &mut StickyAssignment,
-        now: Instant,
-    ) -> Option<usize> {
-        if Self::is_expired(assignment, now) || assignment.failed {
-            return None;
-        }
-        let index = Self::healthy_worker_for_identity(workers, &assignment.worker)?;
-        assignment.last_access = now;
-        assignment.avoid.clear();
-        Some(index)
-    }
-
-    /// Returns the selection with the session outcome (hit, new, rebind,
-    /// expired, or no_session for requests without a session ID).
-    fn select_worker_impl(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> (Option<usize>, &'static str) {
-        let session_id = extract_sticky_routing_key(info.headers);
-        let Some(session_id) = session_id else {
-            return (Self::select_low_load_worker(workers), NO_SESSION);
-        };
-        let now = Instant::now();
-
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            if let Some(index) = Self::hit(workers, &mut assignment, now) {
-                return (Some(index), AFFINITY_HIT);
-            }
-        }
-
-        // New, expired, or orphaned sessions must assign atomically: another
-        // request may have pinned this session while this one waited for the lock.
-        let _assign_guard = self
-            .assign_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (outcome, dispatched, avoid) = match self.assignments.get_mut(session_id) {
-            None => (AFFINITY_NEW, None, Vec::new()),
-            Some(mut assignment) => {
-                if let Some(index) = Self::hit(workers, &mut assignment, now) {
-                    return (Some(index), AFFINITY_HIT);
-                }
-                let outcome = if Self::is_expired(&assignment, now) {
-                    AFFINITY_EXPIRED
-                } else {
-                    AFFINITY_REBIND
-                };
-                // Cloned, not taken: with no worker to place it on, the entry
-                // keeps the workers the session failed on.
-                let avoid = assignment.avoid.clone();
-                (outcome, assignment.dispatched.clone(), avoid)
-            }
-        };
-
-        let Some(selected_index) = self.select_new_session_worker(workers, now, &avoid) else {
-            return (None, outcome);
-        };
-        self.assignments.insert(
-            session_id.to_string(),
-            StickyAssignment {
-                worker: Self::worker_identity(&workers[selected_index]),
-                last_access: now,
-                dispatched,
-                reassigned: (outcome != AFFINITY_NEW).then_some(outcome),
-                failed: false,
-                avoid,
-            },
-        );
-        (Some(selected_index), outcome)
-    }
-}
-
-impl Default for DpStickyPolicy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// `dp_sticky`'s placement: the healthy worker with the fewest live sessions,
+/// then the lowest load. Without session counts, which the session table
+/// passes only when it places a session, the lowest load.
+#[derive(Debug, Default)]
+pub(crate) struct LeastSessionsPolicy;
 
 #[async_trait]
-impl LoadBalancingPolicy for DpStickyPolicy {
+impl LoadBalancingPolicy for LeastSessionsPolicy {
     async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> (Option<usize>, RouteDecision) {
-        let (selected, outcome) = self.select_worker_impl(workers, info);
-        let branch = if selected.is_some() {
-            outcome
-        } else {
-            NO_HEALTHY_WORKERS
+        let counts = info.session_counts;
+        let sessions = |index: usize| counts.and_then(|counts| counts.get(index).copied());
+        let selected = get_healthy_worker_indices(workers)
+            .into_iter()
+            .min_by_key(|&index| (sessions(index).unwrap_or(0), workers[index].load()));
+        let branch = match (selected, counts) {
+            (None, _) => NO_HEALTHY_WORKERS,
+            (Some(_), None) => NO_SESSION,
+            (Some(_), Some(_)) => LEAST_SESSIONS,
         };
         (selected, RouteDecision::branch(branch))
     }
 
-    fn on_dispatch(
-        &self,
-        pool: &'static str,
-        headers: Option<&http::HeaderMap>,
-        worker: &Arc<dyn Worker>,
-    ) {
-        let Some(session_id) = extract_sticky_routing_key(headers) else {
-            return;
-        };
-        let Some(mut assignment) = self.assignments.get_mut(session_id) else {
-            return;
-        };
-        let identity = Self::worker_identity(worker);
-        // Without a reassignment, rank mapping moved the pinned session, or another in-flight
-        // request of the session took the reassignment.
-        let reason = assignment
-            .reassigned
-            .take()
-            .unwrap_or(WORKER_CHANGE_RANK_MAPPING);
-        if assignment
-            .dispatched
-            .as_ref()
-            .is_some_and(|previous| *previous != identity)
-        {
-            MeshMetrics::record_session_worker_change(pool, reason);
-        }
-        assignment.dispatched = Some(identity);
-    }
-
-    /// A failure on the session's bound worker releases the binding: the next
-    /// request, a retry included, is placed again (`rebind`, or `expired`
-    /// after the idle timeout), away from every worker the session failed on
-    /// since its last hit while another one is healthy. Under ATOM PD idx2idx,
-    /// a failed prefill also releases the decode binding, although the decode
-    /// was never sent. A late failure on a worker the session has left keeps
-    /// the new binding; one from an older placement on the worker the session
-    /// is bound to again releases it, at the cost of one extra rebind.
-    fn on_dispatch_failed(&self, headers: Option<&http::HeaderMap>, worker: &Arc<dyn Worker>) {
-        let Some(session_id) = extract_sticky_routing_key(headers) else {
-            return;
-        };
-        let identity = Self::worker_identity(worker);
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            if assignment.worker == identity {
-                assignment.failed = true;
-                if !assignment.avoid.contains(&identity) {
-                    assignment.avoid.push(identity);
-                }
-            }
-        }
+    /// The session table reports `new`, `rebind` or `expired` instead.
+    fn reports_session_result(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -313,8 +64,13 @@ impl LoadBalancingPolicy for DpStickyPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::{
+        core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
+        policies::SessionAffinityPolicy,
+    };
 
     fn workers() -> Vec<Arc<dyn Worker>> {
         ["http://worker-1:8000", "http://worker-2:8000"]
@@ -344,9 +100,16 @@ mod tests {
         headers
     }
 
+    fn expire(policy: &SessionAffinityPolicy, session: &str) {
+        policy.set_last_access(
+            session,
+            Instant::now() - Duration::from_secs(120 * 60) - Duration::from_secs(1),
+        );
+    }
+
     #[tokio::test]
     async fn session_id_is_sticky_while_worker_is_healthy() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -362,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_id_stays_on_the_same_dp_rank() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = dp_workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -377,7 +140,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_sessions_are_spread_by_assignment_count() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = dp_workers();
 
         for (session_id, expected_worker) in [
@@ -400,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn unhealthy_assignment_is_replaced() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -421,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_assignment_is_rebalanced_to_lowest_load_worker() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -432,15 +195,14 @@ mod tests {
         assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
         workers[0].increment_load();
         workers[0].increment_load();
-        policy.assignments.get_mut("session-1").unwrap().last_access =
-            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
+        expire(&policy, "session-1");
 
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
     #[tokio::test]
     async fn session_outcomes_are_reported_as_branches() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let session = SelectWorkerInfo {
@@ -474,7 +236,7 @@ mod tests {
     }
 
     async fn branch(
-        policy: &DpStickyPolicy,
+        policy: &SessionAffinityPolicy,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> &'static str {
@@ -483,7 +245,7 @@ mod tests {
 
     /// Selects a worker for `session` and dispatches the request to it.
     async fn route(
-        policy: &DpStickyPolicy,
+        policy: &SessionAffinityPolicy,
         workers: &[Arc<dyn Worker>],
         pool: &'static str,
         session: &str,
@@ -496,11 +258,6 @@ mod tests {
         let selected = policy.select_worker(workers, &info).await.unwrap();
         policy.on_dispatch(pool, Some(&headers), &workers[selected]);
         selected
-    }
-
-    fn expire(policy: &DpStickyPolicy, session: &str) {
-        policy.assignments.get_mut(session).unwrap().last_access =
-            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
     }
 
     fn worker_changes(rendered: &str) -> Vec<&str> {
@@ -517,7 +274,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
 
         // New, then hit: no change.
@@ -556,7 +313,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let ranks = dp_workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -581,7 +338,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -605,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retry_avoids_the_worker_it_failed_on() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         assert_eq!(route(&policy, &workers, "regular", "s1").await, 0);
         assert_eq!(route(&policy, &workers, "regular", "s2").await, 1);
@@ -636,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_avoid_every_worker_the_session_failed_on_until_a_hit() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers: Vec<Arc<dyn Worker>> = ["http://a:8000", "http://b:8000", "http://c:8000"]
             .into_iter()
             .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
@@ -662,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_failure_on_the_previous_worker_keeps_the_new_binding() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -685,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_off_the_bound_rank_keeps_the_binding() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let ranks = dp_workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -704,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_hit_clears_the_workers_the_session_failed_on() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers: Vec<Arc<dyn Worker>> = ["http://a:8000", "http://b:8000", "http://c:8000"]
             .into_iter()
             .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
@@ -727,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_failed_workers_survive_a_selection_with_no_healthy_worker() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("s");
         let info = SelectWorkerInfo {
@@ -748,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_placed_before_a_rebind_keeps_the_new_binding() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -777,7 +534,7 @@ mod tests {
     /// placement fails late on worker 0. The session is placed once more.
     #[tokio::test]
     async fn an_older_failure_on_the_worker_the_session_returned_to_releases_it() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -802,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_failure_on_the_rank_the_new_binding_maps_to_keeps_it() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let ranks = dp_workers();
         let headers = headers("session-1");
         let info = SelectWorkerInfo {
@@ -827,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_session_id_uses_load_balancing_fallback() {
-        let policy = DpStickyPolicy::new();
+        let policy = SessionAffinityPolicy::dp_sticky();
         let workers = workers();
         workers[0].increment_load();
         workers[0].increment_load();

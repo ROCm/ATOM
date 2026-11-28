@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, SessionAffinityPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -17,7 +17,7 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            PolicyConfig::DpSticky => Arc::new(DpStickyPolicy::new()),
+            PolicyConfig::DpSticky => Arc::new(SessionAffinityPolicy::dp_sticky()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -53,7 +53,7 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
-            "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),
+            "dp_sticky" | "dpsticky" => Some(Arc::new(SessionAffinityPolicy::dp_sticky())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),

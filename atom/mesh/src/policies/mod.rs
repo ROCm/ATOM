@@ -17,16 +17,17 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod session_affinity;
 pub mod tree;
 pub(crate) mod utils;
 pub use cache_aware::CacheAwarePolicy;
-pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use session_affinity::SessionAffinityPolicy;
 pub use tree::PrefixMatchResult;
 
 /// Branch for selections that found no healthy candidate.
@@ -123,6 +124,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that do not track sessions
     }
 
+    /// Whether the session layer reports the session result (`new`, `rebind`,
+    /// `expired`) as this policy's branch when it places a session.
+    fn reports_session_result(&self) -> bool {
+        false
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
@@ -214,6 +221,9 @@ pub struct SelectWorkerInfo<'a> {
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     pub headers: Option<&'a http::HeaderMap>,
+    /// Live sessions bound to each of the candidate workers, in their order.
+    /// Set by the session layer when it places a session.
+    pub session_counts: Option<&'a [usize]>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,

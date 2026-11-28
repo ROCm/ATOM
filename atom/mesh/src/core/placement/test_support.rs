@@ -471,6 +471,7 @@ mod fixture_smoke_tests {
             request_text: Some("hi"),
             tokens: Some(&[1, 2, 3]),
             headers: Some(&hm),
+            session_counts: None,
             hash_ring: None,
             carries_media: false,
         };
