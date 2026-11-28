@@ -7,6 +7,7 @@ Only the scheduler-level shm gating is exercised here; the IPC handshake
 and CUDA stream pool are out of scope for the no-GPU test environment.
 """
 
+import numpy as np
 import pytest
 from conftest import MockConfig
 
@@ -352,3 +353,59 @@ def test_prefill_only_window_still_reports_its_queues():
     metrics = _aggregate(_snapshot("prefill", running=6, waiting=2))
     assert metrics["requests_running"] == 6
     assert metrics["requests_waiting"] == 2
+
+
+# ── RapidServe hand-off: the client receives prefill's token ─────────────
+
+
+@pytest.mark.parametrize("max_tokens", [1, 2, 4])
+def test_decode_streams_prefill_token_first_and_max_tokens_in_all(
+    decode_scheduler_unconstrained, max_tokens
+):
+    """jgong5/ATOM#1598: prefill samples T0 and the decode engine continues from
+    it; T0 counts toward `max_tokens`, so it must reach the client too."""
+    from unittest import mock
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput
+    from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
+
+    sched = decode_scheduler_unconstrained
+    seq = Sequence(
+        [11, 22, 33, 44, 55],
+        4,
+        sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+    )
+    sched.extend([seq])
+    assert sched.allocate_waiting() == [seq]
+    t0, sampled = 7, iter(range(100, 200))
+    sched.on_prefill_done(seq.id, seq.num_prompt_tokens, t0)
+
+    # The decode engine's loop with deferred output: a step's postprocess sees
+    # the ids the previous step sampled.
+    emitted, finished, last = [], [], None
+    stream = mock.Mock()
+    stream.put_nowait.side_effect = lambda outs: emitted.extend(
+        tok for _, out in outs for tok in out.output_tokens
+    )
+    for _ in range(max_tokens + 2):
+        scheduled = sched.schedule()
+        if scheduled is None:
+            break
+        _, seqs = scheduled
+        out = ScheduledBatchOutput(
+            req_ids=[] if last is None else [seq.id],
+            token_ids=[] if last is None else [(last,)],
+            num_rejected=np.zeros(1, dtype=np.int32),
+            num_bonus=np.zeros(1, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=True,
+        )
+        finished += sched.postprocess(list(seqs.values()), out, stream)
+        last = next(sampled)
+        if finished:
+            break
+
+    assert [s.leave_reason for s in finished] == ["max_tokens"]
+    assert emitted == [t0, *range(100, 100 + max_tokens - 1)]
+    assert finished[0].num_completion_tokens == max_tokens

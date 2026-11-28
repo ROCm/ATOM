@@ -7060,6 +7060,9 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            # No output has carried this token yet: the first decode's output
+            # leads with it, as a P/D consumer's does (see `postprocess`).
+            seq._injected_t0 = sampled_token_id
             if seq.required_channel is not None:
                 seq.required_channel_state = seq.required_channel.step(
                     seq.required_channel_state, sampled_token_id
