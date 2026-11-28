@@ -416,6 +416,9 @@ def gemm_a4w4_quant(
             x, x_scale = get_hip_quant(QuantType.per_1x32)(
                 x, quant_dtype=params_dtype, scale_layout_m32k4=True
             )
+        elif x_scale.dim() == 4:  # already 32x4 tiles [m / 32, g / 4, 32, 4]
+            x_scale = x_scale.view(-1, x_scale.shape[1] * 4).view(dtypes.fp8_e8m0)
+            x = x.view(torch.float4_e2m1fn_x2)
         else:  # a fused norm / act quant upstream laid it out for the preshuffle GEMM
             x_scale = _mxfp4_x_scale_to_m32k4(x_scale, x.shape[0], weight.shape[1] * 2)
             x = x.view(torch.float4_e2m1fn_x2)
