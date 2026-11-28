@@ -42,6 +42,12 @@ class StepTables:
         stages = [_find(drafter.model, f"mtp.{j}") for j in range(NDR)]
         target_base = _base(model)
         self.target_blocks, self.draft_blocks = target, stages
+        for block in target + stages:
+            if block.ffn.shared_experts is None:
+                raise MonoUnsupported(
+                    "V4.1 mono decode requires a separate FP8 shared expert; "
+                    "disable ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+                )
         self._geom_key = None
         dmodel = drafter.model
         self.dummy = torch.zeros(1 << 20, dtype=torch.uint8, device=dev)

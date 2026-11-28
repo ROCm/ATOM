@@ -30,6 +30,9 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     if quant_config is None:
         quant_config = config.quant_config
 
+    if not getattr(quant_config, "fuse_shared_experts", True):
+        return False
+
     dp_size = config.parallel_config.data_parallel_size
     # Shared-expert fusion is incompatible with the flattened DP x TP MoE-EP
     # layout (set by the vLLM plugin under DP+EP); disable it there.

@@ -70,6 +70,11 @@ def block_tensors(block, prefix: str) -> tuple[dict, dict]:
     with ``prefix`` (``layers.<i>.`` / ``mtp.<s>.``): ``layer_impl.pack(local=True)``'s inputs, the routed experts
     aside (``expert_packs``)."""
     a, f = block.attn, block.ffn
+    if f.shared_experts is None:
+        raise MonoUnsupported(
+            "V4.1 mono hi requires a separate FP8 shared expert; "
+            "disable ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+        )
     q_lora = a.wqkv_a.output_sizes[0]
     kv_rows = sum(a.wqkv_a.output_sizes)
     w = {}
@@ -134,6 +139,11 @@ def check_block(block, inter: int, tp: int) -> None:
     before anything is packed: every FP8 linear they read, the routed experts' layout and padding codes
     (``check_experts``). The install's check (``hi_runner.check``)."""
     a, f = block.attn, block.ffn
+    if f.shared_experts is None:
+        raise MonoUnsupported(
+            "V4.1 mono hi requires a separate FP8 shared expert; "
+            "disable ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4"
+        )
     lins = [a.wqkv_a, a.wq_b, a.wo_b, a.wo_a]
     lins += [f.shared_experts.gate_up_proj, f.shared_experts.w2]
     idx = getattr(a, "indexer", None)

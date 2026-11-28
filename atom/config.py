@@ -328,6 +328,9 @@ class QuantizationConfig:
         online_quant_config: dict | None = None,
         model: str | None = None,
     ):
+        # A model whose expert mapping has no shared slot can opt out for
+        # every quantization format when it builds its own config.
+        self.fuse_shared_experts = True
         # Layers the checkpoint at `model` stores in a plain float dtype.
         self._stored_unquantized = (
             unquantized_layer_keys(model) if model else frozenset()

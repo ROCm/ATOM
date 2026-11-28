@@ -252,6 +252,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
             shared_expert_spec=converted_linear_spec(draft),
             online_routed_experts=True,
         )
+        # The draft's expert mapping has no shared slot. Keep its shared
+        # MLP separate for both same-format and re-quantized experts.
+        self.moe_quant_config.fuse_shared_experts = False
         # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
         self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]

@@ -40,7 +40,14 @@ class SharedExpertStaging:
     weight_loader and `fuse` after its online quantization."""
 
     def __init__(
-        self, layer, quant_config, hidden_size: int, inter: int, ptpc: bool = False
+        self,
+        layer,
+        quant_config,
+        hidden_size: int,
+        inter: int,
+        ptpc: bool = False,
+        *,
+        shared_expert_spec=None,
     ):
         name = (
             "A fused per-channel FP8 shared expert"
@@ -55,6 +62,12 @@ class SharedExpertStaging:
                 "which places the shared expert among the routed experts."
             )
         self.ptpc = ptpc
+        block = getattr(shared_expert_spec, "weight_block_size", None) or (1, 32)
+        if not ptpc and (block[0] < 1 or block[1] != 32):
+            raise NotImplementedError(
+                f"{layer.prefix}: unsupported MXFP8 shared weight block {block}"
+            )
+        self.scale_block_rows = block[0]
         source = layer.layer_quant_config
         if ptpc:
             # Streaming buffers are still on meta here, and the FP8 online
@@ -126,6 +139,12 @@ class SharedExpertStaging:
             )
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be w1/w2/w3, got {shard_id!r}.")
+        if not self.ptpc and name.endswith("_scale") and self.scale_block_rows > 1:
+            # Expand checkpoint block scales before the weight loader takes
+            # this TP rank's rows (w1/w3) or columns (w2).
+            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
+                self.scale_block_rows, dim=0
+            )
         # A per-channel scale is a row's: w13's shard by row, w2's stay whole.
         load = (
             layer._load_per_channel_weight_scale

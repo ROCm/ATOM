@@ -4,26 +4,36 @@ routed experts (ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4), one 129-expert / top-5 MoE.
 The shared expert is staged in MXFP8 while loading and re-quantized into its
 MXFP4 slot afterwards."""
 
-import importlib
 from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 from torch import nn
 
-aiter = pytest.importorskip("aiter")
-QuantType = aiter.QuantType
-dtypes = aiter.dtypes
-
-moe_mod = importlib.import_module("atom.model_ops.moe")
-quant_spec = importlib.import_module("atom.quant_spec")
-staging_mod = importlib.import_module("atom.model_ops.fused_moe.shared_expert_staging")
+with atom_without_aiter() as load:
+    moe_mod = load("atom.model_ops.moe")
+    quant_spec = load("atom.quant_spec")
+    topk_mod = load("atom.model_ops.topK")
+    staging_mod = load("atom.model_ops.fused_moe.shared_expert_staging")
+    QuantType = moe_mod.QuantType
+    dtypes = moe_mod.dtypes
+    d_dtypes = {name: getattr(dtypes, name) for name in ("fp8", "fp4x2")}
 FusedMoE = moe_mod.FusedMoE
 LayerQuantConfig = quant_spec.LayerQuantConfig
 
 H, I_LOCAL, ROUTED, SHARED = 64, 32, 2, 1
 PAD = 16  # the MXFP4 target may pad the intermediate size
 FP8 = torch.float8_e4m3fn
+
+
+@pytest.fixture(autouse=True)
+def quant_handles(monkeypatch):
+    # quant_spec defers these imports until use, after the import context has
+    # restored the CPU host's modules. Patch only for this test and restore
+    # its original lazy handles so other files still import their own stack.
+    monkeypatch.setattr(quant_spec, "QuantType", QuantType)
+    monkeypatch.setattr(quant_spec, "d_dtypes", d_dtypes)
 
 
 def _spec(dtype):
@@ -34,7 +44,7 @@ def _param(*shape, dtype=torch.float32):
     return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
 
 
-def _fused_mxfp4_layer(ptpc=False, tp_size=1, tp_rank=0):
+def _fused_mxfp4_layer(ptpc=False, tp_size=1, tp_rank=0, block_rows=1):
     """An MXFP4 FusedMoE with one fused shared slot, buffers as the target
     lays them out (w13 halves padded), its shared expert staged in MXFP8
     (per-channel FP8 with ``ptpc``)."""
@@ -64,18 +74,28 @@ def _fused_mxfp4_layer(ptpc=False, tp_size=1, tp_rank=0):
     layer.w2_weight = _param(e, H, I_LOCAL // 2)
     layer.w2_weight_scale = _param(e, H, I_LOCAL // 32)
     layer.shared_expert_staging = staging_mod.SharedExpertStaging(
-        layer, None, H, I_LOCAL, ptpc=ptpc
+        layer,
+        None,
+        H,
+        I_LOCAL,
+        ptpc=ptpc,
+        shared_expert_spec=LayerQuantConfig(
+            quant_type=QuantType.per_1x32,
+            quant_dtype=dtypes.fp8,
+            weight_block_size=(block_rows, 32),
+        ),
     )
     return layer
 
 
-def _shared_checkpoint():
+def _shared_checkpoint(tp_size=1):
     """MXFP8 shared expert as the checkpoint stores it (full, unsharded)."""
     torch.manual_seed(0)
+    inter = I_LOCAL * tp_size
     w = {
-        "w1": (torch.randn(I_LOCAL, H) * 4).to(FP8),
-        "w3": (torch.randn(I_LOCAL, H) * 4).to(FP8),
-        "w2": (torch.randn(H, I_LOCAL) * 4).to(FP8),
+        "w1": (torch.randn(inter, H) * 4).to(FP8),
+        "w3": (torch.randn(inter, H) * 4).to(FP8),
+        "w2": (torch.randn(H, inter) * 4).to(FP8),
     }
     s = {
         k: torch.randint(100, 140, (v.shape[0], v.shape[1] // 32), dtype=torch.uint8)
@@ -129,6 +149,63 @@ def test_shared_slot_loads_into_mxfp8_staging_not_mxfp4_buffers():
     assert torch.equal(staged["w2_weight_scale"][0], s["w2"])
     # The MXFP4 buffers never saw the shared expert.
     assert not layer.w13_weight.data.any() and not layer.w2_weight.data.any()
+
+
+@pytest.mark.parametrize(("tp_size", "tp_rank"), [(1, 0), (2, 0), (2, 1), (4, 3)])
+def test_32x32_block_scales_stage_as_their_1x32_rows(tp_size, tp_rank):
+    """DeepSeek-V4.1's FP8 shared expert has one E8M0 scale per 32x32 block."""
+    w, _ = _shared_checkpoint(tp_size)
+    blocks = {
+        k: torch.randint(
+            100, 140, (v.shape[0] // 32, v.shape[1] // 32), dtype=torch.uint8
+        )
+        for k, v in w.items()
+    }
+    rows = {k: v.repeat_interleave(32, dim=0) for k, v in blocks.items()}
+    staged = []
+    for scales, block_rows in ((blocks, 32), (rows, 1)):
+        layer = _fused_mxfp4_layer(
+            tp_size=tp_size, tp_rank=tp_rank, block_rows=block_rows
+        )
+        _load_shared(layer, w, scales)
+        staged.append(layer.shared_expert_staging.staged)
+    for name, got in staged[0].items():
+        assert torch.equal(got.view(torch.uint8), staged[1][name].view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "prefix", ["layers.3.ffn.experts", "mtp.0.ffn.experts", "other.draft.experts"]
+)
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("same_dtype", [False, True])
+def test_model_owns_shared_fusion_policy(monkeypatch, prefix, fused, same_dtype):
+    monkeypatch.setenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "1")
+    specs = {
+        "shared_experts": _spec(dtypes.fp8),
+        "experts": _spec(dtypes.fp8 if same_dtype else dtypes.fp4x2),
+    }
+    qc = SimpleNamespace(
+        fuse_shared_experts=fused,
+        get_layer_quant_config=lambda p, check_children=False: specs[
+            p.rsplit(".", 1)[-1]
+        ],
+    )
+    monkeypatch.setattr(
+        topk_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            quant_config=qc,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            moe_ep_flatten_tp_across_dp=False,
+        ),
+    )
+    shared = prefix.removesuffix("experts") + "shared_experts"
+    assert (
+        topk_mod.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            qc, shared_expert_prefix=shared, routed_expert_prefix=prefix
+        )
+        is fused
+    )
 
 
 def test_missing_shared_tensor_is_reported():

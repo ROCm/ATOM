@@ -4128,6 +4128,7 @@ class FusedMoE(torch.nn.Module):
                 hidden_size,
                 self.intermediate_size_per_partition,
                 ptpc=stage_shared_ptpc,
+                shared_expert_spec=shared_spec,
             )
             if stage_shared
             else None
