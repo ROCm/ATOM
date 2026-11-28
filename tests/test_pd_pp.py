@@ -2711,7 +2711,74 @@ def test_missing_consumer_rail_notifies_failure_without_writing():
     conn._execute_block_transfer.assert_not_called()
     conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
     factory.assert_not_called()
+    # Nothing asks for this write again, so its source pages go back.
+    assert conn.done_sending == {"old-consumer"}
+
+
+@pytest.mark.parametrize("failure", ["write", "raises", "rail", "no_prefill_data"])
+def test_a_failed_transfer_frees_its_source(failure):
+    # The consumer fails the request and never asks again, so a failure that
+    # kept the source until the run ended would leak its pages for good.
+    conn = _matched_rail_producer()
+    conn._completed_prefills["t"] = {"block_ids": [1], "slot_index": -1}
+    conn._kv_cache_ready_events["t"] = object()
+    conn._execute_block_transfer = MagicMock(return_value=failure != "write")
+    if failure == "raises":
+        conn._execute_block_transfer.side_effect = RuntimeError("bad plan")
+    elif failure == "rail":
+        conn._rail_pool = SimpleNamespace(
+            get=MagicMock(side_effect=RuntimeError("previously failed"))
+        )
+    elif failure == "no_prefill_data":
+        conn._wait_for_prefill_data = lambda _: None
+    request = _matched_rail_request("t", "ionic_2")
+
+    conn._execute_transfer(request)
+
+    conn._notify_transfer_result.assert_called_once_with(request, success=False)
+    assert conn.done_sending == {"t"}
+    assert "t" not in conn._completed_prefills
+    assert "t" not in conn._kv_cache_ready_events
+    assert conn._transfer_refcount == {}
+
+
+@pytest.mark.parametrize(
+    "written", [(False, True), (True, False), (False, False)], ids=str
+)
+def test_a_source_goes_back_once_its_last_consumer_rank_ended(written):
+    # TP fan-out: each decode rank sends its own write request to this rank,
+    # and the pages are free once every one ended, written or not.
+    conn = _matched_rail_producer()
+    conn._execute_block_transfer = MagicMock(side_effect=written)
+    for _ in written:
+        assert not conn.done_sending
+        request = _matched_rail_request("t", "ionic_2")
+        request["consumer_tp_size"] = len(written)
+        conn._execute_transfer(request)
+    assert conn.done_sending == {"t"}
+    assert conn._transfer_refcount == {}
+    assert [
+        call.kwargs["success"] for call in conn._notify_transfer_result.call_args_list
+    ] == list(written)
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_a_failed_pp_stage_write_still_waits_for_the_release(pp_rank):
+    # Under PP-prefill stage 0 frees the shared page table once the consumer
+    # releases it, which it also does after a failure (_fail_recv).
+    conn = _matched_rail_producer()
+    conn.pp_size, conn.pp_rank = 2, pp_rank
+    conn._completed_prefills["t"] = {"block_ids": [1], "slot_index": -1}
+    conn._execute_block_transfer = MagicMock(return_value=False)
+    request = _matched_rail_request("t", "ionic_2")
+    request["src_block_ids"] = [1]
+
+    conn._execute_transfer(request)
+
+    conn._notify_transfer_result.assert_called_once_with(request, success=False)
     assert not conn.done_sending
+    assert ("t" in conn._completed_prefills) == (pp_rank == 0)
+    assert conn._transfer_refcount == {}
 
 
 @pytest.mark.parametrize("succeeds", [False, True])

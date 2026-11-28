@@ -1464,6 +1464,78 @@ def test_the_write_listener_acknowledges_a_request_that_asks(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("build_fails", [False, True])
+def test_a_request_whose_rail_needs_building_starts_its_window_once_built(
+    monkeypatch, build_fails
+):
+    # Building a matched rail's engine takes about a minute and rails build
+    # one at a time. Counted in the request's transfer deadline, that wait
+    # failed its write, and a send worker waiting for it served no one else.
+    mc = _mooncake()
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._side_channel_port = 1
+    events = []
+
+    class _Pool:
+        def __init__(self):
+            self.built = {"ionic_2"}
+
+        def needs_build(self, device):
+            return device not in self.built
+
+        def get(self, device):
+            events.append(("build", device))
+            if build_fails:
+                raise RuntimeError("register_memory failed")
+            self.built.add(device)
+
+    class _Executor:
+        def __init__(self, name):
+            self.name, self.jobs = name, []
+
+        def submit(self, fn, request_data):
+            events.append((self.name, request_data["request_id"]))
+            self.jobs.append((fn, request_data))
+
+    conn._rail_pool = _Pool()
+    conn._rail_builder = _Executor("rail")
+    conn._send_executor = _Executor("send")
+    conn._ack_write_request = lambda data: events.append(("ack", data["request_id"]))
+    request = {
+        "write_nonce": 7,
+        "notify_host": "decode",
+        "notify_port": 9,
+        "consumer_host": "d",
+        "consumer_rpc_port": 1,
+        "write_ack": True,
+    }
+    _listen(
+        monkeypatch,
+        mc,
+        conn._write_listener,
+        [
+            (
+                mc.MSG_WRITE_REQUEST,
+                msgpack.dumps({**request, "request_id": r, "consumer_ib_device": d}),
+            )
+            for r, d in [("cold", "ionic_6"), ("warm", "ionic_2")]
+        ],
+    )
+    # The request on a built rail is unchanged: acknowledged on receipt.
+    assert events == [("rail", "cold"), ("ack", "warm"), ("send", "warm")]
+    [(build, cold)] = conn._rail_builder.jobs
+    assert "_deadline" not in cold
+    assert "_deadline" in conn._send_executor.jobs[0][1]
+
+    events.clear()
+    before = time.monotonic()
+    build(cold)
+    # A failed build is reported by the transfer, as for any failed rail.
+    assert events == [("build", "ionic_6"), ("ack", "cold"), ("send", "cold")]
+    assert cold["_deadline"] >= before + mc.PD_TRANSFER_DEADLINE_S
+    assert conn._send_executor.jobs[-1] == (conn._execute_transfer, cold)
+
+
 def test_the_notification_listener_starts_a_landing_stage_window(monkeypatch):
     mc = _mooncake()
     dest = _Dest()
