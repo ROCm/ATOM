@@ -156,92 +156,273 @@ def _ema(avg: float, sample: float) -> float:
 # and the fill/stall coalescer with a rent-or-buy (EOQ) rule derived from
 # measured step costs:
 #
-#   decode tick   T_d(b) = T0 + c*b      (b = decode seqs per rank)
-#   prefill step  P(n)   = A  + k*n      (n = largest per-rank prefill tokens)
+#   T0 = a, the decode step's part that  (a request held one more decision
+#        does not grow with the batch     waits for the step that decision runs,
+#                                         and its peers skip the time it would
+#                                         add to that step: T_d - k*B)
+#   C  = mean cost of one prefill pass   (prefill step + its aftermath, below)
+#   B  = decode seqs of the group        (every one stalls while a pass runs)
 #
-# A held request costs alpha*T0/T_d decode tokens per tick (the marginal
-# throughput of one more seq in the batch); a prefill forward's fixed part A
-# costs A*alpha*B/T_d tokens (all B decode seqs stall; the per-token part k*n is
-# work that must be done whatever the batching). Firing once the accumulated
-# holding cost reaches the fixed cost -- sum over held ticks of W_t*T0 >= A*B --
-# is the EOQ optimum for a steadily growing queue and 2-competitive otherwise.
-# alpha (accepted tokens per seq per step) and T_d cancel. No interval to tune:
-# a faster prefill (smaller A) or a costlier decode seq (smaller T0 share) fires
-# sooner, and vice versa.
+# A hold makes each of the W admittable requests wait one decode step T_d;
+# a FIRE stalls each of the B decoding requests for the pass. In the closed
+# loop (a fixed population of clients) a request admitted one decision later
+# also leaves one decode seq out of that step, which every one of the B
+# decoding requests would otherwise pay k (the step's slope in the batch) for:
+# admitting earlier does not merely move that time, it raises the batch every
+# later step runs at. So a held request costs T_d - k*B = a, the step's part
+# that does not grow with the batch.
 #
-# Lockstep: every rank fits T0 and A locally from its own step clock; the fits
-# and the per-tick waiting counts ride the existing SUM all_reduce, and every
-# rank decides from the identical reduced means.
+# The two costs are weighed as serving is judged: the product
+# of throughput and interactivity, each a relative change. A held request's
+# wait lengthens its whole round trip Z (wait + decode + the client's turn),
+# and in the closed loop throughput goes as 1/Z, so W*T0 counts as W*T0/Z;
+# a pass's stall lengthens the decode time D of each of the B decoding
+# requests, and interactivity goes as 1/D, so C*B counts as C*B/D. By
+# Little's law, over the requests the group holds, Z/D >= (B + W)/B (the
+# clients' own turns, which the group does not see, would only add to it).
+# So the rule fires once the accumulated holding cost reaches the pass cost
+# over the requests it holds -- sum over held ticks of W_t*T0 >= C*(B + W) --
+# the EOQ optimum of that product for a steadily growing queue and
+# 2-competitive otherwise. In a backlog (W comparable to B) this waits
+# longer than C*B would, which keeps the batch from overshooting while the
+# queue is long; with a short queue it is the plain rent-or-buy rule. No
+# interval and no weight to tune: a cheaper pass, fewer decoding or waiting
+# seqs, or more waiting requests a held tick delays, fire sooner.
+#
+# Sustained backlog: when admission capacity binds, the product rule spaces
+# the passes too far apart (its threshold C*(B + W) shrinks slower than the
+# holding cost as the queue drains), the queue drains slower and closed-loop
+# throughput drops. A rank has a backlog when more fresh requests wait than
+# arrived since the last FIRE, i.e. the last pass could not take its work;
+# that 0/1 rides the SUM all_reduce. When the FIREs that open and close the
+# current cycle both saw a backlog somewhere in the group (one leftover can be
+# a burst or one long prompt), the rule switches to the throughput optimum:
+# FIRE once sum over held ticks of W_t*T_d >= C*B (a hold costs each waiting
+# request a whole decode step; a pass stalls each decoding request for C).
+# This never admits less often than the fixed interval rule during a backlog.
+# Floor: no FIRE before the _FLOOR_TICKS-th decision of a cycle, so the rule
+# never admits more often than the fixed interval rule either. Together, a
+# sustained backlog runs at the fixed cadence (throughput unchanged) and the
+# product rule only stretches the cycle where that buys interactivity.
+#
+# Lockstep: every term of the rule is a reduced (group) value, so every rank
+# decides alike; no rank-local estimate enters the decision (one that did
+# would let ranks fire apart: a pass per rank group instead of one aligned
+# pass).
+#
+# T0 = T_d - k*B is measured from the plain decode steps (outside a pass's
+# aftermath): T_d and B are their mean step and mean batch, which follow the
+# load within a few samples; k is the step's slope in the batch it ran, a
+# regression on the batch's level over a memory of its own (below), which
+# spans the batch's spread across cycles. A step a request finishes in also
+# carries that request's completion work; that work goes with a change of the
+# batch between successive steps, not with its level, so it adds to the
+# noise, not to the slope (a fit on successive differences, or one that sees
+# the batch move only by completions, would take it for the slope and drive
+# T0 to 0). Until the batch has varied there is no slope and T0 = T_d; k is
+# kept within [0, T_d / B].
+#
+# C is measured, not extrapolated: a prefill pass also slows the steps after
+# it -- its GPU work spills into the next step, and ranks still finishing it
+# reach the DP sync of the step after that late -- so that aftermath is
+# charged to the pass: every following decode step's excess over the decode
+# mean, while the step stays above the mean and shorter than the one before
+# (the aftermath decays; a step at or below the mean, or no shorter than the
+# previous one, is back to plain decoding). Steps in a pass's aftermath stay
+# out of the decode mean. A pass sample weighs as the decisions of the cycle
+# it ends: the cycle a decision falls in is drawn by length, so this is the
+# expected cost of the pass a decision is waiting for, and a burst of
+# back-to-back passes (warm-up flood, a load spike) does not outweigh the
+# cycles that follow it by its count of passes.
+#
+# Memory: T_d, k and C are `_AdaptiveMean`s, which size their memory from
+# their own samples instead of a half-life. The rule places a FIRE in a cycle
+# of N decisions to one decision only if T0 and C are known to about 1/N (a
+# relative error e moves the FIRE by e*n in the backlog regime, by half that
+# in the growth regime), so an estimate keeps the fewest samples that give it
+# that standard error: n_eff = CV^2 * N^2 for a mean (CV^2 = noise variance /
+# mean^2, the noise taken from successive samples -- residuals about the line
+# for k -- blind to a slow drift), and for k, whose share k*B of T0 must be
+# resolved, n_eff = CV^2 * (mean B^2 / var B) * N^2 with CV taken on T0
+# (unbounded, i.e. growing a sample a sample, while the batch has not
+# varied). While the
+# samples drift -- the innovations, in units of what that noise and the
+# mean's own error predict, average away from 0 by more than their standard
+# error (squared ratio > 1) -- the memory shrinks by that ratio, so a load
+# change is followed within a few samples. The memory grows by at most one
+# sample per sample (no mean rests on more samples than it has seen since it
+# last forgot), so after an outlier or a shift it regrows as a running mean.
+# N is the measured mean cycle (the mean weight of the pass samples). Nothing
+# to tune; a mean is used from its first sample.
+#
+# No capacity cap: once one pass cannot take the waiting work, the leftover
+# keeps W -- and so the regret -- high from the first decision of the next
+# cycle, and fewer requests decode (smaller B), so EOQ fires sooner without
+# one. The longest hold is the ttft_max_ticks bound checked before this rule.
+# No cold-start cadence: until T0 and C are measured the rule holds (the
+# must-fire bounds still apply). The first pass is forced by the no-decode
+# bound and times C; holding runs the decode steps that time T0; so both are
+# measured within a few decisions of the first request. Should the first pass
+# go untimed, ttft_max_ticks releases the next one.
+#
+# Lockstep: every rank measures T0 and C from its own step clock; the means,
+# the per-tick admittable counts and each rank's executed prefill tokens ride
+# the existing SUM all_reduce, and every rank decides from the identical
+# reduced values.
 # --------------------------------------------------------------------------
 # --prefill-admit-policy values; Config and the CLI take them from here.
 PREFILL_ADMIT_POLICIES = ("interval", "adaptive")
-# decode / prefill fit half-lives in samples, and identifiability guards
-_DEC_HALF_LIFE = 2000.0
-_PF_HALF_LIFE = 200.0
-_DEC_MIN_N = 64
-_PF_MIN_N = 8
-_PF_MIN_CV = 0.05
-# prior fixed prefill cost while the prefill fit is not identifiable: share of
-# a mean prefill step
-_PF_A_PRIOR = 0.25
-# fixed slots: W_eff, T0 (us), A (us), fitted ranks; then dp_size one-hot slots
-# of each rank's prefill tokens executed on the previous tick
-_ADAPT_FIXED = 4
-# Every estimate is bounded; an intercept extrapolation of T_d(b) over the
-# narrow batch range seen in serving (b ~ 300-400 total) drifted toward 0 under
-# load (13 ms -> 2-5 ms) and stretched the cycle to 30-41 ticks (-4.6% thr,
-# TTFT 2.7x vs interval 24), so:
-#   T0 = _T0_FRAC * EMA mean decode step                 (no extrapolation)
-#   A  = prefill-fit intercept clamped to [_A_MIN_FRAC, _A_MAX_FRAC] * mean
-#        prefill step
-#   FIRE on the n-th decision since the last FIRE (n-1 held ticks) once
-#   regret >= A*B and n >= _MIN_TICKS, or once n >= the TTFT cap
-#   _MAX_HOLD_MS / mean decode step (600 ms ~ 24 at ~25 ms/tick), clamped to
-#   [_MIN_TICKS, _TICKS_CAP].
-# Tuned on DSV4.1 DEP4 8k/1k; not meant to be tuned per deployment.
-_T0_FRAC = 0.75
-_A_MIN_FRAC = 0.3
-_A_MAX_FRAC = 1.5
-_MAX_HOLD_MS = 600.0
-_MIN_TICKS = 4
-_TICKS_CAP = 200
-# cap before the decode mean is known (cold start)
-_COLD_MAX_TICKS = 24
+# fixed slots: W_eff, T0 (us), C (us), measured ranks, ranks with a backlog,
+# T_d (us); then dp_size one-hot slots of each rank's prefill tokens executed
+# on the previous tick
+_ADAPT_FIXED = 6
+# Throughput guard: the fewest decisions per cycle. The adaptive rule never
+# admits more often than the fixed interval rule's cadence (40 decisions, the
+# value the DEP serving recipes ran with), so its decode cadence is never
+# choppier than that baseline; the backlog rule below keeps it from admitting
+# less often while a backlog lasts, which pins a sustained backlog to this
+# cadence.
+_FLOOR_TICKS = 40
+# one line per FIRE (rank 0): its n, reason and costs
+_ADAPT_LOG_FIRES = _DEBUG
 
 
-class _EwFit:
-    """Exponentially weighted least squares fit of y = a + b*x."""
+class _AdaptiveMean:
+    """Exponentially weighted mean of y -- and of x, with the line y = a + k*x
+    through them -- that sizes its own memory (see the module-level comment):
+    after every sample, `memory` becomes the fewest samples whose standard
+    error resolves one decision of a cycle of `cycle` decisions, shortened
+    while the samples drift. What must be resolved: the mean of y; with
+    fit=True, the slope's share k * mean x of the intercept (the decode
+    step's slope in the batch, whose part T0 removes from the mean step)."""
 
-    __slots__ = ("decay", "n", "sw", "sx", "sxx", "sxy", "sy")
+    __slots__ = (
+        "memory",
+        "mx",
+        "my",
+        "n",
+        "prev",
+        "prev_x",
+        "sc",
+        "sk",
+        "skk",
+        "sr",
+        "su",
+        "sw",
+        "sww",
+        "vxx",
+        "vxy",
+    )
 
-    def __init__(self, half_life: float):
-        self.decay = 0.5 ** (1.0 / half_life)
+    def __init__(self):
         self.n = 0
-        self.sw = self.sx = self.sy = self.sxx = self.sxy = 0.0
+        self.memory = 1.0
+        # weights and squared weights; weighted means of x and y and the
+        # weighted centered sums of x*x and x*y (updated in place, so an x that
+        # never changes leaves vxx exactly 0)
+        self.sw = self.sww = 0.0
+        self.mx = self.my = self.vxx = self.vxy = 0.0
+        # unweighted: samples; successive pairs (and squared, for their n_eff),
+        # their half squared residual differences (noise), standardized
+        # innovations
+        self.sc = self.sk = self.skk = self.sr = self.su = 0.0
+        self.prev = self.prev_x = 0.0
 
-    def add(self, x: float, y: float) -> None:
-        d = self.decay
+    def mean(self) -> float:
+        return self.my if self.sw > 0 else 0.0
+
+    def mean_weight(self) -> float:
+        """Mean weight of the remembered samples (0 before any)."""
+        return self.sw / self.sc if self.sc > 0 else 0.0
+
+    def slope(self) -> float:
+        """k of y = a + k*x over the remembered samples: 0 until x has varied
+        (no slope to resolve), and within [0, mean y / mean x] -- y does not
+        fall as x grows, and its part that does not grow with x is not
+        negative."""
+        if self.vxx <= 0:
+            return 0.0
+        k = self.vxy / self.vxx
+        return min(max(k, 0.0), self.my / self.mx) if self.mx > 0 else 0.0
+
+    def intercept(self) -> float:
+        """a = mean y - k * mean x: the part of y that does not grow with x
+        (the mean when there is no x)."""
+        return self.my - self.slope() * self.mx if self.sw > 0 else 0.0
+
+    def add(
+        self,
+        y: float,
+        w: float = 1.0,
+        cycle: float | None = None,
+        x: float = 0.0,
+        fit: bool = False,
+    ) -> None:
+        """Fold sample y (at x) of weight w. cycle: the decisions per cycle the
+        estimate must resolve to one; None: this mean's own mean weight (pass
+        samples weigh as the decisions of their cycle). fit: size the memory
+        for the slope (see the class docstring), not the mean."""
+        d = 1.0 - 1.0 / self.memory
+        if self.n:
+            # the residual about the line (fit) or about the mean
+            k = self.slope() if fit else 0.0
+            noise = 0.5 * ((y - self.prev) - k * (x - self.prev_x)) ** 2
+            r = self.sr / self.sk if self.sr > 0 else noise
+            u = 0.0
+            if r > 0:
+                # innovation in units of what noise and the estimate's own
+                # error at this x predict for it
+                n_eff = self.sw * self.sw / self.sww
+                lev = 1.0
+                if fit and self.vxx > 0:
+                    lev += (x - self.mx) ** 2 * self.sw / self.vxx
+                pred = self.my + k * (x - self.mx)
+                u = (y - pred) / (r * (1.0 + lev / n_eff)) ** 0.5
+            self.sk = d * self.sk + 1.0
+            self.skk = d * d * self.skk + 1.0
+            self.sr = d * self.sr + noise
+            self.su = d * self.su + u
+        self.sc = d * self.sc + 1.0
+        self.sw = d * self.sw + w
+        # squared weights decay by d^2: sw^2 / sww is the estimate's n_eff
+        # (2M - 1 for equal weights)
+        self.sww = d * d * self.sww + w * w
+        dx = x - self.mx
+        dy = y - self.my
+        self.mx += w * dx / self.sw
+        self.my += w * dy / self.sw
+        self.vxx = d * self.vxx + w * dx * (x - self.mx)
+        self.vxy = d * self.vxy + w * dx * (y - self.my)
+        self.prev = y
+        self.prev_x = x
         self.n += 1
-        self.sw = self.sw * d + 1.0
-        self.sx = self.sx * d + x
-        self.sy = self.sy * d + y
-        self.sxx = self.sxx * d + x * x
-        self.sxy = self.sxy * d + x * y
-
-    def mean_y(self) -> float:
-        return self.sy / self.sw if self.sw > 0 else 0.0
-
-    def fit(self, min_n: int, min_cv: float):
-        """(intercept, slope, mean_x, mean_y), or None if not identifiable."""
-        if self.n < min_n or self.sw <= 0:
-            return None
-        mx = self.sx / self.sw
-        my = self.sy / self.sw
-        vxx = self.sxx / self.sw - mx * mx
-        if mx <= 0 or vxx <= (min_cv * mx) ** 2:
-            return None
-        slope = (self.sxy / self.sw - mx * my) / vxx
-        return my - slope * mx, slope, mx, my
+        a = self.intercept() if fit else self.mean()
+        if self.sk <= 0 or a <= 0:
+            return
+        if cycle is None:
+            cycle = self.mean_weight()
+        cv2 = self.sr / self.sk / (a * a)
+        # the variance of k * mean x over that of the mean: mean x^2 / var x
+        # (unbounded while x has not varied: no slope is resolved yet, so keep
+        # every sample until it does)
+        vif = 1.0
+        if fit and self.mx != 0:
+            vif = (
+                self.mx * self.mx * self.sw / self.vxx if self.vxx > 0 else float("inf")
+            )
+        # drift: the mean innovation over its standard error, squared (~1
+        # without drift; grows with the square of the samples since a shift)
+        u_mean = self.su / self.sk
+        drift = max(1.0, u_mean * u_mean * self.sk * self.sk / self.skk)
+        # an exponentially weighted mean of memory M has n_eff = 2M - 1. It
+        # grows by at most one sample a sample: an estimate cannot rest on
+        # more samples than it has seen since it last forgot (memory M+1 after
+        # M is the running mean). This also keeps one outlier pair, which
+        # inflates the noise until it is forgotten, from freezing the memory.
+        self.memory = min(
+            self.memory + 1.0,
+            max(1.0, (cv2 * vif * cycle * cycle / drift + 1.0) / 2.0),
+        )
 
 
 class PrefillDecision(NamedTuple):
@@ -254,12 +435,20 @@ class PrefillDecision(NamedTuple):
 
 class PrefillDelayer:
     __slots__ = (
+        "_adapt_arr_since_fire",
         "_adapt_at",
-        "_adapt_dec_fit",
+        "_adapt_backlog_prev",
+        "_adapt_dec",
+        "_adapt_dec_clean",
+        "_adapt_last_fire",
         "_adapt_last_tokens",
-        "_adapt_pf_fit",
+        "_adapt_pf",
+        "_adapt_pf_open",
         "_adapt_prev_dec_per_rank",
         "_adapt_regret",
+        "_adapt_regret_td",
+        "_adapt_since_pf",
+        "_adapt_slope",
         "_adapt_thr_last",
         "_arrival_gap_s",
         "_clock",
@@ -287,8 +476,8 @@ class PrefillDelayer:
         "_stall_count",
         "_stat_adapt_cycles",
         "_stat_adapt_hold_ticks",
-        "_stat_fire_adaptcap",
         "_stat_fire_adaptive",
+        "_stat_fire_backlog",
         # stats
         "_stat_fire_cost",
         "_stat_fire_fill",
@@ -445,16 +634,31 @@ class PrefillDelayer:
         )
         self._reduce_np = self._reduce_buf.numpy()
         # adaptive admission state (see the module-level comment)
-        self._adapt_dec_fit = _EwFit(_DEC_HALF_LIFE)
-        self._adapt_pf_fit = _EwFit(_PF_HALF_LIFE)
+        # the mean decode step (and batch) and, over a memory of its own, the
+        # step's slope in the batch
+        self._adapt_dec = _AdaptiveMean()
+        self._adapt_arr_since_fire = 0
+        self._adapt_backlog_prev = False
+        self._adapt_regret_td = 0.0
+        self._adapt_slope = _AdaptiveMean()
+        self._adapt_pf = _AdaptiveMean()
         self._adapt_last_tokens = 0
         self._adapt_prev_dec_per_rank = 0.0
+        # the previous step was a plain decode step (timed, decode running,
+        # outside a pass's aftermath): the next decode step is a T0 sample
+        self._adapt_dec_clean = False
         self._adapt_regret = 0.0
-        self._adapt_thr_last = (0.0, 0.0, 0.0)
+        self._adapt_thr_last = (0.0, 0.0, 0.0, 0)
+        # pass-cost sample still collecting its aftermath:
+        # [cost us, weight (decisions), last step us]; None = no pass open
+        self._adapt_pf_open = None
+        # decisions since the previous prefill step (-1: none seen yet)
+        self._adapt_since_pf = -1
+        # last adaptive-policy FIRE: (reason, n, eoq_n, C_us, T0_us, B)
+        self._adapt_last_fire = None
         self._stat_adapt_cycles = 0
         self._stat_adapt_hold_ticks = 0
         self._stat_fire_adaptive = 0
-        self._stat_fire_adaptcap = 0
         self.rank_prefill_costs: list[float] = []
         # the alignment gate's waiting cost this hold episode (µs x requests)
         self._hold_cost_us = 0.0
@@ -491,6 +695,7 @@ class PrefillDelayer:
         # target and the coalescer is mostly giving up rather than batching.
         self._stat_fire_cost = 0
         self._stat_fire_fill = 0
+        self._stat_fire_backlog = 0
         self._stat_fire_stall = 0
         self._stat_fire_ttft = 0
         self._stat_fire_kv = 0
@@ -689,14 +894,25 @@ class PrefillDelayer:
             w_eff = (
                 waiting_requests if admittable_requests is None else admittable_requests
             )
-            t0_us, a_us = self._adapt_local_fits()
+            t0_us, c_us = self._adapt_local_fits()
             at = self._adapt_at
             buf = self._reduce_np
             buf[at] = int(w_eff) if prefillable else 0
-            fitted = t0_us > 0 and a_us > 0
+            # measured: a decode step and a pass timed. T0 itself may be a
+            # measured 0 (the step is all per-seq cost) -- that rank still
+            # counts, or the group mean would skip it and over-charge holds
+            fitted = self._adapt_dec.n > 0 and c_us > 0
             buf[at + 1] = int(t0_us) if fitted else 0
-            buf[at + 2] = int(a_us) if fitted else 0
+            buf[at + 2] = int(c_us) if fitted else 0
             buf[at + 3] = 1 if fitted else 0
+            # Backlog: a waiting request that was already here at the
+            # last FIRE -- more fresh heads wait than arrived since -- i.e. the
+            # pass could not take this rank's work. A resumable partial is not
+            # counted: one long prompt spans passes without a queue behind it.
+            self._adapt_arr_since_fire += int(arrived_requests)
+            heads = int(waiting_requests) - (1 if has_partial else 0)
+            buf[at + 4] = 1 if prefillable and heads > self._adapt_arr_since_fire else 0
+            buf[at + 5] = int(self._adapt_dec.mean()) if fitted else 0
             buf[at + _ADAPT_FIXED : at + _ADAPT_FIXED + self.dp_size] = 0
             buf[at + _ADAPT_FIXED + self._rank] = int(self._adapt_last_tokens)
             self._adapt_last_tokens = 0
@@ -727,6 +943,16 @@ class PrefillDelayer:
         )
 
     def _decide(self, reduced: list[int], step_s: float) -> bool:
+        allow = self._decide_inner(reduced, step_s)
+        if allow and self.admit_policy == "adaptive":
+            # every rank FIREs on the same decision: the arrival count restarts
+            # and the backlog seen at this FIRE (left by the previous pass)
+            # is remembered, identically on all ranks (a reduced value)
+            self._adapt_arr_since_fire = 0
+            self._adapt_backlog_prev = reduced[self._adapt_at + 4] > 0
+        return allow
+
+    def _decide_inner(self, reduced: list[int], step_s: float) -> bool:
         """FIRE (True) or HOLD, from the group's reduced signals."""
         (
             n_prefillable,
@@ -935,6 +1161,8 @@ class PrefillDelayer:
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)
         self._fired_cost = max(self.rank_prefill_costs, default=0.0)
+        if self.admit_policy == "adaptive":
+            self._adapt_note_fire(reason)
         if _DEBUG:
             logger.info(
                 f"[PrefillDelayer] FIRE ({reason}): g_pending={g_pending} "
@@ -946,76 +1174,148 @@ class PrefillDelayer:
 
     # ---------------- prefill_admit_policy adaptive ----------------
     def _adapt_local_fits(self) -> tuple[float, float]:
-        """This rank's (T0, A) in us; 0 = not estimated yet.
-        T0 = _T0_FRAC * mean decode step; A = prefill-fit intercept (prior
-        share if not identifiable) clamped to [_A_MIN_FRAC, _A_MAX_FRAC] *
-        mean prefill step."""
-        dec = self._adapt_dec_fit
-        pf = self._adapt_pf_fit
-        t0 = _T0_FRAC * dec.mean_y() if dec.n >= _DEC_MIN_N else 0.0
-        a = 0.0
-        if pf.n >= _PF_MIN_N:
-            my = pf.mean_y()
-            f = pf.fit(_PF_MIN_N, _PF_MIN_CV)
-            a = _PF_A_PRIOR * my if f is None or f[1] <= 0 else f[0]
-            a = min(max(a, _A_MIN_FRAC * my), _A_MAX_FRAC * my)
-        return t0, a
+        """This rank's (T0, C) in us; 0 = not measured yet (T0 may also be a
+        measured 0: the step is all per-seq cost).
+        T0 = the decode step's part that does not grow with the decode batch
+        (intercept of the step on the batch); C = mean cost of a prefill pass."""
+        dec = self._adapt_dec
+        t_d = dec.mean()
+        if dec.mx <= 0:
+            return t_d, self._adapt_pf.mean()
+        k = min(self._adapt_slope.slope(), t_d / dec.mx)
+        return t_d - k * dec.mx, self._adapt_pf.mean()
 
-    def _adapt_max_ticks(self, t0: float, fitted: bool) -> int:
-        """Cap on decisions per cycle from the TTFT budget, identical on every
-        rank (t0 is the reduced mean)."""
-        if not fitted or t0 <= 0:
-            return max(_MIN_TICKS, _COLD_MAX_TICKS)
-        mean_dec_us = t0 / _T0_FRAC
-        n = round(_MAX_HOLD_MS * 1000.0 / mean_dec_us)
-        return min(max(n, _MIN_TICKS), _TICKS_CAP)
+    def _adapt_close_pass(self) -> None:
+        """Fold the open pass-cost sample into C, weighted by the decisions of
+        the cycle it ended."""
+        cost_us, weight, _ = self._adapt_pf_open
+        self._adapt_pf.add(cost_us, weight)
+        self._adapt_pf_open = None
 
     def _adapt_observe(
         self, reduced: list[int], step_s: float, prefill_ran: bool, g_running_dec: int
     ) -> None:
-        """Fold the step that ran since the previous decision into the fits:
-        a prefill step against the largest per-rank prefill token count, a
-        decode step against the decode seqs per rank it ran with."""
+        """Fold the step that ran since the previous decision into the
+        estimates: a prefill step opens a pass-cost sample that its aftermath
+        completes; a plain decode step after a plain decode step feeds the
+        decode step's line in the batch it ran."""
         at = self._adapt_at
-        if step_s > 0:
-            if prefill_ran:
-                toks = max(
-                    reduced[at + _ADAPT_FIXED : at + _ADAPT_FIXED + self.dp_size]
-                )
-                if toks > 0:
-                    self._adapt_pf_fit.add(float(toks), step_s * 1e6)
-            elif self._adapt_prev_dec_per_rank > 0:
-                self._adapt_dec_fit.add(self._adapt_prev_dec_per_rank, step_s * 1e6)
+        if self._adapt_since_pf >= 0:
+            self._adapt_since_pf += 1
+        dec = self._adapt_dec
+        dec_mean = dec.mean()
+        open_ = self._adapt_pf_open
+        timed = step_s > 0 and self._adapt_prev_dec_per_rank > 0
+        if prefill_ran:
+            if open_ is not None:
+                self._adapt_close_pass()
+            toks = max(reduced[at + _ADAPT_FIXED : at + _ADAPT_FIXED + self.dp_size])
+            if toks > 0:
+                # the cycle this pass ends: decisions since the previous one
+                weight = float(max(self._adapt_since_pf, 1))
+                self._adapt_since_pf = 0
+                if step_s > 0:
+                    self._adapt_pf_open = [step_s * 1e6, weight, 0.0]
+            self._adapt_dec_clean = False
+        elif open_ is not None:
+            # A prefill pass also slows the steps after it (its GPU work spills
+            # into the next one, late ranks hold up the DP sync of the one
+            # after): while a step stays above the decode mean and shorter
+            # than the one before, its excess is part of the pass. The first
+            # step back at the mean (or no shorter, e.g. a wider batch) closes
+            # the sample; picked by its time, it is no T0 sample either.
+            y = step_s * 1e6
+            if timed and 0 < dec_mean < y and (open_[2] == 0 or y < open_[2]):
+                open_[0] += y - dec_mean
+                open_[2] = y
+            else:
+                self._adapt_close_pass()
+                self._adapt_dec_clean = timed
+        else:
+            if timed and self._adapt_dec_clean:
+                # A plain decode step at the batch it ran (per rank). A sample
+                # over twice the current mean -- more than one step's worth on
+                # top of a step (warm-up, compile, a stall) -- is clipped to
+                # that, so the estimate cannot run away. Its memory resolves
+                # the intercept to the measured cycle (1 decision before the
+                # first pass is measured).
+                y = step_s * 1e6
+                if dec.n:
+                    y = min(y, 2.0 * dec_mean)
+                cycle = max(self._adapt_pf.mean_weight(), 1.0)
+                x = self._adapt_prev_dec_per_rank
+                dec.add(y, 1.0, cycle, x=x)
+                self._adapt_slope.add(y, 1.0, cycle, x=x, fit=True)
+            self._adapt_dec_clean = timed
         self._adapt_prev_dec_per_rank = g_running_dec / max(self.dp_size, 1)
 
     def _adapt_decide(
         self, reduced: list[int], g_running_dec: int, g_pending: int
     ) -> bool:
-        """Rent-or-buy: FIRE once sum_t W_t*T0 >= A*B (all reduced values)."""
+        """Rent-or-buy (all reduced values; hold while T0 and C are not measured
+        on any rank yet), never before the _FLOOR_TICKS-th decision:
+        - sustained backlog (this pass and the one before left waiting
+          requests behind): admission capacity binds, so FIRE once
+          sum_t W_t*T_d >= C*B -- every held decision costs each waiting
+          request a whole decode step (the throughput rule);
+        - otherwise FIRE once sum_t W_t*T0 >= C*(B + W) (the product rule)."""
         at = self._adapt_at
-        w_eff, t0_sum, a_sum, fitted = reduced[at : at + _ADAPT_FIXED]
+        w_eff, t0_sum, c_sum, fitted, backlog_n, td_sum = reduced[
+            at : at + _ADAPT_FIXED
+        ]
         if w_eff <= 0:
             # nothing a FIRE could admit (slots full / KV-blocked): holding is free
             return self._adapt_hold(g_pending)
-        if fitted > 0:
-            t0 = t0_sum / fitted
-            a = a_sum / fitted
-        else:
-            # cold start: ratio A/T0 = 1 until the fits exist
-            t0, a = 1.0, 1.0
+        if fitted <= 0:
+            # Not measured yet: a few decisions after the first request (see
+            # the module-level comment); the must-fire bounds cover them.
+            self._adapt_thr_last = (0.0, 0.0, 0.0, g_running_dec)
+            return self._adapt_hold(g_pending)
+        t0 = t0_sum / fitted
+        c = c_sum / fitted
         self._adapt_regret += w_eff * t0
-        thr = a * g_running_dec
-        self._adapt_thr_last = (t0, a, thr)
-        # n counts decisions since the last FIRE, this one included: a FIRE
-        # on the n-th follows n-1 held ticks
-        n = self._hold_ticks + 1
-        if n >= self._adapt_max_ticks(t0, fitted > 0):
-            self._stat_adapt_cycles += 1
-            return self._fire("adaptcap", g_pending)
-        if n >= _MIN_TICKS and self._adapt_regret >= thr:
+        self._adapt_regret_td += w_eff * td_sum / fitted
+        if self._hold_ticks + 1 < _FLOOR_TICKS:
+            self._adapt_thr_last = (t0, c, 0.0, g_running_dec)
+            return self._adapt_hold(g_pending)
+        if backlog_n > 0 and self._adapt_backlog_prev:
+            thr = c * g_running_dec
+            self._adapt_thr_last = (t0, c, thr, g_running_dec)
+            if self._adapt_regret_td >= thr:
+                self._stat_adapt_cycles += 1
+                return self._fire("backlog", g_pending)
+            return self._adapt_hold(g_pending)
+        # the pass cost over the requests the group holds (decoding + waiting)
+        thr = c * (g_running_dec + w_eff)
+        self._adapt_thr_last = (t0, c, thr, g_running_dec)
+        if self._adapt_regret >= thr:
             self._stat_adapt_cycles += 1
             return self._fire("adaptive", g_pending)
         return self._adapt_hold(g_pending)
+
+    def _adapt_note_fire(self, reason: str) -> None:
+        """Record a FIRE under the adaptive policy: its decision count n, the
+        EOQ decision count (n when EOQ fired; else extrapolated from the
+        regret so far) and the costs it saw."""
+        t0, c, thr, b = self._adapt_thr_last
+        n = self._hold_ticks + 1
+        regret = self._adapt_regret
+        if reason in ("adaptive", "backlog"):
+            eoq_n = float(n)
+        else:
+            eoq_n = n * thr / regret if regret > 0 else -1.0
+        self._adapt_last_fire = (reason, n, eoq_n, c, t0, b)
+        if _ADAPT_LOG_FIRES and self._rank == 0:
+            logger.info(
+                f"[PrefillDelayer adaptive fire] reason={reason} n={n} "
+                f"eoq_n={eoq_n:.1f} C_us={c:.0f} T0_us={t0:.0f} "
+                f"B={b} regret={regret:.0f} thr={thr:.0f} "
+                f"pf_n={self._adapt_pf.n} pf_mem={self._adapt_pf.memory:.1f} "
+                f"dec_n={self._adapt_dec.n} dec_mem={self._adapt_dec.memory:.1f} "
+                f"Td_us={self._adapt_dec.mean():.0f} "
+                f"k_ns={1e3 * self._adapt_slope.slope() / max(self.dp_size, 1):.0f} "
+                f"k_mem={self._adapt_slope.memory:.1f}"
+            )
 
     def _adapt_hold(self, g_pending: int) -> bool:
         self._stat_adapt_hold_ticks += 1
@@ -1061,6 +1361,7 @@ class PrefillDelayer:
         self._prev_prefillable = -1
         self._hold_cost_us = 0.0
         self._adapt_regret = 0.0
+        self._adapt_regret_td = 0.0
 
     def _maybe_log(self) -> None:
         # Cheap guard first — skip the counter sum entirely when logging is
@@ -1078,7 +1379,7 @@ class PrefillDelayer:
             + self._stat_fire_queue_ms
             + self._stat_fire_vacuous
             + self._stat_fire_adaptive
-            + self._stat_fire_adaptcap
+            + self._stat_fire_backlog
             + self._stat_hold
         )
         if total == 0:
@@ -1100,14 +1401,16 @@ class PrefillDelayer:
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )
             if self.admit_policy == "adaptive":
-                t0, a, thr = self._adapt_thr_last
+                t0, c, thr, b = self._adapt_thr_last
                 cyc = self._stat_adapt_cycles
+                last = self._adapt_last_fire
+                last_s = f"{last[0]}:n={last[1]}:eoq_n={last[2]:.1f}" if last else "-"
                 logger.info(
                     "[PrefillDelayer adaptive] "
                     f"fire_adaptive={self._stat_fire_adaptive} "
-                    f"fire_cap={self._stat_fire_adaptcap} "
-                    f"max_ticks={self._adapt_max_ticks(t0, t0 > 1.0)} "
-                    f"T0_us={t0:.0f} A_us={a:.0f} thr={thr:.0f} "
-                    f"dec_fit_n={self._adapt_dec_fit.n} pf_fit_n={self._adapt_pf_fit.n} "
-                    f"hold_ticks/cycle={self._stat_adapt_hold_ticks / max(cyc, 1):.1f}"
+                    f"T0_us={t0:.0f} C_us={c:.0f} B={b} thr={thr:.0f} "
+                    f"dec_n={self._adapt_dec.n} dec_mem={self._adapt_dec.memory:.1f} "
+                    f"pf_n={self._adapt_pf.n} pf_mem={self._adapt_pf.memory:.1f} "
+                    f"hold_ticks/cycle={self._stat_adapt_hold_ticks / max(cyc, 1):.1f} "
+                    f"last_fire={last_s}"
                 )
