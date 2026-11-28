@@ -550,6 +550,13 @@ class AsyncIOProcManager:
             # Only rank 0 gets the primary output address
             addrs = [None, io_addrs[1]] if i == 0 else [None, None]
 
+            # Drop any inherited kineto registration so this GPU worker registers its
+            # own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0 GPU events.
+            from atom.rocprofiler_register import (
+                drop_inherited_registration_for_children,
+            )
+
+            drop_inherited_registration_for_children()
             process = ctx.Process(
                 target=AsyncIOProc,
                 name=label,

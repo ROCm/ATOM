@@ -1023,6 +1023,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
+    # Opt out of dropping an inherited ROCPROFILER_REGISTER_LIBRARY claim before
+    # spawning GPU workers. Default off: ATOM drops the claim so each worker
+    # registers its own kineto client and torch.profiler captures GPU events
+    # (PyTorch 2.12+/rocprofiler-sdk). Set to 1 only to restore the old
+    # inherit-the-claim behaviour. See atom/rocprofiler_register.py.
+    "ATOM_KEEP_INHERITED_ROCPROFILER_REGISTER": lambda: _flag_env(
+        "ATOM_KEEP_INHERITED_ROCPROFILER_REGISTER"
+    ),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # Level name for the "atom" logger and its console handler (DEBUG, INFO,
     # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns

@@ -2609,6 +2609,13 @@ def launch_engine_core(
         f"{(local_dp_rank + 1) * config.tp_world_size - 1}"
     )
 
+    # Drop any inherited kineto registration so this GPU worker registers its
+    # own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0 GPU events.
+    from atom.rocprofiler_register import (
+        drop_inherited_registration_for_children,
+    )
+
+    drop_inherited_registration_for_children()
     process = multiprocessing.Process(
         target=EngineCore.run_engine,
         name=f"EngineCore-DP{dp_rank}",
@@ -2724,6 +2731,13 @@ class DisaggCoreManager(CoreManager):
 
         from atom.model_engine.engine_core import DecodeEngineCore, PrefillEngineCore
 
+        # Drop any inherited kineto registration so this GPU worker registers its
+        # own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0 GPU events.
+        from atom.rocprofiler_register import (
+            drop_inherited_registration_for_children,
+        )
+
+        drop_inherited_registration_for_children()
         prefill_proc = multiprocessing.Process(
             target=PrefillEngineCore.run_engine,
             name="PrefillEngineCore",
@@ -2733,6 +2747,13 @@ class DisaggCoreManager(CoreManager):
                 "output_address": prefill_output_addr,
             },
         )
+        # Drop any inherited kineto registration so this GPU worker registers its
+        # own (PyTorch 2.12+/rocprofiler-sdk); else torch.profiler sees 0 GPU events.
+        from atom.rocprofiler_register import (
+            drop_inherited_registration_for_children,
+        )
+
+        drop_inherited_registration_for_children()
         decode_proc = multiprocessing.Process(
             target=DecodeEngineCore.run_engine,
             name="DecodeEngineCore",
