@@ -877,6 +877,37 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
     assert events == ["initialize", "serving", "shutdown"]
 
 
+def test_shutdown_stops_grpc_before_closing_the_engine(monkeypatch):
+    """A gRPC call still running when the engine closes waits forever."""
+    events = []
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+        "initialize_tracing",
+        "shutdown_tracing",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *a, **k: None)
+    engine = SimpleNamespace(close=lambda: events.append("engine closed"))
+    monkeypatch.setattr(api_server, "engine", engine)
+
+    async def no_metrics():
+        pass
+
+    monkeypatch.setattr(api_server, "_refresh_metrics_once", no_metrics)
+    monkeypatch.setattr(
+        api_server, "_stop_grpc_server", lambda: events.append("grpc stopped")
+    )
+
+    async def drive():
+        async with api_server.lifespan(api_server.app):
+            pass
+
+    asyncio.run(drive())
+    assert events == ["grpc stopped", "engine closed"]
+
+
 # ---- /kv_event_sources: where a router follows each DP rank's KV events ----
 
 

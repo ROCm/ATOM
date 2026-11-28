@@ -1195,22 +1195,32 @@ class CoreManager:
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
+        hints = None
+        if self.pp_size == 1 and self._routable_engine_count > 1:
+            # A bad rank hint refuses the batch before a callback is registered.
+            hints = self._resolve_and_validate_hints(seqs)
         # Register callbacks before sending to engine core
         for seq in seqs:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.pp_size > 1:
+        if self.pp_size > 1 or self._routable_engine_count == 1:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
-            # drives the pipeline downstream.
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, _add_frame(seqs))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, _add_frame(seqs))
+            # drives the pipeline downstream. Else the single routable engine.
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to engine 0")
+            try:
+                self._send_request(0, _add_frame(seqs))
+            except Exception:
+                self._forget_callbacks(seqs)
+                raise
         else:
-            self._dispatch_to_dp_ranks(seqs)
+            self._dispatch_to_dp_ranks(seqs, hints)
+
+    def _forget_callbacks(self, seqs) -> None:
+        """Drop the stream callbacks of seqs no engine received: no terminal output
+        would ever retire them."""
+        for seq in seqs:
+            self._seq_id_to_callback.pop(seq.id, None)
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
         """The `prefix_spread` or `share_cache` router, or None.
@@ -1306,7 +1316,9 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(
+        self, seqs: list[Sequence], hints: list[int | None] | None = None
+    ) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -1319,7 +1331,8 @@ class CoreManager:
         # whole batch is known good, so a rejected batch never leaks partial
         # load. The resolved hints are reused in the loop below to avoid a second
         # getattr/int pass per seq.
-        hints = self._resolve_and_validate_hints(seqs)
+        if hints is None:
+            hints = self._resolve_and_validate_hints(seqs)
 
         # Backpressure (lazy) dispatch. Only an offline batch (see
         # ``offline_backpressure_batch``) of plain load-balanced seqs: no
@@ -1402,9 +1415,10 @@ class CoreManager:
             # already delivered its frames and the engine finished + released
             # those seqs on an output thread, this rollback cannot double-count:
             # whichever release runs first wins, the other is a no-op.
-            if track_load:
-                for dp_rank, rank_seqs in enumerate(dp_seqs):
-                    if rank_seqs and not dispatched[dp_rank]:
+            for dp_rank, rank_seqs in enumerate(dp_seqs):
+                if rank_seqs and not dispatched[dp_rank]:
+                    self._forget_callbacks(rank_seqs)
+                    if track_load:
                         for seq in rank_seqs:
                             self._release_seq(seq.id)
             raise
@@ -2843,7 +2857,11 @@ class DisaggCoreManager(CoreManager):
         # Send decode payload as-is. Decode admits and allocates the blocks
         # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
         decode_payload = _add_frame(seqs)
-        self._send_request(1, decode_payload)
+        try:
+            self._send_request(1, decode_payload)
+        except Exception:
+            self._forget_callbacks(seqs)
+            raise
 
         # For prefill: limit each sequence to 1 output token.  Prefill discards
         # all sampled tokens (postprocess is a no-op), but setting max_tokens=1

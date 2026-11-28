@@ -72,6 +72,7 @@ def _make_mgr(
     mgr._rank_reqs = [0] * n_ranks
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
+    mgr._seq_id_to_callback = {}
     mgr._prefix_router = None
     mgr._lb_lock = Lock()
     mgr._backlog = BacklogLedger(n_ranks) if strategy == "share_cache" else None
@@ -470,6 +471,19 @@ def test_resolve_and_validate_hints_rejects_out_of_range_without_side_effects():
     assert mgr._seq_load == {}
 
 
+def test_a_batch_with_a_bad_rank_hint_registers_no_callback():
+    # No engine receives the batch, so a callback registered for it would never
+    # see a terminal output to retire it.
+    mgr = _make_mgr(2, strategy="least_requests")
+    mgr.pp_size = 1
+    mgr._seq_id_to_callback = {}
+    seq = _FakeSeq("bad", 10, data_parallel_rank=2)
+    seq.stream_callback = lambda output: None
+    with pytest.raises(ValueError, match="data_parallel_rank=2"):
+        mgr._add_prepared_requests([seq])
+    assert mgr._seq_id_to_callback == {}
+
+
 def test_resolve_and_validate_hints_accepts_and_returns_resolved():
     mgr = _make_mgr(4, strategy="least_requests")
     # In-range hint and no-hint (None) are both fine, and the resolved hints are
@@ -511,6 +525,41 @@ def test_send_failure_rolls_back_undispatched_charge():
     assert mgr._rank_reqs == [1, 1, 0, 0]
     assert mgr._rank_tokens == [10, 10, 0, 0]
     assert set(mgr._seq_load.keys()) == {0, 1}
+
+
+class _SendSocket:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def send_multipart(self, parts, copy=False):
+        if self.fail:
+            raise RuntimeError("send failed")
+
+
+@pytest.mark.parametrize("strategy", ["least_requests", "round_robin"])
+def test_a_failed_send_drops_the_callbacks_of_seqs_no_rank_received(strategy):
+    # No terminal output ever reaches a seq no rank received, so nothing else
+    # would retire its callback; a dispatched rank's seqs keep theirs.
+    mgr = _make_mgr(4, strategy=strategy)
+    mgr.pp_size = 1
+    mgr.engine_core_identities = [b"e0", b"e1", b"e2", b"e3"]
+    mgr.input_sockets = [_SendSocket(), _SendSocket(), _SendSocket(fail=True)]
+    mgr.input_sockets.append(_SendSocket())
+    seqs = [_FakeSeq(i, num_prompt_tokens=10, data_parallel_rank=i) for i in range(4)]
+    for seq in seqs:
+        seq.stream_callback = lambda output: None
+    with pytest.raises(RuntimeError):
+        mgr._add_prepared_requests(seqs)
+    assert set(mgr._seq_id_to_callback) == {0, 1}
+
+    one = _make_mgr(1, strategy=strategy)
+    one.pp_size = 1
+    one.engine_core_identities, one.input_sockets = [b"e0"], [_SendSocket(fail=True)]
+    seq = _FakeSeq("only", num_prompt_tokens=10)
+    seq.stream_callback = lambda output: None
+    with pytest.raises(RuntimeError):
+        one._add_prepared_requests([seq])
+    assert one._seq_id_to_callback == {}
 
 
 def test_reset_clears_even_with_charged_in_flight():

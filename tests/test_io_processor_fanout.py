@@ -134,6 +134,22 @@ class TestPreprocessFanout:
         assert all(s.stream_callback is cb for s in seqs)
 
 
+class TestStopTokenSequences:
+    """Stops given as ids (gRPC's Generate) reach the seq through `preprocess`."""
+
+    def test_given_ids_are_the_stops_and_the_stop_strings_are_not_encoded(self):
+        proc = _make_processor()
+        sp = SamplingParams(stop_strings=["xy"])
+        seq = proc.preprocess([1, 2, 3], sp, stop_token_sequences=[[7, 8], []])
+        assert [list(s) for s in seq.stop_token_sequences] == [[7, 8]]
+        proc.tokenizer.encode.assert_not_called()
+
+    def test_without_ids_the_stop_strings_are_encoded(self):
+        proc = _make_processor()
+        seq = proc.preprocess([1, 2, 3], SamplingParams(stop_strings=["xy", "z"]))
+        assert [list(s) for s in seq.stop_token_sequences] == [[0, 1], [0]]
+
+
 @pytest.mark.parametrize("n", [1, 2])
 @pytest.mark.parametrize("rapidserve", [False, True])
 @pytest.mark.parametrize("logprobs", [False, True])

@@ -19,9 +19,11 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -29,6 +31,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import uvicorn
@@ -275,6 +278,8 @@ _frontend_stats = None
 # response that read differently depending on `stream` is the asymmetry the
 # reasoning and tool-call readers were unified to remove.
 synthetic_token_text: str | None = None
+# With --grpc-port: stops the gRPC server, ending its calls; lifespan runs it.
+_stop_grpc_server: Callable[[], None] | None = None
 
 
 def delivered_text(token_ids) -> str:
@@ -918,13 +923,16 @@ async def _submit_engine_requests(seqs):
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
     # settle the in-flight submission before aborting so it cannot enqueue later.
-    submission = asyncio.create_task(
-        asyncio.to_thread(engine.core_mgr.add_request, seqs)
-    )
+    # A Future, as to_thread runs it: asyncio.run's teardown cancels only Tasks.
+    submit = partial(contextvars.copy_context().run, engine.core_mgr.add_request)
+    submission = asyncio.get_running_loop().run_in_executor(None, submit, seqs)
     try:
         await asyncio.shield(submission)
     except BaseException:
         try:
+            while not submission.done():  # a repeated cancel (shutdown) waits too
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait((submission,))
             await submission
         finally:
             for seq in seqs:
@@ -1917,10 +1925,14 @@ async def lifespan(app: FastAPI):
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
         try:
-            if engine is not None:
-                engine.close()
-            if encoder is not None:
-                encoder.close()
+            try:  # gRPC first: its calls end, seqs aborted, while the engine runs
+                if _stop_grpc_server is not None:
+                    await asyncio.to_thread(_stop_grpc_server)
+            finally:
+                if engine is not None:
+                    engine.close()
+                if encoder is not None:
+                    encoder.close()
         finally:
             try:
                 # After the engine: its output threads flush into the hub.
@@ -2188,6 +2200,46 @@ async def _configure_structured_output(
         # Only strict tools asked for the grammar, and the refusals are
         # worded for JSON Schema output: name what the client did ask for.
         raise ValueError(f"strict function tools: {exc}") from exc
+
+
+async def _configure_chat_structured_output(
+    sampling_params,
+    schema,
+    channel,
+    *,
+    tools,
+    all_tools,
+    tool_choice,
+    strict_schemas=None,
+    kv_transfer=None,
+    multimodal=False,
+):
+    """A chat's grammar: its response format or strict tools, else its tool calls
+    held to `all_tools`, the top-level tools and those its messages declare."""
+    await _configure_structured_output(
+        sampling_params,
+        schema,
+        channel,
+        tools=tools,
+        tool_choice=tool_choice,
+        strict_schemas=strict_schemas,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+    )
+    if schema is None and not strict_schemas and tool_call_parser_cls is not None:
+        await configure_tool_call_grammar(
+            engine,
+            _get_engine_config(),
+            sampling_params,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=all_tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+        )
 
 
 @app.post("/v1/chat/completions")
@@ -2510,30 +2562,17 @@ async def _chat_completions(
                 prompt_or_tokens, assistant_prefix, _reasoning
             )
 
-        await _configure_structured_output(
+        await _configure_chat_structured_output(
             sampling_params,
             schema,
             _reasoning,
             tools=request.tools,
+            all_tools=request_tools(request),
             tool_choice=request.tool_choice,
             strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
-        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
-            await configure_tool_call_grammar(
-                engine,
-                _get_engine_config(),
-                sampling_params,
-                _reasoning,
-                parser_cls=tool_call_parser_cls,
-                tools=request_tools(request),
-                tool_choice=request.tool_choice,
-                kv_transfer=request.kv_transfer_params,
-                multimodal=_has_multimodal_content(messages),
-                relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-                synthetic=synthetic_token_text is not None,
-            )
 
         _reasoning = structured_response_channel(
             _reasoning, schema, bool(strict_schemas)
@@ -3845,16 +3884,23 @@ async def list_models():
     ).model_dump(exclude_none=True)
 
 
+def health_problem() -> str | None:
+    """/health's 503 detail, or None while it answers 200; HealthCheck reads it too."""
+    if encoder is not None:
+        return None
+    if engine is None or not engine.core_mgr.is_healthy():
+        return "Engine workers unavailable"
+    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
+    if dead:
+        return f"Front-end workers {dead} exited"
+    return None
+
+
 @_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
-    if encoder is not None:
-        return {"status": "ok"}
-    if engine is None or not engine.core_mgr.is_healthy():
-        raise HTTPException(status_code=503, detail="Engine workers unavailable")
-    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
-    if dead:
-        raise HTTPException(status_code=503, detail=f"Front-end workers {dead} exited")
+    if (problem := health_problem()) is not None:
+        raise HTTPException(status_code=503, detail=problem)
     return {"status": "ok"}
 
 
@@ -3945,6 +3991,11 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
 
 @_engine_route("/kv_transfer_info")
 async def kv_transfer_info():
+    return kv_transfer_info_body()
+
+
+def kv_transfer_info_body() -> dict:
+    """/kv_transfer_info's body, which gRPC's GetServerInfo also carries."""
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
@@ -3989,6 +4040,11 @@ async def server_info():
     per-DP-rank worker set and enable cache-aware routing to the rank that
     holds a request's prefix.
     """
+    return server_info_body()
+
+
+def server_info_body() -> dict:
+    """/server_info's body, which gRPC's GetServerInfo also carries."""
     cfg = engine.config
     return {
         "model_id": model_name,
@@ -4066,7 +4122,7 @@ async def set_offload_lookups(raw_request: Request):
 
 def main():
     """Main entry point for the server."""
-    global engine, encoder
+    global engine, encoder, _stop_grpc_server
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -4139,6 +4195,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--grpc-port",
+        type=int,
+        default=None,
+        help=(
+            "Also serve ATOM's gRPC service, atom.grpc.v1.AtomEngine (token ids "
+            "in, token ids out), on this port, from the process that owns the "
+            "engine. Needs --api-server-count 1."
+        ),
+    )
+    parser.add_argument(
         "--accept-ec-transfer-params",
         action="store_true",
         help=(
@@ -4158,6 +4224,8 @@ def main():
     args = parser.parse_args()
     if args.api_server_count < 1:
         parser.error("--api-server-count must be at least 1")
+    if args.grpc_port is not None and args.api_server_count > 1:
+        parser.error("--grpc-port needs --api-server-count 1")
     if envs.ATOM_PRELOAD == "daemon":
         # A weight cache daemon serves weights, not requests.
         from atom.model_loader.weight_cache.daemon import run_daemon
@@ -4170,11 +4238,18 @@ def main():
         record_launch()  # the runners start a daemon with it
 
     _setup_frontend(args)
+    if args.grpc_port is not None:
+        from atom.entrypoints.grpc.server import startup_refusal
+
+        if (refusal := startup_refusal(tokenizer)) is not None:
+            parser.error(refusal)
 
     engine_args = EngineArgs.from_cli_args(args)
     if engine_args.encoder_only:
         if args.api_server_count > 1:
             parser.error("--encoder-only serves from one process")
+        if args.grpc_port is not None:
+            parser.error("--encoder-only serves no gRPC (--grpc-port)")
         logger.info(f"Initializing the vision encoder of {args.model}...")
         _setup_reasoning_and_tools(args)
         encoder = engine_args.create_encoder()
@@ -4212,6 +4287,14 @@ def main():
     engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
     if args.api_server_count > 1:
         _start_frontend_workers(args)
+    if args.grpc_port is not None:
+        from atom.entrypoints.grpc.server import start_grpc_server
+
+        try:  # the module main() runs in: `__main__` under `python -m` on this file
+            _stop_grpc_server = start_grpc_server(sys.modules[__name__], args)
+        except Exception:
+            engine.close()  # its processes would keep the failed launch alive
+            raise
     _serve(args)
 
 
