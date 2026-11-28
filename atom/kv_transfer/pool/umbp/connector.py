@@ -91,11 +91,13 @@ class UmbpPoolConnector(KVConnectorBase):
     def kv_pool_memory(self, config: Any, rank: int) -> KVPoolMemory:
         from atom.kv_transfer.pool.umbp.pool import make_umbp_pool_memory
 
-        self.memory = make_umbp_pool_memory(config, self.settings, rank)
+        if self.memory is None:
+            self.memory = make_umbp_pool_memory(config, self.settings, rank)
         return self.memory
 
     def close(self) -> None:
         if self.memory is not None:
+            # An uncertain FABRIC detach must stop normal KV teardown.
             self.memory.close()
 
     def register_kv_caches(self, kv_caches, transfer_tensors=None, num_blocks=None):

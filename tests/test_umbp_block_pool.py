@@ -7,9 +7,6 @@ UMBP manages (atom/kv_transfer/pool/umbp/pool.py)."""
 import test_umbp_l1_pool as umbp_tests
 from test_umbp_l1_pool import make_pool, settle, toks
 
-# The L1 service fixture, the Python model and then the real one.
-l1 = umbp_tests.l1
-
 from atom.kv_transfer.pool.umbp import pool as umbp_pool
 from atom.kv_transfer.pool.umbp.pool import (
     UmbpBlockPool,
@@ -17,6 +14,9 @@ from atom.kv_transfer.pool.umbp.pool import (
     split_point,
 )
 from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
+
+# The L1 service fixture, the Python model and then the real one.
+l1 = umbp_tests.l1
 
 
 def make_split(
