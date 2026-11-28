@@ -9,49 +9,41 @@ leaving it `None` otherwise. `sparse_kv_last_page_lens` is per QUERY TOKEN, all
 ones, because a DSA selection is packed at page_size 1; the sparse builder
 always fills it and deliberately does not touch the dense one.
 
-So the dense array is available exactly where the dense branch runs, and
-reading it before the branch is a crash on a model whose sparse prefill has
-neither a drafter nor a cached prefix. GLM-5.3-Flash served with
+Only sparse MLA reaches this function (dense prefill runs on
+`_forward_prefill_mha`), and reading the dense array there is a crash on a
+model whose sparse prefill has neither a drafter nor a cached prefix. GLM-5.3-Flash served with
 `--no-enable_prefix_caching` is that model: every rank died with
 `'NoneType' object has no attribute 'shape'` on the first request long enough
 to exceed `index_topk`, which is every 16-shot GSM8K prompt.
-
-The dense test is the other half. `cu_seqlens_q` is padded to the step's
-`running_bs` while the per-seq array is not, so the dense branch must still cut
-the q-cums down to the sequences the kernel is being told about.
 """
 
 from types import SimpleNamespace
 
-import pytest
 import torch
+from aiter_stub import atom_under_stubs
 
-try:
-    from atom.model_ops import attention_mla
-    from atom.model_ops.attention_mla import MLAAttention
-
-    _IMPORT_ERR = None
-except ImportError as _e:  # aiter/triton absent on a CPU-only runner
-    _IMPORT_ERR = str(_e)
-
-needs_atom_mla = pytest.mark.skipif(
-    _IMPORT_ERR is not None, reason=f"requires full atom import env: {_IMPORT_ERR}"
-)
+# Against the stand-in AITER, so Pre Checkin (no AITER) runs this file.
+with atom_under_stubs() as load:
+    attention_mla = load("atom.model_ops.attention_mla")
+    head_groups = load("atom.model_ops.attentions.sparse_mla_head_groups")
+MLAAttention = attention_mla.MLAAttention
+PERSISTENT_WORK_BUFFERS = head_groups.PERSISTENT_WORK_BUFFERS
 
 KV_LORA_RANK = 8
 QK_ROPE_HEAD_DIM = 4
 ENTRY = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-NUM_HEADS = 2
+# BF16 with 16 < heads < 128: the shape main's asm path padded to 128 heads.
+NUM_HEADS = 32
 
 
-def _attn(is_sparse: bool):
+def _attn():
     """An `MLAAttention` with only the fields `_forward_prefill_mla` reads.
 
     Built by `__new__` on purpose: a real one needs a distributed group, a
     checkpoint and a GPU, none of which the metadata question depends on.
     """
     self = MLAAttention.__new__(MLAAttention)
-    self.is_sparse_mla = is_sparse
+    self.is_sparse_mla = True
     self.dcp_world_size = 1
     self.use_seg_mla = False
     self.head_repeat_factor = 1
@@ -59,9 +51,10 @@ def _attn(is_sparse: bool):
     self.num_heads = NUM_HEADS
     self.kv_lora_rank = KV_LORA_RANK
     self.qk_rope_head_dim = QK_ROPE_HEAD_DIM
-    self.dtype = torch.float32
-    self.kv_cache_dtype = "bf16"  # not fp8 -> the mla_prefill_fwd branch
+    self.dtype = torch.bfloat16
+    self.kv_cache_dtype = "bf16"
     self.scale = 1.0
+    self.sparse_prefill_head_groups = None
     self.sparse_kv_indices_buffer = torch.zeros(64, dtype=torch.int32)
     # The v-up/o projections are past the point under test.
     self._v_up_proj_and_o_proj = lambda o: o
@@ -72,31 +65,36 @@ def _capture(monkeypatch):
     """Record what reaches the prefill kernel instead of launching it."""
     seen = {}
 
-    def fake_mla_prefill_fwd(
-        q, kv, o, cu_seqlens_q, kv_indptr, kv_indices, last_page_lens, max_q_len, *a
+    def fake_mla_decode_fwd(
+        q, kv, o, cu_seqlens_q, kv_indptr, kv_indices, last_page_lens, max_q_len, **kw
     ):
         seen.update(
+            q=q,
+            num_kv_splits=kw.get("num_kv_splits"),
+            has_partials=kw.get("has_partials", True),
             cu_seqlens_q=cu_seqlens_q,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             last_page_lens=last_page_lens,
             max_q_len=max_q_len,
+            work={name: kw.get(name) for name in PERSISTENT_WORK_BUFFERS},
         )
+        return o, None
 
-    monkeypatch.setattr(attention_mla, "mla_prefill_fwd", fake_mla_prefill_fwd)
+    monkeypatch.setattr(attention_mla, "mla_decode_fwd", fake_mla_decode_fwd)
     return seen
 
 
-@needs_atom_mla
 def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
-    """A sparse prefill with no drafter and no cached prefix must still run."""
+    """A sparse prefill with no drafter and no cached prefix must still run.
+
+    With bf16 KV it runs on the persistent decode kernel, fed the step's
+    sparse-prefill work plan and an explicit split count. Without the split
+    count aiter drops the plan for large 16-head BF16 batches, and that form
+    mis-addresses KV past 4 GiB on gfx950 (ROCm/ATOM#3120).
+    """
     seen = _capture(monkeypatch)
-    attn = _attn(is_sparse=True)
-    monkeypatch.setattr(
-        attention_mla,
-        "get_forward_context",
-        lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=1)),
-    )
+    attn = _attn()
 
     n_tokens = 5
     sparse_cu_seqlens_q = torch.arange(n_tokens + 1, dtype=torch.int32)
@@ -113,44 +111,22 @@ def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
         sparse_kv_indptr=torch.arange(n_tokens + 1, dtype=torch.int32),
         sparse_kv_indices=attn.sparse_kv_indices_buffer,
         sparse_kv_last_page_lens=sparse_kv_last_page_lens,
+        **{
+            f"sparse_prefill_{name}": torch.zeros(1) for name in PERSISTENT_WORK_BUFFERS
+        },
     )
 
-    q = torch.zeros(n_tokens, NUM_HEADS, ENTRY)
-    kv = torch.zeros(64 * 4, ENTRY)
+    q = torch.zeros(n_tokens, NUM_HEADS, ENTRY, dtype=torch.bfloat16)
+    kv = torch.zeros(64 * 4, ENTRY, dtype=torch.bfloat16)
     out = attn._forward_prefill_mla(q, kv, md)
 
     assert out.shape == (n_tokens, NUM_HEADS, KV_LORA_RANK)
     assert seen["last_page_lens"] is sparse_kv_last_page_lens
     assert seen["cu_seqlens_q"] is sparse_cu_seqlens_q
     assert seen["max_q_len"] == 1
-
-
-@needs_atom_mla
-def test_dense_prefill_cuts_the_q_cums_to_the_per_seq_array(monkeypatch):
-    """Dense keeps reading the per-seq array -- and the cut it pays for."""
-    seen = _capture(monkeypatch)
-    attn = _attn(is_sparse=False)
-
-    n_seqs, n_tokens = 2, 6
-    monkeypatch.setattr(
-        attention_mla,
-        "get_forward_context",
-        lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=n_seqs)),
-    )
-    kv_last_page_lens = torch.tensor([3, 3], dtype=torch.int32)
-    md = SimpleNamespace(
-        kv_last_page_lens=kv_last_page_lens,
-        kv_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
-        kv_indices=torch.zeros(2, dtype=torch.int32),
-        # Padded past the two real sequences, as a padded step leaves it.
-        cu_seqlens_q=torch.tensor([0, 3, 6, 6, 6], dtype=torch.int32),
-        max_seqlen_q=3,
-    )
-
-    q = torch.zeros(n_tokens, NUM_HEADS, ENTRY)
-    kv = torch.zeros(64 * 4, ENTRY)
-    attn._forward_prefill_mla(q, kv, md)
-
-    assert seen["last_page_lens"] is kv_last_page_lens
-    assert seen["cu_seqlens_q"].tolist() == [0, 3, 6]
-    assert seen["cu_seqlens_q"].shape[0] == n_seqs + 1
+    assert seen["q"].shape[1] == NUM_HEADS
+    assert seen["num_kv_splits"] is not None
+    # bf16 rows are planned whole, so aiter's reduce has nothing to do.
+    assert seen["has_partials"] is False
+    for name in PERSISTENT_WORK_BUFFERS:
+        assert seen["work"][name] is getattr(md, f"sparse_prefill_{name}")

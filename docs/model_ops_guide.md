@@ -13,7 +13,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `MergedColumnParallelLinear` | `linear.py` | (inherits `LinearBase`) | Merged gate+up projection |
 | `Attention` | `base_attention.py` | `unified_attention_with_output_base` (custom op) | Unified attention entry |
 | MHA `Attention` | `attention_mha.py` | `flash_attn_varlen_func`, `pa_fwd_asm`, `pa_persistent_fwd`, `pa_decode_gluon` | Multi-head attention |
-| `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `mla_prefill_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
+| `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
 | Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP or TP rank's share by `RowSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
 | DSA FP4 index cache | `sparse_indexer_fp4.py` | `indexer_qk_rope_quant_and_cache` | FP4 (E2M1 + e8m0) index-cache geometry and the DSA FP4 predicate |
 | `Fp4MqaRaggedMetadata` | `fp4_mqa_ragged_metadata.py` | `make_fp4_mqa_plan` | FP4 MQA scoring's ragged rows (DeepSeek-V4, V4.1, V3.2 decode and its DCP shard): rows grouped into sequences (`query_start_loc`, `max_qlen`, block tables, `pages_per_block`), each row's bound, and their shape-only launch plan |
@@ -57,7 +57,7 @@ ATOM is a thin model-level inference engine. Every compute-heavy operation deleg
 | MHA decode (Triton) | `aiter.ops.triton.gluon.pa_decode_gluon` | Triton |
 | MHA prefill (Triton unified) | `aiter.ops.triton.unified_attention.unified_attention` | Triton |
 | MLA decode | `aiter.mla.mla_decode_fwd` | ASM |
-| MLA prefill | `aiter.mla.mla_prefill_fwd` | ASM |
+| MLA prefill (sglang plugin, dense) | `aiter.mla.mla_prefill_fwd` | ASM |
 | MLA KV cache | `aiter.concat_and_cache_mla` | CK |
 | RoPE | `aiter.rope_cached_positions_2c_fwd_inplace` | Triton |
 | RMSNorm | `aiter.rmsnorm2d_fwd` | CK |
@@ -201,7 +201,7 @@ class MLAModules:
 2. Otherwise: Fused Q projection + K up-projection via batched FP8/FP4 BMM (`_q_proj_and_k_up_proj`), then:
    - `fused_qk_rope_concat_and_cache_mla` writes to KV cache.
    - Decode: `mla_decode_fwd` (ASM persistent MLA kernel).
-   - Prefill (sparse): `mla_prefill_fwd`.
+   - Prefill (sparse): `mla_decode_fwd` with one query token per row, for every KV dtype; persistent except the non-persistent DCP sparse prefill. BF16 rows are planned whole, so a row's output does not depend on its batch.
 3. V up-projection + O projection via batched BMM (`_v_up_proj_and_o_proj`).
 
 **Decode query-head width.** A rank with fewer query heads than the decode dispatches pads its query with zero heads (`padded_num_heads`, dropped again after the kernel). `mla_dense_min_query_heads` is the one model-level floor: `MLAAttention` pads to it and `AiterMLAMetadataBuilder` plans the step's single `work_*` plan for it. It is 16, or 12 on a rank with exactly 12 heads (Kimi-K3 at `-tp 8`, which then decodes unpadded) when all of these hold:

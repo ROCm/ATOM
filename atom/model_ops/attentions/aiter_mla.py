@@ -62,6 +62,7 @@ from atom.model_ops.attentions.sparse_mla_head_groups import (
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     SparsePrefillHeadGroups,
+    sparse_prefill_kv_granularity,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.glm5_next.geometry import (
@@ -573,10 +574,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        # dcp=1 rule: whole BF16 rows, else ordinary split granularity.
+        self._sparse_prefill_local_kv_granularity = sparse_prefill_kv_granularity(
+            self.dtype_q, self.dtype_kv, self.index_topk_out, self.block_size
+        )
         self._sparse_prefill_kv_granularity = (
             triton.next_power_of_2(self.index_topk_out)
             if self.is_sparse and self.dcp_world_size > 1
-            else max(self.block_size, 16)
+            else self._sparse_prefill_local_kv_granularity
         )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self.indexes_by_token_table = indexes_by_token_table(
@@ -2297,7 +2302,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """The persistent sparse prefill's work plan over ``attn_metadata``'s
         query rows, into the ``prefix`` set's buffers; none for the
         non-persistent "q" prefill, which reads no plan. ``local_heads`` selects
-        a "kv" prefill's dcp=1 plan and ordinary split granularity.
+        a "kv" prefill's dcp=1 plan at the dcp=1 granularity.
 
         Native "q" plans hold one work item a row: each owning layer points
         it at its own keys. Folded plans are rebuilt by each owning layer."""
@@ -2322,7 +2327,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             dtype_kv=self.dtype_kv,
             # Only "q" plans are patched to each layer's rank-local ranges.
             kv_granularity=(
-                max(self.block_size, 16)
+                self._sparse_prefill_local_kv_granularity
                 if local_heads
                 else self._sparse_prefill_kv_granularity
             ),

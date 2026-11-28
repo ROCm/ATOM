@@ -19,7 +19,15 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
     from types import SimpleNamespace
 
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        PERSISTENT_WORK_BUFFERS,
+    )
 
+    forward_vars = {
+        name: value
+        for name, value in vars(meta).items()
+        if name.startswith("sparse_prefill_")
+    }
     builder = SimpleNamespace(
         dcp_sparse_prefill_nonps=False,
         dcp_world_size=8,
@@ -28,13 +36,11 @@ def _forward_work_plan(meta, heads, dtype, topk_out):
         dtype_kv=dtype,
         index_topk_out=topk_out,
         _sparse_prefill_kv_granularity=1 << (topk_out - 1).bit_length(),
-        model_runner=SimpleNamespace(
-            forward_vars={
-                name: value
-                for name, value in vars(meta).items()
-                if name.startswith("sparse_prefill_")
-            }
-        ),
+        model_runner=SimpleNamespace(forward_vars=forward_vars),
+        _sparse_prefill_work_views=lambda prefix, heads: {
+            name: forward_vars[f"{prefix}sparse_prefill_{name}"]
+            for name in PERSISTENT_WORK_BUFFERS
+        },
     )
     AiterMLAMetadataBuilder._sparse_prefill_work_plan(
         builder, meta, "", heads, meta.sparse_kv_last_page_lens
@@ -250,6 +256,10 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
             },
         )
         _forward_work_plan(meta, width, q.dtype, topk)
+        if attn.dcp_sparse_prefill_plan_native:
+            # The native plan keeps rows whole for FP8 too: it runs without
+            # split buffers, so a split row would write out of bounds.
+            assert int(meta.sparse_prefill_reduce_indptr[-1]) == 0
         return attn._forward_prefill_mla(q, cache, meta, return_lse=True)[0]
 
     modes = ("prefill", "decode", "decode_persistent")
@@ -394,26 +404,47 @@ def test_indexer_to_sparse_mla_matches_attention_reference(
             torch.testing.assert_close(output, dense_output, rtol=0.02, atol=0.002)
 
 
+@pytest.mark.parametrize(
+    "plan,heads",
+    [
+        ("dcp_native", 96),
+        ("dcp_rebuild", 96),
+        *(("builder", heads) for heads in (16, 32, 48, 64, 96, 128)),
+    ],
+)
 @pytest.mark.parametrize("candidate_width", [2048, 2176])
-def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width):
+def test_bf16_sparse_prefill_is_independent_of_batch_composition(
+    candidate_width, plan, heads
+):
     """The same ordered candidate row must not acquire batch-dependent splits.
 
     Include the former 384+10 tail and candidates concentrated on one rank.
     The second width also covers a pooled indexer's padded output capacity.
     This exercises production metadata and native MLA, with a CPU FP32 oracle.
+    ``plan``: the DCP forward plan patched per layer, the DCP forward-time
+    rebuild of a folded plan, or the builder's dcp=1 per-step plan that the
+    non-DCP and PCP prefills read.
     """
     from itertools import accumulate
     from types import SimpleNamespace
 
+    import triton
     from aiter import get_mla_metadata_info_v1
     from aiter.mla import mla_decode_fwd
+    from aiter.ops.attention import get_mla_decode_shape_support
 
+    from atom.distributed.dcp_utils import mla_dcp_sparse_prefill_kv_splits
+    from atom.model_ops.attention_mla import MLAAttention
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        sparse_prefill_kv_granularity,
+    )
     from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 
     lengths = [1, 63, 64, 127, 128, 255, 256, 394, 479, 511, 512, 1025, candidate_width]
     gen = torch.Generator(device="cuda").manual_seed(3165 + candidate_width)
     fixed = (
-        torch.randn(len(lengths), 96, 576, generator=gen, device="cuda") * 0.125
+        torch.randn(len(lengths), heads, 576, generator=gen, device="cuda") * 0.125
     ).bfloat16()
     kv = (
         torch.randn(candidate_width, 1, 1, 576, generator=gen, device="cuda") * 0.125
@@ -425,6 +456,16 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
         "reduce_indptr",
         "reduce_final_map",
         "reduce_partial_map",
+    )
+    # aiter folds the heads into 16-head groups where it lacks a wider kernel
+    # (gfx942 bf16 has only qh16): one work item per row and group.
+    fold = get_mla_decode_shape_support(
+        heads, 1, torch.bfloat16, torch.bfloat16, persistent=True, page_size=1
+    ).fold_factor
+    if plan == "dcp_native" and fold > 1:
+        pytest.skip("folded plans are rebuilt, not patched")
+    impl = SimpleNamespace(
+        _sparse_prefill_kv_granularity=triton.next_power_of_2(candidate_width)
     )
     first = None
     for rows in (65, 97, 162, 481):
@@ -442,7 +483,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
         sizes = get_mla_metadata_info_v1(
             rows,
             1,
-            96,
+            heads,
             q.dtype,
             kv.dtype,
             is_sparse=True,
@@ -459,17 +500,46 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
             sparse_kv_last_page_lens=last,
             **{"sparse_prefill_" + name: value for name, value in work.items()},
         )
-        _forward_work_plan(meta, 96, q.dtype, candidate_width)
-        patch_work_kv_ranges(work["work_info_set"], work["work_indptr"], kvptr, rows)
-        # Each live row has one whole interval, even at the smallest batch.
+        if plan == "dcp_native":
+            _forward_work_plan(meta, heads, q.dtype, candidate_width)
+            patch_work_kv_ranges(
+                work["work_info_set"], work["work_indptr"], kvptr, rows
+            )
+        elif plan == "dcp_rebuild":
+            MLAAttention._rebuild_sparse_dcp_persistent_metadata(
+                impl,
+                meta,
+                q,
+                kv,
+                qptr,
+                kvptr,
+                last,
+                heads,
+                work_prefix="sparse_prefill_",
+            )
+        else:
+            builder = SimpleNamespace(
+                dcp_sparse_prefill_nonps=False,
+                block_size=1,
+                dtype_q=q.dtype,
+                dtype_kv=kv.dtype,
+                _sparse_prefill_kv_granularity=sparse_prefill_kv_granularity(
+                    q.dtype, kv.dtype, candidate_width
+                ),
+                _sparse_prefill_work_views=lambda prefix, n, work=work: work,
+            )
+            AiterMLAMetadataBuilder._sparse_prefill_work_plan(
+                builder, meta, "", heads, last
+            )
+        # Each live row is planned whole, even at the smallest batch.
         info = work["work_info_set"][: int(work["work_indptr"][-1])].cpu()
         starts = kvptr.cpu().tolist()
-        assert len(info) == rows
+        assert len(info) == rows * fold
+        intervals = [tuple(iv) for iv in info[:, 4:6].tolist()]
         for row, count in enumerate(counts):
-            row_work = info[info[:, 0] == row]
-            assert len(row_work) == 1
-            assert row_work[0, 4:6].tolist() == [starts[row], starts[row] + count]
-        output = torch.empty(rows, 96, 512, dtype=torch.bfloat16, device="cuda")
+            assert intervals.count((starts[row], starts[row] + count)) == fold
+        assert int(work["reduce_indptr"][-1]) == 0
+        output = torch.empty(rows, heads, 512, dtype=torch.bfloat16, device="cuda")
         mla_decode_fwd(
             q,
             kv,
@@ -480,7 +550,10 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
             last,
             1,
             page_size=1,
+            # ATOM's form; without it aiter drops 16 heads to the split-KV kernel
+            num_kv_splits=mla_dcp_sparse_prefill_kv_splits(False, 1),
             sm_scale=576**-0.5,
+            has_partials=False,
             **work,
         )
         actual = output[: len(lengths)].cpu()
@@ -496,7 +569,7 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
                     actual[row].float(), reference, rtol=0.02, atol=0.003
                 )
         else:
-            assert torch.equal(actual, first), (candidate_width, rows)
+            assert torch.equal(actual, first), (candidate_width, plan, heads, rows)
 
 
 @pytest.mark.parametrize(

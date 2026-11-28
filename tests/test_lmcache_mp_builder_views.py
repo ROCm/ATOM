@@ -230,6 +230,7 @@ def mla_builder_cls():
             "atom.model_ops.attentions.sparse_mla_head_groups",
             HEADS=128,
             SparsePrefillHeadGroups=noop,
+            sparse_prefill_kv_granularity=noop,
         ),
         "atom.model_ops.attentions.selection_pack": _module(
             "atom.model_ops.attentions.selection_pack", pack_row_selections=noop

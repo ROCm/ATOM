@@ -1477,17 +1477,8 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
 
 
-@needs_gpu
-@pytest.mark.parametrize(
-    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
-)
-@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
-def test_sparse_prefill_builder_allocates_for_its_consumer(
-    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
-):
-    """12 heads per rank need distinct decode and prefill work buffers."""
-    from aiter import get_mla_metadata_info_v1
-
+def _builder_runner(monkeypatch, world, cache_dtype, **hf_extra):
+    """A model runner the real `AiterMLAMetadataBuilder.__init__` accepts."""
     from atom.model_ops.attentions import aiter_mla, backends
 
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
@@ -1505,6 +1496,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
             index_topk=2048,
             index_n_heads=32,
             index_head_dim=128,
+            **hf_extra,
         ),
         max_model_len=16384,
         max_num_batched_tokens=16,
@@ -1526,6 +1518,23 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         has_mla_indexer=True,
         forward_vars={},
     )
+    return runner
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
+)
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_sparse_prefill_builder_allocates_for_its_consumer(
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+):
+    """12 heads per rank need distinct decode and prefill work buffers."""
+    from aiter import get_mla_metadata_info_v1
+
+    from atom.model_ops.attentions import aiter_mla
+
+    runner = _builder_runner(monkeypatch, world, cache_dtype)
     builder = aiter_mla.AiterMLAMetadataBuilder(runner)
     assert builder.persistent_num_heads == decode_heads
     assert builder.sparse_prefill_num_heads == prefill_heads
@@ -1555,6 +1564,34 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
             expected_shape = (shape,) if isinstance(shape, int) else tuple(shape)
             assert tuple(tensor.shape) == expected_shape
             assert tensor.dtype == dtype
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "world,kpool,cache_dtype,granularity,local_granularity",
+    [
+        (1, 1, "bf16", 2048, 2048),
+        (1, 64, "bf16", 4096, 4096),
+        (1, 64, "fp8", 16, 16),
+        # The dcp>1 "q" plan is whole for FP8 too: its native use runs
+        # without split buffers.
+        (8, 64, "fp8", 4096, 16),
+    ],
+)
+def test_builder_plans_bf16_sparse_prefill_rows_whole(
+    monkeypatch, world, kpool, cache_dtype, granularity, local_granularity
+):
+    """A pooled BF16 row is 2176 wide (top-k plus the unscored tail pool), so
+    planning it whole takes 4096, not top-k's 2048."""
+    from atom.model_ops.attentions import aiter_mla
+
+    monkeypatch.setenv("ATOM_GLM5_KPOOL", "1")
+    runner = _builder_runner(monkeypatch, world, cache_dtype, index_kpool=kpool)
+    builder = aiter_mla.AiterMLAMetadataBuilder(runner)
+    assert builder._sparse_prefill_kv_granularity == granularity
+    assert builder._sparse_prefill_local_kv_granularity == local_granularity
+    if world > 1:
+        assert granularity >= builder.index_topk_out
 
 
 @needs_gpu

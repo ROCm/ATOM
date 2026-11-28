@@ -22,6 +22,27 @@ WORK = (
 )
 
 
+def granularity_helpers():
+    """The production sparse-prefill granularity helpers, without importing aiter."""
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "atom/model_ops/attentions/sparse_mla_head_groups.py"
+    )
+    names = {"sparse_prefill_rows_whole", "sparse_prefill_kv_granularity"}
+    functions = [
+        n
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.FunctionDef) and n.name in names
+    ]
+    assert {f.name for f in functions} == names
+    namespace = {"torch": torch}
+    exec(  # noqa: S102 - checked-in production helpers
+        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    return {name: namespace[name] for name in names}
+
+
 @pytest.fixture
 def production(monkeypatch):
     path = Path(__file__).resolve().parents[1] / "atom/model_ops/attention_mla.py"
@@ -59,6 +80,7 @@ def production(monkeypatch):
             context=SimpleNamespace(scheduled_bs=2)
         ),
         "mla_dcp_sparse_prefill_kv_splits": lambda *_: 2,
+        **granularity_helpers(),
     }
     attention = next(
         node
@@ -123,7 +145,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     production, native, supported, dtype
 ):
     ns = production
-    rebuilds, patches, launches = [], [], []
+    rebuilds, patches, launches, partials = [], [], [], []
     q = torch.empty(2, 64, 12, dtype=dtype)
     kv = torch.empty(16, 1, 12, dtype=dtype)
     ptr = torch.tensor([0, 4, 9], dtype=torch.int32)
@@ -178,6 +200,7 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
         for name, value in buffers.items():
             assert kwargs[name] is value
         launches.append(kvptr.clone())
+        partials.append(kwargs["has_partials"])
         out.zero_()
         return out, torch.zeros(query.shape[:2])
 
@@ -222,6 +245,9 @@ def test_each_owner_rebuilds_folded_or_unknown_plans(
     attn.owns_sparse_indexer = False
     attn._forward_prefill_mla(q, kv, md, return_lse=True, q_prepadded=True)
     assert len(launches) == 3
+    # Only whole-row plans skip the reduce: any bf16 plan, or the native one.
+    whole = dtype == torch.bfloat16 or (native and supported is True)
+    assert partials == [not whole] * 3
     if native and supported is True:
         assert len(patches) == 2 and not rebuilds
     else:
@@ -355,12 +381,20 @@ def test_plan_support_is_bound_to_the_final_width_and_reset(
 
 
 @pytest.mark.parametrize(
-    "dcp,block,topk,expected",
-    [(1, 128, 2048, 128), (8, 1, 2048, 2048), (8, 1, 2176, 4096)],
+    "dtype,dcp,block,topk,q_granularity,local_granularity",
+    [
+        # BF16 rows are whole under either transport.
+        (torch.bfloat16, 1, 128, 2048, 2048, 2048),
+        (torch.bfloat16, 8, 1, 2048, 2048, 2048),
+        (torch.bfloat16, 8, 1, 2176, 4096, 4096),
+        (torch.float8_e4m3fn, 1, 128, 2048, 128, 128),
+        (torch.float8_e4m3fn, 8, 1, 2048, 2048, 16),
+        (torch.float8_e4m3fn, 8, 1, 2176, 4096, 16),
+    ],
 )
 @pytest.mark.parametrize("local_heads", [False, True])
 def test_work_plan_preserves_transport_granularity(
-    dcp, block, topk, expected, local_heads
+    dtype, dcp, block, topk, q_granularity, local_granularity, local_heads
 ):
     path = (
         Path(__file__).resolve().parents[1] / "atom/model_ops/attentions/aiter_mla.py"
@@ -381,7 +415,12 @@ def test_work_plan_preserves_transport_granularity(
         for n in ast.walk(init)
         if isinstance(n, ast.Assign)
         and any(
-            isinstance(t, ast.Attribute) and t.attr == "_sparse_prefill_kv_granularity"
+            isinstance(t, ast.Attribute)
+            and t.attr
+            in (
+                "_sparse_prefill_local_kv_granularity",
+                "_sparse_prefill_kv_granularity",
+            )
             for t in n.targets
         )
     ]
@@ -396,9 +435,11 @@ def test_work_plan_preserves_transport_granularity(
         counts.append("power")
         return 1 << (value - 1).bit_length()
 
-    def maximum(*values):
-        counts.append("max")
-        return max(values)
+    helper = granularity_helpers()["sparse_prefill_kv_granularity"]
+
+    def granularity(*args):
+        counts.append("helper")
+        return helper(*args)
 
     work = {name: object() for name in WORK}
     instance = SimpleNamespace(
@@ -407,8 +448,8 @@ def test_work_plan_preserves_transport_granularity(
         block_size=block,
         index_topk_out=topk,
         dcp_sparse_prefill_nonps=False,
-        dtype_q=torch.bfloat16,
-        dtype_kv=torch.bfloat16,
+        dtype_q=dtype,
+        dtype_kv=dtype,
         model_runner=SimpleNamespace(
             forward_vars={f"sparse_prefill_{k}": v for k, v in work.items()}
         ),
@@ -417,7 +458,7 @@ def test_work_plan_preserves_transport_granularity(
     ns = {
         "self": instance,
         "triton": SimpleNamespace(next_power_of_2=power),
-        "max": maximum,
+        "sparse_prefill_kv_granularity": granularity,
         "AttentionMetaData": SimpleNamespace,
         "torch": torch,
         "PERSISTENT_WORK_BUFFERS": WORK,
@@ -438,7 +479,7 @@ def test_work_plan_preserves_transport_granularity(
         ns["_sparse_prefill_work_plan"](
             instance, metadata, "", 64, None, local_heads=local_heads
         )
-    want = max(block, 16) if local_heads else expected
+    want = local_granularity if local_heads else q_granularity
     assert plans == [want, want]
-    assert counts == initialized + (["max"] * 2 if local_heads else [])
-    assert initialized == ["power" if dcp > 1 else "max"]
+    # Both granularities are fixed at init; a step only reads them.
+    assert counts == initialized == ["helper"] + (["power"] if dcp > 1 else [])

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Independent head groups for small BF16 persistent sparse-prefill batches."""
+# Copyright (c) 2026 ATOM Project Contributors
+"""Independent head groups for small BF16 persistent sparse-prefill batches,
+and the work-plan granularity shared by the builder, the DCP rebuild and the
+sglang GLM-5.2 bridge."""
 
 import torch
 import triton
@@ -25,6 +28,29 @@ PERSISTENT_WORK_BUFFERS = (
     "reduce_final_map",
     "reduce_partial_map",
 )
+
+
+def sparse_prefill_rows_whole(dtype_q, dtype_kv):
+    """Whether a sparse-prefill work plan keeps each row in one work item. Such
+    a plan has no split rows, so `mla_decode_fwd` is called with
+    has_partials=False and allocates no split buffers: a split row would then
+    write out of bounds. Every planner of these rows keeps them whole: the
+    builder's dcp>1 "q" plans use the next power of two of the row width, head
+    groups use REGION, and the rest (dcp=1 builder, DCP rebuild, the sglang
+    GLM-5.2 bridge) take `sparse_prefill_kv_granularity`. The builder's dcp>1
+    "q" plan is whole for any dtype, so its native FP8 use also skips the
+    split buffers (decided at the call site)."""
+    return dtype_q == dtype_kv == torch.bfloat16
+
+
+def sparse_prefill_kv_granularity(dtype_q, dtype_kv, row_width, page_size=1):
+    """kv_granularity of a sparse-prefill work plan. A BF16 row is planned
+    whole: splitting its candidates by batch occupancy changes the reduction
+    order, so a row's output would depend on what it is batched with.
+    Runs per step, hence the bit trick over `triton.next_power_of_2`."""
+    if sparse_prefill_rows_whole(dtype_q, dtype_kv):
+        return max(1 << max(row_width - 1, 0).bit_length(), page_size, 16)
+    return max(page_size, 16)
 
 
 @triton.jit

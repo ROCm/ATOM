@@ -32,7 +32,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
-from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.mla import mla_decode_fwd
 from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
@@ -73,6 +73,8 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     PERSISTENT_WORK_BUFFERS,
+    sparse_prefill_kv_granularity,
+    sparse_prefill_rows_whole,
 )
 from atom.model_ops.dcp_ops import (
     dcp_all_gather_prefill_query_heads,
@@ -229,7 +231,6 @@ fused_bf16_bmm_cat_quant_pad_mla = mark_trace(
     prefix="k_up_proj_q_pack",
     torch_compile=False,
 )
-mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
 # Paged Triton decode supports both interleaved and shuffled KV caches.
@@ -363,6 +364,15 @@ def check_kv_shuffled_supported(
     if unsupported:
         raise ValueError(
             "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
+        )
+
+
+def check_sparse_mla_page_size(*, mla_page_size: int, is_sparse_mla: bool) -> None:
+    # The indexer emits token slots; a paged kernel would read them as page ids.
+    if is_sparse_mla and mla_page_size > 1:
+        raise RuntimeError(
+            "Sparse MLA requires ATOM_MLA_PAGE_SIZE=1: its top-k indices are "
+            f"token slots, not pages (got {mla_page_size})."
         )
 
 
@@ -955,6 +965,11 @@ class MLAAttention(nn.Module):
         # `_kv_b_proj_gather`. None = not asked yet.
         self._flydsl_gather_ok: bool | None = None
         self._flydsl_gather_fp8_ok: bool | None = None
+        # Not only under seg: sparse prefill passes this page size with the
+        # Triton MLA decode too.
+        check_sparse_mla_page_size(
+            mla_page_size=envs.ATOM_MLA_PAGE_SIZE, is_sparse_mla=self.is_sparse_mla
+        )
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -2739,6 +2754,8 @@ class MLAAttention(nn.Module):
         dcp_kv: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
+        # Dense MLA prefill runs on _forward_prefill_mha.
+        assert self.is_sparse_mla
         B = q.shape[0]
 
         # Under DCP the sparse path has already gathered the group's query heads,
@@ -2747,7 +2764,7 @@ class MLAAttention(nn.Module):
         # the per-rank count.
         # A "kv" DCP prefill (`_dcp_sparse_prefill_kv`) runs as dcp=1 does: this
         # rank's heads over the global top-k of a gathered KV.
-        dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1 and not dcp_kv
+        dcp_sparse = self.dcp_world_size > 1 and not dcp_kv
         if q_prepadded:
             # Fused Q writing pads local heads; DCP gather pads the whole group.
             # Restore all real group heads before the cross-rank merge.
@@ -2761,18 +2778,6 @@ class MLAAttention(nn.Module):
                 if dcp_sparse
                 else self._pad_query_heads(q)
             )
-
-        # BF16 ASM prefill accepts 16 or 128 query heads, unlike decode's
-        # power-of-two widths, so a width between them is padded to 128.
-        asm_head_padding = (
-            not dcp_sparse
-            and not return_lse
-            and q.dtype == torch.bfloat16
-            and not self.kv_cache_dtype.startswith("fp8")
-            and 16 < q.shape[1] < 128
-        )
-        if asm_head_padding:
-            q = torch.nn.functional.pad(q, (0, 0, 0, 128 - q.shape[1]))
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -2790,176 +2795,145 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        # The paged kernels take their batch from the q-cums; cut them to the
-        # requests actually scheduled, which is the width prepare_prefill fills
-        # before padding the tail out to running_bs.
-        #
-        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
-        # these arrays by total_seqs_num_prefill. The two differ only on a batch
-        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
-        # at 0 -- hence is_prefill False, which is the branch this function is
-        # reached from. Every is_prefill batch sets the two counts equal.
-        fwd_context = get_forward_context()
-        n_seqs = fwd_context.context.scheduled_bs
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
-        paged_kv_indptr = attn_metadata.kv_indptr
-        paged_kv_indices = attn_metadata.kv_indices
-        kv_last_page_lens = attn_metadata.kv_last_page_lens
-        max_q_len = attn_metadata.max_seqlen_q
-        if self.is_sparse_mla:
-            paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
-            paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = attn_metadata.sparse_kv_indices
-            # Sparse attention needs one last-page len per query token; the dense
-            # kv_last_page_lens (per-seq) would over-read -> illegal access.
-            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-            if dcp_sparse:
-                # The indexer compacted this rank's owned candidates to the front
-                # of each query token's region, so the region lengths are the
-                # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
-                # Same substitution the decode path makes.
-                paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[
-                    : paged_cu_seqlens_q.shape[0]
-                ]
-            max_q_len = 1
+        paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+        paged_kv_indptr = attn_metadata.sparse_kv_indptr
+        paged_kv_indices = attn_metadata.sparse_kv_indices
+        # Sparse attention needs one last-page len per query token; the dense
+        # kv_last_page_lens (per-seq) would over-read -> illegal access.
+        kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+        if dcp_sparse:
+            # The indexer compacted this rank's owned candidates to the front
+            # of each query token's region, so the region lengths are the
+            # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
+            # Same substitution the decode path makes.
+            paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[
+                : paged_cu_seqlens_q.shape[0]
+            ]
+        max_q_len = 1
 
         final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
-            if envs.ATOM_MLA_PAGE_SIZE is not None:
-                page_size = envs.ATOM_MLA_PAGE_SIZE
-            else:
-                page_size = 1
-            # `mla_prefill_asm_fwd` NEVER writes its LSE output, so DCP also needs
-            # `mla_decode_fwd` kernel.
-            use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
-            if use_decode_kernel:
-                is_fp8 = self.kv_cache_dtype.startswith("fp8")
-                # A full indexer layer selects its own rank-local regions.
-                # Native whole-row plans patch those ranges; folded plans and
-                # small BF16 head groups rebuild. Non-persistent calls use no plan.
-                #
-                # Read from the same predicate the gathered pad width came from
-                # rather than re-deriving the gate: on the persistent kernel set
-                # gqa=64 is correct only in persistent mode, so running one way
-                # while the width was chosen for the other silently miscomputes.
-                # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
-                # the exception, and runs at 64 non-persistent by design. The
-                # assert keeps the two spellings honest if either side gains a
-                # condition.
-                sparse_dcp_persistent = (
-                    dcp_sparse and self.dcp_sparse_prefill_persistent
+            # Sparse MLA refuses ATOM_MLA_PAGE_SIZE > 1 at init.
+            page_size = 1
+            # Every KV dtype runs on mla_decode_fwd: it returns the LSE DCP
+            # merges, and for bf16 KV it is faster than the asm prefill kernel,
+            # which also mis-addresses KV past 4 GiB on gfx942.
+            is_fp8 = self.kv_cache_dtype.startswith("fp8")
+            # A full indexer layer selects its own rank-local regions.
+            # Native whole-row plans patch those ranges; folded plans and
+            # small BF16 head groups rebuild. Non-persistent calls use no plan.
+            #
+            # Read from the same predicate the gathered pad width came from
+            # rather than re-deriving the gate: on the persistent kernel set
+            # gqa=64 is correct only in persistent mode, so running one way
+            # while the width was chosen for the other silently miscomputes.
+            # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
+            # the exception, and runs at 64 non-persistent by design. The
+            # assert keeps the two spellings honest if either side gains a
+            # condition.
+            sparse_dcp_persistent = dcp_sparse and self.dcp_sparse_prefill_persistent
+            assert sparse_dcp_persistent == (
+                dcp_sparse
+                and self.sparse_dcp_metadata_rebuild
+                and self.dcp_persistent_supported
+                # The predicate's page-size term holds: sparse page is always 1.
+                and not self.dcp_sparse_prefill_nonps
+            ), (
+                "DCP sparse prefill would run in a different mode than the "
+                "one its gathered query width was padded for; update "
+                "mla_dcp_sparse_prefill_is_persistent alongside this gate."
+            )
+            nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
+            assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
+                f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
+                f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
+                "max_num_batched_tokens gate should have kept it persistent."
+            )
+            head_groups = self.sparse_prefill_head_groups
+            group_heads = (
+                head_groups is not None
+                and sparse_dcp_persistent
+                and self.owns_sparse_indexer
+                and head_groups.applies(
+                    q,
+                    o,
+                    kv_c_and_k_pe_cache,
+                    self._sparse_prefill_kv_granularity,
                 )
-                assert sparse_dcp_persistent == (
-                    dcp_sparse
-                    and self.sparse_dcp_metadata_rebuild
-                    and self.dcp_persistent_supported
-                    and page_size <= 1
-                    and not self.dcp_sparse_prefill_nonps
-                ), (
-                    "DCP sparse prefill would run in a different mode than the "
-                    "one its gathered query width was padded for; update "
-                    "mla_dcp_sparse_prefill_is_persistent alongside this gate."
-                )
-                nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
-                assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
-                    f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
-                    f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
-                    "max_num_batched_tokens gate should have kept it persistent."
-                )
-                head_groups = self.sparse_prefill_head_groups
-                group_heads = (
-                    head_groups is not None
-                    and sparse_dcp_persistent
-                    and self.owns_sparse_indexer
-                    and head_groups.applies(
-                        q,
-                        o,
-                        kv_c_and_k_pe_cache,
-                        self._sparse_prefill_kv_granularity,
-                    )
-                )
-                kernel_q, kernel_o = q, o
-                if group_heads:
-                    (
-                        kernel_q,
-                        kernel_o,
-                        paged_cu_seqlens_q,
-                        paged_kv_indptr,
-                        paged_kv_indices,
-                        kv_last_page_lens,
-                    ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
-                elif sparse_dcp_persistent and self.owns_sparse_indexer:
-                    if self.dcp_sparse_prefill_plan_native:
-                        patch_work_kv_ranges(
-                            attn_metadata.sparse_prefill_work_info_set,
-                            attn_metadata.sparse_prefill_work_indptr,
-                            paged_kv_indptr,
-                            B,
-                        )
-                    else:
-                        self._rebuild_sparse_dcp_persistent_metadata(
-                            attn_metadata,
-                            q,
-                            kv_c_and_k_pe_cache,
-                            paged_cu_seqlens_q,
-                            paged_kv_indptr,
-                            kv_last_page_lens,
-                            q.shape[1],
-                            work_prefix="sparse_prefill_",
-                        )
-                # Not gated on is_fp8: the DCP arm's sparse_prefill_work_*
-                # buffers are allocated/filled for the layer's real dtype
-                # regardless. The dcp_world_size <= 1 arm is dead for bf16
-                # either way -- use_decode_kernel above already requires fp8
-                # or return_lse, and return_lse is never true when DCP is off
-                # -- kept only so both arms read the same condition.
-                use_work_meta = (
-                    self.dcp_world_size <= 1 or dcp_kv or sparse_dcp_persistent
-                )
-                if group_heads:
-                    work = head_groups.work
-                elif use_work_meta:
-                    work = {
-                        name: getattr(attn_metadata, f"sparse_prefill_{name}", None)
-                        for name in PERSISTENT_WORK_BUFFERS
-                    }
-                else:
-                    work = {}
-                _, final_lse = mla_decode_fwd(
+            )
+            kernel_q, kernel_o = q, o
+            if group_heads:
+                (
                     kernel_q,
-                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     kernel_o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_indices,
                     kv_last_page_lens,
-                    max_q_len,
-                    page_size=page_size,
-                    num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
-                        nonps, 1 if dcp_kv else self.dcp_world_size
-                    ),
-                    sm_scale=self.scale,
-                    q_scale=self._q_scale if is_fp8 else None,
-                    kv_scale=self._k_scale if is_fp8 else None,
-                    return_lse=return_lse,
-                    **work,
-                )
-                if group_heads and final_lse is not None:
-                    final_lse = final_lse.view(B, q.shape[1])
+                ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
+            elif sparse_dcp_persistent and self.owns_sparse_indexer:
+                if self.dcp_sparse_prefill_plan_native:
+                    patch_work_kv_ranges(
+                        attn_metadata.sparse_prefill_work_info_set,
+                        attn_metadata.sparse_prefill_work_indptr,
+                        paged_kv_indptr,
+                        B,
+                    )
+                else:
+                    self._rebuild_sparse_dcp_persistent_metadata(
+                        attn_metadata,
+                        q,
+                        kv_c_and_k_pe_cache,
+                        paged_cu_seqlens_q,
+                        paged_kv_indptr,
+                        kv_last_page_lens,
+                        q.shape[1],
+                        work_prefix="sparse_prefill_",
+                    )
+            # Not gated on is_fp8: the sparse_prefill_work_* buffers are
+            # planned for the layer's real KV dtype, bf16 included.
+            use_work_meta = self.dcp_world_size <= 1 or dcp_kv or sparse_dcp_persistent
+            if group_heads:
+                work = head_groups.work
+            elif use_work_meta:
+                work = {
+                    name: getattr(attn_metadata, f"sparse_prefill_{name}", None)
+                    for name in PERSISTENT_WORK_BUFFERS
+                }
             else:
-                mla_prefill_fwd(
-                    q,
-                    kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
-                    o,
-                    paged_cu_seqlens_q,
-                    paged_kv_indptr,
-                    paged_kv_indices,
-                    kv_last_page_lens,
-                    max_q_len,
-                    self.scale,
-                    0.0,
-                    None,
-                )
+                work = {}
+            _, final_lse = mla_decode_fwd(
+                kernel_q,
+                kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
+                kernel_o,
+                paged_cu_seqlens_q,
+                paged_kv_indptr,
+                paged_kv_indices,
+                kv_last_page_lens,
+                max_q_len,
+                page_size=page_size,
+                # Must not be None: aiter then drops the work plan for
+                # 16-head BF16 at large batch (split-KV kernel), losing batch
+                # invariance and the > 4 GiB addressing on gfx950.
+                num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
+                    nonps, 1 if dcp_kv else self.dcp_world_size
+                ),
+                sm_scale=self.scale,
+                q_scale=self._q_scale if is_fp8 else None,
+                kv_scale=self._k_scale if is_fp8 else None,
+                return_lse=return_lse,
+                # A whole-row plan has no split rows: skip the reduce launch.
+                # bf16 plans are whole on every path; fp8 ones only as the
+                # builder's native "q" plan, which IndexShare consumers reuse.
+                # Ignored without a work plan (non-persistent split-KV kernel).
+                has_partials=not (
+                    sparse_prefill_rows_whole(kernel_q.dtype, kv_c_and_k_pe_cache.dtype)
+                    or (sparse_dcp_persistent and self.dcp_sparse_prefill_plan_native)
+                ),
+                **work,
+            )
+            if group_heads and final_lse is not None:
+                final_lse = final_lse.view(B, q.shape[1])
 
         restore = (
             self._restore_sparse_prefill_query_heads
@@ -2975,7 +2949,7 @@ class MLAAttention(nn.Module):
                 "return_lse requested but the attention kernel produced no LSE "
                 "(empty KV cache?)"
             )
-            if self.is_sparse_mla and self.dcp_world_size > 1:
+            if self.dcp_world_size > 1:
                 # One kernel for what torch spelled in five.
                 #
                 # `torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)` costs
@@ -3084,9 +3058,10 @@ class MLAAttention(nn.Module):
             dtype_kv=kv_buffer.dtype,
             # Preserve the BF16 prefill reduction order when rebuilding a fold.
             kv_granularity=(
-                self._sparse_prefill_kv_granularity
+                sparse_prefill_kv_granularity(
+                    q.dtype, kv_buffer.dtype, self._sparse_prefill_kv_granularity
+                )
                 if work_prefix == "sparse_prefill_"
-                and q.dtype == kv_buffer.dtype == torch.bfloat16
                 else 16
             ),
             max_seqlen_qo=1,
