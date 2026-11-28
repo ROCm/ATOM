@@ -176,9 +176,22 @@ def test_prepare_model_builds_and_passes_mixed_verify_metadata(monkeypatch):
         is_pd_producer=False, prepare_input_ids=lambda *a, **kw: torch.arange(16)
     )
     metadata = _mixed_metadata()
+
+    def prepare_query_metadata(
+        lengths, running_bs, running_tokens, slices, *, is_prefill
+    ):
+        # The shared token bank belongs to the decode region of a mixed batch,
+        # even while the whole forward is in prefill mode. It must not acquire
+        # the prefill graph's padded request capacity.
+        assert not is_prefill
+        assert lengths.tolist() == [K + 1, K + 1]
+        assert (running_bs, running_tokens) == (N_D, N_D * (K + 1))
+        captured["query_metadata"] = True
+        return {}
+
     runner.attn_metadata_builder = SimpleNamespace(
         step_needs_eager=lambda b: True,
-        prepare_query_metadata=lambda *a: {},
+        prepare_query_metadata=prepare_query_metadata,
         consumes_device_verdict=lambda *a: False,
         settles_spec_status=lambda *a: False,
         take_spec_status=lambda processor: None,
@@ -201,6 +214,7 @@ def test_prepare_model_builds_and_passes_mixed_verify_metadata(monkeypatch):
         module.ModelRunner.prepare_model,
     )
     prepare(runner, batch)
+    assert captured["query_metadata"]
     spec = captured["spec_decode_metadata"]
     assert spec is not None
     assert spec.num_draft_tokens_np.tolist() == [0, 0, 3, 3]

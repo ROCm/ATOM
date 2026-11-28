@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -302,16 +303,47 @@ def test_gfx950_preserves_requested_cache_and_attention(
 
 
 @pytest.mark.parametrize(
-    "cache_dtype,a8w4", [("bf16", False), ("fp8", False), ("fp4", False), ("fp4", True)]
+    "cache_dtype,a8w4,capture_attention,ratio,group_size,live_fusion",
+    [
+        ("bf16", False, False, 0, 1, False),
+        ("fp8", False, False, 0, 1, False),
+        ("fp4", False, False, 0, 1, False),
+        ("fp4", True, False, 0, 1, False),
+        ("fp8", False, True, 0, 1, False),
+        ("fp4", True, True, 0, 1, False),
+        ("fp8", False, True, 2, 1, False),
+        ("fp4", True, True, 2, 1, False),
+        ("fp8", False, True, 2, 2, False),
+        ("fp4", True, True, 2, 2, False),
+        ("fp8", False, False, 0, 1, True),
+        ("fp4", True, False, 0, 1, True),
+        ("fp8", False, False, 2, 2, True),
+        ("fp4", True, False, 2, 2, True),
+        ("fp8", False, True, 0, 1, True),
+        ("fp4", True, True, 0, 1, True),
+        ("fp8", False, True, 2, 2, True),
+        ("fp4", True, True, 2, 2, True),
+    ],
 )
-@pytest.mark.parametrize("capture_empty", [False, True])
+@pytest.mark.parametrize("capture_batch", ["ordinary", "resumed", "empty"])
 @torch.inference_mode()
 @pytest.mark.parametrize("side_stream", [False, True])
 def test_native_token_graph_replays_different_request_counts(
-    cache_dtype, capture_empty, side_stream, a8w4, monkeypatch
+    cache_dtype,
+    capture_batch,
+    side_stream,
+    a8w4,
+    capture_attention,
+    ratio,
+    group_size,
+    live_fusion,
+    monkeypatch,
 ):
     from types import MethodType
 
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
     from atom.models.deepseek_v41.attention import Attention, _live_step
     from atom.utils import forward_context
     from atom.utils.region_graph import TokenGraph, eager_region
@@ -324,82 +356,167 @@ def test_native_token_graph_replays_different_request_counts(
         pytest.skip("This regression exercises gfx950 OPUS attention")
     monkeypatch.setenv("ATOM_DSV41_A8W4_ATTN", "auto" if a8w4 else "off")
     torch.manual_seed(2989)
-    width, ring, heads = 256, 128, 16
+    width, ring, heads = 256, 128, 64 if live_fusion else 16
+    conditional_graph = capture_attention and live_fusion
     geo = V41PoolGeometry(
-        1,
+        group_size,
         ((0, 2),),
         256,
         ring,
         512,
         128,
         kv_dtype=cache_dtype,
-        layer_ratios=(0,),
+        speculative_tokens=5 if conditional_graph else 0,
+        layer_ratios=(ratio,),
         index_topk=4,
     )
-    cache = PagedAttentionCache(geo, 4, 3, "cuda", max_tokens=width)
+    cache = PagedAttentionCache(geo, 4, 5, "cuda", max_tokens=width)
+
+    def ring_planes():
+        return (
+            (cache.pool,)
+            if cache_dtype == "bf16"
+            else tuple(p for layer in range(group_size) for p in cache.ring_view(layer))
+        )
+
     if cache_dtype == "bf16":
         cache.pool.normal_()
-        history = (cache.pool.clone(),)
     else:
-        data, scales = cache.ring_view(0)
-        values, steps = quantize_fp8(
-            torch.randn(data.shape, device="cuda", dtype=torch.bfloat16)
-        )
-        data.copy_(values.view(torch.uint8))
+        for layer in range(group_size):
+            data, scales = cache.ring_view(layer)
+            values, steps = quantize_fp8(
+                torch.randn(data.shape, device="cuda", dtype=torch.bfloat16)
+            )
+            data.copy_(values.view(torch.uint8))
+            scales.copy_(steps.view(torch.uint8))
+    history = tuple(p.clone() for p in ring_planes())
+    if ratio:
+        data, scales = cache.main_view(0)
+        raw = torch.randn(data.shape[0], 512, device="cuda", dtype=torch.bfloat16)
+        packed, steps = quantize_fp4(raw, **MAIN_FP4) if a8w4 else quantize_fp8(raw)
+        data.copy_(packed.view(torch.uint8))
         scales.copy_(steps.view(torch.uint8))
-        history = tuple(p.clone() for p in cache.ring_view(0))
     rope = RotaryEmbedding(64, 512, base=10000).cuda()
     positions = torch.empty(width, dtype=torch.int32, device="cuda")
     batch_ids = torch.empty_like(positions)
-    cu = torch.empty(3, dtype=torch.int32, device="cuda")
-    slots = torch.empty(2, dtype=torch.int32, device="cuda")
-    tables = torch.zeros(2, 4, dtype=torch.int32, device="cuda")
-    floor = torch.zeros(2, dtype=torch.int32, device="cuda")
+    cu = torch.empty(5, dtype=torch.int32, device="cuda")
+    slots = torch.empty(4, dtype=torch.int32, device="cuda")
+    tables = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
     ctx = SimpleNamespace(in_hipgraph=False, main_stream=torch.cuda.current_stream())
     monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    replay_builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    replay_builder.model_runner = SimpleNamespace(
+        forward_vars=replay_builder._prefill_replay_buffers(4, "cuda")
+    )
+    boundary_pointers = None
 
-    def prepare(requests):
-        length = width // requests
-        positions.copy_(
-            torch.arange(ring, ring + length, device="cuda").repeat(requests)
+    def prepare(
+        requests,
+        *,
+        graph_layout=capture_attention,
+        padded=False,
+        reverse=False,
+        cached_until=0,
+        live_tokens=width,
+        fuse=live_fusion,
+        is_prefill=True,
+        start_pos=ring,
+    ):
+        nonlocal boundary_pointers
+        graph_layout = graph_layout and is_prefill
+        length = (live_tokens - (2 if padded else 0)) // requests if requests else 0
+        live = length * requests
+        order = (0, 3, 1, 4) if reverse else (4, 1, 3, 0)
+        positions.zero_()
+        batch_ids.fill_(-1)
+        if requests:
+            positions[:live].copy_(
+                torch.arange(start_pos, start_pos + length, device="cuda").repeat(
+                    requests
+                )
+            )
+            batch_ids[:live].copy_(
+                torch.arange(requests, device="cuda").repeat_interleave(length)
+            )
+        cu.copy_(
+            torch.tensor([min(b, requests) * length for b in range(5)], device="cuda")
         )
-        batch_ids.copy_(torch.arange(requests, device="cuda").repeat_interleave(length))
-        cu.copy_(torch.tensor([0, length, width], device="cuda"))
-        slots.copy_(torch.tensor([2, 0 if requests == 2 else -1], device="cuda"))
+        slots.copy_(
+            torch.tensor(list(order[:requests]) + [-1] * (4 - requests), device="cuda")
+        )
+        batches = 4 if graph_layout else requests
+        cached = np.broadcast_to(np.asarray(cached_until, dtype=np.int32), (requests,))
         step = BatchStep(
             tuple(
-                RequestSpan(b, ring, b * length, length, 2 if b == 0 else 0)
+                RequestSpan(b, start_pos, b * length, length, order[b])
                 for b in range(requests)
             ),
             positions,
-            cu[: requests + 1],
-            slots[:requests],
+            cu[: batches + 1],
+            slots[:batches],
             batch_ids,
-            tables[:requests],
-            scheduled_tokens=width,
+            tables[:batches],
+            scheduled_tokens=live,
             max_q_len=length,
-            is_prefill=True,
-            swa_replay_start=floor[:requests],
-            swa_cached_until=floor[:requests],
+            is_prefill=is_prefill,
+            tentative=not is_prefill and length > 1,
+            prefill_attention_graph=graph_layout,
+            prefill_attention_conditional=conditional_graph,
+            prefill_window_fusion=fuse and is_prefill,
+            request_floors=np.where(cached > 0, start_pos // 2, 0).astype(np.int32),
+            request_cached_until=cached,
         )
+        # Production graph publication precedes the fused producer. The same
+        # pointers must survive ordinary/resumed/empty batch transitions.
+        if graph_layout:
+            step.swa_replay_start, step.swa_cached_until = (
+                replay_builder._stage_prefill_replay_layout(
+                    step.request_floors, step.request_cached_until, batches
+                )
+            )
+            pointers = tuple(
+                p.data_ptr() for p in (step.swa_replay_start, step.swa_cached_until)
+            )
+            if boundary_pointers is None:
+                boundary_pointers = pointers
+            assert pointers == boundary_pointers
+            assert step.swa_cached_until.numel() == batches
+            assert step.swa_cached_until[requests:].count_nonzero() == 0
+        else:
+            cache.publish_replay_layout(step, batches)
+        if cached.any() and not graph_layout:
+            assert step.swa_cached_until.numel() == requests
+            assert step.swa_replay_start.numel() == requests
         cache._reserve_prefill_window(step)
         step.begin_forward()
         ctx.attn_metadata = SimpleNamespace(cache=cache, step=step, queries=None)
-        planes = (cache.pool,) if cache_dtype == "bf16" else cache.ring_view(0)
-        for dst, saved in zip(planes, history):
+        for dst, saved in zip(ring_planes(), history):
             dst.copy_(saved)
         return step
 
+    def select_rows(step):
+        if ratio and step.requests:
+            # Fresh storage on every forward, like a live scorer. The captured
+            # MLA must read the newly built CSR, not capture's scorer tensor.
+            # The CSR scan reserves min(visible, topk) entries per live row.
+            # Match the scorer's causal count even when a replay starts at 0.
+            visible = (step.positions[:, None] + 1) // ratio
+            columns = torch.arange(4, device="cuda", dtype=torch.int32)[None, :]
+            first = torch.minimum(step.slots[0] * 4, (visible - 4).clamp_min(0))
+            valid = (columns < visible) & (step.batch_ids[:, None] >= 0)
+            step.selected[0] = torch.where(valid, first + columns, -1).contiguous()
+
+    selection_calls = []
     owner = SimpleNamespace(
         heads=heads,
         head_dim=512,
         spec=SimpleNamespace(
             layer_id=0,
-            kv_owner=None,
-            ratio=0,
+            kv_owner=0 if ratio else None,
+            ratio=ratio,
             topk_owner=0,
             index_group_start=0,
-            index_group_size=1,
+            index_group_size=group_size,
         ),
         attn_sink=torch.zeros(heads, device="cuda"),
         softmax_scale=512**-0.5,
@@ -412,23 +529,47 @@ def test_native_token_graph_replays_different_request_counts(
         wq_b=lambda q, **kw: q.clone().flatten(-2),
         _project_out=lambda output, *args: output.clone(),
     )
-    if side_stream:
-        owner.index_stream = torch.cuda.Stream()
-        marker = torch.zeros(1, device="cuda")
+    if ratio or side_stream:
+        owner.index_stream = torch.cuda.Stream() if side_stream else None
+        marker = torch.zeros(1, device="cuda") if side_stream else None
 
+        # Real Attention._select remains eager on the main stream too. An
+        # inline scorer only fills capture's step.selected, leaving replay's
+        # new BatchStep empty before _prefill_indices_live reads it.
         @eager_region(stream=lambda self: self.index_stream, live=_live_step)
         def select(self, hidden, qr, qr_scale, cache, step, rope, *, compressed):
-            marker.add_(1)
+            selection_calls.append(step)
+            if marker is not None:
+                marker.add_(1)
+            select_rows(step)
 
         owner._fork_select = MethodType(select, owner)
     owner._use_a8w4_attention = MethodType(Attention._use_a8w4_attention, owner)
     for name in (
         "_prepare_attention",
         "_prepare_attention_live",
+        "_prepare_prefill_conditional",
+        "_attend_prefill_conditional",
         "_attention_inputs",
+        "_prefill_indices_live",
+        "_attend_prefill_graph",
+        "_attend_prefill_captured",
         "_attend",
     ):
         setattr(owner, name, MethodType(getattr(Attention, name), owner))
+
+    owners = [owner]
+    for layer_id in range(1, group_size):
+        layer = SimpleNamespace(**vars(owner))
+        layer.spec = SimpleNamespace(**{**vars(owner.spec), "layer_id": layer_id})
+        # Each captured callback must retain its own layer owner. The later
+        # layers share the first layer's selection/CSR, but have separate rings.
+        for name, value in vars(owner).items():
+            if isinstance(value, MethodType):
+                setattr(layer, name, MethodType(value.__func__, layer))
+        layer._fork_select = lambda *a, **k: None
+        layer.index_stream = None
+        owners.append(layer)
 
     preparation_calls = []
     prepare_window = cache.rope_quant_window
@@ -436,7 +577,9 @@ def test_native_token_graph_replays_different_request_counts(
     def track_preparation(*args, **kwargs):
         preparation_calls.append(torch.cuda.is_current_stream_capturing())
         result = prepare_window(*args, **kwargs)
-        if cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4):
+        if not ctx.attn_metadata.step.decode and (
+            cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4)
+        ):
             source = result[0]
             reserved = ctx.attn_metadata.step.prefill_window_staging
             assert source[0].untyped_storage().data_ptr() == reserved.data_ptr()
@@ -444,19 +587,73 @@ def test_native_token_graph_replays_different_request_counts(
         return result
 
     monkeypatch.setattr(cache, "rope_quant_window", track_preparation)
+    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+
+    fused_calls = []
+    fused_prepare = cache_module.prefill_rope_window
+
+    def track_fused(*args, **kwargs):
+        fused_calls.append(torch.cuda.is_current_stream_capturing())
+        return fused_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "prefill_rope_window", track_fused)
+    commit_calls = []
+    commit_window = cache.write_window
+
+    def track_commit(layer, window_kv, step):
+        if live_fusion and step.prefill_window_fusion:
+            assert window_kv is None, "Fused producer must not write SWA twice"
+        commit_calls.append(step)
+        return commit_window(layer, window_kv, step)
+
+    monkeypatch.setattr(cache, "write_window", track_commit)
+    graph_commit_calls = []
+    graph_commit = cache.write_prefill_window_graph
+
+    def track_graph_commit(layer, window_kv, step, cached_until):
+        graph_commit_calls.append(
+            (layer, torch.cuda.is_current_stream_capturing(), cached_until.data_ptr())
+        )
+        return graph_commit(layer, window_kv, step, cached_until)
+
+    monkeypatch.setattr(cache, "write_prefill_window_graph", track_graph_commit)
+    index_calls = []
+    index_group = cache._index_group
+
+    def track_indices(spec, step, *args, **kwargs):
+        index_calls.append((spec.layer_id, step))
+        return index_group(spec, step, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "_index_group", track_indices)
+    attention_calls = []
+    from atom.models.deepseek_v41 import attention as attention_module
+
+    attend = attention_module.sparse_attn_v41_paged_2src
+
+    def track_attention(*args, **kwargs):
+        attention_calls.append(torch.cuda.is_current_stream_capturing())
+        return attend(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module, "sparse_attn_v41_paged_2src", track_attention)
 
     def forward(q, kv):
-        return Attention.forward(owner, q, kv, cache, ctx.attn_metadata.step, rope)
+        for layer in owners:
+            q = Attention.forward(layer, q, kv, cache, ctx.attn_metadata.step, rope)
+        return q
 
     query = torch.randn(1, width, heads, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(1, width, 512, device="cuda", dtype=torch.bfloat16)
-    for requests in (2, 1):
+    for requests in (4, 1):
         prepare(requests)
         forward(query, kv)
-    prepare(2)
-    if capture_empty:
-        ctx.attn_metadata.step.requests = ()
+    prepare(
+        0 if capture_batch == "empty" else 4,
+        cached_until=ring + 17 if capture_batch == "resumed" else 0,
+    )
     preparation_calls.clear()
+    attention_calls.clear()
+    graph_commit_calls.clear()
+    fused_calls.clear()
     graph = TokenGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -468,26 +665,170 @@ def test_native_token_graph_replays_different_request_counts(
             ctx.in_hipgraph = False
         torch.cuda.current_stream().wait_stream(stream)
         ctx.main_stream = torch.cuda.current_stream()
-        live_preparation = cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4)
+        live_preparation = (
+            cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4)
+        ) and not capture_attention
         expected_capture = (
-            [] if capture_empty and live_preparation else [not live_preparation]
+            []
+            if capture_batch == "empty" and live_preparation
+            else [not live_preparation]
         )
-        assert preparation_calls == expected_capture
-        for requests in (2, 1, 2):
+        assert preparation_calls == expected_capture * group_size
+        if capture_attention:
+            assert attention_calls == [True] * group_size
+            assert fused_calls == [True] * group_size
+            assert graph_commit_calls == []
+        else:
+            assert fused_calls == (
+                [False] * group_size if live_fusion and capture_batch != "empty" else []
+            )
+        # Capture can write only 64 tokens/request; this same bucket must
+        # later commit all 128 ring rows of a single 256-token request.
+        replay_cases = (
+            (4, False, False, 0, width),
+            (1, False, True, 0, width),
+            (0, False, False, 0, width),
+            (4, True, True, 0, width),
+            (2, True, False, ring + 17, width),
+            (3, True, True, (ring + 17, 0, ring + 33), width),
+            (2, True, False, 0, width),
+            (1, False, True, ring + width, width),
+            (1, False, False, 0, 16),
+            (1, False, True, 0, width),
+        )
+        replay_steps = [(*case, True, ring) for case in replay_cases]
+        # Five cache slots, four graph rows, two resumed requests, zero floors:
+        # this failed in the old live callback before attention could launch.
+        replay_steps += [
+            (2, True, False, (16, 0), width, True, 0),
+            (0, False, False, 0, width, True, 0),
+            (1, False, True, 16, width, True, 0),
+        ]
+        replay_steps += [
+            (*case, ring)
+            for case in (
+                # A DPA prefill graph also serves a decoding peer, an idle peer,
+                # then prefill again. The live callback must follow the new step.
+                [
+                    (4, False, True, 0, 4, False),
+                    (1, False, False, 0, 1, False),
+                    *(
+                        [
+                            (4, False, False, 0, 24, False),
+                            (2, False, True, 0, 12, False),
+                        ]
+                        if conditional_graph
+                        else []
+                    ),
+                    (0, False, False, 0, 4, False),
+                    (4, False, False, 0, 4, True),
+                    (1, False, False, 0, width, True),
+                ]
+                if live_fusion
+                else []
+            )
+        ]
+        for (
+            requests,
+            padded,
+            reverse,
+            cached_until,
+            live_tokens,
+            is_prefill,
+            start_pos,
+        ) in replay_steps:
             fresh_q, fresh_kv = torch.randn_like(query), torch.randn_like(kv)
-            prepare(requests)
+            step = prepare(
+                requests,
+                padded=padded,
+                reverse=reverse,
+                cached_until=cached_until,
+                live_tokens=live_tokens,
+                is_prefill=is_prefill,
+                start_pos=start_pos,
+            )
+            live = step.scheduled_tokens
             preparation_calls.clear()
+            attention_calls.clear()
+            selection_calls.clear()
+            commit_calls.clear()
+            graph_commit_calls.clear()
+            index_calls.clear()
+            fused_calls.clear()
             got = graph.replay((fresh_q, fresh_kv)).clone()
-            assert preparation_calls == ([False] if live_preparation else [])
-            prepare(requests)
+            # Validate after replay has been enqueued: a host-side assertion in
+            # the side-stream scorer could hide a missing graph dependency.
+            if ratio and requests:
+                visible = ((step.positions + 1) // ratio).clamp_max(4)
+                torch.testing.assert_close(
+                    (step.selected[0] >= 0).sum(-1),
+                    torch.where(step.batch_ids >= 0, visible, 0).to(torch.int64),
+                    rtol=0,
+                    atol=0,
+                )
+            if live_fusion:
+                assert fused_calls == (
+                    [False] * group_size
+                    if requests and is_prefill and not capture_attention
+                    else []
+                )
+                assert attention_calls == (
+                    [False] * group_size
+                    if requests and not (capture_attention and is_prefill)
+                    else []
+                )
+            assert len(commit_calls) == group_size * int(
+                bool(requests) and not (capture_attention and is_prefill)
+            )
+            assert all(s is step for s in commit_calls)
+            assert graph_commit_calls == []
+            assert len(index_calls) == int(bool(requests))
+            assert all(layer_id == 0 and s is step for layer_id, s in index_calls)
+            if ratio or side_stream:
+                assert len(selection_calls) == 1 and selection_calls[0] is step
+            assert (
+                preparation_calls
+                == (
+                    [False]
+                    if requests
+                    and (live_preparation or (conditional_graph and not is_prefill))
+                    else []
+                )
+                * group_size
+            )
+            if capture_attention and is_prefill:
+                assert attention_calls == []
+            planes = ring_planes()
+            committed = tuple(p.clone() for p in planes)
+            if not requests or np.all(step.request_cached_until >= ring + width):
+                for actual, saved in zip(committed, history):
+                    torch.testing.assert_close(actual, saved, rtol=0, atol=0)
+            prepare(
+                requests,
+                graph_layout=False,
+                fuse=False,
+                padded=padded,
+                reverse=reverse,
+                cached_until=cached_until,
+                live_tokens=live_tokens,
+                is_prefill=is_prefill,
+                start_pos=start_pos,
+            )
             expected = forward(fresh_q, fresh_kv)
+            assert torch.isfinite(got).all()
+            case_context = (
+                f"{requests=}, {padded=}, {reverse=}, {cached_until=}, "
+                f"{live_tokens=}, {is_prefill=}, {start_pos=}"
+            )
             torch.testing.assert_close(
-                got,
-                expected,
+                got[:, :live],
+                expected[:, :live],
                 rtol=0.03,
                 atol=0.02,
-                msg=lambda message, requests=requests: f"{requests} requests: {message}",
+                msg=lambda message, case=case_context: f"{case}: {message}",
             )
+            for actual, plane in zip(committed, planes):
+                torch.testing.assert_close(actual, plane, rtol=0, atol=0)
         assert len(graph.keys()) == 1
     finally:
         ctx.in_hipgraph = False

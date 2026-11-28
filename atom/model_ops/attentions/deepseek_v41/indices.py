@@ -393,6 +393,7 @@ def build_indices(
     stride=0,
     *,
     split=None,
+    out=None,
 ):
     """`layers` consecutive layers' indices, starting at `window`'s, laid out
     by `indptrs`: `ratio`'s `(prefix, extend, reserved top-k)` of
@@ -418,25 +419,38 @@ def build_indices(
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
     plane = step.running_tokens * (topk + geometry.window_size * history)
-    prefix = torch.empty(
-        layers * plane,
-        dtype=torch.int64 if packed else torch.int32,
-        device=step.positions.device,
+    extend_size = (
+        0
+        if step.decode
+        else step.running_tokens
+        * (
+            geometry.window_size
+            if split_prefill
+            else min(step.max_q_len, geometry.window_size)
+        )
     )
-    extend = torch.empty(
-        (
-            0
-            if step.decode
-            else step.running_tokens
-            * (
-                geometry.window_size
-                if split_prefill
-                else min(step.max_q_len, geometry.window_size)
-            )
-        ),
-        dtype=torch.int32,
-        device=step.positions.device,
-    )
+    if out is None:
+        prefix = torch.empty(
+            layers * plane,
+            dtype=torch.int64 if packed else torch.int32,
+            device=step.positions.device,
+        )
+        extend = torch.empty(
+            extend_size, dtype=torch.int32, device=step.positions.device
+        )
+    else:
+        prefix, extend = out
+        if (
+            prefix.shape != (layers * plane,)
+            or prefix.dtype != (torch.int64 if packed else torch.int32)
+            or extend.shape != (extend_size,)
+            or extend.dtype != torch.int32
+            or prefix.device != step.positions.device
+            or extend.device != step.positions.device
+            or not prefix.is_contiguous()
+            or not extend.is_contiguous()
+        ):
+            raise ValueError("CSR output buffers do not match the step's capacity")
     if step.running_tokens and (plane or (geometry.window_fp8 and not step.decode)):
         _indices[(step.running_tokens, layers)](
             selected if topk else prefix,

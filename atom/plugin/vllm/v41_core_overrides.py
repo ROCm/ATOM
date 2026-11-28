@@ -277,7 +277,10 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             raise RuntimeError("CSA2 cache must be allocated before serving")
         # No runner token inputs carry the query metadata here.
         self.publish_query_metadata(
-            np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
+            np.asarray(batch.num_scheduled_tokens, np.int32),
+            running_bs,
+            running_tokens,
+            is_prefill=is_prefill and not tentative,
         )
         with (
             _unverified_steps(cache)
@@ -556,6 +559,10 @@ def _attend_block(
 
     `hidden_scale_dtype` is set when `_forward` passed the scale as a uint8
     view; the scale is viewed back to it here.
+
+    Native DPA now switches captured prefill preparation/MLA against live
+    decode peers. Plugin metadata disables that native capture path; this
+    copy keeps the same Q/KV arithmetic in vLLM's existing eager break.
     """
     if hidden_scale_dtype is not None:
         hidden_scale = hidden_scale.view(hidden_scale_dtype)

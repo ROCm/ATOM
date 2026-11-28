@@ -3165,6 +3165,7 @@ class ModelRunner:
                 query_bs,
                 query_tokens,
                 forward_mode.decode_ubatch_slices,
+                is_prefill=forward_mode.is_prefill and not batch.is_mixed,
             )
         )
         spec_group = self.h2d_groups.get("spec_decode")

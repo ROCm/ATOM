@@ -442,6 +442,254 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_zero_floor_resume_publishes_cached_boundaries(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for device metadata publication")
+    geo = V41PoolGeometry(1, (), 32, 4, 512, 32, kv_dtype="fp8", layer_ratios=(0,))
+    cache = PagedAttentionCache(geo, 4, 5, device, max_tokens=8)
+    step = SimpleNamespace(
+        request_floors=np.array([0, 0], dtype=np.int32),
+        request_cached_until=np.array([16, 0], dtype=np.int32),
+        positions=torch.zeros(8, dtype=torch.int32, device=device),
+        decode=False,
+    )
+    cache.publish_replay_layout(step, 4)
+    # A resume from position zero still needs the commit boundary: keeping
+    # the five-row shared zero buffer would overwrite already-cached rows.
+    assert step.swa_replay_start.tolist() == [0, 0]
+    assert step.swa_cached_until.tolist() == [16, 0]
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize(
+    "phase", ["prefill", "single_token_prefill", "decode", "verify"]
+)
+@pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
+def test_prefill_attention_graph_fixes_only_prefill_request_capacity(
+    monkeypatch, cache_dtype, phase, graph_enabled, publication
+):
+    from atom.utils.h2d import PublicationOwner
+
+    is_prefill = phase in ("prefill", "single_token_prefill")
+    device = "cuda" if publication == "packed" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for packed metadata publication")
+    geo = V41PoolGeometry(
+        1,
+        (),
+        32,
+        4,
+        512,
+        32,
+        kv_dtype=cache_dtype,
+        speculative_tokens=2,
+        layer_ratios=(0,),
+    )
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, device, 32
+    builder.max_bs = 4
+    builder._prefill_attention_graph = graph_enabled
+    # DPA enables producer fusion while leaving the attention graph disabled.
+    builder._prefill_window_fusion = True
+    builder.cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=8)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(4, 8, 2, device, geo)
+    )
+    owner = None
+    if publication != "unbound":
+        owner = PublicationOwner(
+            device, torch.cuda.Event() if device == "cuda" else None
+        )
+        names = ("cu_seqlens_q", "batch_id_per_q_token")
+        early = owner.group(
+            "early",
+            [owner.bind(builder.model_runner.forward_vars[n], n) for n in names],
+        )
+        if publication == "packed":
+            assert early.use_packed() == "packed"
+    late_accesses = []
+    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
+    original_copy = cu.copy_to_gpu
+
+    def track_copy(*args, **kwargs):
+        late_accesses.append("prefix copy")
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(cu, "copy_to_gpu", track_copy)
+    if owner is not None:
+        original_wait = owner._wait_sources
+
+        def track_wait():
+            late_accesses.append("source wait")
+            return original_wait()
+
+        monkeypatch.setattr(owner, "_wait_sources", track_wait)
+    pointers = None
+    for count in (2, 1, 0, 2) if is_prefill else (2, 1):
+        length = 3 if phase == "verify" else (2 if phase == "prefill" else 1)
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            is_final_chunk=None,
+            replaying={},
+            state_slots_committed=list(range(count)),
+            req_ids=tuple(range(count)),
+            num_scheduled_tokens=(length,) * count,
+            context_lens=(8 + length,) * count,
+            block_tables=((0, 1),) * count,
+            total_seqs_num=count,
+            total_tokens_num=count * length,
+        )
+        if owner is not None:
+            owner.begin()
+        counts = builder.prepare_query_metadata(
+            np.asarray((length,) * count, dtype=np.int32),
+            count,
+            8,
+            is_prefill=is_prefill,
+        )
+        capacity = 4 if graph_enabled and is_prefill else count
+        assert counts == {"cu_seqlens_q": capacity + 1, "batch_id_per_q_token": 8}
+        if owner is None:
+            for name, width in counts.items():
+                builder.model_runner.forward_vars[name].copy_to_gpu(width)
+        else:
+            early.set_counts(counts)
+            early.publish()
+        late_accesses.clear()
+        metadata, _ = builder._prepare(
+            batch,
+            count,
+            8,
+            is_prefill=is_prefill,
+            tentative=phase == "verify",
+            max_q_len=None if is_prefill else length,
+        )
+        assert late_accesses == [], "The published query source must remain untouched"
+        step = metadata.step
+        if owner is not None:
+            owner.finish()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        assert step.prefill_attention_graph is (graph_enabled and is_prefill)
+        assert step.prefill_window_fusion is is_prefill
+        assert step.decode is (not is_prefill)
+        assert step.slots.numel() == capacity
+        assert step.cu_seqlens_q.tolist() == (
+            [i * length for i in range(count + 1)]
+            + [count * length] * (capacity - count)
+        )
+        assert step.batch_ids[count * length :].tolist() == [-1] * (8 - count * length)
+        if graph_enabled and is_prefill:
+            from atom.model_ops.attentions.deepseek_v41.planes import split_source
+
+            size = (capacity * geo.ring_slots + 8) * geo.window_row_bytes
+            planes = split_source(step.prefill_window_staging[:size], geo.head_dim)
+            current = tuple(p[capacity * geo.ring_slots :] for p in planes)
+            addresses = tuple(p.data_ptr() for p in (*planes, *current))
+            pointers = addresses if pointers is None else pointers
+            assert addresses == pointers
+            assert step.swa_cached_until.shape == (capacity,)
+            assert step.swa_replay_start.shape == (capacity,)
+            assert step.swa_cached_until.count_nonzero() == 0
+            assert step.swa_cached_until.data_ptr() == (
+                builder.model_runner.forward_vars[
+                    "v41_prefill_cached_until"
+                ].gpu.data_ptr()
+            )
+        elif is_prefill:
+            # Eager prefill also stages its window, at the live request width.
+            assert step.prefill_window_staging is not None
+        else:
+            assert step.prefill_window_staging is None
+
+
+@pytest.mark.parametrize("publication", ["unbound", "direct", "packed"])
+def test_prefill_replay_boundaries_publish_before_layers(monkeypatch, publication):
+    """Resumed/empty transitions reuse addresses, with no layer-local upload."""
+    from atom.utils.h2d import PublicationOwner
+
+    device = "cuda" if publication == "packed" else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required for packed metadata publication")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    buffers = builder._prefill_replay_buffers(4, device)
+    builder.model_runner = SimpleNamespace(forward_vars=buffers)
+    geo = V41PoolGeometry(1, (), 32, 4, 512, 32, kv_dtype="fp8", layer_ratios=(0,))
+    # Cache slots can outnumber the graph's request capacity. In particular,
+    # a zero-floor resume must not substitute the larger cache zero buffer.
+    cache = PagedAttentionCache(geo, 4, 5, device, max_tokens=8)
+    owner = group = None
+    if publication != "unbound":
+        owner = PublicationOwner(
+            device, torch.cuda.Event() if device == "cuda" else None
+        )
+        group = owner.group(
+            "step_metadata", [owner.bind(buf, name) for name, buf in buffers.items()]
+        )
+        if publication == "packed":
+            assert group.use_packed() == "packed"
+    copies = []
+    for name, buf in buffers.items():
+        original = buf.copy_to_gpu
+
+        def copy(*args, _name=name, _copy=original, **kwargs):
+            copies.append(_name)
+            return _copy(*args, **kwargs)
+
+        monkeypatch.setattr(buf, "copy_to_gpu", copy)
+
+    def unexpected_upload(*args, **kwargs):
+        raise AssertionError("The already-staged boundaries must not be uploaded again")
+
+    monkeypatch.setattr(cache, "publish_replay_layout", unexpected_upload)
+    pointers = None
+    for floors, cached in (
+        ([0, 0], [0, 0]),
+        ([16], [33]),
+        ([0, 0], [16, 0]),
+        ([], []),
+        ([0, 16], [0, 34]),
+    ):
+        if owner is not None:
+            owner.begin()
+        copies.clear()
+        layout = builder._stage_prefill_replay_layout(
+            np.asarray(floors, np.int32),
+            np.asarray(cached, np.int32),
+            4,
+            publication_group=group,
+        )
+        assert len(copies) == (2 if group is None else 0)
+        requests = tuple(
+            PagedRequest(i, floor, 2 * i, 2, i, (0, 1))
+            for i, floor in enumerate(floors)
+        )
+        step = begin_step(
+            cache,
+            requests,
+            is_prefill=True,
+            running_bs=4,
+            running_tokens=8,
+            floors=np.asarray(floors, np.int32),
+            cached_until=np.asarray(cached, np.int32),
+            replay_layout=layout,
+        )
+        if group is not None:
+            group.publish()
+            owner.finish()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        actual = (step.swa_replay_start, step.swa_cached_until)
+        assert [p.tolist() for p in actual] == [
+            values + [0] * (4 - len(values)) for values in (floors, cached)
+        ]
+        addresses = tuple(p.data_ptr() for p in actual)
+        pointers = addresses if pointers is None else pointers
+        assert addresses == pointers
+
+
 def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)

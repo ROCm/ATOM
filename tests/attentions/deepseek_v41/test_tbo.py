@@ -1176,10 +1176,15 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv
     hf = normalize_hf_config(json.loads(fixture.read_text()))
     runner = SimpleNamespace(
         block_size=256,
+        enforce_eager=False,
+        warmup_max_tokens=lambda: 16,
         forward_vars=metadata_buffers(2, 16, 8, "cpu"),
         config=SimpleNamespace(
             hf_config=hf,
             speculative_config=None,
+            plugin_config=None,
+            disagg_is_decode=False,
+            enable_dp_attention=False,
             kv_cache_dtype=kv_dtype,
             index_cache_dtype="fp4",
             index_cache_layout="preshuffle",

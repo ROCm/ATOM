@@ -55,6 +55,7 @@ from atom.utils.forward_context import (
 )
 from atom.utils.tbo import NUM_TBO_UBATCHES
 
+from .a8w4_attention import configured_a8w4_attention
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import (
@@ -220,6 +221,41 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # One SWA staging source per execution owner, not per attention layer.
         # Layers consume it serially; TBO children overlap and need disjoint
         # sources. Reserve before profiling so this scratch is in the budget.
+        self._prefill_attention_graph = (
+            model_runner.config.plugin_config is None
+            and not model_runner.enforce_eager
+            and not model_runner.config.disagg_is_decode
+            and any(
+                0 < tokens <= model_runner.warmup_max_tokens()
+                for tokens in envs.ATOM_TOKEN_GRAPH_SIZES
+            )
+            and not model_runner.config.enable_tbo
+            and not self._decoder_replays
+            and (
+                self.geometry.kv_dtype == "fp8"
+                or configured_a8w4_attention(model_runner.config, self.device)
+            )
+        )
+        if self._prefill_attention_graph:
+            model_runner.forward_vars.update(
+                self._prefill_replay_buffers(self.max_bs, self.device)
+            )
+        self._prefill_attention_conditional = (
+            self._prefill_attention_graph and model_runner.config.enable_dp_attention
+        )
+        # DPA can also fuse preparation without attention capture (for example
+        # enforce_eager), using the live width and published ring boundaries.
+        self._prefill_window_fusion = self._prefill_attention_graph or (
+            model_runner.config.enable_dp_attention
+            and model_runner.config.plugin_config is None
+            and not model_runner.config.disagg_is_decode
+            and not model_runner.config.enable_tbo
+            and not self._decoder_replays
+            and (
+                self.geometry.kv_dtype == "fp8"
+                or configured_a8w4_attention(model_runner.config, self.device)
+            )
+        )
         self._prefill_window_staging = (
             torch.empty(
                 (self.max_bs * self.geometry.ring_slots + self.max_num_batched_tokens)
@@ -388,6 +424,37 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             key_rope.copy_to_gpu()
             buffers[names["key_rope"]] = key_rope
         return buffers
+
+    @staticmethod
+    def _prefill_replay_buffers(max_bs, device):
+        """Fixed replay boundaries, published with the step before any layer."""
+        return {
+            name: CpuGpuBuffer(
+                max_bs,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=torch.device(device).type != "cpu",
+                publication_group="v41_step",
+            )
+            for name in ("v41_prefill_floor", "v41_prefill_cached_until")
+        }
+
+    def _stage_prefill_replay_layout(
+        self, floors, cached_until, running_bs, *, publication_group=None
+    ):
+        """Pad both boundaries at stable addresses through one step publication."""
+        return tuple(
+            self._stage(
+                name,
+                np.empty(0, np.int32) if values is None else values,
+                running_bs,
+                publication_group=publication_group,
+            )
+            for name, values in (
+                ("v41_prefill_floor", floors),
+                ("v41_prefill_cached_until", cached_until),
+            )
+        )
 
     @staticmethod
     def _engram_rows_buffer(max_num_batched_tokens, device):
@@ -788,12 +855,26 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         # The step's one upload, after everything below is staged into it.
         group = self._step_group("step_metadata")
+        prefill_graph = (
+            getattr(self, "_prefill_attention_graph", False)
+            and is_prefill
+            and not tentative
+        )
+        # One layout for every request composition in this token bucket.
+        # Padding the request metadata fixes both the history/current boundary
+        # and the scale-plane base; backing storage was reserved at the maximum.
+        # Keep the original running_bs for the compressor and scheduler plans.
+        # The early query producer already staged this final prefix width.
+        # Reusing that publication leaves its pinned source untouched here.
+        attention_bs = self.query_metadata_bs(
+            running_bs, running_tokens, is_prefill=prefill_graph
+        )
         # Published in span order, including the private dummy slots used at
         # startup.
         state_slot_out = self._populate_state_slot_mappings(
             SimpleNamespace(state_slots_committed=[span.slot for span in spans]),
             len(spans),
-            running_bs,
+            attention_bs,
             publication_group=group,
         )
         # One plan per ratio for the whole batch, into the fixed-address
@@ -833,7 +914,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             tentative=verifying,
             is_prefill=is_prefill,
             buffers=self.model_runner.forward_vars,
-            running_bs=running_bs,
+            running_bs=attention_bs,
             running_tokens=running_tokens,
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
@@ -850,6 +931,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             start_histories=histories,
             publication_group=group,
             query_prefix_ready=True,
+            replay_layout=(
+                self._stage_prefill_replay_layout(
+                    floors, cached_until, attention_bs, publication_group=group
+                )
+                if prefill_graph
+                else None
+            ),
+        )
+        step.prefill_attention_graph = prefill_graph
+        step.prefill_attention_conditional = getattr(
+            self, "_prefill_attention_conditional", False
+        )
+        step.prefill_window_fusion = (
+            getattr(self, "_prefill_window_fusion", False)
+            and is_prefill
+            and not tentative
         )
         step.request_resumes = resumes
         ubatch_slices = ubatch_slices or ()
@@ -1098,6 +1195,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 histories[k] = mapping.advance_history(None, compressed)[0]
         return resumes, floors, cached, histories
+
+    def query_metadata_bs(self, running_bs, running_tokens, *, is_prefill=False):
+        if is_prefill and getattr(self, "_prefill_attention_graph", False):
+            return min(self.max_bs, running_tokens)
+        return running_bs
 
     def query_lengths(self, batch, is_prefill, running_tokens):
         # A step lays out its scheduled spans alone (`_prepare`), a prefill
@@ -1641,7 +1743,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             is_final_chunk=None if finishing else (False,) * count,
             replaying={},
         )
-        self.publish_query_metadata(np.asarray(lengths, np.int32), count, tokens)
+        self.publish_query_metadata(
+            np.asarray(lengths, np.int32), count, tokens, is_prefill=True
+        )
         metadata, positions = self._prepare(
             batch, count, tokens, is_prefill=True, engram_live=False
         )

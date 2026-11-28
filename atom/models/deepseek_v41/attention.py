@@ -32,6 +32,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.attentions.deepseek_v41.planes import prefill_window_views
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 from atom.model_ops.deepseek_v41.compressor import Compressor
@@ -58,7 +59,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils import envs, forward_context
-from atom.utils.region_graph import eager_region, forks, join_stream
+from atom.utils.region_graph import conditional_region, eager_region, forks, join_stream
 
 from .config import AttentionMode
 from .layers import converted_linear_config, native_quant_config
@@ -77,6 +78,16 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _prefill_graph_active():
+    """A host-only branch, evaluated against this rank's live forward."""
+    metadata = forward_context.get_forward_context().attn_metadata
+    return (
+        metadata.step.prefill_attention_graph
+        and not metadata.step.decode
+        and metadata.queries is None
+    )
 
 
 def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
@@ -568,7 +579,16 @@ class Attention(nn.Module):
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
-        output = self._attend(query, cache, step, queries, prepared)
+        if (
+            getattr(step, "prefill_attention_graph", False)
+            and not step.decode
+            and queries is None
+            and prepared is not None
+            and (cache.kv_fp8 or prepared[0])
+        ):
+            output = self._attend_prefill_graph(query, cache, step, prepared)
+        else:
+            output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
             rope,
@@ -579,9 +599,36 @@ class Attention(nn.Module):
         """Capture fixed-shape preparation; stage variable sources live.
 
         A token bucket fixes ordinary BF16/fallback Q and current-KV buffers.
-        Quantized prefill also stages per-request SWA history, and bounded
-        replay may change the query rows, so those paths need live preparation.
+        Native quantized prefill may also fix its request capacity per token
+        bucket. Otherwise its SWA source addresses, and bounded replay's query
+        rows, still need live preparation.
         """
+        if (
+            getattr(step, "prefill_attention_graph", False)
+            and not step.decode
+            and queries is None
+        ):
+            a8w4 = self._use_a8w4_attention(query, cache)
+            if cache.kv_fp8 or a8w4:
+                if step.prefill_attention_conditional:
+                    query_fp8 = cache.query_fp8(query, a8w4=a8w4)
+                    source, _ = prefill_window_views(
+                        step, cache.geometry.head_dim, cache.geometry.ring_slots
+                    )
+                    self._prepare_prefill_conditional(
+                        query,
+                        kv_normed,
+                        query_fp8,
+                        cache,
+                        step,
+                        rope,
+                        queries,
+                        a8w4=a8w4,
+                    )
+                    return a8w4, query_fp8, source, None
+                return self._attention_inputs(
+                    query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+                )
         if queries is not None or (
             not step.decode
             and (cache.kv_fp8 or (cache.packed and envs.ATOM_DSV41_A8W4_ATTN != "off"))
@@ -594,6 +641,23 @@ class Attention(nn.Module):
         return self._attention_inputs(
             query, kv_normed, cache, step, rope, queries, a8w4=a8w4
         )
+
+    @conditional_region(condition=_prefill_graph_active, live=_live_rows)
+    def _prepare_prefill_conditional(
+        self, query, kv_normed, query_fp8, cache, step, rope, queries, *, a8w4
+    ):
+        if not step.prefill_attention_graph or step.decode or queries is not None:
+            self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
+            return
+        cache.rope_quant_window(
+            self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
+        )
+
+    @conditional_region(condition=_prefill_graph_active, live=_live_rows)
+    def _attend_prefill_conditional(self, query, cache, step, prepared, queries):
+        if not step.prefill_attention_graph or step.decode or queries is not None:
+            return self._attend(query, cache, step, queries, prepared=None)
+        return self._attend_prefill_captured(query, cache, step, prepared)
 
     @eager_region(live=_live_rows)
     def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
@@ -617,6 +681,55 @@ class Attention(nn.Module):
             )
             cache.rotate_query(query, rope, queries.positions, query_fp8)
         return a8w4, query_fp8, kv, window_kv
+
+    @eager_region(live=_live_step)
+    def _prefill_indices_live(self, prefix, extend, cache, step, *, a8w4):
+        """Publish live CSR; ring boundaries were published before preparation."""
+        if not step.requests:
+            # Idle DP ranks have no scorer result. Publish empty lists through
+            # zero indptrs; the captured MLA must not read stale indices.
+            cache.indptrs(step, a8w4=a8w4)
+            return
+        first = (
+            self.spec.index_group_start
+            if self.spec.index_group_size > 1
+            else self.spec.layer_id
+        )
+        cache._index_group(self.spec, step, first, 1, a8w4=a8w4, out=(prefix, extend))
+
+    def _attend_prefill_graph(self, query, cache, step, prepared):
+        if step.prefill_attention_conditional:
+            return self._attend_prefill_conditional(
+                query, cache, step, prepared, queries=None
+            )
+        return self._attend_prefill_captured(query, cache, step, prepared)
+
+    def _attend_prefill_captured(self, query, cache, step, prepared):
+        """Capture quantized MLA; fused preparation already committed its ring."""
+        a8w4, query_fp8, kv, window_kv = prepared
+        buffers, fill = cache.prefill_graph_buffers(self.spec, step, a8w4=a8w4)
+        prefix, prefix_ptr, extend, extend_ptr = buffers
+        if fill:
+            self._prefill_indices_live(prefix, extend, cache, step, a8w4=a8w4)
+        kwargs = {"pool_scale_dtype": torch.float8_e4m3fn} if a8w4 else {}
+        output = sparse_attn_v41_paged_2src(
+            tuple(part.flatten(0, 1) for part in query_fp8),
+            cache.main_view(self.spec.kv_owner),
+            prefix,
+            prefix_ptr,
+            kv,
+            extend,
+            extend_ptr,
+            self.attn_sink,
+            self.softmax_scale,
+            out=query.flatten(0, 1),
+            **kwargs,
+        )
+        if window_kv is not None:
+            cache.write_prefill_window_graph(
+                self.spec.layer_id, window_kv, step, step.swa_cached_until
+            )
+        return output
 
     @eager_region(live=_live_rows)
     def _attend(self, query, cache, step, queries, prepared=None):

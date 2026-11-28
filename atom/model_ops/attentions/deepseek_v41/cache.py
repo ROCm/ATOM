@@ -10,6 +10,7 @@ from atom.model_ops.attentions.deepseek_v41.planes import (
     gather_window_planes,
     gather_windows,
     prefill_window,
+    prefill_window_views,
     reset_windows,
     split_source,
     write_window_planes,
@@ -30,6 +31,7 @@ from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
 )
+from atom.model_ops.deepseek_v41.prefill_window import prefill_rope_window
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
@@ -413,6 +415,7 @@ class PagedAttentionCache:
         ):
             raise RuntimeError("Indptr buffers cannot be reallocated under capture")
         self.max_tokens = max(tokens, self.max_tokens)
+        self._a8w4_graph_indptr_buffers = None
         self.indptr_buffers = {
             ratio: tuple(
                 torch.empty(
@@ -474,6 +477,7 @@ class PagedAttentionCache:
         finals=None,
         start_histories=None,
         lean=False,
+        replay_layout=None,
     ):
         """`floors`, `cached_until`, `finals`, `start_histories`: per request,
         on the host, `BatchStep`'s `request_*` and `start_histories`; None for
@@ -543,6 +547,8 @@ class PagedAttentionCache:
             np.ones(count, np.bool_) if finals is None else np.asarray(finals)
         )
         step.start_histories = start_histories
+        if replay_layout is not None:
+            step.swa_replay_start, step.swa_cached_until = replay_layout
         self._reserve_prefill_window(step)
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
@@ -558,7 +564,10 @@ class PagedAttentionCache:
             return step
         self._reserve_indptrs(step.running_tokens)
         # Before the indptrs, which count each row's window from its floor.
-        self.publish_replay_layout(step, count if running_bs is None else running_bs)
+        if replay_layout is None:
+            self.publish_replay_layout(
+                step, count if running_bs is None else running_bs
+            )
         return step
 
     def publish_replay_layout(self, step, running_bs, floors=None):
@@ -571,7 +580,9 @@ class PagedAttentionCache:
         step.swa_replay_start = step.swa_cached_until = zeros
         if floors is not None:
             step.swa_replay_start = floors
-        elif step.request_floors.any() and not step.decode:
+        elif not step.decode and (
+            step.request_floors.any() or step.request_cached_until.any()
+        ):
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,
@@ -906,14 +917,18 @@ class PagedAttentionCache:
                 # Owned by this step, inside its attention capture region.
                 # A TBO child or bounded query step must not overwrite the
                 # parent's BF16 adapter indptrs or another child's buffers.
-                buffers = {
-                    ratio: torch.empty(
-                        (2, step.running_tokens + 1),
-                        dtype=torch.int32,
-                        device=step.positions.device,
-                    ).unbind()
-                    for ratio in self.geometry.layer_ratios
-                }
+                buffers = (
+                    self._prefill_graph_indptrs(a8w4=True)
+                    if getattr(step, "prefill_attention_graph", False)
+                    else {
+                        ratio: torch.empty(
+                            (2, step.running_tokens + 1),
+                            dtype=torch.int32,
+                            device=step.positions.device,
+                        ).unbind()
+                        for ratio in self.geometry.layer_ratios
+                    }
+                )
                 step.a8w4_indptrs = fill_step_indptrs(
                     step, self.geometry, buffers, split=True
                 )
@@ -1057,12 +1072,11 @@ class PagedAttentionCache:
     ):
         """Rotate the query, quantize the KV row, and store it where it can be.
 
-        A decode stores the row and produces nothing: no query of a decode
-        attends to it, so the window write folds in here. A prefill produces
-        the row and stores nothing, because the queries in this very chunk have
-        yet to read the rows a store would overwrite -- that write stays behind
-        attention, in `write_window`. The cache layout only decides the
-        payload, so both halves of that read the same either way.
+        A decode writes the ring directly. Fused native quantized prefill
+        snapshots the old ring and commits the new rows in the same producer;
+        attention reads staging, either captured or live for DPA. Other paths
+        leave the commit behind attention, in `write_window`, to preserve its
+        historical reads.
 
         Returns the attention's second source -- BF16 current KV, or for
         A8W8/A8W4 a contiguous pair with batch-local history and current KV -- and
@@ -1103,6 +1117,34 @@ class PagedAttentionCache:
             )
             return None, None
         quantized_attn = self.kv_fp8 or a8w4
+        if (
+            quantized_attn
+            and window_fp8
+            and (
+                getattr(step, "prefill_attention_graph", False)
+                or getattr(step, "prefill_window_fusion", False)
+            )
+            and query is not None
+            and query_fp8 is not None
+            and kv.is_cuda
+        ):
+            history = self.ring_view(layer)
+            source, _ = prefill_window_views(step, dim, self.geometry.ring_slots)
+            prefill_rope_window(
+                *seam,
+                query_fp8,
+                history,
+                source,
+                step.batch_ids,
+                step.cu_seqlens_q,
+                step.slots,
+                step.swa_cached_until,
+                ring=self.geometry.ring_slots,
+                rope_dim=rope.rope_dim,
+            )
+            # History was snapshotted before the fused producer committed.
+            # Quantized MLA reads this staging source, so no later write is owed.
+            return source, None
         qat = None if quantized_attn else torch.empty_like(kv)
         values = scales = None
         attention_source = qat
@@ -1177,6 +1219,22 @@ class PagedAttentionCache:
                 min(step.max_q_len, window.ring_slots),
                 cached_until=cached,
             )
+
+    def write_prefill_window_graph(self, layer, kv, step, cached_until):
+        """Capture the existing fused data/scale writer after MLA.
+
+        Its token grid is fixed by the bucket. Live batch IDs and lengths
+        mask padding and select each request's final ring, even when replay
+        has a longer request than capture. The resume boundary is graph-owned.
+        """
+        write_window_planes(
+            *kv,
+            self.ring_view(layer),
+            step,
+            self.geometry.window(layer, self.num_pages),
+            self.geometry.head_dim,
+            cached_until,
+        )
 
     def window_target(self, layers, step):
         """Where a kernel writing ``layers``' fp8 windows itself puts a step's
@@ -1272,7 +1330,56 @@ class PagedAttentionCache:
             ]
         return [self.state_bytes[slot]]
 
-    def _index_group(self, spec, step, first, layers, *, a8w4=False):
+    def _prefill_graph_indptrs(self, *, a8w4=False):
+        """Fixed CSR pointers for native prefill graphs only.
+
+        Keep A8W4 separate from the BF16 adapter's pointers. Allocate once
+        before the graph's first live fill; eager, TBO and bounded-query
+        steps keep their existing per-step A8W4 allocations.
+        """
+        if not a8w4:
+            return self.indptr_buffers
+        if self._a8w4_graph_indptr_buffers is None:
+            self._a8w4_graph_indptr_buffers = {
+                ratio: tuple(torch.empty_like(p) for p in pair)
+                for ratio, pair in self.indptr_buffers.items()
+            }
+        return self._a8w4_graph_indptr_buffers
+
+    def prefill_graph_buffers(self, spec, step, *, a8w4=False):
+        """Graph-owned CSR lists, shared by an index group.
+
+        The caller records one eager fill for the first layer. It writes these
+        lists directly from the live selection; MLA replays their fixed addresses.
+        No per-replay CSR allocation or copy is needed. Ring boundaries have
+        already been published at fixed addresses with the step metadata.
+        """
+        first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
+        key = (first, "graph_a8w4" if a8w4 else "graph_fp8")
+        built = step.group_indices.get(key)
+        if built is not None:
+            return built, False
+        buffers = self._prefill_graph_indptrs(a8w4=a8w4)
+        prefix_ptr, extend_ptr = buffers[spec.ratio]
+        tokens = step.running_tokens
+        built = (
+            torch.empty(
+                tokens * self.geometry.batch_topk(spec.ratio),
+                dtype=torch.int32,
+                device=step.positions.device,
+            ),
+            prefix_ptr[: tokens + 1],
+            torch.empty(
+                tokens * self.geometry.window_size,
+                dtype=torch.int32,
+                device=step.positions.device,
+            ),
+            extend_ptr[: tokens + 1],
+        )
+        step.group_indices[key] = built
+        return built, True
+
+    def _index_group(self, spec, step, first, layers, *, a8w4=False, out=None):
         """One build covering `layers` consecutive layers from `first`.
 
         The per-layer ring offset is read off the geometry rather than
@@ -1296,4 +1403,5 @@ class PagedAttentionCache:
             layers,
             stride,
             split=True if a8w4 else None,
+            out=out,
         )

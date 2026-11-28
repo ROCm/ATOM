@@ -18,6 +18,7 @@ from atom.utils.region_graph import (
     TokenGraph,
     _record_segments,
     _weak,
+    conditional_region,
     eager_region,
     join_stream,
     token_graph,
@@ -425,3 +426,68 @@ def test_a_region_argument_keeps_its_named_tuple_type():
     assert type(weak) is Pair and weak.width == 64
     assert weak.values.data_ptr() == value.values.data_ptr()
     assert type(_weak((value.values, 1))) is tuple
+
+
+@torch.inference_mode()
+def test_conditional_regions_keep_live_fallback_and_side_stream_inputs(context):
+    state = {"step": SimpleNamespace(graph=True, scale=2.0)}
+    calls = []
+
+    class ConditionalToy(Toy):
+        @eager_region(live=lambda: {"step": state["step"]})
+        def tail(self, x, step):
+            return x * step.scale
+
+        @conditional_region(
+            condition=lambda: state["step"].graph,
+            live=lambda: {"step": state["step"]},
+        )
+        def branch(self, x, step):
+            calls.append((step.graph, torch.cuda.is_current_stream_capturing()))
+            if step.graph:
+                return self.tail(x * 2, step)
+            # A newly allocated output must reach the recorded next segment.
+            return x * step.scale + 3
+
+        def forward(self, x):
+            y = x + 1
+            self.beside(y)
+            y = self.branch(y, state["step"])
+            y = self.branch(y, state["step"])
+            join_stream(self.side)
+            return y + self.side_out[x.shape[0]]
+
+    model = ConditionalToy()
+    _set(0.5, 0)
+    graph = TokenGraph()
+    stream = torch.cuda.Stream()
+    for n in (32, 8):
+        model.side_out[n] = torch.zeros(n, 64, device="cuda")
+        x = torch.randn(n, 64, device="cuda")
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            context.main_stream = stream
+            model(x)
+            calls.clear()
+            graph.record(model, (x,))
+            assert calls == [(True, True)] * 2
+        torch.cuda.current_stream().wait_stream(stream)
+    context.main_stream = torch.cuda.current_stream()
+    try:
+        for n, use_graph, scale in (
+            (8, True, 0.5),
+            (32, False, 3.0),
+            (8, False, -1.0),
+            (32, True, 4.0),
+            (8, True, 2.0),
+        ):
+            state["step"] = SimpleNamespace(graph=use_graph, scale=scale)
+            x = torch.randn(n, 64, device="cuda")
+            calls.clear()
+            actual = graph.replay((x,)).clone()
+            assert calls == ([] if use_graph else [(False, False)] * 2)
+            expected = model(x)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        graph.release_graphs()
