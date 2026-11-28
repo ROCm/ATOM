@@ -1378,7 +1378,20 @@ def _replayssm_ut_fwd_kernel(
 
 
 def _serial_launch_config(
-    N: int, HV: int, V: int, max_query_len: int, is_kda: bool
+    N: int,
+    HV: int,
+    V: int,
+    max_query_len: int,
+    is_kda: bool,
+    *,
+    H: int,
+    K: int,
+    cache_len: int,
+    input_dtypes: tuple[
+        torch.dtype, torch.dtype, torch.dtype, torch.dtype, torch.dtype
+    ],
+    record_dtypes: tuple[torch.dtype, torch.dtype, torch.dtype],
+    state_dtype: torch.dtype,
 ) -> tuple[int, int, int]:
     """(BV, num_warps, num_stages) for `_replayssm_fwd_kernel`.
 
@@ -1397,10 +1410,27 @@ def _serial_launch_config(
 
     The small-batch rule is gated to gfx950, the only architecture it was
     measured on. The gfx1250 ladder below is gated to the one shape it was
-    measured on; other shapes and gfx942 keep the large-batch config.
+    measured on. The gfx942 rule is limited to its measured single-sequence
+    head shape, verify window, record capacity and dtypes.
     """
     if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
+    if (
+        not is_kda
+        and (N, H, HV, K, V, max_query_len, cache_len) == (1, 8, 24, 128, 128, 4, 16)
+        and input_dtypes
+        == (
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            torch.bfloat16,
+        )
+        and record_dtypes == (torch.bfloat16, torch.bfloat16, torch.float32)
+        and state_dtype == torch.float32
+        and get_gfx_runtime() == "gfx942"
+    ):
+        return 16, 1, 3
     if (
         not is_kda
         and HV == 48
@@ -1573,7 +1603,19 @@ def replayssm_gated_delta_rule(
         )
         return o
 
-    BV, num_warps, num_stages = _serial_launch_config(N, HV, V, max_query_len, is_kda)
+    BV, num_warps, num_stages = _serial_launch_config(
+        N,
+        HV,
+        V,
+        max_query_len,
+        is_kda,
+        H=H,
+        K=K,
+        cache_len=cap,
+        input_dtypes=(q.dtype, k.dtype, v.dtype, g.dtype, beta.dtype),
+        record_dtypes=(buf_k.dtype, buf_u.dtype, buf_g.dtype),
+        state_dtype=ckpt.dtype,
+    )
     NV = triton.cdiv(V, BV)
     # Replay tile height: the cursor can reach cap - max_query_len before a
     # flush resets it, and `tl.dot` wants at least 16 rows on CDNA, so a
