@@ -764,8 +764,8 @@ def test_engine_compatibility_refuses_what_phase_one_does_not_move():
     cfg = parse_mooncake_store_config(_extra())
     check_engine_compatibility(cfg, _config())
     state_owning = _config()
-    state_owning.hf_config.model_type = "kimi_linear"
-    with pytest.raises(ValueError, match="M3 PAGE layout, and V4.1's replay PAGEs"):
+    state_owning.hf_config.model_type = "qwen3_next"
+    with pytest.raises(ValueError, match="this model resolves to 'qwen'"):
         check_engine_compatibility(cfg, state_owning)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))

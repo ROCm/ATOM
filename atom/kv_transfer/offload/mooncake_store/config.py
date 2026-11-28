@@ -183,19 +183,27 @@ def parse_mooncake_store_config(
     )
 
 
+def store_state_tier(config: Any) -> bool:
+    """Whether this model's Store objects come with checkpoint images of its
+    per-request state (Kimi-K3's KDA state)."""
+    return offcfg.select_offload_layout(config) == "kimi_k3"
+
+
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Accept dense, M3 PAGE, and V4.1 replay PAGEs; refuse other layouts and DCP.
+    """Accept dense, M3 PAGE, V4.1 replay PAGEs and Kimi-K3; refuse other
+    layouts and DCP.
 
     M3 uses complete PAGE regions, including its NSA index cache. V4.1's PAGE
     regions are stored the same way and its request state is rebuilt by replay.
     That V4.1 on the Store needs bounded replay is the model's own runtime gate
-    (`deepseek_v41.config.validate_runtime_config`). Other hybrid layouts need a
-    state tier this connector does not carry. A DCP rank's pages cover a
-    virtual block that the chunk keys do not name.
+    (`deepseek_v41.config.validate_runtime_config`). Kimi-K3 stores its KDA
+    state images beside its dense KV (`mooncake_store.state_tier`). Other hybrid
+    layouts need a state tier this connector does not carry. A DCP rank's pages
+    cover a virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is neither dense, M3, nor V4.1, DCP > 1, or the
-            chunk is not a whole number of KV blocks.
+        ValueError: The model is not dense, M3, V4.1 or Kimi-K3, DCP > 1, or
+            the chunk is not a whole number of KV blocks.
     """
     require_mooncake_layout(offcfg.select_offload_layout(config))
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)

@@ -561,6 +561,8 @@ def state_tier_capability(config) -> StateTierCapability:
         return replace(none, reason=str(exc))
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
+    if name == "mooncake_store" and layout != "kimi_k3":
+        return replace(none, reason=f"the Mooncake Store keeps no {layout!r} state")
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size > 1 and not state_tier_spans_pipeline(layout):
         return replace(
@@ -610,6 +612,19 @@ def _lmcache_engine_config(config):
     return build_lmcache_config(kvcfg)
 
 
+def _offload_connector(config) -> tuple[str | None, dict]:
+    """The state tier's connector name and transfer config, `multi` unwrapped."""
+    cfg = getattr(config, "kv_transfer_config", None) or {}
+    if not isinstance(cfg, dict):
+        return None, {}
+    if cfg.get("kv_connector") == "multi":
+        sub, _why = _offload_subconfig(cfg)
+        if sub is None:
+            return None, {}
+        cfg = sub
+    return cfg.get("kv_connector"), cfg
+
+
 def state_tier_cpu_entries(spec, config) -> int:
     """Checkpoint images each worker's state tier keeps.
 
@@ -628,8 +643,17 @@ def state_tier_cpu_entries(spec, config) -> int:
     return state_tier_cpu_bytes() * stages // spec.pipeline_op_bytes
 
 
+def state_tier_index_cap(spec, config) -> int | None:
+    """The engine index's entry cap: the CPU tier's, or None for the Mooncake
+    Store, which evicts on its own and whose touches report what is gone."""
+    if spec is None or _offload_connector(config)[0] == "mooncake_store":
+        return None
+    return state_tier_cpu_entries(spec, config)
+
+
 def state_tier_chunk_tokens(config) -> int:
-    """The LMCache chunk size in tokens for the joint KV leg, or 0.
+    """The tier's chunk size in tokens for the joint KV leg (LMCache's, or
+    the Mooncake Store's `mooncake_store.chunk_tokens`), or 0.
 
     Decided from config for the same reason `state_tier_capability` is: this
     runs in the engine process at `BlockManager.__init__`, and the scheduler
@@ -646,6 +670,13 @@ def state_tier_chunk_tokens(config) -> int:
     disable the joint KV load.
     """
     try:
+        name, cfg = _offload_connector(config)
+        if name == "mooncake_store":
+            from atom.kv_transfer.offload.mooncake_store.config import (
+                store_chunk_tokens,
+            )
+
+            return store_chunk_tokens(cfg)
         return int(_lmcache_engine_config(config).chunk_size)
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
@@ -662,8 +693,11 @@ def state_tier_chunk_tokens(config) -> int:
 
 def state_tier_verified_for_s(config) -> float:
     """`tier_verified_for_s` for one worker's LMCache CPU pool, the floor
-    when it cannot be read. Like `state_tier_chunk_tokens`, call it only when
-    a tier is hosted."""
+    when it cannot be read or the tier is a Mooncake Store. Like
+    `state_tier_chunk_tokens`, call it only when a tier is hosted."""
+    if _offload_connector(config)[0] == "mooncake_store":
+        # The Store evicts on its own clock; a touch's read lease lasts 10 s.
+        return _TIER_VERIFIED_MIN_S
     try:
         pool_gib = float(_lmcache_engine_config(config).max_local_cpu_size)
     except Exception:  # noqa: BLE001 - `state_tier_chunk_tokens` logged why
@@ -678,4 +712,4 @@ def state_tier_verified_for_s(config) -> float:
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
-_STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
+_STATE_TIER_BACKENDS = frozenset({"lmcache_offload", "mooncake_store"})

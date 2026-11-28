@@ -40,6 +40,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
+    store_state_tier,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
@@ -150,6 +151,9 @@ class _StoreLookup(StoreLookupBase):
                 pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
         self._next_warning_at: dict[str, float] = {}
+        # A rebuildable state's images, asked in the same RPC as the chunks
+        # (`state_tier.WindowImageProbe`).
+        self.image_probe = None
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
@@ -167,9 +171,12 @@ class _StoreLookup(StoreLookupBase):
         if not chunks:
             return 0
         keys = self._rank_keys(hashes, 0, chunks)
-        merged = self._ask(keys)
+        probe = self.image_probe
+        images, image_keys = probe.keys(seq) if probe is not None else ([], [])
+        merged = self._ask(keys + image_keys)
         if merged is None:
             return None
+        merged, image_codes = merged[: len(keys)], merged[len(keys) :]
         # Per rank, the run of chunks from chunk 0 some pool holds: at least
         # `held` (an unanswered key counts as absent), at most `bound` (as
         # present).
@@ -195,6 +202,9 @@ class _StoreLookup(StoreLookupBase):
             hit,
             (time.perf_counter() - started) * 1000,
         )
+        if probe is not None:
+            # Indexed on the scheduler thread with the hit (`state_tier`).
+            seq._store_state_images = probe.present(images, image_codes)
         return hit
 
     def renew(self, seq: Any, start: int, end: int) -> int:
@@ -401,6 +411,21 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
     LABEL = "Mooncake Store offload"
     # It answers `lookup_ready`, so the scheduler may start its loads early.
     supports_early_load = True
+
+    def __new__(cls, config: Any = None, *args: Any, **kwargs: Any):
+        # Registered once for every layout; one with state adds its tier.
+        # No config: `copy` and `pickle` rebuilding an instance.
+        if (
+            cls is MooncakeStoreOffloadScheduler
+            and config is not None
+            and store_state_tier(config)
+        ):
+            from atom.kv_transfer.offload.mooncake_store.state_tier import (
+                MooncakeStoreStateScheduler,
+            )
+
+            return super().__new__(MooncakeStoreStateScheduler)
+        return super().__new__(cls)
 
     def __init__(self, config: Any) -> None:
         kvc = getattr(config, "kv_transfer_config", {}) or {}

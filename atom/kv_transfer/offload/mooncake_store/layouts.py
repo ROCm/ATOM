@@ -3,8 +3,9 @@
 
 """The layouts the Mooncake Store offload moves, and the codec for each.
 
-Dense KV, M3 complete PAGEs and V4.1 replay PAGEs: every row of the
-store-agnostic table in :mod:`atom.kv_transfer.offload.kv_store.layouts`.
+Dense KV, M3 complete PAGEs, V4.1 replay PAGEs and Kimi-K3's dense KV: every
+row of the store-agnostic table in :mod:`atom.kv_transfer.offload.kv_store.layouts`.
+A layout with a state tier (`store_state_tier`) adds checkpoint images beside.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 
 from atom.kv_transfer.offload.kv_store.layouts import (
     DENSE_CODEC_ID,
+    KIMI_K3_CODEC_ID,
     REPLAY_PAGE_CODEC_ID,
     STORE_LAYOUTS,
     StoreLayout,
@@ -20,10 +22,10 @@ from atom.kv_transfer.offload.kv_store.layouts import (
 )
 
 _LAYOUTS = StoreLayouts(
-    ("dense", "m3", "dsv41"),
+    ("dense", "m3", "dsv41", "kimi_k3"),
     refusal=(
         "the Mooncake Store offload moves the dense KV layout, M3 PAGE "
-        "layout, and V4.1's replay PAGEs"
+        "layout, V4.1's replay PAGEs, and Kimi-K3's KV with its state"
     ),
 )
 
@@ -62,6 +64,7 @@ def build_mooncake_codec(
 
 __all__ = [
     "DENSE_CODEC_ID",
+    "KIMI_K3_CODEC_ID",
     "MOONCAKE_LAYOUTS",
     "REPLAY_PAGE_CODEC_ID",
     "build_mooncake_codec",
