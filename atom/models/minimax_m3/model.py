@@ -3,6 +3,9 @@
 
 """Inference-only MiniMax-M3 model support for ATOM."""
 
+import contextlib
+import logging
+import weakref
 from typing import ClassVar
 
 import torch
@@ -17,7 +20,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -44,8 +47,28 @@ from atom.model_ops.linear import (
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod, moe_after_router_hook
 from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+try:  # aiter with the grouped MoE output epilogue (routed scale + shared add)
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_output_epilogue as _moe_output_epilogue,
+    )
+except ImportError:  # pragma: no cover - older aiter keeps the separate ops
+    _moe_output_epilogue = None
+try:  # aiter with the routed MoE tail deferred into the next all-reduce
+    from aiter.ops.flydsl.moe_deferred_tail import moe_defer_tail as _moe_defer_tail
+except ImportError:  # pragma: no cover - older aiter: the flag is a no-op
+    _moe_defer_tail = None
+try:  # aiter with the shared-expert fold into the routed MoE GEMMs
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        moe_shared_expert_fold as _moe_shared_expert_fold,
+    )
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        prepare_shared_fold_weights as _prepare_shared_fold_weights,
+    )
+except ImportError:  # pragma: no cover - older aiter: the flag is a no-op
+    _moe_shared_expert_fold = _prepare_shared_fold_weights = None
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -60,6 +83,19 @@ from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
+
+# ATOM_MINIMAX_M3_SHARED_FOLD: batches of at most this many tokens keep the
+# separate shared MLP. aiter's T<=64 fold launch (routed GEMM2 16x128 with the
+# 64x64 shared tiles) was measured nondeterministic under hot-expert routing
+# (16% of launches wrote garbage 16-B pieces into routed rows, MI455X); larger
+# buckets measured 0/300. Remove once that launch is fixed.
+_SHARED_FOLD_MAX_DECLINED_TOKENS = 64
+_shared_fold_floor_logged = False
+
+# The largest MoE call whose tail is deferred into the next all-reduce (the k5
+# one-shot kernel's row cap; larger calls would only run the deferred launch in
+# front of another AR path).
+_TAIL_IN_AR_MAX_ROWS = 256
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -285,6 +321,53 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+def _unshuffled(shuffle, shuffled: torch.Tensor) -> torch.Tensor:
+    """Undo ``shuffle``, a pure byte permutation of a 1-byte tensor: shuffle the
+    byte planes of an index tensor of the same shape and dtype to get its map."""
+    n = shuffled.numel()
+    idx = torch.arange(n, device=shuffled.device, dtype=torch.int64).view(
+        shuffled.shape
+    )
+    src = torch.zeros(n, device=shuffled.device, dtype=torch.int64)
+    for b in range(4):
+        plane = ((idx >> (8 * b)) & 0xFF).to(torch.uint8).view(shuffled.dtype)
+        src |= shuffle(plane).view(torch.uint8).reshape(-1).to(torch.int64) << (8 * b)
+    raw = torch.empty_like(shuffled)
+    raw.view(torch.uint8).view(-1)[src] = shuffled.view(torch.uint8).reshape(-1)
+    return raw
+
+
+def _shared_fold_weights_of(mlp: "MiniMaxM3MLP") -> dict | None:
+    """The shared expert's weights in aiter's fold layouts, or None when it is
+    not a pair of native MXFP8 1x32 linears (or not yet loaded)."""
+    from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
+
+    parts = []
+    for lin in (mlp.gate_up_proj, mlp.down_proj):
+        w, s = lin.weight.data, getattr(lin, "weight_scale", None)
+        if (
+            getattr(lin, "native_a8_group_rows", None) != 1
+            or s is None
+            or w.dtype != torch.float8_e4m3fn
+            or w.dim() != 2
+            or getattr(lin, "bias", None) is not None
+        ):
+            return None
+        s = s.data
+        if getattr(lin.weight, "is_shuffled", False) or getattr(
+            w, "is_shuffled", False
+        ):
+            w = _unshuffled(lambda t: shuffle_weight(t, layout=(16, 16)), w)
+            s = _unshuffled(shuffle_mxfp8_bpreshuffle_scale, s)
+        if s.shape != (w.shape[0], w.shape[1] // 32):
+            return None
+        parts += [w, s]
+    w13, s13, w2, s2 = parts
+    if w13.shape[0] != 2 * w2.shape[1] or w13.shape[1] != w2.shape[0]:
+        return None
+    return _prepare_shared_fold_weights(w13, s13, w2, s2)
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -295,6 +378,7 @@ class MiniMaxM3MoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         del layer_id
@@ -357,23 +441,298 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        # The shared gate_up's input is `quantize_fp8(hidden_states)` when it
+        # is a native group-32 FP8/W4A8 linear; the MXFP4 experts' A1 quant can
+        # write those bytes in its own pass (ATOM_MINIMAX_M3_MOE_QUANT_SHARED).
+        self.shared_input_from_moe_quant = (
+            envs.ATOM_MINIMAX_M3_MOE_QUANT_SHARED
+            and self.shared_experts is not None
+            and self.shared_experts.gate_up_proj.native_a8_group_rows is not None
+            and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Router GEMM + biased top-k in one aiter launch (bitwise the same
+        # routing); FusedMoE says whether its routing and experts take it.
+        self._front_fusion = bool(
+            hasattr(self.experts, "supports_fused_router")
+            and self.experts.supports_fused_router(self.gate.weight)
+        )
+
+        self.alt_stream = alt_stream
+        self.prefix = prefix
+        self._use_dual_stream = False
+        # The shared expert folded into the routed GEMM launches at decode
+        # token counts (from the dual-stream op, eager); its weights in the
+        # fold's layouts are built once loaded (`process_weights_after_loading`).
+        self._shared_fold = bool(
+            envs.ATOM_MINIMAX_M3_SHARED_FOLD
+            and _moe_shared_expert_fold is not None
+            and self.shared_experts is not None
+            and not self.shared_input_from_moe_quant
+            and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+        )
+        self._shared_fold_weights = None
+        global _shared_fold_floor_logged
+        if self._shared_fold and not _shared_fold_floor_logged:
+            _shared_fold_floor_logged = True
+            logging.getLogger("atom").info(
+                "MiniMax-M3 shared fold: batches of <= %d tokens keep the separate "
+                "shared MLP (the T<=64 fold launch is nondeterministic)",
+                _SHARED_FOLD_MAX_DECLINED_TOKENS,
+            )
+        # Token counts aiter did not fold (e.g. routed tiles it has no shared
+        # tile for): their first call ran the shared MLP after the routed one;
+        # later calls take the dual-stream path. Decided in warm-up, before
+        # graph capture.
+        self._shared_fold_declined: set[int] = set()
+        # The routed scale and the shared add folded into the routed MoE's
+        # gather-reduce. Python-side state, so only the paths that run eagerly
+        # inside the dual-stream custom op take it (`_use_dual_stream`).
+        self._glue_epilogue = (
+            _moe_output_epilogue
+            if (
+                _moe_output_epilogue is not None
+                and self.shared_experts is not None
+                and not self.shared_input_from_moe_quant
+                and isinstance(self.experts.quant_method, Mxfp4MoEMethod)
+            )
+            else None
+        )
+        # With the glue epilogue or the shared fold, the gather-reduce (+ routed scale + shared add) is left to the all-reduce that reads this
+        # layer's output (aiter `moe_defer_tail`); `_owner_layer` (set by the
+        # decoder layer) tells whether anything else reads it (forward hooks).
+        self._tail_in_ar = bool(
+            (self._glue_epilogue is not None or self._shared_fold)
+            and _moe_defer_tail is not None
+            and tp_size > 1
+            and get_pp_group().world_size == 1
+        )
+        self._owner_layer = None
+        # The router launches before the shared MLP's kernels (dual stream + glue
+        # epilogue + fused router only).
+        self._routed_first = bool(
+            self._glue_epilogue is not None and self._front_fusion
+        )
+        if self.shared_experts is not None and (
+            self.alt_stream is not None or self._shared_fold
+        ):
+            atom_config = get_current_atom_config()
+            if (
+                envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+                and not atom_config.enable_tbo
+            ):
+                self._use_dual_stream = True
+                atom_config.compilation_config.static_forward_context[prefix] = self
+
+    def process_weights_after_loading(self) -> None:
+        # Parent-first: the shared linears are normally still unshuffled here.
+        if self._shared_fold:
+            self._shared_fold_weights = _shared_fold_weights_of(self.shared_experts)
+
+    def _shared_fold_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routed + shared in the routed MoE's launches; the separate shared
+        MLP after the routed one when aiter did not take the fold (and the
+        token count is then remembered as declined)."""
+        defer = getattr(self, "_tail_in_ar", False) and self._defer_tail_now(
+            hidden_states
+        )
+        # The fold's gather-reduce (+ routed
+        # scale + its shared rows) may go to the next all-reduce too.
+        with (
+            _moe_shared_expert_fold(
+                self._shared_fold_weights, self._routed_scale()
+            ) as fold,
+            _moe_defer_tail() if defer else contextlib.nullcontext(),
+        ):
+            routed_output = self._route_and_experts(hidden_states)
+        if fold.consumed:
+            return routed_output
+        self._shared_fold_declined.add(hidden_states.shape[0])
+        return self._scale_routed(routed_output) + self.shared_experts(hidden_states)
+
+    def _routed_scale(self) -> float:
+        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+            return float(self.routed_scaling_factor)
+        return 1.0
+
+    def _scale_routed(self, routed_output: torch.Tensor) -> torch.Tensor:
+        scale = self._routed_scale()
+        if scale != 1.0:
+            routed_output = routed_output * scale
+        return routed_output
+
+    def _route_and_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The routed experts' TP-partial output, before the routed scale."""
+        if self._front_fusion:
+            return self.experts.forward_fused_router(hidden_states, self.gate.weight)
+        router_logits = self.gate(hidden_states)
+        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
+    def _defer_tail_now(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this call's routed tail may go to the next all-reduce: the flag,
+        a decode-sized call, and nothing but the next layer's input AR (or the
+        final norm's) reading this layer's output: no forward hook on this layer,
+        no forward pre-hook on the next one (DSpark / Eagle3 taps), no global
+        module hook."""
+        if not self._tail_in_ar or hidden_states.shape[0] > _TAIL_IN_AR_MAX_ROWS:
+            return False
+        from torch.nn.modules import module as _nn_module
+
+        if _nn_module._global_forward_hooks or _nn_module._global_forward_pre_hooks:
+            return False
+        owner = self._owner_layer() if self._owner_layer is not None else None
+        if owner is None or owner._forward_hooks:
+            return False
+        nxt = getattr(owner, "_next_layer", None)
+        nxt = nxt() if nxt is not None else None
+        return nxt is None or not nxt._forward_pre_hooks
+
+    def _routed_plus_shared(
+        self,
+        hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+        before_add=None,
+        launch_shared=None,
+    ) -> torch.Tensor:
+        """`_scale_routed(routed) + shared_output` with the scale and the add in
+        the routed MoE's gather-reduce when aiter takes the epilogue; `before_add`
+        (the wait for the stream producing `shared_output`) runs right before
+        that launch, or before the separate add when it did not.
+
+        `launch_shared` (routed first, `shared_output` None): launches the shared
+        MLP and returns its output; it runs right after the router launch (or
+        after the routed MoE when no router hook ran). The gather-reduce may be
+        deferred into the all-reduce that reads the returned (then unwritten)
+        tensor."""
+        defer = getattr(self, "_tail_in_ar", False) and self._defer_tail_now(
+            hidden_states
+        )
+        with self._glue_epilogue(
+            shared_output, self._routed_scale(), before=before_add
+        ) as epilogue:
+            with contextlib.ExitStack() as stack:
+                if launch_shared is not None:
+
+                    def _after_router():
+                        epilogue.addend = launch_shared()
+
+                    stack.enter_context(moe_after_router_hook(_after_router))
+                if defer:
+                    stack.enter_context(_moe_defer_tail())
+                routed_output = self._route_and_experts(hidden_states)
+            if launch_shared is not None and epilogue.addend is None:
+                # No router launch ran the hook: the shared MLP after the routed one.
+                epilogue.addend = launch_shared()
+        if epilogue.consumed:
+            return routed_output
+        if before_add is not None:
+            before_add()
+        if launch_shared is not None:
+            shared_output = epilogue.addend
+        return self._scale_routed(routed_output) + shared_output
+
+    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the routed E128/top-4 branch and keep its TP-partial output."""
+        return self._scale_routed(self._route_and_experts(hidden_states))
+
+    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = self.gate(hidden_states)
-
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
-
+        if self.shared_input_from_moe_quant:
+            # Serial only: the shared expert reads the routed quant's output
+            # here, so the two branches are not independent. The dual-stream
+            # path below keeps the shared expert's own quant.
+            if self._front_fusion:
+                routed_output, shared_x, shared_x_scale = (
+                    self.experts.forward_fused_router_with_mxfp8_copy(
+                        hidden_states, self.gate.weight
+                    )
+                )
+            else:
+                router_logits = self.gate(hidden_states)
+                routed_output, shared_x, shared_x_scale = (
+                    self.experts.forward_with_mxfp8_copy(hidden_states, router_logits)
+                )
+            routed_output = self._scale_routed(routed_output) + self.shared_experts(
+                shared_x, x_scale=shared_x_scale
+            )
+            return routed_output.view(orig_shape)
+        if getattr(self, "_glue_epilogue", None) is not None and self._use_dual_stream:
+            # Reached only from the dual-stream op (eager), see `_glue_epilogue`.
+            shared_output = self.shared_experts(hidden_states)
+            return self._routed_plus_shared(hidden_states, shared_output).view(
+                orig_shape
+            )
+        routed_output = self.routed_expert_forward(hidden_states)
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
-
         return routed_output.view(orig_shape)
+
+    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Overlap the independent shared MLP with the routed MoE branch (or,
+        with the shared fold, run it inside the routed MoE's launches)."""
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, orig_shape[-1])
+        if (
+            getattr(self, "_shared_fold_weights", None) is not None
+            and hidden_states.shape[0] > _SHARED_FOLD_MAX_DECLINED_TOKENS
+            and hidden_states.shape[0] not in self._shared_fold_declined
+        ):
+            return self._shared_fold_forward(hidden_states).view(orig_shape)
+        if self.alt_stream is None:
+            return self.single_stream_moe_forward(hidden_states).view(orig_shape)
+        current_stream = torch.cuda.current_stream()
+        alt_stream = self.alt_stream
+
+        if (
+            getattr(self, "_routed_first", False)
+            and getattr(self, "_glue_epilogue", None) is not None
+        ):
+            # The shared MLP forks here as before but is launched after the router,
+            # so the router is the fork's first dependent launch (a captured graph
+            # keeps it on this stream).
+            fork = torch.cuda.Event()
+            fork.record(current_stream)
+            launched = []
+
+            def launch_shared() -> torch.Tensor:
+                alt_stream.wait_event(fork)
+                with torch.cuda.stream(alt_stream):
+                    launched.append(self.shared_experts(hidden_states))
+                return launched[0]
+
+            output = self._routed_plus_shared(
+                hidden_states,
+                None,
+                before_add=lambda: current_stream.wait_stream(alt_stream),
+                launch_shared=launch_shared,
+            )
+            launched[0].record_stream(current_stream)
+            return output.view(orig_shape)
+
+        alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(alt_stream):
+            shared_output = self.shared_experts(hidden_states)
+
+        if getattr(self, "_glue_epilogue", None) is not None:
+            # The join moves to right before the gather-reduce that adds it.
+            output = self._routed_plus_shared(
+                hidden_states,
+                shared_output,
+                before_add=lambda: current_stream.wait_stream(alt_stream),
+            )
+            shared_output.record_stream(current_stream)
+            return output.view(orig_shape)
+
+        routed_output = self.routed_expert_forward(hidden_states)
+        current_stream.wait_stream(alt_stream)
+        shared_output.record_stream(current_stream)
+        return (routed_output + shared_output).view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_dual_stream:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -631,6 +990,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
         layer_num: int = 0,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         attn_cls = (
@@ -655,7 +1015,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 params_dtype=params_dtype,
                 prefix=f"{prefix}.block_sparse_moe",
+                alt_stream=alt_stream,
             )
+            # The deferred MoE tail asks this layer whether anything
+            # (forward hooks) reads its output besides the next all-reduce.
+            if hasattr(self.block_sparse_moe, "_owner_layer"):
+                self.block_sparse_moe._owner_layer = weakref.ref(self)
         else:
             self.mlp = MiniMaxM3MLP(
                 config=config,
@@ -771,6 +1136,12 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and getattr(config, "n_shared_experts", 0)
+            else None
+        )
+        alt_stream = self.alt_stream
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: layer_type(
@@ -781,10 +1152,16 @@ class MiniMaxM3Model(nn.Module):
                 quant_config=quant_config,
                 layer_num=layer_num,
                 params_dtype=atom_config.torch_dtype,
+                alt_stream=alt_stream,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        # Deferred MoE tail: a layer's output is the next layer's input
+        # (its forward pre-hooks read it too).
+        for idx in range(self.start_layer, self.end_layer - 1):
+            if isinstance(self.layers[idx], MiniMaxM3DecoderLayer):
+                self.layers[idx]._next_layer = weakref.ref(self.layers[idx + 1])
 
         if get_pp_group().is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
