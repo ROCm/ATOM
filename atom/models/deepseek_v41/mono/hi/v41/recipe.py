@@ -371,8 +371,8 @@ def sgpr_spill_ok(sparse: int, source: Source | None, rows: int | None = None, e
     ok = kn["SPILL_OK"]
     if ok != "auto":
         return bool(ok)
-    if kn["RESIDUAL"] == "auto":  # (residual_layout's rule; tp unknown: a TP build)
-        shard = residual_layout(2 if tp is None else tp, split, kn, rows) == "sharded"
+    # tp unknown: a TP build
+    shard = residual_layout(2 if tp is None else tp, split, kn, rows) == "sharded"
     shard = shard and bool(kn["SHARD_SPILL_OK"])
     return (
         source is not None
