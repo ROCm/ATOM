@@ -4,7 +4,7 @@
 import warnings
 
 import torch
-from aiter import mixed_sample_outer_exponential, topk_select
+from aiter import mixed_sample_outer_exponential, spec_verify_pick, topk_select
 from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
@@ -148,6 +148,66 @@ class Sampler(nn.Module):
             needs_independent_noise=True,
             any_greedy=any_greedy,
         )
+
+    def fuses_verify_picks(
+        self,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> bool:
+        """Whether ``verify_picks`` makes a sampled verify step's picks: the
+        unfiltered temperature path, which is the only one it implements.
+        The caller adds what the sampler cannot see (an all-greedy batch, a
+        lossless ratio verify, grammar constraints, no verification rows)."""
+        return not self._needs_filtering(top_ks, top_ps)
+
+    def verify_picks(
+        self,
+        logits: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(target_token_ids, bonus_token_ids)`` of a sampled verify step in
+        one aiter launch: what ``sample_verification_tokens`` and the bonus
+        ``forward`` call return on an unfiltered batch that is not all greedy.
+
+        The noise is the two calls' own draws, in their order: one
+        ``[verification rows, vocab]`` ``exponential_(1)``, then one
+        ``[requests, vocab]``. ``aiter.spec_verify_pick`` reads each row where
+        it lies in ``logits`` (no ``index_select``), gives a verification row
+        its request's temperature, and picks the lowest-id argmax on rows at or
+        below ``SAMPLER_EPS`` and the race of ``mixed_sample_outer_exponential``
+        on the others. That race scales by ``1/T`` before subtracting the row
+        max, where ``fused_mixed_sample`` subtracts first, so on the same noise
+        the two can pick different tokens on a near tie at small ``T``: the
+        law sampled is the same, the tokens are not bit for bit those of the
+        two-call path.
+        """
+        rows, requests = target_logits_indices.numel(), bonus_logits_indices.numel()
+        vocab_size, device = logits.shape[1], logits.device
+        noise_target = torch.empty(
+            (rows, vocab_size), dtype=torch.float, device=device
+        ).exponential_(1)
+        noise_bonus = torch.empty(
+            (requests, vocab_size), dtype=torch.float, device=device
+        ).exponential_(1)
+        target_token_ids = torch.empty(rows, dtype=torch.int32, device=device)
+        bonus_token_ids = torch.empty(requests, dtype=torch.int32, device=device)
+        spec_verify_pick(
+            target_token_ids,
+            bonus_token_ids,
+            logits,
+            noise_target,
+            noise_bonus,
+            temperatures,
+            target_logits_indices,
+            bonus_logits_indices,
+            cu_num_draft_tokens,
+            eps=self.eps,
+            greedy_eps=SAMPLER_EPS,
+        )
+        return target_token_ids, bonus_token_ids
 
     def forward(
         self,
