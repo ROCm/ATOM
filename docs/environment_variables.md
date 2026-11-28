@@ -335,6 +335,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 | **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_SPLITK_CONSUMER_REDUCE_MAX_M** | int | 64 | MiniMax-M3: a batch of at most this many tokens whose tuned per-token FP8 GEMM splits K leaves the split-K reduction to the kernel that consumes its output, for two GEMMs: the QKV GEMM (reduced by the q/k norm + RoPE + cache kernel) and the dense MLP gate/up GEMM (reduced by SwiGLU-OAI). One kernel launch less per GEMM, same output bits. Takes effect on gfx1250 only; elsewhere M3 keeps the plain GEMM and SwiGLU-OAI path. aiter's deferred GEMM then decides per call whether it defers. `0` keeps the standalone reduce kernel. **Needs aiter with #7449 and #8011**; upgrade ATOM and aiter together. |
 
 ### Llama-style
 

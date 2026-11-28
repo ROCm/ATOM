@@ -45,9 +45,10 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_reducing
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
+from atom.models.minimax_m3.splitk import defer_qkv_splitk_reduce, defer_splitk_reduce
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -271,17 +272,24 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # gate_up's only reader is the activation (its op takes a set limit).
+        defer_splitk_reduce(self.gate_up_proj, self.swiglu_limit is not None)
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
-        x = swiglu_oai_split(
-            gate_up,
-            alpha=self.swiglu_alpha,
-            beta=self.swiglu_beta,
-            limit=self.swiglu_limit,
-        )
+        if self.gate_up_proj.splitk_consumer_max_m > 0:
+            x = swiglu_oai_split_reducing(
+                gate_up, self.swiglu_alpha, self.swiglu_beta, self.swiglu_limit
+            )
+        else:
+            x = swiglu_oai_split(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
         return self.down_proj(x)
 
 
@@ -442,6 +450,8 @@ class MiniMaxM3Attention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
+        # q/k/v in forward are views of qkv for shapes only.
+        defer_qkv_splitk_reduce(self.qkv_proj, self.attn)
 
     def forward(
         self,
@@ -595,6 +605,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
+        defer_qkv_splitk_reduce(self.qkv_proj, self.attn)
 
     def forward(
         self,
