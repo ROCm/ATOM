@@ -23,11 +23,12 @@ mean the same thing in both. The catalog is the human-facing authority; this fil
 what `triage.py expand` injects. Where they differ, they differ on purpose, and the
 two divergences are recorded here so neither reads as drift:
 
-**This file carries 22 rules the catalog does not.** `A4 A5 B7 D10 D11 E4 F2 G2`
+**This file carries 23 rules the catalog does not.** `A4 A5 B7 D10 D11 E4 F2 G2`
 extend existing families; `H` (batch object invariants), `I` (stateful cache
 invariants) and `T` (Triton kernel review) are new families; `N1-N6` are distilled
 from `references/maintainer-lens.md` section 3 -- the maintainer's lens -- so a
-reviewer reading the lens and a bot applying `N1-N6` are applying the same standard.
+reviewer reading the lens and a bot applying `N1-N6` are applying the same standard;
+`N7` extends that family from ATOM#3353.
 `HK1-HK7` are here too, as the Housekeeping table rather than numbered bodies.
 
 **This file does not carry `P1-P5`.** The catalog's performance-evidence family was
@@ -681,6 +682,34 @@ This rule does not say the workaround is wrong. It says the card must carry the 
 the reason it is not being fixed here, so the reviewer decides that rather than inheriting it.
 → `⚠️ [FILE]:[LINE] describes itself as [WORD] — name the underlying defect and say why it
 is handled here rather than at its source, or drop the wording if it is not actually temporary`
+
+**N7 — a mode-, model- or switch-specific attribute added to a common engine object** ⚠️
+The engine objects every request goes through — `InputOutputProcessor`, `LLMEngine`, the
+scheduler, the model runner, a shared layer — are common code: their attributes are the
+contract every caller, subclass and test double relies on. A field that exists only to serve
+one mode, one model or one env switch does not belong on them. Put that mode's state in the
+mode's own module and plug it in through a generic hook (a validator registered at startup,
+a check inside the module that owns the mode) instead of growing the common object.
+Trigger, either shape: (a) an added `self.<attr> = envs.ATOM_<X> == "<value>"` (or `!=` /
+`in`) under `atom/model_engine/` — a boolean derived from one mode value of one switch, kept
+on a common object; or (b) the same attribute name assigned in added lines of two or more
+files under `tests/` *and* introduced as `self.<attr> =` in an added line under `atom/`. Shape
+(b) is the stronger signal: when unrelated test doubles each need the new field patched in,
+the field has leaked into an object those tests never cared about. Plain tunables read once
+into `self` (`self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK`) are not this rule.
+Real example (ATOM#3353, "[DP] ATOM_DP_LM_HEAD_MODE=argmax: exchange the DP-sharded LM head's
+greedy ids, not logits", MERGED as `4cc9fbe7`): `atom/model_engine/llm_engine.py` gained
+`self._greedy_ids_only = envs.ATOM_DP_LM_HEAD_MODE == "argmax"` in
+`InputOutputProcessor.__init__` and read it in `preprocess`, and the PR set
+`_greedy_ids_only=False` on test doubles in four unrelated test files
+(`test_io_processor_fanout.py`, `test_required_channel.py`, `test_structured_admission.py`,
+`test_dspark_admission.py`). The first test that built a processor without `__init__`
+(`tests/entrypoints/test_empty_prompt.py`) broke non-GPU unit tests on `main` with
+`AttributeError: 'InputOutputProcessor' object has no attribute '_greedy_ids_only'`.
+Jin Lingpeng: "不要加这些奇怪的属性" (don't add these odd attributes). The fix moves the
+greedy-only admission check into the argmax mode's own module and deletes the four patched
+test fields.
+→ `⚠️ [attr] on [common class] serves only [mode/model/switch] — keep that state in the mode's own module and reach it through a generic hook; test doubles needing the field patched in is the symptom`
 
 ### T — Triton Kernel Review
 
