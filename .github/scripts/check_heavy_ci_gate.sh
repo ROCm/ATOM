@@ -106,7 +106,8 @@ check_relevant_paths() {
   fi
 
   local changed_files filter_result filter_status
-  if ! changed_files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"; then
+  # One line a file: its path, a tab, and its path before a rename.
+  if ! changed_files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | "\(.filename)\t\(.previous_filename // "")"')"; then
     echo "Failed to query PR changed files; skipping heavy CI."
     emit_undecidable "files-query-failed"
     exit 0
@@ -119,7 +120,12 @@ import fnmatch
 import os
 import sys
 
-files = [line.strip() for line in os.environ["CHANGED_FILES"].splitlines() if line.strip()]
+# GitHub lists at most this many files; a list that long may be cut short.
+MAX_LISTED_FILES = 3000
+
+entries = [line for line in os.environ["CHANGED_FILES"].splitlines() if line.strip()]
+# A change touches both sides of a rename.
+files = sorted({path.strip() for line in entries for path in line.split("\t") if path.strip()})
 ignore_patterns = [
     line.strip()
     for line in os.environ.get("CI_GATE_PATHS_IGNORE", "").splitlines()
@@ -145,6 +151,10 @@ relevant = [
     if (not include_patterns or any(matches(pattern, path) for pattern in include_patterns))
     and not any(matches(pattern, path) for pattern in ignore_patterns)
 ]
+
+if len(entries) >= MAX_LISTED_FILES:
+    print(f"Changed files: {len(entries)} listed, possibly cut short; none ruled out")
+    sys.exit(0)
 
 print(f"Changed files: {len(files)}; relevant files for this workflow: {len(relevant)}")
 for path in relevant[:20]:

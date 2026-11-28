@@ -1,0 +1,9 @@
+# Code owners. main's ruleset requires a review from a code owner, so a PR
+# needs an approval from an owner of every file it changes before it merges,
+# and only such an approval makes its review decision APPROVED: the approval
+# that authorizes heavy CI (.github/scripts/ci_gate). GitHub reads this file
+# from a PR's base branch, so a PR cannot change its own reviewers.
+#
+# Owners: to be filled in. A pattern with no owners leaves its files unowned,
+# and an unowned file needs no code owner's review.
+*

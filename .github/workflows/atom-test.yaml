@@ -65,6 +65,18 @@ jobs:
       smoke_requested: ${{ steps.gate.outputs.smoke_requested }}
       pr_check_takeover: ${{ steps.gate.outputs.pr_check_takeover }}
     steps:
+      - name: Authorize manual run
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          allowed="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" \
+            --jq '.user.permissions.admin or .user.permissions.maintain')"
+          if [ "${allowed}" != "true" ]; then
+            echo "::error::A manual run of ${GITHUB_WORKFLOW} needs the maintain or admin role; ${ACTOR} has neither. Ask a maintainer to trigger it."
+            exit 1
+          fi
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
@@ -75,26 +87,30 @@ jobs:
           CI_GATE_PR_CHECK_JOB: Offline inference smoke test
           CI_GATE_NOOP_JOB: Check Heavy CI Gate (no-op label)
           CI_GATE_LABELS: ci:full,ci:atom
+          # What can change this workflow's PR run: the product code it tests,
+          # every area a PR run may execute (ci_gate/suites.py RUN_AREAS) and
+          # this workflow. Unit tests, docs, tools and other workflows cannot.
+          # tests/test_ci_gate_suites.py keeps this equal to ci_gate/suites.py.
+          CI_GATE_PATHS_INCLUDE: |
+            atom/**
+            setup.py
+            pyproject.toml
+            MANIFEST.in
+            README.md
+            .gitattributes
+            scripts/**
+            docker/**
+            .github/scripts/**
+            .github/actions/**
+            .github/benchmark/**
+            .github/runner-config.yml
+            .github/workflows/golden_outputs/**
+            .github/workflows/atom-test.yaml
+          # The product code the plugin and ATOMesh suites test.
           CI_GATE_PATHS_IGNORE: |
-            **/*.md
-            docs/**
-            .claude/**
-            atomrl/**
-            .github/workflows/atomrl-*.yaml
+            atom/*.md
             atom/plugin/**
             atom/mesh/**
-            .github/benchmark/models_atomesh.yaml
-            .github/scripts/atomesh/**
-            .github/workflows/atomesh-*.yaml
-            .github/workflows/atom-review-bot*.yml
-            .github/scripts/atomesh_*.sh
-            .github/dashboard/atomesh_*.html
-            .github/workflows/atom-vllm-*.yaml
-            .github/workflows/atom-sglang-*.yaml
-            .github/benchmark/oot_models_accuracy.json
-            .github/benchmark/sglang_models_accuracy.json
-            LICENSE
-            .gitignore
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash ./.github/scripts/check_heavy_ci_gate.sh

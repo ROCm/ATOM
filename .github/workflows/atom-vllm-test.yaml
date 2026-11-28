@@ -47,20 +47,27 @@ jobs:
           CI_GATE_WORKFLOW: atom-vllm-test.yaml
           CI_GATE_LABELS: ci:full,ci:vllm
           # Approval alone does not start the vllm plugin CI: a PR runs it
-          # when it changes the plugin, its CI or its image, or carries
+          # when it changes the plugin, any area a PR run may execute
+          # (ci_gate/suites.py RUN_AREAS) or this workflow, or carries
           # ci:vllm / ci:full. Core-only changes are covered by the nightly.
+          # tests/test_ci_gate_suites.py keeps this equal to ci_gate/suites.py.
           CI_GATE_PATHS_INCLUDE: |
             atom/plugin/**
+            setup.py
+            pyproject.toml
+            MANIFEST.in
+            README.md
+            .gitattributes
+            scripts/**
+            docker/**
+            .github/scripts/**
+            .github/actions/**
+            .github/benchmark/**
+            .github/runner-config.yml
+            .github/workflows/golden_outputs/**
             .github/workflows/atom-vllm-test.yaml
-            .github/scripts/plugin_ci/**
-            .github/scripts/atom_oot_test.sh
-            .github/scripts/check_mtp_acceptance.sh
-            .github/benchmark/oot_models_accuracy.json
-            docker/atom_release.dockerfile
-            docker/vllm_release.dockerfile
-            docker/patches/**
           CI_GATE_PATHS_IGNORE: |
-            **/*.md
+            atom/*.md
             atom/plugin/sglang/**
             atom/plugin/rtpllm/**
             .github/scripts/plugin_ci/run_sglang_ci.sh

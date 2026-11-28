@@ -1,0 +1,101 @@
+name: CI Evaluator
+
+# Writes each heavy-CI suite's Status (e.g. "ATOM Test Status") on a PR's head
+# commit from the PR's current state: .github/scripts/ci_gate/README.md.
+#
+# Shadow phase: the Statuses are marked [preview] and are not required; the
+# re-runs, cancels and dependency holds a decision asks for are only listed
+# in the job summary, next to the old gate's result for comparison.
+#
+# pull_request_target and workflow_run always run this file from the default
+# branch, and no job checks out PR code.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft, labeled, unlabeled, closed]
+  workflow_run:
+    # By name; evaluate.py keeps only the suites' files and the relay.
+    workflows: ["ATOM Test", "ATOM SGLang Test", "ATOM vLLM Test", "Atomesh Accuracy Validation", "CI Review Relay"]
+    types: [completed]
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to evaluate; empty runs the scheduled pass"
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: Resolve PRs to evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.resolve.outputs.prs }}
+    steps:
+      - name: Checkout the gate code from the default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/ci_gate
+          persist-credentials: false
+
+      - name: Resolve
+        id: resolve
+        working-directory: .github/scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_GATE_PR: ${{ inputs.pr }}
+        run: python3 -m ci_gate.evaluate resolve
+
+  evaluate:
+    name: "Evaluate PR #${{ matrix.pr }}"
+    needs: resolve
+    if: ${{ needs.resolve.outputs.prs != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
+    # One evaluation of a PR at a time, across every trigger; a queued one is
+    # replaced by a newer one, which reads the PR afresh.
+    concurrency:
+      group: ci-evaluator-pr-${{ matrix.pr }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
+      statuses: write
+    steps:
+      - name: Checkout the gate code from the default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/ci_gate
+          persist-credentials: false
+
+      - name: Evaluate
+        working-directory: .github/scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: python3 -m ci_gate.evaluate evaluate "${PR_NUMBER}"
+
+      - name: Show the failure on the PR
+        if: ${{ failure() }}
+        working-directory: .github/scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: python3 -m ci_gate.evaluate error "${PR_NUMBER}"

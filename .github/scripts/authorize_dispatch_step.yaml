@@ -1,0 +1,18 @@
+# The first step of every root job of a manually dispatchable workflow that
+# reaches a self-hosted runner: a manual run goes on only for a user with the
+# maintain or admin role on the repository. tests/test_ci_dispatch_authorization.py
+# checks that every such workflow starts with exactly this step, on a
+# GitHub-hosted runner, so the check runs before a self-hosted runner is taken.
+# The token's implicit Metadata: read is enough for the permission endpoint.
+name: Authorize manual run
+if: ${{ github.event_name == 'workflow_dispatch' }}
+env:
+  GH_TOKEN: ${{ github.token }}
+  ACTOR: ${{ github.triggering_actor }}
+run: |
+  allowed="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" \
+    --jq '.user.permissions.admin or .user.permissions.maintain')"
+  if [ "${allowed}" != "true" ]; then
+    echo "::error::A manual run of ${GITHUB_WORKFLOW} needs the maintain or admin role; ${ACTOR} has neither. Ask a maintainer to trigger it."
+    exit 1
+  fi

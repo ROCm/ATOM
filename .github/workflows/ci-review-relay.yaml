@@ -1,0 +1,25 @@
+name: CI Review Relay
+
+# Tells the CI evaluator (ci-evaluator.yaml) that a review changed, through its
+# workflow_run trigger: a pull_request_review run of a fork PR gets a
+# read-only token. The run title carries the PR number; the evaluator re-reads
+# the PR itself, so nothing here is trusted. A PR whose merge commit predates
+# this file never runs it; the evaluator's scheduled pass covers those.
+run-name: "review-relay #${{ github.event.pull_request.number }}"
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  relay:
+    name: Relay review event
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Note the PR
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "Review event on PR ${PR_NUMBER}; the CI evaluator re-reads it."
