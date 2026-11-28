@@ -371,6 +371,10 @@ def producer(*, live: int = 4, transfer: int = 2):
     conn._num_state_slots = live + transfer
     conn._locate_transfer_slots()
     conn._staged_sources = {}
+    # Each transfer's KV-ready event (`_source_ready`); `queue_push` marks its
+    # prefill finished unless told otherwise.
+    conn._kv_ready_lock = threading.Lock()
+    conn._kv_ready_events, conn._kv_ready_expired = {}, {}
     conn._write_requests = queue.Queue()
     conn._pending_writes = []
     conn._sending_writes = {}
@@ -401,8 +405,12 @@ def producer(*, live: int = 4, transfer: int = 2):
     return conn
 
 
-def queue_push(conn, transfer_id: int, src_slot: int, *, queued_at=None):
+def queue_push(
+    conn, transfer_id: int, src_slot: int, *, queued_at=None, prefilled=True
+):
     """A consumer's WRITE_REQ for `transfer_id`, accepted and waiting."""
+    if prefilled:
+        conn._kv_ready_expired[transfer_id] = None
     request = {
         "transfer_id": transfer_id,
         "src_slot_index": src_slot,
@@ -513,6 +521,20 @@ def test_a_transfer_slot_is_pushed_only_once_its_copy_landed():
     conn._service_write_requests()
     assert (conn.pushed, conn._pending_writes) == ([9], [])
     assert conn.reports == [{"decode_req_id": "d9", "ok": True}]
+
+
+def test_a_landed_copy_still_waits_for_the_prefill_forward():
+    conn = producer()
+    queue_push(conn, 9, src_slot=5, prefilled=False)
+    stage(conn, {9: (1, 5)})
+    conn._staged_sources[9].done = True
+    forward = FakeEvent()
+    conn._kv_ready_events[9] = forward
+    conn._service_write_requests()
+    assert (conn.pushed, len(conn._pending_writes)) == ([], 1)
+    forward.done = True
+    conn._service_write_requests()
+    assert (conn.pushed, conn._pending_writes) == ([9], [])
 
 
 def test_a_copy_that_never_lands_fails_after_the_handshake_timeout(caplog):

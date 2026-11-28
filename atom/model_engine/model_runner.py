@@ -901,6 +901,9 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # ATOM_MORIIO_DIAG_POST_READY and ATOM_DRAFT_SLOT_CHECK, set in __init__.
+    _diag_post_ready: ClassVar[bool] = False
+    _draft_slot_check: Any = None
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1001,6 +1004,17 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
+        self._diag_post_ready = envs.ATOM_MORIIO_DIAG_POST_READY
+        if use_spec and envs.ATOM_DRAFT_SLOT_CHECK:
+            from atom.spec_decode.slot_check import DraftSlotCheck
+
+            def describe(blocks: list[int]) -> str:
+                describe_blocks = getattr(get_kvconnector(), "describe_blocks", None)
+                return describe_blocks(blocks) if callable(describe_blocks) else "-"
+
+            self._draft_slot_check = DraftSlotCheck(
+                self.block_size, self.device, describe
+            )
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
@@ -4065,6 +4079,12 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
+        if self._diag_post_ready:
+            note = getattr(get_kvconnector(), "note_forward", None)
+            if callable(note):
+                note(batch, self.block_size, self.num_spec_tokens)
+        if self._draft_slot_check is not None:
+            self._draft_slot_check.begin_forward(batch)
         (
             input_ids,
             temperatures,

@@ -237,6 +237,19 @@ class KVPoolMemory(ABC):
     #: parts takes them all from one `allocate` then.
     single_allocation: bool = True
 
+    #: Whether `allocate` returns fabric-exportable VMM memory, which a fabric
+    #: transport can register as it is.
+    exports_fabric: bool = False
+
+    #: Whether this memory is offered only so a transport gets the kind it
+    #: moves. Under `multi` another sub's pool stands in for it when that pool
+    #: is of the same kind (see `serves`).
+    transport_only: bool = False
+
+    def serves(self, other: KVPoolMemory) -> bool:
+        """Whether this pool can stand in for `other` (a `transport_only` one)."""
+        return self.exports_fabric or not other.exports_fabric
+
     @abstractmethod
     def allocate(self, nbytes: int, device: torch.device) -> torch.Tensor:
         """A zero-filled `uint8` buffer of `nbytes` on `device`."""
