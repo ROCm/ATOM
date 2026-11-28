@@ -1,0 +1,19 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261128",
+ "digest": "sha256:58d7808f5fbfdf020616ebfc421327e095e839d2b59d1b296861ff09dca8d2fd",
+ "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261124",
+ "atom": {
+  "commit": "380aeb8a094e6506ae08d31f6e0189af302420c5",
+  "date": "2026-11-27",
+  "title": "Allocate Kimi's block-residual bank once per forward (#3577)"
+ },
+ "aiter": {
+  "commit": "9da5928186becafe81dd2b63a9031dfdabcece52",
+  "date": "2026-11-27",
+  "title": "[Triton/Gluon] Add gfx942 FP8 head-dim-256 MHA config (#7516)"
+ },
+ "dependency_changes": [
+  "google-re2 1.1.20251105 (new; ATOM main dependency)",
+  "llguidance 1.9.1 (new; ATOM main dependency)"
+ ]
+}
