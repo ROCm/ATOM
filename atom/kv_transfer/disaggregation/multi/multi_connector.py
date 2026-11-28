@@ -453,6 +453,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         tier = self._prefetch_tier()
         return tier is not None and tier.lowers_hbm_hit_to_chunk
 
+    @property
+    def needs_hbm_probe_before_lookup(self):
+        tier = self._prefetch_tier()
+        return tier is not None and tier.needs_hbm_probe_before_lookup
+
     def held_tier_hit(self, seq):
         tier = self._prefetch_tier()
         return 0 if tier is None else int(tier.held_tier_hit(seq))

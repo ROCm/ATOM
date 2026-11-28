@@ -4025,15 +4025,21 @@ class Scheduler:
         """`(hbm_probe, probed_tier_kv, detachable)` for a request about to be
         admitted: the HBM probe and tier answer the detach decision was made on,
         and whether its lookup may be left unanswered. `(None, (0, 0), False)`
-        when detaching is off, for the admission to probe once it has the
-        connector's answer (`_reprobe_after_tier_answer`)."""
-        if not self._lookup_detach_enabled(seq):
+        when neither detaching nor the connector
+        (`needs_hbm_probe_before_lookup`) wants the HBM hit before the lookup,
+        for the admission to probe once it has the connector's answer
+        (`_reprobe_after_tier_answer`)."""
+        detach = self._lookup_detach_enabled(seq)
+        if not (detach or self._connector_flag("needs_hbm_probe_before_lookup")):
             return None, (0, 0), False
         probe = self._probe_hbm_prefix(seq)
+        seq.offload_hbm_probe_tokens = (
+            max(0, probe.num_cached_blocks) * self.block_manager.hash_block_size
+        )
         return (
             probe,
             self._tier_hit(seq),
-            self._can_detach_tier_lookup(seq, probe.num_cached_blocks),
+            detach and self._can_detach_tier_lookup(seq, probe.num_cached_blocks),
         )
 
     def _reprobe_after_tier_answer(

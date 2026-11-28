@@ -131,6 +131,10 @@ class KVConnectorSchedulerBase(ABC):
     chunk_size: int = 0
     lowers_hbm_hit_to_chunk: bool = False
     supports_early_load: bool = False
+    # A tier holding what HBM evicted rather than a copy of it is asked only
+    # past the HBM hit, which the scheduler then probes before every lookup
+    # (`Sequence.offload_hbm_probe_tokens`).
+    needs_hbm_probe_before_lookup: bool = False
 
     def lookup_ready(self, seq: Any) -> bool:
         """Whether `seq`'s tier answer can be consumed without a round trip."""

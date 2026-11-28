@@ -670,6 +670,28 @@ def lmcache_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
     return connector_integer(extra, "lmcache.chunk_size", envs.LMCACHE_CHUNK_SIZE)
 
 
+def lmcache_save_policy(kv_transfer_config: Mapping[str, Any] | None) -> str:
+    """The in-process tier's ``save_policy``: ``eager`` (the default) stores
+    every prompt chunk a prefill computes, ``lazy`` only the blocks the GPU
+    prefix cache is about to evict (`LazySaveSchedulerMixin`).
+
+    Read from ``kv_connector_extra_config``, else the connector's top level; a
+    value in either that is neither is refused rather than read as eager.
+    """
+    found = [
+        source["save_policy"]
+        for source in (connector_extras(kv_transfer_config), kv_transfer_config or {})
+        if "save_policy" in source
+    ]
+    for policy in found:
+        if policy not in ("eager", "lazy"):
+            raise ValueError(
+                f"lmcache_offload: unknown save_policy={policy!r}; expected "
+                "'eager' or 'lazy'"
+            )
+    return found[0] if found else "eager"
+
+
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
     """Apply ``{"lmcache.<field>": value}`` extras from kv_transfer_config."""
     if not kv_transfer_config:

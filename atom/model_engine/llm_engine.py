@@ -609,6 +609,9 @@ class LLMEngine:
             # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
             "lookups_skipped_by_memo",
             "suppressed_load_retries",
+            # Keyed blocks HBM evicted before a lazy demotion stored them
+            # (`LazySaveSchedulerMixin`); absent under the eager policy.
+            "lazy_evicted_unsaved",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)

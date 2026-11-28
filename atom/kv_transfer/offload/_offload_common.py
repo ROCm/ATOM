@@ -822,8 +822,9 @@ class OffloadSchedulerMixin(ABC):
         scheduler thread each time it is retried) suppresses the next attempt.
         """
 
-        # sid -> (weak ref to the sequence asked about, hit or None, budget).
-        self._tier_hit_memo: dict[str, tuple[object, int | None, int]] = {}
+        # sid -> (weak ref to the sequence asked about, hit or None, budget,
+        # the prompt position the lookup started at).
+        self._tier_hit_memo: dict[str, tuple[object, int | None, int, int]] = {}
         self._tier_memo_steps = envs.OFFLOAD_LOOKUP_MEMO_STEPS
         self._tier_retry_steps = envs.OFFLOAD_LOOKUP_RETRY_STEPS
 
@@ -845,6 +846,12 @@ class OffloadSchedulerMixin(ABC):
             # then released by the ordinary lifecycle drops below.
             return lambda seq=seq: seq
 
+    def _tier_lookup_start(self, seq) -> int:
+        """The chunk-aligned prompt position `seq`'s tier lookup starts at: 0,
+        the whole prompt, unless the tier holds only what HBM evicted
+        (`LazySaveSchedulerMixin`). A remembered hit answers that start only."""
+        return 0
+
     def _remembered_tier_hit(self, seq, sid: str) -> tuple[bool, int | None]:
         """`(answered, hit)` -- spending one step of this entry's budget.
 
@@ -855,11 +862,11 @@ class OffloadSchedulerMixin(ABC):
         entry = memo.get(sid) if memo else None
         if entry is None:
             return False, None
-        ref, hit, budget = entry
-        if ref() is not seq or budget <= 0:
+        ref, hit, budget, start = entry
+        if ref() is not seq or budget <= 0 or start != self._tier_lookup_start(seq):
             memo.pop(sid, None)
             return False, None
-        memo[sid] = (ref, hit, budget - 1)
+        memo[sid] = (ref, hit, budget - 1, start)
         self.total_lookups_skipped_by_memo += 1
         return True, hit
 
@@ -871,6 +878,7 @@ class OffloadSchedulerMixin(ABC):
             self._weak_seq(seq),
             None if hit is None else int(hit),
             int(budget),
+            self._tier_lookup_start(seq),
         )
 
     def _last_tier_hit(self, seq, sid: str) -> int | None:

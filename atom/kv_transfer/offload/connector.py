@@ -13,6 +13,9 @@ both the scheduler and worker from configuration alone:
   subclassing the ``kimi_k3`` connector;
 * ``m3`` stores MiniMax-M3 PAGE-only KV including the NSA index cache.
 
+``save_policy: lazy`` (`lazy_save`) runs on the ``dense`` and ``m3`` layouts,
+whose scheduler is the dense one, and picks its classes on both sides.
+
 Keeping selection config-only is important because the scheduler process does
 not have access to the worker's transfer tensors.
 """
@@ -26,7 +29,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.offload._offload_common import StateOffloadFace
-from atom.kv_transfer.offload.config import select_offload_layout
+from atom.kv_transfer.offload.config import lmcache_save_policy, select_offload_layout
 
 logger = logging.getLogger("atom")
 
@@ -53,9 +56,23 @@ def _in_process_variant(config) -> str:
     return variant
 
 
+def _in_process_policy(config, variant: str) -> str:
+    """The ``save_policy``, refused where lazy saves are not supported."""
+    policy = lmcache_save_policy(getattr(config, "kv_transfer_config", None))
+    if policy == "lazy" and variant not in ("dense", "m3"):
+        raise ValueError(
+            f"lmcache_offload: save_policy 'lazy' does not support the "
+            f"{variant!r} layout yet: a prefix hit there also needs the "
+            "per-request state checkpoint at its boundary, and a demotion moves "
+            "only KV pages"
+        )
+    return policy
+
+
 def _build_worker(config):
     variant = _in_process_variant(config)
-    logger.info("lmcache_offload: worker family=%s", variant)
+    policy = _in_process_policy(config, variant)
+    logger.info("lmcache_offload: worker family=%s save_policy=%s", variant, policy)
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
             DSV4OffloadConnector,
@@ -84,6 +101,11 @@ def _build_worker(config):
 
         return M3OffloadConnector(config)
 
+    if policy == "lazy":
+        from atom.kv_transfer.offload.lazy_save import LazyDenseOffloadConnector
+
+        return LazyDenseOffloadConnector(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
     return DenseOffloadConnector(config)
@@ -91,7 +113,13 @@ def _build_worker(config):
 
 def _build_scheduler(config):
     variant = _in_process_variant(config)
-    logger.info("lmcache_offload: scheduler family=%s", variant)
+    policy = _in_process_policy(config, variant)
+    logger.info("lmcache_offload: scheduler family=%s save_policy=%s", variant, policy)
+    if policy == "lazy":
+        from atom.kv_transfer.offload.lazy_save import LazyOffloadScheduler
+
+        return LazyOffloadScheduler(config)
+
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
             DSV4OffloadScheduler,
@@ -243,6 +271,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """Close the impl's lookup threads at scheduler teardown (the Mooncake
         Store's)."""
         self._impl.close()
+
+    @property
+    def needs_hbm_probe_before_lookup(self) -> bool:
+        return self._impl.needs_hbm_probe_before_lookup
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         callback = getattr(self._impl, "can_detach_lookup", None)

@@ -1701,6 +1701,55 @@ still falls back safely to per-group ID preparation and blocking host copies.
 `OFFLOAD_COMMITTED_SIDECAR_CAPACITY`. `"max_pending_saves": N` overrides
 `OFFLOAD_MAX_PENDING_SAVES`. All apply only to that connector.
 
+### Lazy saves (`save_policy`)
+
+`"save_policy": "lazy"` (in `kv_connector_extra_config`, else at the
+connector's top level; default `"eager"`, any other value is refused) stores a
+block in the CPU tier only when the HBM prefix cache is about to evict it,
+rather than every prompt chunk a prefill computes, so the tier holds what
+HBM evicted (a block loaded back from it stays in both); a lookup then asks the
+tier only past the HBM hit.
+
+It runs on the `dense` layout, the models with no per-request state (MHA:
+Qwen3, Qwen3-MoE, Llama, Mixtral, GPT-OSS, GLM-4.5, MiniMax-M2, MiMo-V2,
+Mistral; MLA: DeepSeek-V3/R1, Kimi-K2.5, and DeepSeek-V3.2 and GLM-5/5.2 with
+their DSA index cache), and on `m3` (MiniMax-M3). The `hybrid` (DeepSeek-V4),
+`kimi_k3` and `qwen` (Qwen3-Next, Qwen3.5, Qwen3.8) layouts are refused for
+now: a prefix hit there also needs the per-request state checkpoint at its
+boundary, and a demotion moves only KV pages. It is refused at startup unless:
+
+- the LMCache chunk size (`LMCACHE_CHUNK_SIZE`) equals the tokens one KV block
+  spans: `--block-size`, times `--decode-context-parallel-size` under DCP (the
+  GLM-5.2 DCP recipe's 64 x 4 = 256 does; the M3 recipe's 256 with
+  `--block-size 128` does not);
+- prehashed saves are on: `PYTHONHASHSEED` set for the builtin hash, no
+  blending;
+- LMCache KV events are off;
+- prefix caching is on, `pipeline_parallel_size` is 1, and the role saves.
+
+Use it when the sessions that come back hold more KV than the CPU tier keeps
+on its own: eager's tier is then full, most of it copies of blocks HBM still
+holds, and it evicts chunks that are asked for again, while lazy keeps most
+of HBM plus the tier. When the tier holds every session that comes back,
+eager recomputes nothing and lazy only adds what its demotions miss: leave it
+off.
+
+In a scaled-down CPU model of multi-turn sessions with the tier at 1.4x the
+HBM pool (the real scheduler and block pool over a stand-in tier that evicts
+in LMCache's order), lazy computed 0.6-0.7x eager's prefill blocks with live
+sessions holding 1.4-2.0 pools of KV on a mostly idle engine, and 0.2-0.5x at
+1.6-1.8 pools with every slot busy, where eager's tier missed nearly every
+turn. With 1.0-1.2 pools it computed 0.9-1.1x, and 1.3-2.4x when turns were
+so short that several admissions landed on each step and allocated more than
+the eviction window. Not measured on GPU.
+
+`lazy_evicted_unsaved` (`get_statistics`, summed in the engine's `offload`
+stats) counts keyed blocks HBM evicted before a demotion stored them, found
+when a request keys the block again. It is approximate: in that model it read
+up to about 20% above them. It does not count a block lost because its saved
+bit was stale, which on a mostly idle engine was the larger number.
+`lazy_save.py` lists when each happens.
+
 AOS1 follows the engine's location policy exactly. Submission passes
 `store_location` to `StorageManager.batched_put`; discovery searches only
 `retrieve_locations`, and reads target the backend location returned by that

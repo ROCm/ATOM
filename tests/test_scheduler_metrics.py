@@ -363,6 +363,26 @@ def test_deferred_free_counts_shared_blocks_once():
     assert values[("atom:kv_cache_blocks_deferred_free", ())] == 8
 
 
+def test_offload_totals_sum_the_lazy_evicted_unsaved_count():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    ranks = {}
+    for rank, count in enumerate((3, 4)):
+        scheduler = Scheduler(MockConfig(enable_prefix_caching=True))
+        ranks[rank] = EngineUtilityHandler(
+            None, Queue(), scheduler=scheduler
+        ).collect_metrics()
+        ranks[rank]["offload"] = {"lazy_evicted_unsaved": count}
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
+    )
+    stats = LLMEngine.get_metrics_statistics(engine)
+    assert stats["offload"]["lazy_evicted_unsaved"] == 7
+
+
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
     from aiter_stub import stubbed_aiter
 

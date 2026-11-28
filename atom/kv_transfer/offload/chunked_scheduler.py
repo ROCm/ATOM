@@ -562,15 +562,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
 
         num_prompt = seq.num_prompt_tokens
-        token_ids = self._lookup_token_ids(seq)
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
         _t0 = time.perf_counter()
         try:
-            hit = self._lookup_client.lookup(
-                token_ids, lookup_id=sid, **self._tier_lookup_kwargs(seq)
-            )
+            hit = self._tier_lookup(seq, sid)
             _us = int((time.perf_counter() - _t0) * 1e6)
             self._perf_bump("lookup_n")
             self._perf_bump("lookup_us", _us)
@@ -603,7 +600,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     _lh = [
                         k
                         for (_s, _e, k) in list(
-                            tdb.process_tokens(token_ids, make_key=False)
+                            tdb.process_tokens(
+                                self._lookup_token_ids(seq), make_key=False
+                            )
                         )[:3]
                     ]
             except Exception as e:  # noqa: BLE001  # debug-only introspection
@@ -617,6 +616,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 _lh,
             )
         return hit
+
+    def _tier_lookup(self, seq, sid: str) -> int | None:
+        """One synchronous tier lookup of `seq`'s prompt under lookup id `sid`.
+
+        The seam a layout overrides to ask the tier differently (the M3
+        layout's prehashed save sends its cached chunk hashes);
+        the caller owns the pin and memo bookkeeping either way.
+        """
+        return self._lookup_client.lookup(
+            self._lookup_token_ids(seq),
+            lookup_id=sid,
+            **self._tier_lookup_kwargs(seq),
+        )
 
     def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
         """Turn a tier hit into this step's answer, and arm what it implies."""
