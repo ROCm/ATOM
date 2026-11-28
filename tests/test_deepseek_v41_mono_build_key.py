@@ -66,7 +66,7 @@ BUILDS = {
     ),
     "eg": (
         eg.build_engram, eg.ABI, eg.EngramBuild(rows=6, tp=4, eps=1e-20),
-        {"rows": 12, "tp": 2, "eps": 1e-6, "split": False},
+        {"rows": 12, "tp": 2, "eps": 1e-6, "split": False, "mode": 2, "ctas": 128},
     ),
     "cp": (
         cp.build_compress, cp.ABI,
