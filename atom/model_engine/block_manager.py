@@ -1912,7 +1912,9 @@ class BlockManager:
         if hit_hash == -1:
             return True
         if self.paged_state_checkpoints is not None:
-            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+            if self.paged_state_checkpoints.begin_restore(
+                hit_hash, seq.state_slot, seq
+            ):
                 return True
             return self._request_state_load(seq, hit_hash)
         return self._request_state_load(seq, hit_hash)
@@ -2221,7 +2223,9 @@ class BlockManager:
             seq.state_fork_src = -1
             if hit_hash == -1:
                 return True  # cold start: nothing claimed, nothing to restore
-            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+            if self.paged_state_checkpoints.begin_restore(
+                hit_hash, seq.state_slot, seq
+            ):
                 # Queued for the next batch, which gathers the image out of its
                 # PAGE units into the committed slot. What the caller holds is
                 # what it asked for.
@@ -3879,6 +3883,7 @@ class BlockManager:
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.forget_pending(seq)
+            self.paged_state_checkpoints.rerank_checkpoints(seq)
         # A midstep reservation is the same intent one step earlier: a slot
         # held for a forward that is now not going to run. Handed back vacant —
         # publishing it would file a hash over bytes nobody wrote. Before the

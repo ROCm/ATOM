@@ -2,12 +2,15 @@
 
 """Control-plane invariants for PAGE-backed state checkpoint images."""
 
+import array
+import itertools
 import pickle
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
+from atom.model_engine import block_pool, page_unit_checkpoint
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -847,3 +850,195 @@ def test_a_slot_copied_as_is_borrows_nothing(decode_keep, step):
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
     assert pool.has_free()
+
+
+class TestOneLruWithCachedBlocks:
+    """Checkpoints and cached prefix blocks compete in one LRU.
+
+    Before, `ensure_free_units` evicted a checkpoint only once the free list
+    was empty -- every cached prefix block went first, however recently it was
+    released and however long the checkpoint had sat unused. An agentic run
+    fills the pool with images of turns that the next turn has superseded and
+    then spends the prefixes the next turns need.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clock(self, monkeypatch):
+        ticks = itertools.count(1)
+
+        def tick():
+            return float(next(ticks))
+
+        monkeypatch.setattr(block_pool, "monotonic", tick)
+        monkeypatch.setattr(page_unit_checkpoint, "monotonic", tick)
+
+    @staticmethod
+    def cache_block(pool, h):
+        """Take a vacant block, index it under `h` and release it (cached)."""
+        block_id = pool.pop()
+        pool.allocate(block_id)
+        pool.publish(block_id, h, array.array("i", [h]))
+        pool.free(block_id)
+        return block_id
+
+    @staticmethod
+    def fill_vacant(pool):
+        while pool.num_free - pool.num_reusable_free:
+            pool.allocate(pool.pop())
+
+    def test_a_colder_checkpoint_goes_before_a_cached_block(self):
+        pool, store = make_store(num_units=10)
+        ready(store, 101)  # used at t=1..
+        self.cache_block(pool, 7)  # released after it
+        self.fill_vacant(pool)
+
+        assert store.ensure_free_units(1)
+
+        assert store.lookup(101) == -1, "the colder checkpoint was kept"
+        assert pool.lookup(7) >= 0, "the warmer cached block was spent"
+        assert store.evictions == 1
+
+    def test_a_warmer_checkpoint_stays_behind_an_older_cached_block(self):
+        pool, store = make_store(num_units=10)
+        self.cache_block(pool, 7)
+        ready(store, 101)
+        self.fill_vacant(pool)
+
+        assert store.ensure_free_units(1)
+
+        assert store.lookup(101) >= 0
+        assert store.evictions == 0
+
+    def test_vacant_blocks_still_go_first(self):
+        pool, store = make_store(num_units=10)
+        ready(store, 101)
+        self.cache_block(pool, 7)
+        assert pool.num_free - pool.num_reusable_free > 0
+
+        assert store.ensure_free_units(1)
+
+        assert store.evictions == 0
+
+    def test_a_demoted_checkpoint_goes_first(self):
+        pool, store = make_store(num_units=10)
+        self.cache_block(pool, 7)
+        ready(store, 101)
+        self.fill_vacant(pool)
+
+        store.demote(101)
+        assert store.ensure_free_units(1)
+
+        assert store.lookup(101) == -1
+        assert pool.lookup(7) >= 0
+
+    def test_a_restore_rewarms_a_demoted_checkpoint(self):
+        pool, store = make_store(num_units=10)
+        self.cache_block(pool, 7)
+        ready(store, 101)
+        store.demote(101)
+        store.begin_restore(101, dst_slot=3)
+        store.take_restore_ops()
+        store.complete_inflight()  # restore done, pin released
+        self.fill_vacant(pool)
+
+        assert store.ensure_free_units(1)
+
+        assert store.lookup(101) >= 0
+
+
+class TestRerankCheckpoints:
+    """When a request's blocks go back, its own images are as warm as them and
+    the image it resumed from is superseded by any deeper one it stored."""
+
+    @staticmethod
+    def coordinator():
+        return PagedStateCheckpointCoordinator(
+            BlockPool(40),
+            PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+            enabled=True,
+        )
+
+    @staticmethod
+    def store_for(c, seq, h):
+        c.checkpoint(seq, 0, h)
+        c.take_checkpoint_ops()
+        c.complete_previous_batch()
+        assert c.store.contains(h)
+
+    @staticmethod
+    def resume(c, seq, h):
+        assert c.begin_restore(h, seq.state_slot, seq)
+        c.take_checkpoint_ops()
+        c.complete_previous_batch()
+
+    def two_turns(self):
+        c = self.coordinator()
+        self.store_for(c, _seq(0), 11)  # turn 1's prompt end
+        turn2 = _seq(1)
+        self.resume(c, turn2, 11)
+        self.store_for(c, turn2, 22)  # turn 2's prompt end
+        c.rerank_checkpoints(turn2)
+        return c
+
+    def test_the_superseded_image_is_kept_until_its_successor_is_restored(self):
+        """Turn 3 may not match turn 2's anchor (the generation prompt
+        landing in its block) and then needs turn 1's."""
+        c = self.two_turns()
+
+        assert c.store._lru[c.store.lookup(11)] != float("-inf")
+        assert c.checkpoints_demoted == 0
+
+    def test_restoring_the_successor_demotes_the_superseded_image(self):
+        c = self.two_turns()
+
+        self.resume(c, _seq(2), 22)  # turn 3
+
+        assert next(iter(c.store._lru)) == c.store.lookup(11)
+        assert c.store._lru[c.store.lookup(11)] == float("-inf")
+        assert c.store.contains(11), "demoted, not released"
+        assert c.checkpoints_demoted == 1
+
+    def test_a_fallback_to_the_older_image_demotes_nothing(self):
+        c = self.two_turns()
+
+        self.resume(c, _seq(2), 11)  # turn 3 could not match 22
+
+        assert c.store._lru[c.store.lookup(11)] != float("-inf")
+        assert c.checkpoints_demoted == 0
+
+    def test_nothing_is_demoted_without_a_deeper_ready_image(self):
+        c = self.coordinator()
+        self.store_for(c, _seq(0), 11)
+        turn2 = _seq(1)
+        self.resume(c, turn2, 11)
+        c.rerank_checkpoints(turn2)
+
+        assert c.store._lru[c.store.lookup(11)] != float("-inf")
+        assert c.checkpoints_demoted == 0
+
+    def test_a_midstep_image_is_ranked_like_a_boundary(self):
+        c, _ = _snapshot_coordinator(2, readable_midstep=True)
+        self.store_for(c, _seq(0), 11)
+        turn2 = _seq(1)
+        turn2.midstep_anchor_pos = 40
+        self.resume(c, turn2, 11)
+        c.publish_midstep(c.reserve_midstep(turn2, [(40, 22)]), turn2)
+        c.take_checkpoint_ops()
+        c.complete_previous_batch()
+        assert c.store.contains(22)
+        c.rerank_checkpoints(turn2)
+
+        self.resume(c, _seq(2), 22)
+
+        assert c.checkpoints_demoted == 1
+
+    def test_a_requests_own_image_is_rewarmed_when_it_finishes(self):
+        c = self.coordinator()
+        seq = _seq(0)
+        self.store_for(c, seq, 11)
+        self.store_for(c, _seq(1), 22)
+        assert next(iter(c.store._lru)) == c.store.lookup(11)
+
+        c.rerank_checkpoints(seq)
+
+        assert next(reversed(c.store._lru)) == c.store.lookup(11)

@@ -216,6 +216,10 @@ class CheckpointRecord:
     unit_ids: tuple[int, ...]
     state: str = COPYING
     pin_count: int = 0
+    # The image the storing request resumed from, or -1. Demoted the first
+    # time this one is restored; see
+    # `PagedStateCheckpointCoordinator.rerank_checkpoints`.
+    predecessor: int = -1
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,7 @@ class PageUnitCheckpointStore:
         offload_sink: bool = False,
     ):
         self.pool = pool
+        pool.stamp_release = True
         self.spec = spec
         # Whether anything downstream can carry a store. False leaves the
         # offload queue permanently empty and takes no pins, which is what a
@@ -274,7 +279,10 @@ class PageUnitCheckpointStore:
         self._changes: deque[tuple[int, int | None]] = deque(maxlen=_CHANGE_LOG_LIMIT)
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
-        self._lru: OrderedDict[int, None] = OrderedDict()
+        # READY checkpoints, coldest first, each with the `monotonic()` time it
+        # was last useful: stored, restored, or its storing request finished.
+        # A demoted image (`demote`) sits at the front with time -inf.
+        self._lru: OrderedDict[int, float] = OrderedDict()
         self._inflight_stores: list[int] = []
         self._queued_restores: list[tuple[int, CheckpointRestoreOp]] = []
         self._inflight_restores: list[int] = []
@@ -362,11 +370,10 @@ class PageUnitCheckpointStore:
     def _next_victim(self, protected: int = -1) -> int:
         """Which eligible checkpoint to spend when the free list is short.
 
-        This is the eviction policy, and the only place it lives: least
-        recently used, which `_lru` already orders. A different policy
-        replaces this method and nothing else -- in particular it must not
-        touch `_is_evictable`, which is the eligibility rule three callers
-        share.
+        Least recently used, which `_lru` already orders. Whether it goes
+        before a cached prefix block is `_colder_than_cached`'s call. A
+        different policy must not touch `_is_evictable`, which is the
+        eligibility rule three callers share.
         """
         return next(self._evictable(protected), -1)
 
@@ -398,28 +405,81 @@ class PageUnitCheckpointStore:
         return False
 
     def ensure_free_units(self, count: int) -> bool:
-        """Raise the free list to `count`, spending checkpoints for the shortfall.
+        """Raise the free list to `count`, spending checkpoints where they are colder.
 
-        Free units are taken first -- a caller asking for what is already
-        there evicts nothing -- and `pop` hands out never-used blocks before
-        cached ones, so a store reaches for the cache only once the pool has
-        nothing spare. Each eviction returns a whole image's units, so the
-        loop overshoots by at most one checkpoint.
+        Vacant units are taken first -- a caller asking for what is already
+        there evicts nothing. Past them, a take spends cached prefix blocks in
+        `BlockPool._take_free`'s order, and a checkpoint last used before the
+        next such block was released is evicted instead
+        (`_colder_than_cached`): both kinds of reusable content compete in one
+        LRU. Each eviction returns a whole image's units, so the loop
+        overshoots by at most one checkpoint.
 
         Unreachable counts are refused before anything is spent. The loop
         alone gives up only once it has evicted everything it can, so a count
         the cache cannot reach would destroy the cache on the way to saying
-        no. The test lives here rather than in the one caller that used to
-        carry it, because every caller needs it and only the argument being
-        1 keeps `_fresh_block` from needing it today.
+        no.
         """
         if not self.has_available_units(count):
             return False
-        while self.pool.num_free < count:
-            victim = self._next_victim()
-            if victim < 0:
-                return False
+        while True:
+            if self.pool.num_free >= count:
+                if self.pool.num_free - self.pool.num_reusable_free >= count:
+                    return True
+                victim = self._next_victim()
+                if not self._colder_than_cached(victim):
+                    return True
+            else:
+                victim = self._next_victim()
+                if victim < 0:
+                    return False
             self._evict(victim)
+
+    def _colder_than_cached(self, victim: int) -> bool:
+        """Whether checkpoint `victim` was last used before the next cached block.
+
+        That block is what the take spends once the vacant ones are gone.
+        Superseded checkpoints are demoted to -inf (`demote`) and so always go
+        before it.
+        """
+        if victim < 0:
+            return False
+        released = self.pool.oldest_reusable_free()
+        return released is not None and self._lru[victim] < released
+
+    def touch(self, prefix_hash: int) -> None:
+        """Mark `prefix_hash`'s READY image as used now."""
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id >= 0:
+            self._lru.move_to_end(checkpoint_id)
+            self._lru[checkpoint_id] = monotonic()
+
+    def set_predecessor(self, prefix_hash: int, predecessor: int) -> None:
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id >= 0:
+            self.records[checkpoint_id].predecessor = predecessor
+
+    def take_predecessor(self, prefix_hash: int) -> int:
+        """The predecessor `prefix_hash`'s READY image names, once, or -1."""
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0:
+            return -1
+        record = self.records[checkpoint_id]
+        predecessor, record.predecessor = record.predecessor, -1
+        return predecessor
+
+    def demote(self, prefix_hash: int) -> bool:
+        """Make `prefix_hash`'s READY image the first to evict; False if it is
+        no longer held.
+
+        Not released: a request that shares the prefix may still restore it,
+        and `begin_restore` then moves it back to the warm end.
+        """
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0:
+            return False
+        self._lru.move_to_end(checkpoint_id, last=False)
+        self._lru[checkpoint_id] = float("-inf")
         return True
 
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
@@ -478,6 +538,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         record.pin_count += 1
         self._lru.move_to_end(checkpoint_id)
+        self._lru[checkpoint_id] = monotonic()
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
@@ -580,7 +641,7 @@ class PageUnitCheckpointStore:
         )
         self.records[checkpoint_id] = record
         self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
-        self._lru[checkpoint_id] = None
+        self._lru[checkpoint_id] = monotonic()
         self._note_change(record.prefix_hash)
         return True
 
@@ -604,7 +665,7 @@ class PageUnitCheckpointStore:
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
             self._note_change(record.prefix_hash)
-            self._lru[checkpoint_id] = None
+            self._lru[checkpoint_id] = monotonic()
             self._queue_offload_store(checkpoint_id, record)
 
         restores, self._inflight_restores = self._inflight_restores, []
@@ -1058,6 +1119,13 @@ class PagedStateCheckpointCoordinator:
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
+        # Per live request, by `id(seq)` like `_pending`: the image it resumed
+        # from (`begin_restore`) and the boundaries it stored
+        # (`take_checkpoint_ops`, `publish_midstep`). Taken by
+        # `rerank_checkpoints`.
+        self._resumed_from: dict[int, int] = {}
+        self._stored_by: dict[int, list[int]] = {}
+        self.checkpoints_demoted = 0
 
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
@@ -1123,9 +1191,10 @@ class PagedStateCheckpointCoordinator:
         `take_checkpoint_ops` and READY one batch after that, the same two
         steps `checkpoint`'s boundaries take.
         """
-        del seq
         for slot, _pos, h in reservations:
             self._scratch_queued.append((h, slot))
+            if seq is not None:
+                self._stored_by.setdefault(id(seq), []).append(h)
 
     def cancel_midstep(self, reservations: list[tuple]) -> None:
         """Hand back scratch slots whose forward never ran."""
@@ -1281,8 +1350,30 @@ class PagedStateCheckpointCoordinator:
         """
         return self.store.restore_queued_for(dst_slot)
 
-    def begin_restore(self, h: int, dst_slot: int) -> bool:
-        return self.store.begin_restore(h, dst_slot) is not None
+    def begin_restore(self, h: int, dst_slot: int, seq: Sequence | None = None) -> bool:
+        if self.store.begin_restore(h, dst_slot) is None:
+            return False
+        if seq is not None:
+            self._resumed_from[id(seq)] = h
+        predecessor = self.store.take_predecessor(h)
+        if predecessor not in (-1, h) and self.store.demote(predecessor):
+            self.checkpoints_demoted += 1
+        return True
+
+    def rerank_checkpoints(self, seq: Sequence) -> None:
+        """Re-rank `seq`'s checkpoints as its blocks are released.
+
+        Its stored images become as warm as its prefix. The image it resumed
+        from is superseded, but is demoted only when a successor is restored
+        (`begin_restore`): the next turn falls back to it when its prompt end
+        lands inside the successor's anchor block.
+        """
+        resumed = self._resumed_from.pop(id(seq), -1)
+        stored = [h for h in self._stored_by.pop(id(seq), ()) if self.store.contains(h)]
+        for h in stored:
+            self.store.touch(h)
+            if resumed != -1 and h != resumed:
+                self.store.set_predecessor(h, resumed)
 
     def take_checkpoint_ops(
         self,
@@ -1294,7 +1385,10 @@ class PagedStateCheckpointCoordinator:
             # (of its verify `step`, for a decode one) and no other. See
             # `_supersede`.
             src_slot = seq.state_slot
-            if src_slot < 0 or self.store.contains_or_pending(h):
+            if src_slot < 0:
+                continue
+            if self.store.contains_or_pending(h):
+                self._stored_by.setdefault(id(seq), []).append(h)
                 continue
             if seq.num_forwards != forwards:
                 # A forward was scheduled since: the slot has moved past it.
@@ -1317,6 +1411,7 @@ class PagedStateCheckpointCoordinator:
                 op = replace(op, step=step, scratch_slot=scratch, step_slot=step_slot)
             self._store_ops.append(op)
             self.checkpoints_kept += 1
+            self._stored_by.setdefault(id(seq), []).append(h)
         restores = self.store.take_restore_ops()
         if self._scratch_queued:
             self._take_scratch_stores(
@@ -1506,6 +1601,7 @@ class PagedStateCheckpointCoordinator:
             # otherwise show only as a pool that has quietly shrunk.
             "offload_pins_reclaimed": self.store.offload_pins_reclaimed,
             "checkpoints_orphaned": self.checkpoints_orphaned,
+            "checkpoints_demoted": self.checkpoints_demoted,
         }
         # `getattr`, not a direct call: `attach_offload` accepts anything that
         # answers `hashes`, and the tests attach a double that does not carry

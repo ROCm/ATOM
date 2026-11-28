@@ -1404,6 +1404,39 @@ class TestPagedCopyCheckpoint:
         # adopted as the request's kernel-visible slot.
         assert bm.paged_state_checkpoints.store.contains(h)
 
+    def test_a_resumed_turns_image_demotes_the_one_it_superseded(self):
+        """BlockManager wiring: `allocate` restores with the request,
+        `deallocate` re-ranks what it stored, and the next restore demotes."""
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        checkpoints = bm.paged_state_checkpoints
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h1 = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+
+        second = stateful_seq(list(range(48)))
+        bm.allocate(second, bm.can_allocate(second))
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.hash_blocks(second, bm.checkpoint_limit(second) - second.num_cached_tokens)
+        h2 = boundary_hash(bm, second)
+        assert h2 != h1
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(h2)
+        bm.deallocate(second)
+
+        third = stateful_seq(list(range(56)))
+        bm.allocate(third, bm.can_allocate(third))
+
+        assert checkpoints.checkpoints_demoted == 1
+        first_id = checkpoints.store.lookup(h1)
+        assert next(iter(checkpoints.store._lru)) == first_id
+
     def test_deallocate_cancels_a_queued_restore_before_reusing_its_slot(self):
         bm = make_block_manager(
             paged_copy_config(),
