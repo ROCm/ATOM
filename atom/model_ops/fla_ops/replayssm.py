@@ -41,7 +41,7 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
-from .op import exp
+from .op import exp, zero_pad_output
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -773,6 +773,9 @@ def _replayssm_fwd_kernel(
 
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:  # padded / idle batch entry
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
@@ -1240,6 +1243,9 @@ def _replayssm_ut_fwd_kernel(
         return
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
@@ -1724,6 +1730,9 @@ def _replayssm_kda_fwd_kernel(
         return
     slot = tl.load(slot_idx + i_n).to(tl.int64)
     if slot < 0:
+        o_v = i_v * BV + tl.arange(0, BV)
+        p_o = o + (bos * HV + i_hv) * V + o_v
+        zero_pad_output(p_o, T, o_v < V, HV * V)
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)

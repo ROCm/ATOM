@@ -73,9 +73,11 @@ def reset_replay_runtime_for_tests() -> None:
 def replayssm_enabled() -> bool:
     """Match Native: on for speculative serving unless the env forces it off.
 
-    ``ATOM_ENABLE_REPLAYSSM=0`` keeps the per-step snapshot path.
+    ``ATOM_ENABLE_REPLAYSSM=0`` runs the batched verify path, which writes
+    every step's state into ``intermediate_ssm``.
     ``ATOM_ENABLE_REPLAYSSM=1`` forces the ring even without server args
-    (tests). Unset follows whether this process is an MTP server.
+    (tests). Unset follows the server's speculative steps or algorithm
+    (MTP, DFLASH, ...).
 
     The SGLang radix cache does not change the choice: the commit hook
     materializes the tracked step's state into the track slot itself.

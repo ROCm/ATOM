@@ -10,7 +10,6 @@ two verify rounds, with and without a flush in the second.
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -69,13 +68,15 @@ def _inputs(gen):
     )
 
 
-def _snapshot_states(impl, layer_cache, cache_indices, live_state, conv, inputs):
+def _snapshot_states(
+    monkeypatch, impl, layer_cache, cache_indices, live_state, conv, inputs
+):
     """Per-step states of the snapshot path from `live_state` / `conv`."""
     saved_t = layer_cache.temporal.clone()
     saved_c = layer_cache.conv[0].clone()
     layer_cache.temporal[cache_indices.long()] = live_state
     layer_cache.conv[0].copy_(conv)
-    _run(impl, layer_cache, cache_indices, *inputs, replay=False)
+    _run(monkeypatch, impl, layer_cache, cache_indices, *inputs, replay=False)
     states = layer_cache.intermediate_ssm[:BS].clone()
     layer_cache.temporal.copy_(saved_t)
     layer_cache.conv[0].copy_(saved_c)
@@ -109,10 +110,10 @@ def test_track_slot_holds_the_snapshot_paths_state(monkeypatch, cache_len):
         state0 = layer_cache.temporal[live].clone()
         conv0 = layer_cache.conv[0].clone()
         ref1 = _snapshot_states(
-            impl, layer_cache, cache_indices, state0, conv0, inputs1
+            monkeypatch, impl, layer_cache, cache_indices, state0, conv0, inputs1
         )
         untouched = layer_cache.temporal[track[1]].clone()
-        _run(impl, layer_cache, cache_indices, *inputs1, replay=True)
+        _run(monkeypatch, impl, layer_cache, cache_indices, *inputs1, replay=True)
         assert replay_runtime().cache_len == cache_len
         _commit(layer_cache, cache_indices, accept=2, track_steps=[1, -1])
         torch.testing.assert_close(
@@ -127,10 +128,10 @@ def test_track_slot_holds_the_snapshot_paths_state(monkeypatch, cache_len):
         # first round committed (or the checkpoint they were flushed into).
         inputs2 = _inputs(gen)
         conv1 = layer_cache.conv[0].clone()
-        _run(impl, layer_cache, cache_indices, *inputs2, replay=True)
+        _run(monkeypatch, impl, layer_cache, cache_indices, *inputs2, replay=True)
         _commit(layer_cache, cache_indices, accept=3, track_steps=[2, 0])
         ref2 = _snapshot_states(
-            impl, layer_cache, cache_indices, ref1[:, 1], conv1, inputs2
+            monkeypatch, impl, layer_cache, cache_indices, ref1[:, 1], conv1, inputs2
         )
         torch.testing.assert_close(
             layer_cache.temporal[track[0]], ref2[0, 2], rtol=2e-2, atol=2e-2
@@ -143,5 +144,4 @@ def test_track_slot_holds_the_snapshot_paths_state(monkeypatch, cache_len):
             [3, 3] if flushed else [5, 5]
         )
     finally:
-        os.environ.pop("ATOM_ENABLE_REPLAYSSM", None)
         reset_replay_runtime_for_tests()
