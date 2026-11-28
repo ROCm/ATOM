@@ -48,6 +48,7 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
+from atom.distributed.pp_host_fence import runtime as ipc_transport
 from atom.distributed.ulysses_sp import (
     get_sp_world_size,
     local_num_kv_heads,
@@ -991,6 +992,7 @@ class ModelRunner:
         # (`ForwardMode.decide`).
         self.tbo_decode_graphs = False
 
+        self._pp_host_fence = None
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
@@ -1103,6 +1105,7 @@ class ModelRunner:
         if drafter is not None:
             drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
+        self._pp_host_fence = ipc_transport.initialize(self, get_pp_group())
         self._refuse_unrelayed_pp_taps(drafter)
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
@@ -1354,6 +1357,8 @@ class ModelRunner:
         # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
         # both. A close error propagates once the rest of the teardown has run.
         try:
+            if self._pp_host_fence is not None:
+                self._pp_host_fence.close()
             sp_mega_moe = getattr(self, "sp_mega_moe", None)
             if sp_mega_moe is not None:
                 sp_mega_moe.close()
@@ -2335,6 +2340,16 @@ class ModelRunner:
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
+        if self._pp_host_fence is not None:
+            logger.info(
+                "PP_HOST_FENCE_KV rank=%s ringBytes=%s nonTorchBytes=%s availableKvBytes=%s blocks=%s utilization=%s",
+                self._pp_host_fence.rank,
+                self._pp_host_fence.ring_bytes,
+                non_torch,
+                available_for_kv,
+                num_kvcache_blocks,
+                config.gpu_memory_utilization,
+            )
         block_bytes = plan.entry_bytes[plan.paged_class]
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
@@ -3661,6 +3676,8 @@ class ModelRunner:
         """Flush pending PP isend. Returns True for call_func wait_out."""
         if self._pp_pending_send:
             commit_pp_send_work(self._pp_pending_send)
+        if self._pp_host_fence is not None:
+            self._pp_host_fence.flush()
         return True
 
     def release_constraints(self, request_ids):

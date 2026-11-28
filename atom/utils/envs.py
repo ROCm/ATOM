@@ -63,6 +63,15 @@ def _optional_flag_env(name: str) -> bool | None:
     return _flag_env(name)
 
 
+def _pp_host_fence_ipc() -> bool:
+    flag = os.getenv("ATOM_PP_HOST_FENCE_IPC", "0")
+    if flag not in ("0", "1"):
+        raise ValueError("ATOM_PP_HOST_FENCE_IPC must be 0 or 1")
+    if flag == "1" and os.getenv("ATOM_PP_EARLY_RECV", "0") != "0":
+        raise ValueError("PP IPC and early receive cannot be combined")
+    return flag == "1"
+
+
 def _preload_mode() -> str:
     """ATOM_PRELOAD: "off", "server" (1: take the weights from a weight cache
     daemon) or "daemon" (be one)."""
@@ -1520,6 +1529,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Experimental source-bound PP8/TP1 K3 transport; see its support contract.
+    "ATOM_PP_HOST_FENCE_IPC": _pp_host_fence_ipc,
     # Batches the PP head keeps in flight, middle prefill chunks included,
     # before it waits for the oldest to come back. At the default (the stage
     # count), one slow batch stalls the head while the stages ahead of it

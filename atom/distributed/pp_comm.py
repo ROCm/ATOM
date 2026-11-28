@@ -15,6 +15,8 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.communication import set_custom_all_reduce
 
+from atom.distributed.pp_host_fence import runtime as ipc_transport
+from atom.distributed.pp_host_fence.async_core import SendFuture
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -50,7 +52,7 @@ def pp_send_allgather_group():
 class P2PWork:
     """Handle for an in-flight isend; prevents payload GC until completion."""
 
-    work: torch.distributed.Work | None
+    work: torch.distributed.Work | SendFuture | None
     payload: torch.Tensor | None
 
 
@@ -111,6 +113,10 @@ def init_pp_aware_dist_env(
 
 def send_intermediate_tensors(it: IntermediateTensors) -> None:
     """Blocking send of hidden_states/residual to the next PP stage."""
+    adapter = ipc_transport.active()
+    if adapter is not None and adapter.sender is not None:
+        adapter.send(it.tensors, ()).wait()
+        return
     pp = get_pp_group()
     tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
     dst = (pp.rank_in_group + 1) % pp.world_size
@@ -119,6 +125,9 @@ def send_intermediate_tensors(it: IntermediateTensors) -> None:
 
 def recv_intermediate_tensors() -> IntermediateTensors:
     """Receive hidden_states/residual from the previous PP stage."""
+    adapter = ipc_transport.active()
+    if adapter is not None and adapter.receiver is not None:
+        return IntermediateTensors(adapter.recv())
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
@@ -149,6 +158,9 @@ def async_send_intermediate_tensors(
     again: they are sent as they are. The rest are cloned, since the model
     may overwrite them (a graph's output buffer, say) before the send lands.
     """
+    adapter = ipc_transport.active()
+    if adapter is not None and adapter.sender is not None:
+        return [P2PWork(adapter.send(it.tensors, owned), None)]
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]

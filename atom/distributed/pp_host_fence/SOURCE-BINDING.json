@@ -1,0 +1,38 @@
+{
+  "status": "PUBLIC_PORT_CPU_REVIEW_PENDING_GPU_NOT_VALIDATED",
+  "publicBase": "2610191c6481c34c56c15afd51cb6f8ce435531c",
+  "historicalNativeBase": "5310947e5b8e0977f6351b2d5a98cda5edb3afbe",
+  "architecture": "gfx1250",
+  "runtime": {
+    "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+    "hip": "7.16.26315"
+  },
+  "mainConfigSha256": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
+  "draftConfigSha256": "5a3c2f4f91c965ed93b14de5f12a4e9c17fd98d8c99916ed2deb26ce8702f970",
+  "activeSourceSha256": {
+    "atom/distributed/pp_comm.py": "43fbcecd8e7ac0fdf49f950c41f1c9f1e0b1c76690e22832b38729a959387d9e",
+    "atom/model_engine/model_runner.py": "56f2b9f39eecc15e22214a8361445206fb363ca7d38fa791b520785c352cd400",
+    "atom/distributed/pp_host_fence/async_core.py": "06b2ccb24f9b4627e90aef636dff2f876e310e496ee7194d3da951f55cb655bd",
+    "atom/distributed/pp_host_fence/contract.py": "41d11ad8d9be5a2799497ce8ed96fabf476ffd3085bf8b5e5d5cbae0b2377a0b",
+    "atom/distributed/pp_host_fence/gloo_channel.py": "3afbf85a45d18e325e650d0d6061886a5d7ed4728b183e01ee4e3320b3631fb1",
+    "atom/distributed/pp_host_fence/k3_edge_schema.py": "14768413e15b7f72b0ad48b7b4f4a09e267d5be3e2cc883d5aa248b0938b8462",
+    "atom/distributed/pp_host_fence/runtime.py": "bce7977b56611912e457c77bfb640738db7243ec32be7735fc711d0e0a05ea4a",
+    "atom/distributed/pp_host_fence/tensor_backend.py": "3ae850fc926adadc3b7f6a80c7a310c1a9c8de38bcd8ef6d0b76ee65ff71fe37",
+    "atom/distributed/pp_host_fence/__init__.py": "9bd0c8e0cc7a2ec652049048bd2f96b1ba6bbfc3e8650e38a94d11f20a29d20a",
+    "atom/model_engine/async_proc.py": "f41048e964792f5bf65b394ef1290595133582e18dcfd3591d828f3828925d0e",
+    "atom/spec_decode/pp_aux_relay.py": "31af151e8fdcd21c5103802145f817444965f8ad7a5643ab47e250ae41810f90",
+    "atom/config.py": "461247aab1cdaff9c086143ed7f78d789656d739e7f3f4f90afd9d89324d8729",
+    "atom/models/kimi_k3/model.py": "beceb64d9791829757a6b3aa2ef1ca1a9f6a9f416d6fae7973af41eb1366ddcb",
+    "atom/spec_decode/drafter.py": "01ab60f93214b1af844d175895b79d7be51d262ea5f03c559d8654112d105093",
+    "atom/model_engine/model_setup.py": "32e348a6f5a9aff4b15d4210c909ea17e88ffbbbf17cbf4dd7adbe1c269c8b45",
+    "atom/mono/runtime/hip_ipc.py": "4250bf513dfc14a53ec2088ff55b783d00ddfb052dc23f692761a500c8e2f3ba",
+    "atom/mono/runtime/uncached.py": "5ecec791e0d5842a0f30e0185ff60c2674f1fb2fb5aa86c937e228f731d9c3fd",
+    "atom/utils/envs.py": "9d9c8c6ae569af752238ef3297da3e4ebd8398f53d590a44bf08b77b4a858922",
+    "atom/model_ops/attention_residual.py": "9b4020be4a99f296ebf3b387f40e55617921b2c32300f84e00537c7e9f64ba4b"
+  },
+  "limits": [
+    "This public-base port has not been GPU or model-output validated.",
+    "Only the source-bound eager K3 PP8/TP1 two-host 4+4 layout is accepted.",
+    "No in-process model reload, abrupt-peer recovery, or early-receive combination."
+  ]
+}

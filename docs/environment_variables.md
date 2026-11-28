@@ -55,6 +55,7 @@ The nodes trust each other: the engine's store and the workers' reply channels a
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_PP_HOST_FENCE_IPC** | 0 or 1 | 0 | Experimental, source-bound K3 PP8×TP1 HIP IPC transport on two hosts with four stages each. Six same-host edges use CPU READY/CONSUMED messages and local copy/clone fences; the cross-host edge keeps RCCL. Requires the exact [support contract](pp_host_fence_ipc.md); refuses early receive, unsupported configurations and in-process reload. Default off pending public-head GPU and model-output validation. |
 | **ATOM_PP_MAX_INFLIGHT** | int | 0 | Batches the PP head keeps in flight before it waits for the oldest to return. Every launched batch counts until the last stage completes it, middle prefill chunks included. `0` uses `pipeline_parallel_size`; a negative value is an error. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. Its cost is queueing: batches past the stage count wait on the stages, so each takes longer to return. Kimi-K3's PP8 P/D prefill at C88 sets 16, ~15% more throughput than 8, and 12 was no better than 16. Other models and PP sizes are unmeasured, so the default stays the stage count. |
 
 ## Prefill delayer (TP/DCP and DP attention)
