@@ -76,6 +76,40 @@ def markov_logits_tile(
     BLOCK_K: tl.constexpr,
     STORE_EMBED: tl.constexpr,
 ):
+    """`markov_logits_tile_of` for ids read from ``prev_ids_ptr``."""
+    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
+    # assuming unit stride here reads another position's tokens.
+    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    return markov_logits_tile_of(
+        prev, base_ptr, w1_ptr, w2_ptr, embed_out_ptr, tile, offs_row, offs_v,
+        row_mask, v_mask, rank, stride_base_row, stride_w1_vocab, stride_embed_row,
+        stride_w2_vocab, vocab_offset, BLOCK_ROW, BLOCK_V, BLOCK_K, STORE_EMBED,
+    )  # fmt: skip
+
+
+@triton.jit
+def markov_logits_tile_of(
+    prev,
+    base_ptr,
+    w1_ptr,
+    w2_ptr,
+    embed_out_ptr,
+    tile,
+    offs_row,
+    offs_v,
+    row_mask,
+    v_mask,
+    rank,
+    stride_base_row,
+    stride_w1_vocab,
+    stride_embed_row,
+    stride_w2_vocab,
+    vocab_offset,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    STORE_EMBED: tl.constexpr,
+):
     """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
     padded vocab lanes; with ``STORE_EMBED`` tile 0 also publishes
     ``W1[prev]`` to ``embed_out`` (the greedy op's confidence head reads it).
@@ -87,10 +121,6 @@ def markov_logits_tile(
     and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
     2**31 elements at serving sizes.
     """
-    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
-    # assuming unit stride here reads another position's tokens.
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
     acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
     for k in range(tl.cdiv(rank, BLOCK_K)):
         offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)

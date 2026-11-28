@@ -54,13 +54,27 @@ The draft ships no embedding or LM head; both are the target's.
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+import triton
+import triton.language as tl
 from aiter import QuantType, dtypes
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.rotary_embedding import get_rope
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import QuantizationConfig
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.kv_transfer.disaggregation import kv_config_has_producer
+from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
+from atom.model_ops.dspark_markov_stage1 import (
+    BLOCK_K,
+    BLOCK_V,
+    markov_launch_geometry,
+    markov_logits_tile_of,
+)
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -69,6 +83,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     sparse_pa_per_row,
     to_page16_shuffle,
 )
+from atom.model_ops.tile_argmax import argmax_lowest_id
 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
     triton_fused_norm_rope_cache,
 )
@@ -82,6 +97,14 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.models.minimax_m3.packed_argmax import (
+    EMPTY,
+    EMPTY_K,
+    pack_max_id,
+    ranks_best,
+    unpack_id,
+)
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -149,6 +172,94 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+
+
+@triton.jit
+def _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W: tl.constexpr):
+    """The id of the largest packed value over the W ranks' rows ``[W, B]``."""
+    return unpack_id(ranks_best(gathered_ptr, offs_row, row_mask, num_rows, W, 1))
+
+
+@triton.jit
+def _markov_step_atomic(
+    base_ptr,  # this position's base logits, this rank's vocab shard, rows strided
+    prev_ids_ptr,  # FIRST: [B] the anchors
+    gathered_ptr,  # not FIRST: [W, B] int64, every rank's packed best of the previous position
+    prev_packed_ptr,  # not FIRST: [B] int64, this rank's packed best of the previous position (reset here)
+    out_prev_ptr,  # not FIRST: the previous position's column of the [B, T] ids
+    w1_ptr,
+    w2_ptr,
+    packed_ptr,  # [B] int64: this position's best on this rank, atomic_max (reset by the next launch)
+    num_rows,
+    vocab_size,
+    rank,
+    stride_base_row,
+    stride_prev,
+    stride_out,
+    stride_w1_vocab,
+    stride_w2_vocab,
+    vocab_offset,
+    FIRST: tl.constexpr,
+    W: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One block position of the sharded greedy Markov block in one launch: the
+    previous position's cross-rank winner (tile 0 also writes it into the
+    previous column and resets this rank's previous packed best), the bias
+    GEMV of `markov_logits_tile_of`, and each tile's (max, lowest id) folded
+    into the row's packed best by ``atomic_max``: the reduction launch of
+    `dspark_markov_argmax` without the launch. The same values and tie rule,
+    so the same ids."""
+    tile = tl.program_id(0)
+    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    row_mask = offs_row < num_rows
+    v_mask = offs_v < vocab_size
+    if FIRST:
+        prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    else:
+        prev = _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W)
+        if tile == 0:
+            tl.store(out_prev_ptr + offs_row * stride_out, prev, mask=row_mask)
+            tl.store(
+                prev_packed_ptr + offs_row,
+                tl.full([BLOCK_ROW], EMPTY_K, tl.int64),
+                mask=row_mask,
+            )
+    vals = markov_logits_tile_of(
+        prev, base_ptr, w1_ptr, w2_ptr, base_ptr, tile, offs_row, offs_v, row_mask,
+        v_mask, rank, stride_base_row, stride_w1_vocab, 0, stride_w2_vocab,
+        vocab_offset, BLOCK_ROW, BLOCK_V, BLOCK_K, False,
+    )  # fmt: skip
+    tile_max, tile_idx = argmax_lowest_id(
+        vals, offs_v[None, :], v_mask[None, :], 2147483647
+    )
+    hit = tile_idx != 2147483647
+    packed = pack_max_id(tile_max, tile_idx + vocab_offset)
+    tl.atomic_max(packed_ptr + offs_row, packed, mask=row_mask & hit, sem="relaxed")
+
+
+@triton.jit
+def _markov_last_atomic(
+    gathered_ptr,
+    packed_ptr,
+    out_ptr,
+    num_rows,
+    stride_out,
+    W: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """The last position's cross-rank winner into its column; resets this rank's
+    packed best for the next block."""
+    offs_row = tl.program_id(0) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    row_mask = offs_row < num_rows
+    best_id = _ranks_best_id(gathered_ptr, offs_row, row_mask, num_rows, W)
+    tl.store(out_ptr + offs_row * stride_out, best_id, mask=row_mask)
+    tl.store(
+        packed_ptr + offs_row, tl.full([BLOCK_ROW], EMPTY_K, tl.int64), mask=row_mask
+    )
 
 
 class M3DSparkAttention(nn.Module):
@@ -448,6 +559,11 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             if getattr(config, "enable_confidence_head", False)
             else None
         )
+        # Only a confidence-scheduled verify reads the head (the proposer drops
+        # it otherwise), so the block skips its GEMM.
+        self.emit_confidence = self.confidence_head is not None and bool(
+            atom_config.dspark.confidence_schedule
+        )
 
         # Bound by share_with_target(); the checkpoint ships neither.
         self.embed_tokens = None
@@ -457,6 +573,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self._bt16 = None
+        # `_markov_atomic`'s per-position packed bests, allocated with the
+        # block rows
+        self._mk_packed = None
 
     # ---- drafting entry points (called by the proposer) --------------------
 
@@ -481,6 +600,12 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._alloc_markov_packed(T, device)
+
+    def _alloc_markov_packed(self, num_draft: int, device) -> None:
+        self._mk_packed = torch.full(
+            (num_draft, self.max_num_seqs), EMPTY, dtype=torch.int64, device=device
+        )
 
     def prepare_paged_block(
         self,
@@ -542,7 +667,93 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
+    def _sharded_markov_sample(self) -> bool:
+        """Whether the block is sampled off this rank's vocab shard: the ranks
+        exchange each position's ``(max, id)`` instead of all-gathering the
+        ``[B * T, V]`` logits, and each reads a quarter of ``W2`` per position
+        (see ``DeepseekV41DSpark._sharded_markov_sample``). Not with the
+        confidence head on, which reads each position's ``W1[prev]`` row: that
+        block keeps the all-gathered path."""
+        head, markov = self.lm_head, self.markov_head
+        return (
+            head is not None
+            and not self.emit_confidence
+            and head.tp_size > 1
+            and head.bias is None
+            # `_head_and_sample_sharded` multiplies the raw shard, so the head
+            # must be the plain TP-sharded one: an even, unpadded split of the
+            # vocab and no sequence-parallel logits path.
+            and not sp_is_enabled()
+            and head.num_embeddings % head.tp_size == 0
+            and head.weight.shape[0] == head.num_embeddings // head.tp_size
+            and markov.fused_sample
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
+        )
+
+    def _head_and_sample_sharded(self, hidden, anchor_ids, num_draft):
+        """``head_and_sample`` with the LM head left sharded; the same ids as
+        the whole-vocab op."""
+        bs = anchor_ids.shape[0]
+        head, markov = self.lm_head, self.markov_head
+        base_logits = tgemm.mm(hidden, head.weight).view(bs, num_draft, -1)
+        tp_group = get_tp_group()
+        w1, w2 = markov.markov_w1.weight, markov.markov_w2.weight
+        out_ids = anchor_ids.new_empty(bs, num_draft)
+        self._markov_atomic(base_logits, anchor_ids, w1, w2, out_ids, head, tp_group)
+        return out_ids, None
+
+    def _markov_atomic(self, base_logits, anchor_ids, w1, w2, out_ids, head, tp_group):
+        """The sharded greedy Markov block, one launch and one all-gather per
+        position (`_markov_step_atomic`) and one closing launch. Each position's
+        packed best lives in a persistent ``[T, max_num_seqs]`` int64 buffer,
+        at its reset value between blocks (each is reset by the launch after the
+        all-gather that read it), so no launch clears it."""
+        bs, num_draft, v_local = base_logits.shape
+        world = tp_group.world_size
+        rank = w2.shape[1]
+        geometry = markov_launch_geometry(bs, v_local)
+        # Sized with the block buffers ahead of graph capture; never regrown
+        # here, a captured graph holds its address. A forward that runs before
+        # the block buffers exist (the profile pass) sizes it on first use.
+        if self._mk_packed is None:
+            self._alloc_markov_packed(num_draft, base_logits.device)
+        assert num_draft <= self._mk_packed.shape[0]
+        assert bs <= self._mk_packed.shape[1]
+        gathered = None
+        for k in range(num_draft):
+            base_k = base_logits[:, k]
+            packed = self._mk_packed[k, :bs]
+            prev_packed = self._mk_packed[max(k - 1, 0), :bs]
+            _markov_step_atomic[(geometry.v_tiles, geometry.row_tiles)](
+                base_k, anchor_ids, packed if gathered is None else gathered,
+                prev_packed, out_ids[:, max(k - 1, 0)], w1, w2, packed,
+                bs, v_local, rank, base_k.stride(0), anchor_ids.stride(0),
+                out_ids.stride(0), w1.stride(0), w2.stride(0), head.vocab_start_idx,
+                FIRST=k == 0, W=world, BLOCK_ROW=geometry.block_row,
+                BLOCK_V=BLOCK_V, BLOCK_K=BLOCK_K, num_warps=geometry.num_warps,
+                num_stages=2,
+            )  # fmt: skip
+            gathered = (
+                tp_group.all_gather(
+                    packed.view(torch.float32).view(bs, 2),
+                    dim=0,
+                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                )
+                .view(torch.int64)
+                .view(-1)
+            )
+        block_row = min(1024, triton.next_power_of_2(bs))
+        _markov_last_atomic[(triton.cdiv(bs, block_row),)](
+            gathered, self._mk_packed[num_draft - 1, :bs], out_ids[:, num_draft - 1],
+            bs, out_ids.stride(0), W=world, BLOCK_ROW=block_row, num_warps=1,
+        )  # fmt: skip
+
     def head_and_sample(self, hidden, anchor_ids, num_draft):
+        if self._sharded_markov_sample():
+            return self._head_and_sample_sharded(hidden, anchor_ids, num_draft)
         bs = anchor_ids.shape[0]
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
@@ -556,7 +767,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
                 )
             )
         confidence = None
-        if self.confidence_head is not None:
+        if self.emit_confidence:
             confidence = self.confidence_head(
                 hidden.view(bs, num_draft, -1), torch.stack(markov_embeds, dim=1)
             )
