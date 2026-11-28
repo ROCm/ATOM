@@ -392,3 +392,23 @@ def mxfp4_default_backends(monkeypatch):
     monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
     monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
     monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)
+
+
+# -- 9. The V4.1 seams the plugin host / recipe tests route -----------------------
+# A model writes its seams' contracts at its call sites (plugin_poc's V4.1
+# model, ATOM's shared ops); the host and recipe tests declare the same specs.
+def _declare_v41_seams() -> None:
+    import importlib.util
+
+    from atom import plugin_host
+
+    spec = importlib.util.spec_from_file_location(
+        "plugin_v41_seams", Path(__file__).resolve().parent / "plugin_v41_seams.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for spec in module.specs():
+        plugin_host.seam(spec, source="tests.plugin_v41_seams")
+
+
+_declare_v41_seams()

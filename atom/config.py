@@ -2468,6 +2468,11 @@ class Config:
 
     # only use for plugin mode
     plugin_config: PluginConfig | None = None
+    # --plugin-recipe as plain, picklable data (atom.plugin_recipe.RecipeSource:
+    # the recipes' text); each process resolves it to the plugin plan. None:
+    # native. --plugin-arm: which planned plugins serve.
+    plugin_source: Any = None
+    plugin_arm: str = "plugin"
     # only for quark_online_quantization
     online_quant_config: dict | None = None
     hf_overrides: dict[str, Any] | None = None
@@ -4036,6 +4041,11 @@ class Config:
         # between runs would otherwise show up only as a cold compile, with no
         # error; logged at debug so two runs can be diffed.
         logger.debug("Compile cache HF architecture factor: %s", architecture_factor)
+        # A plugin plan puts opaque ops and AITER providers into the graph. An
+        # empty plan keys nothing, so the native cache keys stay as they were.
+        source = getattr(self, "plugin_source", None)
+        if source is not None and not source.empty:
+            factors.append((source.plan_id, envs.ATOM_PLUGIN_HOST))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

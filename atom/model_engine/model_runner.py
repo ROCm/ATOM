@@ -30,7 +30,7 @@ from aiter.dist.parallel_state import (
 )
 from torch.profiler import record_function
 
-from atom import structured_output
+from atom import plugin_host, structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_agree, group_min
 from atom.distributed.pcp_utils import (
@@ -1021,6 +1021,11 @@ class ModelRunner:
             dtype=np.int64,
         )
 
+        # A recipe's plan (--plugin-recipe) before the build: the model's seams
+        # bind as it is built, and the plan may name the model class to build.
+        plugin_host.configure(
+            config.plugin_source, arm=config.plugin_arm, config=config
+        )
         self.model = get_model(config, self.device, self._build_and_load_model)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
@@ -1054,6 +1059,13 @@ class ModelRunner:
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
+
+        # A recipe's module / method takeovers, after both loads; then the plan
+        # against the seams the built models declared (refuses the start).
+        plugin_host.install_modules(self.model)
+        if getattr(self, "drafter", None) is not None:
+            plugin_host.install_modules(self.drafter.model, prefix="draft")
+        plugin_host.check_plan()
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -1105,13 +1117,25 @@ class ModelRunner:
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         self._refuse_unrelayed_pp_taps(drafter)
         installer = mono_decode_installers.get(hf_config.architectures[0])
-        if installer is not None:
-            self.model = resolve_obj_by_qualname(installer)(
-                self.model,
-                config,
-                drafter,
-                metadata_builder=self.attn_metadata_builder,
+
+        def install_native(model, atom_config, drafter, **kwargs):
+            """The model's own installer (its mono decode, where it has one)."""
+            if installer is None:
+                return model
+            return resolve_obj_by_qualname(installer)(
+                model, atom_config, drafter, **kwargs
             )
+
+        # The boot hook (`model.install`): a planned plugin may wrap or replace
+        # the model to serve; native runs the model's own installer.
+        self.model = plugin_host.call(
+            plugin_host.MODEL_INSTALL,
+            install_native,
+            self.model,
+            config,
+            drafter,
+            metadata_builder=self.attn_metadata_builder,
+        )
         self._bind_verify_head()
         self._init_dp_argmax_head()
         # A model that can run a whole decode step itself (sampling and
@@ -1129,6 +1153,13 @@ class ModelRunner:
             self.attn_metadata_builder.build_mixed_prefill_banks()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        # The plan's providers load their native code before warmup and capture
+        # (a prepare that fails refuses the start); then every parameter and
+        # buffer is recorded: one weight preparation for every graph, prefill
+        # and decode of this process (the capture report names any change).
+        plugin_host.prepare_plan(self.device)
+        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+        plugin_host.freeze_weights(self.model, drafter_model, prefixes=("", "draft"))
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -4907,6 +4938,9 @@ class ModelRunner:
                 f"Consider reducing gpu_memory_utilization."
             )
 
+        # Which owner each captured bucket and the eager calls routed to, against
+        # the recipe; and any shared weight the captures changed.
+        plugin_host.log_route_report("capture")
         return time.time() - start_time, self.capture_sizes, _pool_bytes
 
     def _record_prefill_graphs(self) -> None:

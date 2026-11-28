@@ -304,9 +304,16 @@ class Drafter(abc.ABC):
         self.mtp_k: int = self._resolve_mtp_k()
 
         # Flavor-specific draft-model construction (plain MTP / eagle3 / DSpark).
+        from atom import plugin_host
+
         draft_hf = self.speculative_config.draft_model_hf_config
+        draft_arch = draft_hf.architectures[0]
         model_class = resolve_obj_by_qualname(
-            support_draft_model_arch_dict[draft_hf.architectures[0]]
+            plugin_host.draft_model_class_for(
+                draft_arch,
+                support_draft_model_arch_dict[draft_arch],
+                self.config,
+            )
         )
         self.model = self._build_draft_model(model_class)
 

@@ -355,6 +355,8 @@ class EngineCore:
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
                 admit_policy=config.prefill_admit_policy,
+                busy_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL_BUSY,
+                busy_decode_seqs=envs.ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS,
             )
         )
 

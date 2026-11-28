@@ -204,6 +204,36 @@ def _dp_sync_interval_env() -> int | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_TOKENS", 0
+    ),
+    "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS": lambda: _nonnegative_int_env(
+        "ATOM_DP_SESSION_PREFIX_OWNER_MAX_EXTRA_REQS", 8
+    ),
+    "ATOM_PREFILL_COST_CEIL": lambda: (
+        os.getenv("ATOM_PREFILL_COST_CEIL", "0").lower() in ("1", "true")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY", "0")
+    ),
+    "ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY", "0")
+    ),
+    "ATOM_PREFILL_LONG_CAP_BUSY_SEQS": lambda: int(
+        os.getenv("ATOM_PREFILL_LONG_CAP_BUSY_SEQS", "48")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_ROWS", "0")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_LONG_ROWS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_LONG_ROWS", "4096")
+    ),
+    "ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS": lambda: int(
+        os.getenv("ATOM_PREFILL_SHORT_FIRST_MAX_SKIPS", "32")
+    ),
     # Optional standalone OpenTelemetry tracing (read once per process).
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
@@ -799,6 +829,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # starts on gfx950 through the shared expert's in-place K pad, 288 -> 320,
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
+    # Plugin host kill switch (atom/plugin_host.py): "0" serves every seam
+    # natively and passes AITER an empty enable list. It cannot enable a plugin;
+    # only --plugin-recipe does.
+    "ATOM_PLUGIN_HOST": lambda: os.getenv("ATOM_PLUGIN_HOST", "1") != "0",
+    # "1": ask every owner of a seam and raise when two accept one call (their
+    # cells overlap). Off by default; like the switch above it enables nothing.
+    "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

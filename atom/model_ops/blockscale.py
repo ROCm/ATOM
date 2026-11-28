@@ -12,6 +12,8 @@ import functools
 import torch
 import triton
 
+from atom import plugin_host
+
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
 )
@@ -20,6 +22,24 @@ from .blockscale_kernels.quantization import (
     quantize_fp4_kernel,
     quantize_fp8_kernel,
     quantize_fp8_taps_kernel,
+)
+
+# The `v41.op.quant_fp8_g32` seam: its contract, written at its call site in this file.
+_SEAM_OP_QUANT_FP8_G32 = plugin_host.seam(
+    plugin_host.SeamSpec(
+        name="v41.op.quant_fp8_g32",
+        contract=1,
+        kind="op",
+        form="call",
+        inputs=("x",),
+        kwargs=("dequantize",),
+        returns=("x_fp8", "x_scale"),
+        key=("x",),
+        graph="capture_safe",
+        doc="quantize_fp8: e4m3 + e8m0 [..., K/32]; dequantize=True is QAT",
+        target="atom/model_ops/blockscale.py",
+    ),
+    source="atom/model_ops/blockscale.py",
 )
 
 
@@ -52,6 +72,7 @@ def _check_quant_input(x, group):
     return x.contiguous()
 
 
+@plugin_host.site("v41.op.quant_fp8_g32")
 def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
     """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
     x = _check_quant_input(x, 32)

@@ -136,6 +136,33 @@ def test_the_key_holds_the_listed_settings_only(tmp_path, monkeypatch):
     assert diffs == ["env.ATOM_MOE_GU_ITLV: daemon=None client=1"]
 
 
+def test_a_plugin_recipes_model_classes_are_in_the_key(tmp_path, monkeypatch):
+    from atom import plugin_recipe
+
+    def source(target):
+        recipe = tmp_path / f"{target}.json"
+        recipe.write_text(
+            json.dumps(
+                {
+                    "schema": plugin_recipe.RECIPE_SCHEMA,
+                    "arch": "Toy",
+                    "model_options": {"target_model_cls": target},
+                }
+            )
+        )
+        return plugin_recipe.from_cli(str(recipe))
+
+    monkeypatch.setenv("ATOM_PLUGIN_HOST", "1")
+    native = _key(tmp_path, monkeypatch, plugin_source=None)
+    assert native["model_classes"] is None
+    a = _key(tmp_path, monkeypatch, plugin_source=source("pkg.A"))
+    b = _key(tmp_path, monkeypatch, plugin_source=source("pkg.B"))
+    assert a["model_classes"] == {"target": "pkg.A", "draft": None}
+    assert key._diff_key(a, b) == ["model_classes.target: daemon=pkg.A client=pkg.B"]
+    monkeypatch.setenv("ATOM_PLUGIN_HOST", "0")  # the kill switch builds ATOM's
+    assert _key(tmp_path, monkeypatch, plugin_source=source("pkg.A")) == native
+
+
 def test_a_setting_of_a_sub_config_is_in_the_key(tmp_path, monkeypatch):
     # Project-before-merge: loading then keeps a tensor the other way lacks.
     off, on = (
