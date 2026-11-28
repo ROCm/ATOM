@@ -235,6 +235,7 @@ Key entry points:
 | Distributed | `docs/distributed_guide.md` |
 | Dynamic chunked pipeline parallel | `docs/dynamic_chunking_guide.md` |
 | Metrics & observability | `docs/metrics_guide.md` |
+| ATOMesh multimodal images and E/P/D (design; lands with its PR stack) | `docs/atomesh_multimodal_epd.md` |
 | CI/PR workflow | `/ci-pr-guide` |
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |
