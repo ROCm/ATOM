@@ -128,6 +128,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     torch.nn.Module.__init__(layer)
     layer.kv_cache_dtype, layer.index_cache_dtype = kv, index
     layer._sparse_pa_mxfp4, layer._select_page_kwargs = attend_fp4, {}
+    layer._decode_select_supported = None  # __init__ is bypassed: fused selection off
     layer.skip_index_topk, layer.index_topk_cache_state = False, {}
     layer.indexer_cp_group = object() if indexer_cp else None
     layer._cp_index_topk_decode = lambda idx_q, bt, sl, *a, **kw: topk(idx_q, 0, bt, sl)
