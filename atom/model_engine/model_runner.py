@@ -3518,7 +3518,11 @@ class ModelRunner:
 
                 intermediate_tensors = recv_aux = None
                 if pp_enabled and not pp_group.is_first_rank:
-                    intermediate_tensors = recv_intermediate_tensors()
+                    # The last stage's drafter keeps the relayed aux block
+                    # (`take_relayed_aux`), so it gets a tensor of its own.
+                    intermediate_tensors = recv_intermediate_tensors(
+                        fresh=(PP_AUX_KEY,) if pp_group.is_last_rank else ()
+                    )
                     # GLM-5.2 IndexShare: load prior rank's top-k for leading
                     # shared layers. Pop so compiled model sees only hidden_states.
                     recv_sparse = intermediate_tensors.tensors.pop(
@@ -3567,9 +3571,12 @@ class ModelRunner:
                             model_output.tensors[PP_AUX_KEY] = aux
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
-                    # The relay hands its payload over: no clone needed.
+                    # The relay's payload is copied like the rest: on a stage
+                    # with no tap of its own it is a view of the resident
+                    # receive buffer, which the next step's receive
+                    # overwrites while this send may still be in flight.
                     self._pp_pending_send = async_send_intermediate_tensors(
-                        model_output, owned=(PP_AUX_KEY,)
+                        model_output
                     )
                     hidden_states = None
                 elif self._is_pure_middle_chunk(batch):
