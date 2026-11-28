@@ -118,8 +118,8 @@ HAND_CM = CM_DEV if os.environ.get("ATOM_MONO_HANDCM", "1") == "1" else 0
 K_WQKV = RUN_ARG_NAMES.index("k1_wqkv")
 K_WQKV_S = RUN_ARG_NAMES.index("k1_wqkv_s")
 # (RQW) the reduce CTAs' wave 7 reads the next layer's q-task wqkv_a tile into L2
-# during the reduce; at build: ATOM_MONO_RQW=1
-RQW_SITE = os.environ.get("ATOM_MONO_RQW", "0") == "1"
+# during the reduce; on by default, ATOM_MONO_RQW=0 builds without it
+RQW_SITE = os.environ.get("ATOM_MONO_RQW", "1") == "1"
 K_MOE = 146
 assert RUN_ARG_NAMES[K_MOE] == "moe_layer"
 # CDNA buffer resource flags (DATA_FORMAT 32, NUM_FORMAT float: raw loads ignore them)
@@ -235,10 +235,8 @@ def _rqw_loads(tid, w, ws, task):
 
 @traced
 def _rqw_site(tid, on, row, task, scratch):
-    """(RQW, absw bit 1) Wave 7 of a CTA where ``on``: the switch word read
-    there only; bit 1 -> ``_rqw_loads`` of the weights of the table row at
-    ``row`` (layer i+1's; an A/A build: the base's path, no loads); the
-    reduce's waves 0-1 skip it all."""
+    """(RQW) Wave 7 of a CTA where ``on``: ``_rqw_loads`` of the weights of
+    the table row at ``row`` (layer i+1's); the reduce's other waves skip it."""
     if on & (uniform(tid // 64) == WAVES - 1):
         nxt = LayerTable(row, 0)
         _rqw_loads(tid, nxt.i64(K_WQKV), nxt.i64(K_WQKV_S), task)
