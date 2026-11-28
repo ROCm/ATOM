@@ -156,6 +156,13 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
             runner.config.max_model_len - _profile_lookahead(runner),
         )
     ]
+    if runner.config.enable_dp_attention:
+        # Only a DP-unified decode enters the sharded logits head. Mixed
+        # steps above cannot measure its full-vocabulary collective buffers.
+        # Scheduling charges the full draft width even for a shorter verify.
+        decode_bs = min(runner.config.max_num_seqs, runner.warmup_max_tokens() // width)
+        if decode_bs:
+            shapes.extend((0, decode_bs, q) for q in sorted({1, width}))
     if not shapes:
         return torch.cuda.max_memory_allocated(), 0
     # Enough private pages for all current writes plus shared zero history.
@@ -190,7 +197,12 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
                         )
                     runner.tokenID_processor.clean()
                     torch.cuda.reset_peak_memory_stats()
-                    runner.forward(batch)
+                    # Fresh IDs have no confidence history to select q. Keep
+                    # full-K verification outputs/KV/draft metadata and pass
+                    # only the pure-decode forward width separately.
+                    runner.forward(
+                        batch, profile_query_width=q if prefill == 0 else None
+                    )
                     torch.cuda.synchronize()
                     allocated = torch.cuda.max_memory_allocated()
                     reserved = torch.cuda.max_memory_reserved()

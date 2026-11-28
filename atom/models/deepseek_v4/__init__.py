@@ -1724,6 +1724,36 @@ def _mixed_span(tag: str):
     return _NULL_SPAN
 
 
+class _MixedAttentionWorkspace:
+    """Token-bounded eager temporaries shared by the target's attention layers.
+
+    Allocate before KV profiling, not once per layer or per changing mixed
+    shape. TBO microbatches own disjoint token rows until their forward ends.
+    Pure decode keeps its graph-owned outputs.
+    """
+
+    def __init__(self, capacity, heads, head_dim, *, device, fp8):
+        self.q = torch.empty(
+            (capacity, heads * head_dim), dtype=torch.bfloat16, device=device
+        )
+        self.out = (
+            torch.empty(
+                (capacity, heads, head_dim), dtype=torch.bfloat16, device=device
+            )
+            if fp8
+            else None
+        )
+
+    def rows(self, start, count):
+        if start < 0 or count < 0 or start + count > self.q.shape[0]:
+            raise ValueError(
+                f"mixed attention rows [{start}, {start + count}) exceed "
+                f"workspace capacity {self.q.shape[0]}"
+            )
+        sl = slice(start, start + count)
+        return self.q[sl], None if self.out is None else self.out[sl]
+
+
 class DeepseekV4Attention(nn.Module):
     """Hybrid attention: MQA + grouped output LoRA + sliding window + attn_sink.
 
@@ -2190,6 +2220,7 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         run_indexer_proj: bool = True,
+        q_out: torch.Tensor | None = None,
     ):
         """Graphable projection/norm prelude shared by both attention paths.
 
@@ -2208,7 +2239,11 @@ class DeepseekV4Attention(nn.Module):
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
         qr, qr_scale = self.q_norm(q_lora)
-        q = self.wq_b(qr, x_scale=qr_scale)
+        q = (
+            self.wq_b(qr, x_scale=qr_scale)
+            if q_out is None
+            else self.wq_b(qr, x_scale=qr_scale, out=q_out)
+        )
 
         # Indexer Q/weights projection (no paged access) -> graphed piece.
         idx_q_quant = idx_weights = idx_q_scale = None
@@ -2383,11 +2418,18 @@ class DeepseekV4Attention(nn.Module):
             return torch.zeros_like(x)
         if not fc.attn_metadata.is_mixed:
             return self.forward_impl_default(x, positions)
+        q_out, out = self._mixed_workspace.rows(
+            fc.context.ubatch_token_offset, x.shape[0]
+        )
+        if not self.wq_b.supports_out():
+            q_out = None
         # Each half owns its compressor plan; the carrier has none.
         q, kv_pre, qr, qr_scale, *_ = self._attn_pre(
-            x, positions, run_indexer_proj=False
+            x, positions, run_indexer_proj=False, q_out=q_out
         )
-        o = self._attn_mixed(fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions)
+        o = self._attn_mixed(
+            fc.attn_metadata, q, kv_pre, qr, qr_scale, x, positions, out=out
+        )
         return self._attn_post(o, positions)
 
     def _attn_mixed(
@@ -2399,6 +2441,7 @@ class DeepseekV4Attention(nn.Module):
         qr_scale: torch.Tensor | None,
         x: torch.Tensor,
         positions: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run QK-norm/RoPE once, then compressors and sparse attention per segment.
 
@@ -2418,7 +2461,8 @@ class DeepseekV4Attention(nn.Module):
         qkn = self._qk_norm_rope(q, kv_pre, positions, True)
 
         # Each segment writes only its own rows, preserving the other query slice.
-        out = qkn.q_sa
+        if out is None:
+            out = qkn.q_sa
         if out is None:
             out = torch.empty(
                 (n_p + n_d, self.n_local_heads, self.head_dim),
@@ -3910,6 +3954,18 @@ class DeepseekV4Model(nn.Module):
                 for layer_id in range(args.n_layers)
             ]
         )
+        if atom_config.enable_mixed_prefill_decode:
+            first_attn = self.layers[0].attn
+            workspace = _MixedAttentionWorkspace(
+                atom_config.max_num_batched_tokens,
+                first_attn.n_local_heads,
+                first_attn.head_dim,
+                # Weight-cache construction puts parameters on meta, not buffers.
+                device=first_attn.swa_plane.device,
+                fp8=first_attn.kv_fp8,
+            )
+            for layer in self.layers:
+                layer.attn._mixed_workspace = workspace
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelHead(args.vocab_size, args.dim, self.norm_eps, self.hc_eps)
 

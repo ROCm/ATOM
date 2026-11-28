@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -22,6 +23,15 @@ from atom.model_engine.mixed_profile import _batch, mixed_profile_shapes
 def runner_module():
     with atom_without_aiter() as load:
         yield load("atom.model_engine.model_runner")
+
+
+@pytest.fixture(params=["base", "rollout"])
+def profile_runner_cls(request, runner_module):
+    if request.param == "rollout":
+        from atom.rollout.model_runner_ext import RLHFModelRunner
+
+        return RLHFModelRunner
+    return runner_module.ModelRunner
 
 
 @pytest.mark.parametrize("width", [1, 8])
@@ -125,6 +135,194 @@ def test_profile_addresses_include_full_draft_lookahead(
         )
 
 
+@pytest.mark.parametrize("width,profile_query_width", [(1, 1), (8, 8), (8, None)])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_pure_decode_profile_preserves_full_k_through_postprocess(
+    runner_module, profile_runner_cls, monkeypatch, width, profile_query_width, deferred
+):
+    from atom.model_ops import rejection_sampler
+
+    runner = profile_runner_cls.__new__(profile_runner_cls)
+    runner._true_vocab_size = 0
+    runner.config = SimpleNamespace(
+        max_model_len=257,
+        max_num_seqs=4,
+        speculative_config=SimpleNamespace(use_dspark=lambda: True),
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_tbo=False,
+        enable_tbo_decode=False,
+    )
+    runner.block_size = 64
+    runner.pool_plan = SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2})
+    runner.drafter = SimpleNamespace(
+        mtp_k=7,
+        is_block_drafter=True,
+        uses_confidence_schedule=True,
+        verify_scheduler=SimpleNamespace(ell_by_req={}, ell_nonblocking=lambda: None),
+        context_kv_only=False,
+        compute_draft_kv=Mock(),
+        lossless=None,
+        runner=runner,
+    )
+    full, full_pages = _batch(runner, 0, 4, 8, long_context=True)
+    batch, pages = _batch(runner, 0, 4, width, long_context=True)
+    assert batch.block_tables == full.block_tables
+    assert pages == full_pages
+    assert batch.context_lens.tolist() == full.context_lens.tolist()
+    assert runner.drafter.mtp_k == 7
+
+    def all_gather(outputs, local, group):
+        for output in outputs:
+            output.copy_(local)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(
+        runner_module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    runner.enforce_eager = True
+    runner.capture_sizes_np = np.array([0], dtype=np.int32)
+    runner.running_tokens_per_dp_rank = np.zeros(2, dtype=np.int32)
+    runner.tbo_decode_graphs = False
+    runner._local_tbo_eligibility = lambda batch: (False, False, 0, 0)
+    runner._producer_graph_shapes = lambda: None
+    runner._cut_ubatches = lambda mode, batch: mode
+    runner.prepare_sample = lambda batch, group: (None, None, None, True, False)
+    runner.h2d_groups = {"token_inputs": Mock(), "spec_decode": Mock()}
+    lengths = batch.num_scheduled_tokens
+    cu = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    runner.attn_metadata_builder = Mock(
+        step_needs_eager=Mock(return_value=False),
+        consumes_device_verdict=Mock(return_value=False),
+        settles_spec_status=Mock(return_value=False),
+        query_lengths=Mock(return_value=batch.num_scheduled_tokens),
+        decode_spans=Mock(return_value=(4, lengths, cu)),
+    )
+    runner.arange_np = np.arange(32, dtype=np.int32)
+    runner.forward_vars = {}
+    for name in (
+        "target_logits_indices",
+        "cu_num_draft_tokens",
+        "bonus_logits_indices",
+    ):
+        host = np.zeros(32, dtype=np.int32)
+        runner.forward_vars[name] = SimpleNamespace(np=host, gpu=torch.from_numpy(host))
+    runner.drafter.prepare_spec_decode_indices = lambda *args: (
+        runner_module.Drafter.prepare_spec_decode_indices(runner.drafter, *args)
+    )
+    context = SimpleNamespace(spec_decode_metadata=None)
+
+    def prepare_inputs(batch, ids, *, forward_mode, spec_decode_indices):
+        context.spec_decode_metadata = runner_module.Drafter.calc_spec_decode_metadata(
+            runner.drafter, ids, spec_decode_indices
+        )
+        context.context = SimpleNamespace(
+            forward_mode=forward_mode,
+            pcp_split=False,
+            positions=torch.arange(4 * width),
+        )
+
+    runner.prepare_inputs = Mock(side_effect=prepare_inputs)
+    runner.tokenID_processor = SimpleNamespace(
+        is_pd_producer=False,
+        is_pipeline_parallel=False,
+        is_deferred_out=deferred,
+        prev_batch=None,
+        prev_rejected_num=np.zeros(4, dtype=np.int32),
+        prev_bonus_num=np.zeros(4, dtype=np.int32),
+        spec_status_queue=Mock(),
+        input_ids=SimpleNamespace(gpu=torch.zeros(4 * width + 1, dtype=torch.int32)),
+        prepare_input_ids=Mock(return_value=torch.zeros(4 * width, dtype=torch.int32)),
+        prepare_sampled_ids=Mock(
+            side_effect=lambda batch, ids, *args, **kwargs: (
+                {rid: row[row >= 0].tolist() for rid, row in zip(batch.req_ids, ids)},
+                {},
+            )
+        ),
+    )
+    for name in (
+        "_advance_forward_vars",
+        "_gate_staging_reuse",
+        "_mark_staging_h2d_enqueued",
+        "_record_forward_vars_event",
+        "_record_kv_cache_ready",
+        "_kv_after_forward",
+    ):
+        setattr(runner, name, Mock())
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(runner_module, "reset_forward_context", lambda: None)
+    for name in ("get_tp_group", "get_pp_group"):
+        monkeypatch.setattr(runner_module, name, lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
+    runner._served = runner.verify_head = runner.structured_output = None
+    runner.forward_done_event = Mock()
+    runner.run_model = lambda ids, batch: torch.zeros(len(ids), 2)
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden: torch.zeros(len(hidden), 8)
+    )
+    runner.sampler = lambda **kwargs: torch.arange(4, dtype=torch.int32)
+    runner.rejection_sampler = rejection_sampler.RejectionSampler()
+    drafts = np.zeros((4, 7), dtype=np.int32)
+    runner.propose_draft_token_ids = Mock(return_value=drafts)
+
+    # Replace only GPU kernels: retain the real sampler's full-K allocation,
+    # metadata construction, postprocess reshape/gather, and draft dispatch.
+    class AcceptAll:
+        def __getitem__(self, grid):
+            def launch(
+                out,
+                status,
+                cu_drafts,
+                ids,
+                indices,
+                target,
+                bonus,
+                bonus_indices,
+                k,
+                **kwargs,
+            ):
+                counts = torch.diff(cu_drafts, prepend=cu_drafts.new_zeros(1))
+                out.fill_(-1)
+                for i, n in enumerate(counts.tolist()):
+                    out[i, :n] = 0
+                    out[i, n] = bonus[i]
+                status[0] = counts
+                status[1] = k - counts
+                status[2] = bonus_indices
+
+            return launch
+
+    monkeypatch.setattr(
+        rejection_sampler, "rejection_greedy_sample_kernel", AcceptAll()
+    )
+    monkeypatch.setattr(
+        rejection_sampler,
+        "topk_select",
+        lambda logits, *a, **k: (None, logits.argmax(-1)),
+    )
+    monkeypatch.setattr(rejection_sampler, "RELAXED_TOP_N", 1)
+    result = runner.forward(batch, profile_query_width=profile_query_width)
+    mode = runner.prepare_inputs.call_args.kwargs["forward_mode"]
+    assert not mode.is_prefill and mode.running_tokens_are_unified
+    assert mode.max_seqlen_q == width
+    assert mode.running_bs == 4 and mode.running_tokens == 4 * width
+    assert runner.tokenID_processor.prepare_input_ids.call_args.args[1] == width
+    metadata = context.spec_decode_metadata
+    assert batch.num_spec_step == metadata.num_spec_steps == 7
+    assert metadata.num_draft_tokens_np.tolist() == [width - 1] * 4
+    sampled = runner.tokenID_processor.prepare_sampled_ids.call_args.args[1]
+    assert sampled.shape == (4, 8)
+    torch.testing.assert_close(
+        sampled[:, width - 1], torch.arange(4, dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        runner.propose_draft_token_ids.call_args.args[3],
+        torch.arange(4, dtype=torch.int32),
+    )
+    assert result.draft_token_ids is drafts
+
+
 @pytest.mark.parametrize("max_seqs", [512, 1024])
 @pytest.mark.parametrize("budget", [2048, 16384])
 @pytest.mark.parametrize("width", [1, 8])
@@ -159,8 +357,17 @@ def test_long_context_work_is_bounded_without_reducing_query_shapes(
 
 @pytest.mark.parametrize("fail_unsplit", [False, True])
 @pytest.mark.parametrize("confidence", [False, True])
+@pytest.mark.parametrize("dp_attention", [False, True])
+@pytest.mark.parametrize("token_budget,spec_bs", [(16, 2), (64, 4)])
 def test_profile_budgets_reserved_peak_and_releases_scratch(
-    monkeypatch, fail_unsplit, confidence
+    monkeypatch,
+    runner_module,
+    profile_runner_cls,
+    fail_unsplit,
+    confidence,
+    dp_attention,
+    token_budget,
+    spec_bs,
 ):
     from atom.model_engine import mixed_profile
     from atom.spec_decode.dspark_verify import VerifyScheduler
@@ -173,9 +380,17 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
         max_num_seqs=4,
         max_model_len=128,
         speculative_config=None,
+        enable_dp_attention=dp_attention,
     )
-    memory = {"allocated": 80, "reserved": 80, "peak": 85, "reserved_peak": 85}
+    memory = {
+        "allocated": 80,
+        "reserved": 80,
+        "peak": 85,
+        "reserved_peak": 85,
+        "non_torch": 7,
+    }
     observed = []
+    shapes = []
     pool_open = False
 
     @contextmanager
@@ -189,33 +404,43 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             pool_open = False
             memory["allocated"] = 80
 
-    def forward(batch):
+    def forward(self, batch, *, profile_query_width=None):
+        assert profile_query_width == (batch.width if batch.prefill == 0 else None)
         assert runner.gpu_forward_metrics is None
         observed.append(memory["reserved"])
+        shapes.append((batch.prefill, batch.decode, batch.width))
         if confidence:
             verify._ell_map = {42: 1}
             verify._ell_pending.append(object())
         if fail_unsplit:
             raise RuntimeError("unsplit forward failed")
-        allocated, reserved = 128, 140
+        allocated, reserved = (148, 170) if batch.prefill == 0 else (128, 140)
         memory.update(peak=allocated, reserved_peak=reserved, reserved=reserved)
+        memory["non_torch"] = 13 if batch.prefill == 0 else 7
 
-    runner = SimpleNamespace(
+    # Keep the real rollout override between the profiler and model execution.
+    monkeypatch.setattr(runner_module.ModelRunner, "forward", forward)
+    runner = profile_runner_cls.__new__(profile_runner_cls)
+    runner.__dict__.update(
         config=config,
         gpu_forward_metrics=object(),
         max_bs=4,
         block_size=16,
-        warmup_max_tokens=lambda: 64,
+        warmup_max_tokens=lambda: token_budget,
         attn_metadata_builder=SimpleNamespace(temporary_profile_cache=temporary_pool),
         tokenID_processor=SimpleNamespace(clean=lambda: None),
-        forward=forward,
     )
     if confidence:
         runner.drafter = SimpleNamespace(mtp_k=7, verify_scheduler=verify)
     monkeypatch.setattr(
         mixed_profile,
         "_batch",
-        lambda *args, **kwargs: (SimpleNamespace(context_lens=[64, 64]), 1),
+        lambda runner, prefill, decode, width, **kwargs: (
+            SimpleNamespace(
+                context_lens=[64, 64], prefill=prefill, decode=decode, width=width
+            ),
+            1,
+        ),
     )
     cuda = mixed_profile.torch.cuda
     monkeypatch.setattr(cuda, "synchronize", lambda: None)
@@ -228,7 +453,9 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
     monkeypatch.setattr(cuda, "max_memory_allocated", lambda: memory["peak"])
     monkeypatch.setattr(cuda, "max_memory_reserved", lambda: memory["reserved_peak"])
     monkeypatch.setattr(
-        cuda, "mem_get_info", lambda: (1000 - memory["reserved"] - 7, 1000)
+        cuda,
+        "mem_get_info",
+        lambda: (1000 - memory["reserved"] - memory["non_torch"], 1000),
     )
 
     original_metrics = runner.gpu_forward_metrics
@@ -237,7 +464,17 @@ def test_profile_budgets_reserved_peak_and_releases_scratch(
             mixed_profile.profile_mixed_memory(runner)
     else:
         # Include the unsplit reserved peak, excluding the temporary pool.
-        assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
+        expected_reserved = 170 if dp_attention else 140
+        assert mixed_profile.profile_mixed_memory(runner) == (
+            80 + (expected_reserved - 100),
+            13 if dp_attention else 7,
+        )
+        decode_shapes = {(d, q) for p, d, q in shapes if p == 0}
+        assert decode_shapes == (
+            {(spec_bs, 1), (spec_bs, 8)}
+            if dp_attention and confidence
+            else {(4, 1)} if dp_attention else set()
+        )
     assert not pool_open
     assert runner.gpu_forward_metrics is original_metrics
     assert observed

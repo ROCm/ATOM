@@ -3108,8 +3108,16 @@ class ModelRunner:
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     @_profile_runner_stage
-    def prepare_model(self, batch: ScheduledBatch):
-        shrunk_q = self._dspark_apply_q_bucket(batch)
+    def prepare_model(
+        self, batch: ScheduledBatch, *, profile_query_width: int | None = None
+    ):
+        # Startup profiling has no confidence history. Override its forward
+        # shape without changing the full-K metadata used by postprocess.
+        shrunk_q = (
+            self._dspark_apply_q_bucket(batch)
+            if profile_query_width is None
+            else profile_query_width
+        )
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
@@ -4055,7 +4063,9 @@ class ModelRunner:
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
-    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+    def forward(
+        self, batch: ScheduledBatch, *, profile_query_width: int | None = None
+    ) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -4072,7 +4082,7 @@ class ModelRunner:
             top_ps,
             all_greedy,
             needs_independent_noise,
-        ) = self.prepare_model(batch)
+        ) = self.prepare_model(batch, profile_query_width=profile_query_width)
         self._mark_staging_h2d_enqueued()
         prepare_token_constraints(
             self, batch, get_forward_context().spec_decode_metadata

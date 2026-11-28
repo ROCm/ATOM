@@ -387,7 +387,8 @@ def test_sparse_attention_passes_caller_slice_to_kernel(
         model,
         "get_forward_context",
         lambda: SimpleNamespace(
-            context=SimpleNamespace(is_dummy_run=False), attn_metadata=metadata
+            context=SimpleNamespace(is_dummy_run=False, ubatch_token_offset=0),
+            attn_metadata=metadata,
         ),
     )
     monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
@@ -445,19 +446,188 @@ def test_full_forward_selects_mixed_only_when_needed(monkeypatch, mixed):
         model,
         "get_forward_context",
         lambda: SimpleNamespace(
-            context=SimpleNamespace(is_dummy_run=False), attn_metadata=metadata
+            context=SimpleNamespace(is_dummy_run=False, ubatch_token_offset=0),
+            attn_metadata=metadata,
         ),
     )
     monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
     calls = []
     layer = SimpleNamespace(
+        _mixed_workspace=model._MixedAttentionWorkspace(
+            2, 2, 2, device="cpu", fp8=True
+        ),
+        wq_b=SimpleNamespace(supports_out=lambda: True, runs_bf16=False),
         forward_impl_default=lambda *a: calls.append("default") or x,
         _attn_pre=lambda *a, **kw: (x, x, x, None),
-        _attn_mixed=lambda *a: calls.append("mixed") or x,
+        _attn_mixed=lambda *a, **kw: calls.append("mixed") or x,
         _attn_post=lambda o, p: o,
     )
     assert model.DeepseekV4Attention._forward_impl_mixed(layer, x, torch.arange(2)) is x
     assert calls == (["mixed"] if mixed else ["default"])
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mixed_workspace_with_meta_weights(monkeypatch, fp8, enabled):
+    import atom.models.deepseek_v4 as model
+    from atom.config import CompilationLevel
+    from atom.model_loader.weight_utils import params_on_meta
+
+    class Block(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.attn = torch.nn.Module()
+            self.attn.attn_sink = model.atom_parameter(torch.empty(2))
+            self.attn.register_buffer("swa_plane", torch.zeros(1, 4), persistent=False)
+            self.attn.n_local_heads = 2
+            self.attn.head_dim = 4
+            self.attn.kv_fp8 = fp8
+
+    monkeypatch.setattr(model, "Block", Block)
+    monkeypatch.setattr(model, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for name in ("VocabParallelEmbedding", "RMSNorm", "ParallelHead"):
+        monkeypatch.setattr(model, name, lambda *a, **kw: torch.nn.Identity())
+    args = SimpleNamespace(
+        max_seq_len=32,
+        norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_mult=2,
+        vocab_size=16,
+        dim=4,
+        n_layers=2,
+    )
+    config = SimpleNamespace(
+        enable_mixed_prefill_decode=enabled,
+        max_num_batched_tokens=8,
+        compilation_config=SimpleNamespace(level=CompilationLevel.NO_COMPILATION),
+    )
+    with params_on_meta():
+        target = model.DeepseekV4Model(atom_config=config, args=args)
+
+    first = target.layers[0].attn
+    assert first.attn_sink.is_meta
+    assert first.swa_plane.device == torch.device("cpu")
+    if not enabled:
+        assert all(
+            not hasattr(layer.attn, "_mixed_workspace") for layer in target.layers
+        )
+        return
+    workspace = first._mixed_workspace
+    assert all(layer.attn._mixed_workspace is workspace for layer in target.layers)
+    assert workspace.q.device == first.swa_plane.device
+    assert workspace.q.shape == (8, 8)
+    workspace.q.fill_(3)
+    torch.testing.assert_close(
+        workspace.rows(2, 3)[0], torch.full((3, 8), 3, dtype=torch.bfloat16)
+    )
+    if fp8:
+        assert workspace.out.device == first.swa_plane.device
+        assert workspace.out.shape == (8, 2, 4)
+    else:
+        assert workspace.out is None
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("supports_out", [False, True])
+def test_mixed_workspace_growing_tokens_and_decode_alternation(
+    monkeypatch, fp8, supports_out
+):
+    import atom.models.deepseek_v4 as model
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import QKNormRopeOut
+
+    workspace = model._MixedAttentionWorkspace(64, 2, 2, device="cpu", fp8=fp8)
+    workspace.q.zero_()
+    if fp8:
+        workspace.out.zero_()
+    pointers = (workspace.q.data_ptr(), None if not fp8 else workspace.out.data_ptr())
+    ctx = SimpleNamespace(is_dummy_run=False, ubatch_token_offset=0, is_prefill=True)
+    metadata = SimpleNamespace(
+        is_mixed=True,
+        prefill_attn_metadata=object(),
+        decode_attn_metadata=object(),
+    )
+    fc = SimpleNamespace(context=ctx, attn_metadata=metadata)
+    monkeypatch.setattr(model, "get_forward_context", lambda: fc)
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    projection_outputs = []
+
+    class Projection:
+        runs_bf16 = False
+
+        def supports_out(self):
+            return supports_out
+
+        def __call__(self, x, *, x_scale, out=None):
+            assert (out is not None) == supports_out
+            projection_outputs.append(out)
+            return x * 2 if out is None else torch.mul(x, 2, out=out)
+
+    def norm(q, *args):
+        # FP8 norm materializes packed Q; BF16 norm reuses Q in place.
+        q = q.reshape(-1, 2, 2)
+        return QKNormRopeOut(q_packed=q.clone()) if fp8 else QKNormRopeOut(q_sa=q)
+
+    def attend(qkn, positions, *, out, **kw):
+        query = qkn.q_packed if fp8 else qkn.q_sa
+        out.copy_(query + 10)
+
+    layer = SimpleNamespace(
+        dim=4,
+        q_lora_rank=4,
+        head_dim=2,
+        n_local_heads=2,
+        indexer=None,
+        _mixed_workspace=workspace,
+        wq_b=Projection(),
+        wqkv_a=lambda x: torch.cat([x, x[:, :2]], dim=-1),
+        q_norm=lambda q: (q, None),
+        _qk_norm_rope=norm,
+        _launch_compressors=lambda x: None,
+        _sparse_attention=attend,
+        _attn_post=lambda out, pos: out.clone(),
+        forward_impl_default=lambda x, pos: x * 2 + 10,
+    )
+    layer._attn_pre = model.DeepseekV4Attention._attn_pre.__get__(layer)
+    layer._attn_mixed = model.DeepseekV4Attention._attn_mixed.__get__(layer)
+    forward = model.DeepseekV4Attention._forward_impl_mixed.__get__(layer)
+    # Two in-flight microbatches retain separate rows across layers. Grow both
+    # through odd sizes, and interleave ordinary decode without touching them.
+    for n in (3, 7, 13, 23, 32):
+        for offset in (0, 32):
+            ctx.ubatch_token_offset = offset
+            metadata.is_mixed = True
+            metadata.num_prefill_tokens = n - 2
+            ctx.input_ids = torch.arange(n)
+            x = torch.arange(n * 4, dtype=torch.bfloat16).reshape(n, 4)
+            other = slice(32, 64) if offset == 0 else slice(0, 32)
+            workspace.q[other].fill_(-11)
+            if fp8:
+                workspace.out[other].fill_(-13)
+            torch.testing.assert_close(forward(x, ctx.input_ids), x * 2 + 10)
+            assert torch.all(workspace.q[other] == -11)
+            if fp8:
+                assert torch.all(workspace.out[other] == -13)
+            if supports_out:
+                assert (
+                    projection_outputs[-1].data_ptr() == workspace.q[offset:].data_ptr()
+                )
+            before_q = workspace.q.clone()
+            before_out = workspace.out.clone() if fp8 else None
+            metadata.is_mixed = False
+            torch.testing.assert_close(
+                forward(x[:2], ctx.input_ids[:2]), x[:2] * 2 + 10
+            )
+            torch.testing.assert_close(workspace.q, before_q)
+            if fp8:
+                torch.testing.assert_close(workspace.out, before_out)
+    assert pointers == (
+        workspace.q.data_ptr(),
+        None if not fp8 else workspace.out.data_ptr(),
+    )
+    for offset, n in ((-1, 1), (0, 65), (33, 32)):
+        with pytest.raises(ValueError, match="workspace capacity"):
+            workspace.rows(offset, n)
 
 
 @pytest.mark.parametrize("mixed,decode", [(False, False), (False, True), (True, False)])
