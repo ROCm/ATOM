@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer, midstep_rerun_rows
 from atom.model_ops.attention_mla import MLAAttention
@@ -194,14 +195,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
             return tensors
 
-        if config.pipeline_parallel_size > 1 and self.model_runner.has_mla_indexer:
-            # A PP stage places its MLA rows and KDA slots by layer; a sparse
-            # MLA model's indexer regions have no such placement.
+        if config.pipeline_parallel_size > 1 and pooled_path_enabled(
+            self._kpool_size()
+        ):
+            # A pooled indexer's tail keys (`kpool_tail_cache`) are no slot
+            # region, so P/D leaves them behind; refused here only under PP.
             raise NotImplementedError(
                 f"{model_type} disaggregated serving does not support pipeline "
-                "parallelism with a sparse MLA indexer (pipeline_parallel_size="
-                f"{config.pipeline_parallel_size}). Run the P and D instances "
-                "with PP=1."
+                "parallelism with a pooled sparse indexer (index_kpool="
+                f"{self._kpool_size()}): its kpool tail cache is not transferred."
             )
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
@@ -234,10 +236,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             # g * (peer regions / groups) + start_layer + l. The MLA rows and
             # KDA slots are each numbered over their own kind only, so that
             # placement would write one layer's KV or state over another's.
-            mla, slots = self._pp_consumer_region_indices(
-                len(tensors.block_regions), len(tensors.slot_regions)
+            block, slots = self._pp_consumer_region_indices(
+                tensors.block_region_consumer_indices,
+                len(tensors.block_regions),
+                sum(r.semantic_role == INDEX_CACHE_ROLE for r in tensors.block_regions),
+                len(tensors.slot_regions),
             )
-            tensors.block_region_consumer_indices = mla
+            tensors.block_region_consumer_indices = block
             tensors.slot_region_consumer_indices = slots
         return tensors
 
@@ -283,18 +288,20 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         return segments
 
     def _pp_consumer_region_indices(
-        self, num_block_regions: int, num_slot_regions: int
+        self,
+        base_block: list[int] | None,
+        num_block_regions: int,
+        num_index_regions: int,
+        num_slot_regions: int,
     ) -> tuple[list[int], list[int]]:
-        """This stage's MLA and KDA regions, placed in a PP=1 peer's lists.
+        """This stage's MLA, index and KDA regions, placed in a PP=1 peer's lists.
 
         Each row is placed by its module's own layer number: the peer numbers
         its MLA rows over the full-attention layers and its slots over the KDA
         layers, group by group (conv, SSM, then ReplaySSM's records and its
-        one cursor), the same order `state_slot_regions` publishes here.
-
-        Only dense MLA rows are placed, as Kimi-K3 has: `get_kv_transfer_tensors`
-        refuses a sparse MLA model (`has_mla_indexer`, e.g. `glm5_next_text`)
-        under PP before this.
+        one cursor), the same order `state_slot_regions` publishes here. A
+        sparse model's index regions, after every MLA row, keep the base
+        builder's placement: `base_block` past the MLA rows.
         """
         runner = self.model_runner
         num_hidden_layers = runner.config.hf_config.num_hidden_layers
@@ -332,10 +339,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return placed
 
         mla = place(MLA_ROWS, mla_pos, len(full))
-        if len(mla) != num_block_regions:
+        # The splice point is the base's MLA-region count; a miscount would
+        # send one layer's KV to another's region or drop an index region.
+        if len(mla) != num_block_regions - num_index_regions:
             raise RuntimeError(
-                f"{num_block_regions} PAGE regions published for {len(mla)} "
-                "MLA rows; PP disaggregation places one region per row"
+                f"{num_block_regions - num_index_regions} MLA PAGE regions published "
+                f"for {len(mla)} MLA rows; PP disaggregation places one region per row"
+            )
+        block = mla + (list(base_block[len(mla) :]) if base_block is not None else [])
+        if len(block) != num_block_regions:
+            raise RuntimeError(
+                f"{num_block_regions} PAGE regions published for {len(block)} "
+                "MLA and index rows; PP disaggregation places one region per row"
             )
         kda = place(LINEAR_STATE_ROWS, kda_pos, None)
         # Counted from the caches, not from the regions: a stage without a
@@ -351,7 +366,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         slots = [g * len(kda_pos) + pos for g in range(groups) for pos in kda]
         if cursor:
             slots.append(groups * len(kda_pos))
-        return mla, slots
+        return block, slots
+
+    def _supports_dcp_index_staging(self) -> bool:
+        # One key per token is the base's preshuffled page, which the DCP
+        # gather splits by token; a pooled key covers `index_kpool` tokens.
+        return not pooled_path_enabled(self._kpool_size())
 
     # Every PP stage scatters its own layers' state into the unit ids the head
     # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
@@ -902,8 +922,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
 
 class KimiAiterMLAGDNMetadataBuilder(_KimiMLAGDNCommon, AiterMLAMetadataBuilder):
-    def _supports_dcp_index_staging(self) -> bool:
-        return False
+    pass
 
 
 class KimiTritonMLAGDNMetadataBuilder(_KimiMLAGDNCommon, TritonMLAMetadataBuilder):

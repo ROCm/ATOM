@@ -2683,6 +2683,7 @@ class MooncakeConnector(KVConnectorBase):
                     prefill_data,
                     req_id,
                     engine=engine,
+                    kv_cache_ready_event=kv_cache_ready_event,
                 )
             else:
                 transfer_ok = self._execute_block_transfer(
@@ -3248,24 +3249,7 @@ class MooncakeConnector(KVConnectorBase):
             stages_token_units = (
                 self._kv_staging is not None and kv_cache_ready_event is not None
             )
-            stages_sharded_index = (
-                interleave < self.block_size
-                and INDEX_CACHE_ROLE in self._block_region_roles
-            )
-            if stages_sharded_index and (
-                interleave != 1
-                or self.block_size % 16
-                or self._prepare_sharded_index is None
-                or self._gather_sharded_index is None
-                or self._index_staging_chunk_pages <= 0
-            ):
-                raise RuntimeError(
-                    "Sharded preshuffled DSA index transfer requires "
-                    "interleave=1, a block size divisible by 16, and producer "
-                    "index staging; got "
-                    f"{interleave=}, block_size={self.block_size}, "
-                    f"has_staging={self._gather_sharded_index is not None and self._prepare_sharded_index is not None}."
-                )
+            stages_sharded_index = self._stages_sharded_index(interleave)
 
         staged_regions: list[tuple[int, int, int]] = []
         staged_token_regions: list[int] = []
@@ -3360,42 +3344,95 @@ class MooncakeConnector(KVConnectorBase):
                 engine=engine,
             ):
                 return False
-        if staged_regions:
-            if kv_cache_ready_event is None:
-                raise RuntimeError(
-                    "Missing prefill KV-cache ready event for staged DSA index transfer"
-                )
-            # Wait only for this request's prefill writes; unrelated GPU work
-            # can continue on other streams while the staging stream is blocked.
-            stream = self._send_worker_stream()
-            stream.wait_event(kv_cache_ready_event)
-            for dst_start in range(
-                0, len(dst_block_ids), self._index_staging_chunk_pages
-            ):
-                dst_chunk = dst_block_ids[
-                    dst_start : dst_start + self._index_staging_chunk_pages
-                ]
-                chunk_plan = sharded_plan.slice_pages(
-                    dst_start, dst_start + len(dst_chunk)
-                )
-                # On the gathers' stream: the uploads wait for this request's ready
-                # event, not the forward, and the gathers run after the index kernels.
-                with torch.cuda.stream(stream):
-                    gather_indices = self._prepare_sharded_index(chunk_plan)
+        return self._execute_staged_index_regions(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_regions,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+            deadline=deadline,
+        )
 
-                for region_idx, dst_base, bpb in staged_regions:
-                    if not self._execute_staged_index_layer_chunk(
-                        target,
-                        region_idx,
-                        dst_base,
-                        bpb,
-                        dst_chunk,
-                        req_id,
-                        gather_indices,
-                        engine=engine,
-                        deadline=deadline,
-                    ):
-                        return False
+    def _stages_sharded_index(self, interleave: int) -> bool:
+        """Whether an unsharded producer gathers its index pages for a DCP
+        consumer: a preshuffled page splits below one 16-row tile."""
+        if not (
+            interleave < self.block_size
+            and INDEX_CACHE_ROLE in self._block_region_roles
+        ):
+            return False
+        if self._prepare_sharded_index is None or self._gather_sharded_index is None:
+            regions = [
+                i
+                for i, r in enumerate(self._block_region_roles)
+                if r == INDEX_CACHE_ROLE
+            ]
+            raise RuntimeError(
+                f"DSA index regions {regions} cannot reach a DCP consumer: this "
+                "backend builds no index staging (`_supports_dcp_index_staging` "
+                "is False, e.g. for a pooled index)."
+            )
+        if (
+            interleave != 1
+            or self.block_size % 16
+            or self._index_staging_chunk_pages <= 0
+        ):
+            raise RuntimeError(
+                "Sharded preshuffled DSA index transfer requires interleave=1, a "
+                "block size divisible by 16 and staging chunk pages; got "
+                f"{interleave=}, block_size={self.block_size}, "
+                f"chunk_pages={self._index_staging_chunk_pages}."
+            )
+        return True
+
+    def _execute_staged_index_regions(
+        self,
+        target: str,
+        sharded_plan: DCPShardPlan | None,
+        dst_block_ids: list[int],
+        staged_regions: list[tuple[int, int, int]],
+        req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None,
+        *,
+        engine=None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Gather and write each staged index region onto the DCP shard plan."""
+        if not staged_regions:
+            return True
+        if kv_cache_ready_event is None:
+            raise RuntimeError(
+                "Missing prefill KV-cache ready event for staged DSA index transfer"
+            )
+        # Wait only for this request's prefill writes; unrelated GPU work
+        # can continue on other streams while the staging stream is blocked.
+        stream = self._send_worker_stream()
+        stream.wait_event(kv_cache_ready_event)
+        for dst_start in range(0, len(dst_block_ids), self._index_staging_chunk_pages):
+            dst_chunk = dst_block_ids[
+                dst_start : dst_start + self._index_staging_chunk_pages
+            ]
+            chunk_plan = sharded_plan.slice_pages(dst_start, dst_start + len(dst_chunk))
+            # On the gathers' stream: the uploads wait for this request's ready
+            # event, not the forward, and the gathers run after the index kernels.
+            with torch.cuda.stream(stream):
+                gather_indices = self._prepare_sharded_index(chunk_plan)
+
+            for region_idx, dst_base, bpb in staged_regions:
+                if not self._execute_staged_index_layer_chunk(
+                    target,
+                    region_idx,
+                    dst_base,
+                    bpb,
+                    dst_chunk,
+                    req_id,
+                    gather_indices,
+                    engine=engine,
+                    deadline=deadline,
+                ):
+                    return False
         return True
 
     def _make_page_plan(
@@ -3735,6 +3772,7 @@ class MooncakeConnector(KVConnectorBase):
         *,
         engine=None,
         blocks_only: bool = False,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
     ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
         consumer_is_fp4 = "consumer_block_base_addrs_fp4" in request_data
@@ -3897,11 +3935,18 @@ class MooncakeConnector(KVConnectorBase):
         # producer pushes its token runs instead of whole blocks, exactly as
         # the block-only path does.
         consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        sharded_plan = None
         sharded_runs = None
+        stages_sharded_index = False
         if consumer_dcp_size > 1 and self.dcp_size == 1:
-            sharded_runs = self._consumer_dcp_plan(
+            sharded_plan = self._consumer_dcp_plan(
                 request_data, src_block_ids, dst_block_ids
-            ).token_runs(dst_block_ids)
+            )
+            sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            stages_sharded_index = self._stages_sharded_index(
+                request_data.get("consumer_dcp_interleave", 1)
+            )
+        staged_index_regions: list[tuple[int, int, int]] = []
         deadline = request_data.get("_deadline")
         batch = _RdmaBatch(
             lambda srcs, dsts, lens: self._rdma_write(
@@ -3925,6 +3970,12 @@ class MooncakeConnector(KVConnectorBase):
                 srcs = src_base + src_ids * bpb
                 dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
                 lens = np.full(src_ids.size, bpb, dtype=np.int64)
+            elif (
+                stages_sharded_index
+                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
+            ):
+                staged_index_regions.append((region_idx, dst_base, bpb))
+                continue
             else:
                 srcs, dsts, lens = self._dcp_token_descriptors(
                     region_idx, src_base, dst_base, bpb, sharded_runs
@@ -3934,6 +3985,12 @@ class MooncakeConnector(KVConnectorBase):
                 return False
 
         if blocks_only:
+            # Unreachable: the chunked path refuses a slot transfer to a DCP
+            # consumer (`has_slot_regions` with `consumer_dcp_size > 1`).
+            if staged_index_regions:
+                raise RuntimeError(
+                    "staged DSA index regions in a chunked slot transfer"
+                )
             return batch.flush()
 
         # SWA ring transfer: every row of a live slot crosses the wire.
@@ -3973,6 +4030,17 @@ class MooncakeConnector(KVConnectorBase):
 
         if not batch.flush():
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        if staged_index_regions and not self._execute_staged_index_regions(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_index_regions,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+            deadline=deadline,
+        ):
             return False
 
         # ---- Phase 2: Slot transfer ----
