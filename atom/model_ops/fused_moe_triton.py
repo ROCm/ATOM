@@ -942,6 +942,8 @@ def _mega_combine_window(mega):
     view = _from_gpu_ptr(base, (rows * stride_elems,), torch.bfloat16).as_strided(
         (rows, cfg.hidden_dim), (stride_elems, 1)
     )
+    if view.data_ptr() != base:
+        raise RuntimeError("MegaMoE combine window must alias the symmetric VA")
     cached = (view, peer_rows, cfg.max_tokens_per_rank, cfg.topk)
     mega._atom_combine_window = cached
     return cached
@@ -973,7 +975,7 @@ def triton_mega_moe(
     Functionally ``MegaMoEGfx1250.forward`` with its own grouped flydsl GEMM
     swapped for ours: dispatch, experts, fused combine. The transport half is
     MegaMoE's -- the same ``_dispatch`` and ``_combine``, so the same mori
-    all-to-all and the same barrier-free reduce -- and only the expert GEMM in
+    all-to-all and the same combine barrier/reduce -- and only the expert GEMM in
     the middle differs.
 
     Written against MegaMoE's INTERNALS on purpose. The alternative is a public
@@ -1002,6 +1004,17 @@ def triton_mega_moe(
                 f"MegaMoE has no {_name!r}: this path drives the transport "
                 "through its internals, which have moved. See triton_mega_moe."
             )
+
+    # _dispatch is private and omits forward()'s capacity check. A receive-grid
+    # bound cannot make an oversized send safe: dispatch writes the full input.
+    cfg = mega._config
+    token_count = hidden_states.shape[0]
+    if token_count > cfg.max_tokens_per_rank:
+        raise ValueError(
+            f"tokens={token_count} exceeds max_tokens_per_rank={cfg.max_tokens_per_rank}"
+        )
+    if cfg.stage1_fused:
+        raise ValueError("triton_mega_moe requires token-major dispatch")
 
     recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
         hidden_states.contiguous(),
