@@ -5,6 +5,8 @@ FROM ${OOT_BASE_IMAGE} AS atom_oot
 
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
+# Build-time only: keep downloaded wheels out of the layers.
+ARG PIP_NO_CACHE_DIR=1
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_COMMIT
 ARG INSTALL_LM_EVAL=1
@@ -25,17 +27,49 @@ ENV CMAKE_MAKE_PROGRAM=/usr/local/bin/ninja
 # install` below satisfies it by reinstalling the STOCK ROCm rccl into
 # /opt/rocm, which then shadows the custom build via ldconfig. That regresses
 # GLM-5.2 decode perf (memory-bound kernels run ~40% slower under the stock rccl
-# even though its collective kernels are never called in decode). Back it up here
-# and restore after all OOT installs (mirrors the Triton backup/restore below).
-RUN echo "========== [OOT 0/7] Back up base-image custom RCCL ==========" && \
-    mkdir -p /tmp/rccl-base-backup && \
-    (cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true) && \
-    (cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true) && \
-    ls -l /tmp/rccl-base-backup/ || true
-
+# even though its collective kernels are never called in decode). Back it up at
+# the start of [OOT 1/7] and restore it right after `apt --fix-broken install`
+# in the same RUN, so the backup is never stored in a layer (mirrors the Triton
+# backup/restore below).
+#
+# Restore the base image's custom RCCL over the stock rccl that `apt --fix-broken
+# install` pulls into /opt/rocm, so the OOT image runs the SAME custom RCCL as the
+# native image. It runs in the same RUN as `--fix-broken`, so the stock library
+# is never stored in a layer; no later RUN calls apt. Removes the stock /opt/rocm
+# librccl so ldconfig unambiguously resolves the custom build in /usr/local/lib
+# (leaving the stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied —
+# only the .so is swapped, exactly the runtime state the native image ships).
+# The stock rccl-dev still ships rccl-targets.cmake, whose roc::rccl target
+# points at the stock library's real file (librccl.so.1.0.<rocm version>); the
+# vLLM build reaches it through torch's LoadHIP.cmake (find_package(rccl)), and
+# CMake fails if that file is missing. So when the stock library is replaced,
+# its real path becomes a symlink to the custom RCCL, and the build configures
+# and links against the same library the image runs. Without a custom RCCL
+# backup (BUILD_RCCL=0 base) the stock library stays and nothing is linked.
 RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
+    mkdir -p /tmp/rccl-base-backup && \
+    { cp -a /usr/local/lib/librccl.so* /tmp/rccl-base-backup/ 2>/dev/null || true; } && \
+    { cp -a /etc/ld.so.conf.d/rccl.conf /tmp/rccl-base-backup/ 2>/dev/null || true; } && \
     apt-get update && \
     apt --fix-broken install -y && \
+    echo "========== [OOT] Restore base-image custom RCCL ==========" && \
+    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
+      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
+      STOCK_RCCL="$(readlink -e /opt/rocm/lib/librccl.so.1 2>/dev/null || true)" && \
+      rm -f /opt/rocm*/lib/librccl.so* && \
+      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
+      if [ -n "${STOCK_RCCL}" ]; then ln -s /usr/local/lib/librccl.so.1.0 "${STOCK_RCCL}"; fi && \
+      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
+        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
+      else \
+        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
+      fi && \
+      ldconfig && \
+      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
+    else \
+      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
+    fi && \
+    rm -rf /tmp/rccl-base-backup && \
     apt-get install -y --no-install-recommends ca-certificates jq ninja-build vim && \
     "${VENV_PYTHON}" -m pip install --upgrade cmake && \
     cmake --version && \
@@ -47,12 +81,17 @@ RUN echo "========== [OOT 1/7] Prepare build tools ==========" && \
     echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
     ldconfig
 
+COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
+
 # Keep OOT aligned with the Triton that the ATOM base image ships.
 # vLLM/OOT installs can perturb Triton; back up everything and restore after.
+# The backup, every install that can perturb Triton, and the restore share one
+# RUN so the ~1.6 GB backup is never stored in a layer; the copy-back only
+# happens when the installed tree differs from the backup.
 RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========" && \
-    "${VENV_PYTHON}" -m pip show atom || true && \
-    "${VENV_PYTHON}" -m pip show amd-aiter || true && \
-    "${VENV_PYTHON}" -m pip show amd-mori-nightly || true && \
+    { "${VENV_PYTHON}" -m pip show atom || true; } && \
+    { "${VENV_PYTHON}" -m pip show amd-aiter || true; } && \
+    { "${VENV_PYTHON}" -m pip show amd-mori-nightly || true; } && \
     echo "========== [OOT 2/7] Back up base image triton ==========" && \
     SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
     BASE_TRITON_VERSION="$("${VENV_PYTHON}" -c "import triton; print(triton.__version__)")" && \
@@ -63,11 +102,8 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
       cp -a "$f" /tmp/triton-base-backup/; \
     done && \
     echo "Base image triton backed up: import_version=${BASE_TRITON_VERSION}" && \
-    ls /tmp/triton-base-backup/
-
-COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
-
-RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
+    ls /tmp/triton-base-backup/ && \
+    echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
     test -n "${VLLM_COMMIT}" && \
     rm -rf /app/vllm && \
     git clone "${VLLM_REPO}" /app/vllm && \
@@ -77,9 +113,8 @@ RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
     git apply /tmp/vllm-torch210-compat.patch && \
     git submodule update --init --recursive && \
     echo "vLLM commit:" && \
-    git rev-parse HEAD
-
-RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
+    git rev-parse HEAD && \
+    echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
     sed -i -e '/^[[:space:]]*"torch == /d' pyproject.toml && \
@@ -96,9 +131,8 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
         "runai-model-streamer-azure==0.15.7" && \
     "${VENV_PYTHON}" -m pip install \
         google-auth google-cloud-storage azure-identity azure-storage-blob && \
-    "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
-
-RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
+    "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt && \
+    echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
     AMD_SMI_SRC=$("${VENV_PYTHON}" -c 'from pathlib import Path; \
         import sysconfig; \
         candidates = [Path("/opt/rocm/share/amd_smi"), \
@@ -109,67 +143,54 @@ RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
                    or (path / "setup.py").is_file()))') && \
     echo "Using amd-smi source: ${AMD_SMI_SRC}" && \
     "${VENV_PYTHON}" -m pip wheel "${AMD_SMI_SRC}" --wheel-dir=/tmp/amd-smi-wheels && \
-    "${VENV_PYTHON}" -m pip install /tmp/amd-smi-wheels/*.whl
-
-RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
+    "${VENV_PYTHON}" -m pip install /tmp/amd-smi-wheels/*.whl && \
+    echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
     cd /app/vllm && \
     VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py clean --all && \
     MAX_JOBS="${MAX_JOBS}" VLLM_TARGET_DEVICE=rocm "${VENV_PYTHON}" setup.py bdist_wheel --dist-dir=/tmp/vllm-wheels && \
-    ls -lh /tmp/vllm-wheels
-
-RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && \
+    ls -lh /tmp/vllm-wheels && \
+    echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && \
     cd /app/vllm && \
-    "${VENV_PYTHON}" -m pip uninstall -y vllm || true && \
+    { "${VENV_PYTHON}" -m pip uninstall -y vllm || true; } && \
     "${VENV_PYTHON}" -m pip install --no-deps /tmp/vllm-wheels/*.whl && \
     if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \
-    "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true
-
-RUN echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
-    "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')"
-
-# Restore the exact base-image Triton after all OOT installs finish.
-RUN echo "========== [OOT] Restore base image triton ==========" && \
-    SITE_PACKAGES=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
-    "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true && \
-    rm -rf "${SITE_PACKAGES}/triton" \
-           "${SITE_PACKAGES}"/triton-*.dist-info && \
-    cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
-    for f in /tmp/triton-base-backup/triton-*.dist-info; do \
-      [ -d "$f" ] || continue; \
-      cp -a "$f" "${SITE_PACKAGES}/"; \
-    done && \
+    { "${VENV_PYTHON}" -m pip show vllm torch triton torchvision torchaudio amdsmi amd-aiter atom amd-mori-nightly || true; } && \
+    rm -rf /tmp/vllm-wheels /tmp/amd-smi-wheels /app/vllm/build /app/vllm/.deps \
+           /app/vllm/rust/target /root/.cargo/registry /root/.cargo/git && \
+    echo "========== [VLLM-ATOM] Validate vision/audio wheels ==========" && \
+    "${VENV_PYTHON}" -c "import torch, torchvision, torchaudio; from torchvision.transforms import InterpolationMode; from transformers.models.auto.image_processing_auto import get_image_processor_config; print(f'torch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'InterpolationMode: {InterpolationMode.BILINEAR}'); print(f'get_image_processor_config: {get_image_processor_config.__name__}')" && \
+    echo "========== [OOT] Restore base image triton ==========" && \
+    BASE_DIST_INFO="$(cd /tmp/triton-base-backup && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
+    CUR_DIST_INFO="$(cd "${SITE_PACKAGES}" && ls -d triton-*.dist-info 2>/dev/null | sort | tr '\n' ' ')" && \
+    TRITON_CHANGED=0 && \
+    if [ "${BASE_DIST_INFO}" != "${CUR_DIST_INFO}" ]; then TRITON_CHANGED=1; fi && \
+    if [ "${TRITON_CHANGED}" = "0" ]; then \
+      for p in triton ${BASE_DIST_INFO}; do \
+        diff -rq -x __pycache__ "/tmp/triton-base-backup/${p}" "${SITE_PACKAGES}/${p}" >/dev/null \
+          || { TRITON_CHANGED=1; break; }; \
+      done; \
+    fi && \
+    if [ "${TRITON_CHANGED}" = "0" ]; then \
+      echo "Triton unchanged since the base image (${BASE_DIST_INFO}); nothing to restore"; \
+    else \
+      echo "Triton changed (${CUR_DIST_INFO:-none} vs base ${BASE_DIST_INFO}); restoring the base image copy" && \
+      { "${VENV_PYTHON}" -m pip uninstall -y triton 2>/dev/null || true; } && \
+      rm -rf "${SITE_PACKAGES}/triton" \
+             "${SITE_PACKAGES}"/triton-*.dist-info && \
+      cp -a /tmp/triton-base-backup/triton "${SITE_PACKAGES}/" && \
+      for f in /tmp/triton-base-backup/triton-*.dist-info; do \
+        [ -d "$f" ] || continue; \
+        cp -a "$f" "${SITE_PACKAGES}/"; \
+      done; \
+    fi && \
     rm -rf /tmp/triton-base-backup && \
     "${VENV_PYTHON}" -c "import triton; print(f'triton.__version__ = {triton.__version__}')" && \
-    "${VENV_PYTHON}" -m pip show triton || true
-
-# Restore the base image's custom RCCL over any stock rccl that OOT apt pulled
-# into /opt/rocm, so the OOT image runs the SAME custom RCCL as the native image.
-# Must run after ALL OOT apt/pip installs. Removes the stock /opt/rocm librccl so
-# ldconfig unambiguously resolves the custom build in /usr/local/lib (leaving the
-# stock rccl dpkg metadata in place keeps rocm-hip's dep satisfied — only the .so
-# is swapped, exactly the runtime state the native image ships).
-RUN echo "========== [OOT] Restore base-image custom RCCL ==========" && \
-    if ls /tmp/rccl-base-backup/librccl.so* >/dev/null 2>&1; then \
-      echo "Removing stock rccl from /opt/rocm and restoring custom build to /usr/local/lib" && \
-      rm -f /opt/rocm*/lib/librccl.so* && \
-      cp -a /tmp/rccl-base-backup/librccl.so* /usr/local/lib/ && \
-      if [ -f /tmp/rccl-base-backup/rccl.conf ]; then \
-        cp -a /tmp/rccl-base-backup/rccl.conf /etc/ld.so.conf.d/rccl.conf ; \
-      else \
-        echo "/usr/local/lib" > /etc/ld.so.conf.d/rccl.conf ; \
-      fi && \
-      ldconfig && \
-      echo "librccl now resolves to:" && ldconfig -p | grep -i librccl ; \
-    else \
-      echo "WARNING: no base-image custom RCCL backup found; leaving rccl unchanged" ; \
-    fi && \
-    rm -rf /tmp/rccl-base-backup
-
+    { "${VENV_PYTHON}" -m pip show triton || true; }
 
 RUN echo "========== [vLLM-ATOM] Final transformers version ==========" && \
     "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
-    "${VENV_PYTHON}" -m pip show transformers || true
+    { "${VENV_PYTHON}" -m pip show transformers || true; }
 
 CMD ["/bin/bash"]

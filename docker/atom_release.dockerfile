@@ -18,10 +18,10 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 #   base ──┬── build_rccl  ──┐
 #          └── build_aiter ──┴── atom_image (merge builders + install MORI/ATOM)
 #
-# Triton is NOT built from source: the ROCm PyTorch base image already ships a
-# matching Triton (installed as a torch dependency), and aiter handles its own
-# Triton needs at install time. The previous build_triton stage that compiled
-# ROCm/triton release/internal/3.5.x has been removed.
+# Triton is NOT built from source: the base stage provides it (the pinned AMD
+# wheel on the rocm/pytorch line, the SDK wheel on rocm10), and both AITER
+# installs keep it via AITER_USE_SYSTEM_TRITON=1. The previous build_triton
+# stage that compiled ROCm/triton release/internal/3.5.x has been removed.
 # ====================================================================
 
 # --------------------------------------------------------------------
@@ -220,6 +220,13 @@ ENV ATOM_BASE_IMAGE=${BASE_IMAGE}
 # same setting in vllm's own docker/Dockerfile.rocm.
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
+# Build-time only (ARG, not ENV): wheels pip downloads during the build are not
+# left in /root/.cache/pip of a layer, while pip inside the shipped image keeps
+# its default cache. Stages built FROM base inherit it (the redeclaration in
+# atom_image is redundant but harmless); images built FROM the shipped image do
+# not, so the plugin Dockerfiles declare their own.
+ARG PIP_NO_CACHE_DIR=1
+
 # AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
 RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
@@ -270,11 +277,11 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         fi; \
     fi
 
-# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
-# newer Triton (3.8.0) that regressed benchmark throughput; install the
-# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
-# here in the shared base so every downstream stage (the aiter build included)
-# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
+# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships
+# Triton 3.6.0 (+rocm7.2.4); install the AMD-published 3.8.0 wheel plus its
+# matching triton_kernels from AMD's index, here in the shared base so every
+# downstream stage (the aiter build included) links the same Triton. Empty
+# TRITON_PIN_VERSION keeps the base image's Triton.
 # The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
@@ -381,11 +388,9 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
-# Keep AITER compiled against the Triton the base image ships (the ROCm 10
-# SDK's 3.8.0 build). Without this, AITER's setup resolves its own Triton
-# from PyPI and the prebuilt kernels then mismatch the runtime Triton.
-# Only meaningful on the rocm10 flavor (the rocm/pytorch apt images carry a
-# Triton AITER already agrees with), but harmless to set everywhere.
+# AITER must keep the Triton the base stage installed, on every flavor:
+# without this, AITER's setup.py runs install_triton.sh and replaces it.
+# The final-stage AITER install sets the same variable.
 ENV AITER_USE_SYSTEM_TRITON=1
 
 RUN pip install --upgrade setuptools_scm
@@ -433,6 +438,22 @@ else:
         print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
 PY
 
+# The prebuild leaves a ninja build directory, aiter/jit/build/<md>/build, for
+# every module: object files, build.ninja, and a second copy of the linked
+# module (aiter.jit.core copies build/<md>/build/<md>.so to aiter/jit/<md>.so).
+# Runtime loads aiter/jit/*.so and a JIT build recreates build/<md>/build, so
+# nothing reads it; the only cost is that a forced rebuild of a prebuilt module
+# is no longer incremental. Generated sources (build/<md>/blob) and JIT
+# metadata (build/compiled_kids_opus.json) stay.
+RUN cd /app/aiter-test/aiter/jit && \
+    if [ ! -d build ]; then \
+        echo "aiter/jit/build does not exist (PREBUILD_KERNELS=${PREBUILD_KERNELS}); nothing to clean up"; \
+    else \
+        echo "aiter/jit/build before cleanup: $(du -sh build | cut -f1)" && \
+        rm -rf build/*/build && \
+        echo "aiter/jit/build after cleanup: $(du -sh build | cut -f1)"; \
+    fi
+
 # The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
 FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 
@@ -442,6 +463,7 @@ FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG PIP_NO_CACHE_DIR=1
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -489,6 +511,8 @@ ARG INSTALL_MOONCAKE_STORE=1
 # RDMA Store segments); includes the RD-atomic QP depth clamp (#4312).
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
+ARG MOONCAKE_GO_VERSION="1.26.10"
+ARG MOONCAKE_GO_SHA256="ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
@@ -504,8 +528,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== Skipped Mooncake (INSTALL_MOONCAKE=0) =========="; \
     fi
 
-# [MC 2/4] Install dependencies (system packages + RDMA + Go + submodules)
-ENV PATH="/usr/local/go/bin:${PATH}"
+# [MC 2/4] Install dependencies (system packages + RDMA + submodules). The Go
+# that dependencies.sh installs is removed here and replaced in [MC 3/4] by the
+# toolchain the etcd wrapper's go.mod declares (MOONCAKE_GO_VERSION).
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 2/4] Install Mooncake dependencies =========="; \
         apt-get update && apt-get install -y --no-install-recommends \
@@ -515,9 +540,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
             openssh-server openmpi-common && \
         cd /app/mooncake && bash dependencies.sh -y && \
         rm -rf /usr/local/go && \
-        wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-        tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-        rm go1.22.2.linux-amd64.tar.gz; \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
 # [MC 2.5/4] Install AMD Pensando ionic RDMA provider for Mooncake RDMA transport.
@@ -549,7 +572,19 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
+# Go builds the etcd wrapper (USE_ETCD=ON), a shared library; nothing runs Go
+# at runtime, so the toolchain lives only in this RUN: it is installed here,
+# put on PATH here (CMake calls `go` by name), and removed at the end together
+# with the module and build caches it fills. GOTOOLCHAIN=local stops Go from
+# downloading another toolchain; keep MOONCAKE_GO_VERSION equal to
+# mooncake-common/etcd/go.mod's `toolchain` line by hand when bumping
+# MOONCAKE_COMMIT.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
+        { wget -q -O /tmp/go.tar.gz "https://go.dev/dl/go${MOONCAKE_GO_VERSION}.linux-amd64.tar.gz" \
+          && echo "${MOONCAKE_GO_SHA256}  /tmp/go.tar.gz" | sha256sum -c - \
+          && tar -C /usr/local -xzf /tmp/go.tar.gz && rm -f /tmp/go.tar.gz; } || exit 1; \
+        export PATH="/usr/local/go/bin:${PATH}"; \
+        export GOTOOLCHAIN=local; \
         MC_WITH_STORE=OFF; \
         if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
@@ -595,7 +630,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
                || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; }; \
            fi \
         && echo "--- Clean up build artifacts ---" \
-        && rm -rf /app/mooncake/build /app/mooncake/.git; \
+        && rm -rf /app/mooncake/build /app/mooncake/.git \
+                  /usr/local/go /root/go /root/.cache/go-build; \
     fi
 
 # Default to ibv_reg_mr; set MOONCAKE_DISABLE_HIP_DMABUF=0 at runtime to opt in
@@ -619,22 +655,40 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # WARNING: dpkg -i --force-all overwrites Ubuntu-repo rccl with the ROCm custom
 # build, breaking rocm-hip's version dep in dpkg metadata. All apt-get install
 # operations (Mooncake, Rust, etc.) MUST be completed before this step.
-COPY --from=build_rccl /rccl-pkgs/ /tmp/rccl/
-RUN if ls /tmp/rccl/*.deb >/dev/null 2>&1; then \
+# Bind-mounted rather than COPY'd so the .deb files never land in a layer.
+RUN --mount=type=bind,from=build_rccl,source=/rccl-pkgs,target=/tmp/rccl \
+    if ls /tmp/rccl/*.deb >/dev/null 2>&1; then \
         DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb; \
     else \
         echo "no RCCL .deb staged (BUILD_RCCL=0) -- keeping the base image's RCCL"; \
-    fi && \
-    rm -rf /tmp/rccl
+    fi
 
-# Triton ships with the ROCm PyTorch base image (installed as a torch dependency);
-# no separate build/copy step is needed here.
+# Triton comes from the base stage (pinned AMD wheel on rocm/pytorch, SDK wheel
+# on rocm10); no separate build/copy step is needed here.
 
 # Aiter: copy compiled source tree + re-register editable install
 # (pip install -e creates egg-link automatically, no need to COPY them)
+# AITER_USE_SYSTEM_TRITON=1 as in build_aiter: without it AITER's setup.py runs
+# install_triton.sh, which uninstalls and reinstalls Triton here and writes a
+# second full copy of it (~1.6 GB) into this layer.
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
-RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
+RUN cd /app/aiter-test && \
+    AITER_USE_SYSTEM_TRITON=1 pip install -e . --no-build-isolation && \
     pip show amd-aiter
+
+# Reproduces, on the rocm10 flavor, the packages install_triton.sh used to leave
+# behind (triton_kernels and its pytest), without its Triton reinstall.
+ARG ROCM10_TRITON_KERNELS_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG ROCM10_TRITON_KERNELS_SPEC="triton-kernels==1.0.0"
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+        echo "========== [ATOM] Install ${ROCM10_TRITON_KERNELS_SPEC} (index ${ROCM10_TRITON_KERNELS_INDEX_URL}) =========="; \
+        python3 -m pip install --extra-index-url "${ROCM10_TRITON_KERNELS_INDEX_URL}" "${ROCM10_TRITON_KERNELS_SPEC}" && \
+        python3 -c "import triton_kernels; from importlib.metadata import version; \
+assert 'rocm10' in version('triton'), version('triton'); \
+print('triton', version('triton'), '| triton_kernels', version('triton_kernels'), '| pytest', version('pytest'))"; \
+    else \
+        echo "========== Skipped triton-kernels restore (not rocm10-base) =========="; \
+    fi
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
 RUN pip install rocm-trace-lite && \
@@ -645,6 +699,11 @@ RUN pip install rocm-trace-lite && \
 # ulimit: the atomesh cargo build spawns one rustc per crate in parallel and
 # runs out of file descriptors on the docker default nofile limit (os error 24,
 # "could not execute process rustc (never executed)"); raise it for this step.
+# Of the cargo output only target/release/atomesh (default binary path of the
+# PD scripts) and target/release/libmesh.so (package data, loaded by
+# atom.entrypoints.atomesh) are used; the rest of target/ and the downloaded
+# crates in ~/.cargo/registry are build-only. The Rust toolchain stays, so a
+# rebuild in the container only re-downloads crates.
 ARG CACHEBUST=1
 # Optional Cargo features; ext-proc is excluded unless explicitly requested.
 ARG ATOM_MESH_FEATURES=""
@@ -654,17 +713,22 @@ RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e . && \
+    cd /app/ATOM/atom/mesh/target && \
+    find . -mindepth 1 -maxdepth 1 ! -name release -exec rm -rf {} + && \
+    find release -mindepth 1 -maxdepth 1 ! -name atomesh ! -name libmesh.so -exec rm -rf {} + && \
+    test -x release/atomesh && test -f release/libmesh.so && \
+    rm -rf /root/.cargo/registry /root/.cargo/git
 RUN pip show atom || true
 RUN python -c "import llguidance, re2; from importlib.metadata import version; print('structured output: llguidance', version('llguidance'))"
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
-# atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
+# atomesh: expose the binary produced by the ATOM package build hook on PATH.
+# A symlink, so the image does not carry a second copy of the binary, which
+# stays at target/release/atomesh for the PD scripts.
 RUN echo "========== Install atomesh binary ==========" && \
-    cd /app/ATOM/atom/mesh && \
-    strip target/release/atomesh && \
-    cp target/release/atomesh /usr/local/bin/atomesh && \
+    ln -sf /app/ATOM/atom/mesh/target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
@@ -832,7 +896,7 @@ print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi
 
 # Guarantee the perf-good Triton survived every install above: re-pin if
 # something pulled a different one, then assert the exact version or fail the
-# build -- the image must never silently ship the base image's newer Triton.
+# build -- the image must never silently ship the base image's Triton.
 # The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
