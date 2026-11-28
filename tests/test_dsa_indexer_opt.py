@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The Mono DSA indexer's bit-identical options (``build.DC1_*``): every
+"""The Mono DSA indexer's kernel options (``build.DC1_*``): every
 binding builds with ``DC1_DEFAULT``, option 2 only from PACKED_HIST_MIN_ROWS
 rows a step, and a build the mask does not fit runs with 0."""
 
@@ -43,3 +43,26 @@ def test_a_mask_the_build_does_not_fit_runs_with_0():
     # 64 and 128 need DCP
     assert kix.unfit(replace(key, dc1=MASK))
     assert key.dc1 == 0
+
+
+def test_dropping_the_options_is_logged_once_naming_them(caplog):
+    from atom.mono.dsa_indexer import bind
+
+    bind._log_dc1_dropped.cache_clear()
+    binding = _binding(MASK, replicated=True)
+    with caplog.at_level("INFO", logger="atom"):
+        for _ in range(3):
+            assert binding.key(20, 5).dc1 == 0
+    dropped = [r.getMessage() for r in caplog.records if "kernel options" in r.message]
+    assert len(dropped) == 1
+    for name in kix.dc1_names(MASK):
+        assert name in dropped[0]
+    # A build every option fits logs nothing.
+    caplog.clear()
+    with caplog.at_level("INFO", logger="atom"):
+        assert _binding(MASK).key(20, 5).dc1 == MASK
+    assert not [r for r in caplog.records if "kernel options" in r.message]
+
+
+def test_every_option_has_a_name():
+    assert len(kix.dc1_names(kix.DC1_ALL)) == kix.DC1_ALL.bit_count()

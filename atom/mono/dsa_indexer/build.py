@@ -46,6 +46,24 @@ DC1_ALL = (
 # 41.77 / 38.04 / 37.31 at 20, 62.95 / 53.79 / 50.47 at 60. Packing the
 # histograms pays from ``PACKED_HIST_MIN_ROWS`` rows, which ``bind`` applies.
 DC1_DEFAULT = DC1_ALL
+# ``IxBuild.dc1`` bit -> its option's name, in bit order (logs)
+DC1_NAMES = {
+    DC1_ACTIVE_POLL: "active_poll",
+    DC1_PACKED_HIST: "packed_hist",
+    DC1_FLAT_STORE: "flat_store",
+    DC1_XPOSE_SUM: "xpose_sum",
+    DC1_EARLY_CNT: "early_cnt",
+    DC1_BUCKET_EXIT: "bucket_exit",
+    DC1_EARLY_W: "early_w",
+    DC1_JOINT_POLL: "joint_poll",
+}
+
+
+def dc1_names(mask: int) -> tuple[str, ...]:
+    """The options ``mask`` (``IxBuild.dc1``) names, in bit order."""
+    return tuple(name for bit, name in DC1_NAMES.items() if mask & bit)
+
+
 # ``packed_hist`` from this many rows a step: with fewer, packing the pushes
 # costs more than their smaller size saves
 PACKED_HIST_MIN_ROWS = 20

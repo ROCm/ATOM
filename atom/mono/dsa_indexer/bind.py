@@ -17,6 +17,7 @@ run -- calls the indexer's own forward on every rank alike.
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import cache
 
 import torch
 from aiter.dist.parallel_state import (
@@ -45,6 +46,19 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+
+
+@cache
+def _log_dc1_dropped(names: tuple[str, ...], why: str) -> None:
+    """Once per set of options and reason: a build one of its DC1 options
+    does not fit runs with none of them (``IndexerBinding.key``)."""
+    logger.info(
+        "mono DSA indexer: kernel options %s off for this build (%s)",
+        ", ".join(names),
+        why,
+    )
+
+
 DUAL_SCORE_ROWS = (160, 192, 224, 256)
 
 
@@ -85,8 +99,11 @@ class IndexerBinding:
             short_gemm=self.short_gemm,
             dc1=dc1,
         )
-        if key.dc1 and kix.unfit(key):
-            key = replace(key, dc1=0)
+        if key.dc1:
+            why = kix.unfit(key)
+            if why:
+                _log_dc1_dropped(kix.dc1_names(key.dc1), why)
+                key = replace(key, dc1=0)
         return key
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:
