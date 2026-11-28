@@ -323,6 +323,11 @@ class DraftKvBuilder(PoolRowsMixin):
         check_cache = getattr(module, "check_cache", None)
         if check_cache is not None:
             check_cache(k_cache, v_cache)
+        # Published to `kv_cache_data`: per-block scale planes only. A declared
+        # per-tensor scale is one shared scalar the draft's attention reads off
+        # its own binding; anything walking `kv_cache_data` by block (the
+        # offload codec) must not see it.
+        k_scale = v_scale = None
         if self._kv_scale is not None:
             if self._kv_scale_tensor is None:
                 self._kv_scale_tensor = torch.full(
@@ -330,7 +335,8 @@ class DraftKvBuilder(PoolRowsMixin):
                 )
             module.k_scale = module.v_scale = self._kv_scale_tensor
         elif pool.scale_fields:  # the layout's, as the target binder asks
-            module.k_scale, module.v_scale = pool.scale_views(idx)
+            k_scale, v_scale = pool.scale_views(idx)
+            module.k_scale, module.v_scale = k_scale, v_scale
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
@@ -338,8 +344,8 @@ class DraftKvBuilder(PoolRowsMixin):
             layer_num=module.layer_num,
             k_cache=k_cache,
             v_cache=v_cache,
-            k_scale=getattr(module, "k_scale", None),
-            v_scale=getattr(module, "v_scale", None),
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def get_kv_transfer_tensors(self):

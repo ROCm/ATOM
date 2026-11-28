@@ -512,30 +512,41 @@ def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
     assert seen == {"dtype": pool_dtype} and p.config.kv_cache_dtype == target
 
 
-def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
-    """The DSpark GQA draft's pool binds every layer the same one-element tensor
-    at the scale its spec declares, at bind time: both its write and its read
-    take the scale as a device pointer, and nothing may be built for it inside
-    a captured forward."""
+# The pool dtypes the DSpark GQA draft runs: bf16, and fp8 as production does.
+_GQA_KV_DTYPES = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
+
+
+def _gqa_draft(blocks, device="cpu", kv_dtype=torch.bfloat16):
+    """A flash pool with the DSpark GQA draft's declared unit scale, and its
+    builder; returns the builder and the draft's paged layers, numbered from 1."""
     pool = MhaKvPool(
         layers=2,
         block_size=128,
         num_kv_heads=2,
         head_dim=64,
-        kv_dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
         flash_layout=True,
     )
-    pool.allocate(2, "cpu")
+    pool.allocate(blocks, device)
     runner = _runner(draft_layers=2)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
     builder = DraftKvBuilder(
         runner, lambda **_: pool, kv_scale=DraftKvPoolSpec().kv_scale
     )
     builder._kv_pool = pool
-
     layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    for i, m in enumerate(layers, start=1):
+        m.layer_num = i
+    return builder, layers
+
+
+def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
+    """The DSpark GQA draft's pool binds every layer the same one-element tensor
+    at the scale its spec declares, at bind time: both its write and its read
+    take the scale as a device pointer, and nothing may be built for it inside
+    a captured forward."""
+    builder, layers = _gqa_draft(2)
     for m in layers:
-        m.layer_num = 0
         builder.build_kv_cache_tensor(m)
 
     scale = layers[0].k_scale
@@ -543,8 +554,79 @@ def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
 
 
+@pytest.mark.parametrize("kv_dtype", _GQA_KV_DTYPES)
+def test_a_per_tensor_scale_stays_off_the_blockwise_kv_cache_data(kv_dtype):
+    """The shared unit scale is the layers' own binding, not per-block data:
+    the entries published to `kv_cache_data` carry the draft's K/V only, so a
+    block-wise walker such as the LMCache offload codec accepts them and moves
+    exactly the draft's K and V bytes per block."""
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+
+    blocks = 4
+    builder, layers = _gqa_draft(blocks, kv_dtype=kv_dtype)
+    entries = {f"layer_{m.layer_num}": builder.build_kv_cache_tensor(m) for m in layers}
+
+    assert all(e.k_scale is None and e.v_scale is None for e in entries.values())
+    assert all(m.k_scale.numel() == 1 for m in layers)  # the binding keeps it
+    codec = DenseKVByteCodec(entries, num_blocks=blocks)
+    assert codec.bytes_per_block * blocks == sum(
+        t.nbytes for e in entries.values() for t in (e.k_cache, e.v_cache)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused GPU staging")
+@pytest.mark.parametrize("kv_dtype", _GQA_KV_DTYPES)
+def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids(kv_dtype):
+    """What an LMCache tier save and a later tier load do to the draft's pool:
+    the codec gathers some blocks into a staging buffer and scatters it back
+    into other block ids. The draft's K/V rows come back byte for byte, beside
+    a target-like block-major cache, and nothing else is written."""
+    pytest.importorskip("triton")
+    from atom.config import KVCacheTensor
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+
+    blocks = 6
+    builder, layers = _gqa_draft(blocks, "cuda", kv_dtype)
+    entries = {
+        # A target layer's block-major cache, as the target builder publishes it.
+        "layer_0": KVCacheTensor(
+            layer_num=0, k_cache=torch.empty(blocks, 128, 576, device="cuda")
+        )
+    }
+    for m in layers:
+        entries[f"layer_{m.layer_num}"] = builder.build_kv_cache_tensor(m)
+    # As bytes: the codec moves bytes, and fp8 has no fill or compare of its own.
+    caches = [
+        t.view(torch.uint8)
+        for e in entries.values()
+        for t in (e.k_cache, e.v_cache)
+        if t is not None and t.numel()
+    ]
+    for t in caches:
+        t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
+    before = [t.clone() for t in caches]
+
+    codec = DenseKVByteCodec(entries, num_blocks=blocks)
+    saved, restored = [1, 4], [0, 3]
+    buf = torch.empty(
+        len(saved) * codec.bytes_per_block, dtype=torch.uint8, device="cuda"
+    )
+    codec.gpu_to_chunk_major_device_buffer(buf, [saved])
+    sentinel = 0x5A  # not zero, so a stray write of zeros shows too
+    for t in caches:
+        t.fill_(sentinel)
+    codec.chunk_major_device_buffer_to_gpu(buf, [restored])
+    torch.cuda.synchronize()
+
+    untouched = [b for b in range(blocks) if b not in restored]
+    for t, ref in zip(caches, before):
+        assert torch.equal(t[restored], ref[saved])
+        assert torch.equal(t[untouched], torch.full_like(t[untouched], sentinel))
+
+
 def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
-    """Bind one paged layer through the builder; return the module."""
+    """Bind one paged layer through the builder; return the module and the
+    entry it publishes to `kv_cache_data`."""
     pool.allocate(2, "cpu")
     runner = _runner(draft_layers=1)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype=kv_cache_dtype)
@@ -552,8 +634,7 @@ def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
     builder._kv_pool = pool
     module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
     module.layer_num = 0
-    builder.build_kv_cache_tensor(module)
-    return module
+    return module, builder.build_kv_cache_tensor(module)
 
 
 def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
@@ -566,7 +647,7 @@ def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
         head_dim=64,
         kv_dtype=torch.float8_e4m3fnuz,
     )
-    module = _bind_first_layer(pool, "fp8")
+    module, entry = _bind_first_layer(pool, "fp8")
 
     k, v = pool.kv_views(0)
     k_scale, v_scale = pool.scale_views(0)
@@ -575,6 +656,9 @@ def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
     assert module.k_scale.shape == k_scale.shape
     assert module.k_scale.data_ptr() == k_scale.data_ptr()
     assert module.v_scale.data_ptr() == v_scale.data_ptr()
+    # Per-block planes: published to `kv_cache_data` too, for block-wise walkers.
+    assert entry.k_scale.data_ptr() == k_scale.data_ptr()
+    assert entry.v_scale.data_ptr() == v_scale.data_ptr()
 
 
 @pytest.mark.parametrize("blocks_per_entry", [1, 8])
@@ -593,12 +677,14 @@ def test_a_flash_pool_binds_entry_wide_flash_views_and_the_declared_scale(
         blocks_per_entry=blocks_per_entry,
         flash_layout=True,
     )
-    module = _bind_first_layer(pool, "fp8", kv_scale=DraftKvPoolSpec().kv_scale)
+    module, entry = _bind_first_layer(pool, "fp8", kv_scale=DraftKvPoolSpec().kv_scale)
 
     assert module.k_cache.shape == (2, 128 * blocks_per_entry, 2, 64)
     assert module.k_cache.shape[1] == pool.entry_tokens
     assert module.v_cache.shape == pool.fa_views(0)[1].shape
     assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0
+    # The declared per-tensor scale stays on the binding, off `kv_cache_data`.
+    assert entry.k_scale is None and entry.v_scale is None
 
 
 @pytest.mark.parametrize("dcp", [1, 8])

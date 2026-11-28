@@ -61,6 +61,8 @@ class KVCacheTensor:
     layer_num: int
     k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    # Per-block scale planes, block-major like the caches; None when the layer
+    # has none (a per-tensor scale stays on the layer's own binding).
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major.
