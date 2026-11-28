@@ -373,10 +373,10 @@ class TestLaunchContract:
             (v41_prefill_token_graph_patch, "install_v41_prefill_token_graph_patch"),
         ):
             monkeypatch.setattr(module, name, rewired)
-        monkeypatch.setattr(sglang_version_guard, "sglang_version", lambda: "0.5.23")
-        with pytest.raises(ValueError, match=r"this SGLang \(sglang 0\.5\.23"):
-            bridge.install_deepseek_v41_proxy_pool_patch()
         monkeypatch.setattr(sglang_version_guard, "sglang_version", lambda: "0.5.22")
+        with pytest.raises(ValueError, match=r"this SGLang \(sglang 0\.5\.22"):
+            bridge.install_deepseek_v41_proxy_pool_patch()
+        monkeypatch.setattr(sglang_version_guard, "sglang_version", lambda: "0.5.23")
         sglang_version_guard.refuse_unsupported_sglang()
 
     def test_moe_fields_are_where_sglang_publishes_them(self, real_sglang):
