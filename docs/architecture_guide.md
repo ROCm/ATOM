@@ -152,7 +152,8 @@ is specific to one model, and a model that uses neither runs exactly as before.
   `prepare_model`): `tokenIDProcessor.prepare_input_ids` then builds the step
   from zero rejected / bonus counts and the runner takes the status
   (`take_deferred_spec_status`) right after the target's launch, where
-  `postprocess` needs it.
+  `postprocess` needs it. A prefill defers it the same way: it carries no
+  request over, so nothing before its launch reads the status.
 
 DeepSeek-V4.1's metadata builder also takes a model's decode round
 (`atom/model_engine/model_hooks.py`, `DecodeRound`, handed over by the model's

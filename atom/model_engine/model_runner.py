@@ -640,9 +640,11 @@ class tokenIDProcessor:
 
         ``defer_spec_status``: the attention builder advances this step from
         the previous verdict on the device
-        (`AttentionMetadataBuilder.consumes_device_verdict`), so the step is
-        built as if no draft had been rejected (zero counts) and the wait is
-        owed until after the target's launch (`take_deferred_spec_status`).
+        (`AttentionMetadataBuilder.consumes_device_verdict`), or the step is a
+        prefill, which carries no request over and so reads no status before
+        `postprocess`. The step is built as if no draft had been rejected
+        (zero counts) and the wait is owed until after the target's launch
+        (`take_deferred_spec_status`).
         """
         bs = batch.total_seqs_num
         self.batch_info.np[:] = (
@@ -3178,12 +3180,16 @@ class ModelRunner:
         # after the target's launch (`forward`): a pure prefill, or a decode
         # whose builder advances from the previous verdict on the device.
         # Mixed decode rows need the host counts before attention stages their
-        # rolled-back context lengths, even though the mode is prefill.
-        self.spec_status_deferred = (
-            forward_mode.is_prefill and not batch.is_mixed
-        ) or self.attn_metadata_builder.consumes_device_verdict(
+        # rolled-back context lengths, even though the mode is prefill. The
+        # builder is asked every step, a prefill's included: its answer also
+        # records the step, so a later decode knows what forward ran before it
+        # (`DeviceRound.consumes`).
+        consumes_verdict = self.attn_metadata_builder.consumes_device_verdict(
             batch, forward_mode.max_seqlen_q
         )
+        self.spec_status_deferred = (
+            forward_mode.is_prefill and not batch.is_mixed
+        ) or consumes_verdict
         # No GPU consumer runs between these host producers and this
         # upload. Token assembly publishes before launching its kernel.
         input_ids = self.tokenID_processor.prepare_input_ids(
