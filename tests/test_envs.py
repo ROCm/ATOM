@@ -374,6 +374,24 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "0")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
 
+    def test_offload_load_event_wait_default_enabled(self, monkeypatch):
+        monkeypatch.delenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", raising=False)
+        assert _get_envs().ATOM_OFFLOAD_LOAD_EVENT_WAIT is True
+
+    @pytest.mark.parametrize("value", ["0", "off", ""])
+    def test_offload_load_event_wait_opt_out(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_OFFLOAD_LOAD_EVENT_WAIT", value)
+        assert _get_envs().ATOM_OFFLOAD_LOAD_EVENT_WAIT is False
+
+    def test_offload_load_wait_hold_default_enabled(self, monkeypatch):
+        monkeypatch.delenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", raising=False)
+        assert _get_envs().ATOM_OFFLOAD_LOAD_WAIT_HOLD is True
+
+    @pytest.mark.parametrize("value", ["0", "off", ""])
+    def test_offload_load_wait_hold_opt_out(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_OFFLOAD_LOAD_WAIT_HOLD", value)
+        assert _get_envs().ATOM_OFFLOAD_LOAD_WAIT_HOLD is False
+
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
@@ -428,7 +446,7 @@ def test_offload_env_vars_are_documented():
     offload = [
         name
         for name in envs.environment_variables
-        if name.startswith(("OFFLOAD_", "LMCACHE_"))
+        if name.startswith(("OFFLOAD_", "LMCACHE_", "ATOM_OFFLOAD_", "ATOM_STORE_"))
     ]
     assert offload
     assert [name for name in offload if f"**{name}**" not in doc] == []

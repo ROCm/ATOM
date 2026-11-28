@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -238,6 +239,26 @@ def build_offload_engine(
     return engine, cfg, meta
 
 
+class LoadExecutor(ThreadPoolExecutor):
+    """The load pool: every job rings the KV progress doorbell when it ends
+    (`ATOM_OFFLOAD_LOAD_EVENT_WAIT`; a plain pool otherwise).
+
+    A load job records its terminal result (`_done_load` / `_failed_load`)
+    before it returns, so the ring follows the record; `get_finished` rearms
+    the doorbell before it drains them. With no doorbell installed
+    (`progress_doorbell.install`) the ring is a no-op.
+    """
+
+    def submit(self, fn, /, *args, **kwargs):
+        future = super().submit(fn, *args, **kwargs)
+        future.add_done_callback(_ring_kv_progress)
+        return future
+
+
+def _ring_kv_progress(_future) -> None:
+    progress_doorbell.ring()
+
+
 class OffloadWorkerMixin:
     """Executor plumbing + completion reporting shared by offload workers.
 
@@ -290,7 +311,10 @@ class OffloadWorkerMixin:
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save, thread_name_prefix=f"{thread_name_prefix}-save"
         )
-        self._load_executor = ThreadPoolExecutor(
+        load_pool = (
+            LoadExecutor if envs.ATOM_OFFLOAD_LOAD_EVENT_WAIT else ThreadPoolExecutor
+        )
+        self._load_executor = load_pool(
             max_workers=n_load, thread_name_prefix=f"{thread_name_prefix}-load"
         )
         self._lock = threading.Lock()
@@ -491,6 +515,9 @@ class OffloadWorkerMixin:
             self._done_save.add(self._save_completion_id(req))
 
     def get_finished(self) -> KVConnectorOutput:
+        # Before the drain: a load recorded after this either is in this answer
+        # or rings the doorbell again (`progress_doorbell`).
+        progress_doorbell.rearm()
         with self._lock:
             dl, fl, ds = self._drain_common_completions_locked()
             completions = set(self._connector_completions)

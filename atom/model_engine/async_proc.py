@@ -30,7 +30,9 @@ import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.config import local_device_index
+from atom.kv_transfer import progress_doorbell
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.progress_doorbell import KV_PROGRESS_DOORBELL
 from atom.model_engine.block_table_codec import (
     FORWARD_RPC,
     BlockTableDeltaDecoder,
@@ -209,6 +211,10 @@ class AsyncIOProc:
             )
             t.start()
             self.io_threads.append(t)
+            # KV progress doorbell sender: whoever in this worker rings it
+            # (`progress_doorbell.ring`) is heard on this channel at once.
+            kv_queue = self.kv_queue
+            progress_doorbell.install(lambda: kv_queue.put_nowait(KV_PROGRESS_DOORBELL))
 
         # Dedicated collective-RPC reply thread
         if self.rpc_output_addr is not None:
@@ -704,7 +710,13 @@ class AsyncIOProcManager:
                     continue
                 obj = output_socket.recv(copy=False)
                 obj = pickle.loads(obj)
-                self.kv_outputs_queues[worker_id].put_nowait(obj)
+                if isinstance(obj, str) and obj == KV_PROGRESS_DOORBELL:
+                    # Not an answer: it never joins an aggregation. Rings this
+                    # process's doorbell, which sets `kv_progress_event` where
+                    # one is installed (`progress_doorbell`).
+                    progress_doorbell.ring()
+                else:
+                    self.kv_outputs_queues[worker_id].put_nowait(obj)
                 if self.kv_progress_event is not None:
                     self.kv_progress_event.set()
         finally:

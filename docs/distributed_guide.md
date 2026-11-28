@@ -109,15 +109,17 @@ The `stateless_init_dp_group()` method (in `ParallelConfig`) calls `stateless_in
 
 ### Synchronized busy loop
 
-The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks: every round by default, every N paired rounds after a busy sync with `ATOM_DP_SYNC_INTERVAL` (see [DP state sync interval](#dp-state-sync-interval)). The `_sync_dp_state()` method packs three signals into an int64 tensor and performs a single `AllReduce(MAX)`:
+The DP busy loop overrides the base `EngineCore.busy_loop()` to synchronize state across DP ranks: every round by default, every N paired rounds after a busy sync with `ATOM_DP_SYNC_INTERVAL` (see [DP state sync interval](#dp-state-sync-interval)). The `_sync_dp_state()` method packs five signals into an int64 tensor and performs a single `AllReduce(MAX)`:
 
 ```python
-# State synced: [has_unfinished, shutdown, held]
+# State synced: [has_unfinished, shutdown, held, hidden, decoding]
 state_tensor = torch.tensor(
     [
-        1 if local_has_unfinished else 0,
-        1 if local_shutdown else 0,
-        1 if local_held else 0,
+        int(local_has_unfinished),
+        int(local_shutdown),
+        int(local_held),
+        int(local_hidden),  # ATOM_DP_IDLE_WHEN_BLOCKED: work the vote left out
+        int(local_decoding),  # Scheduler.has_running_decode()
     ],
     dtype=torch.int64, device="cpu",
 )
@@ -130,6 +132,7 @@ This ensures:
 - **All ranks run a step together**: when any rank has unfinished work, every rank steps, an idle one with a dummy batch. The step's phase and padded shape are agreed per step by `ForwardMode.decide`.
 - **Graceful shutdown**: all ranks must agree before exiting.
 - **One hold holds the group**: a rank paused, offloaded or fenced for a weight sync holds every rank, so their forwards stay paired.
+- **The group's decodes are visible to every rank**: `dp_group_decoding` is set when any rank has a running decode, so a rank that would delay its next forward (the offload load-wait hold, `ATOM_OFFLOAD_LOAD_WAIT_HOLD`) does not add to a peer's ITL.
 
 ### Dummy batch execution
 

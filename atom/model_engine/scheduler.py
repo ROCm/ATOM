@@ -2083,6 +2083,10 @@ class Scheduler:
             and not self.deferred_free_blocks
         )
 
+    def has_running_decode(self) -> bool:
+        """Whether `running` holds anything besides partial prefills."""
+        return len(self.running) > self._partial_prefill_count
+
     def has_forward_work(self) -> bool:
         """Whether a scheduling pass on this rank may produce a batch now.
 
@@ -2696,21 +2700,17 @@ class Scheduler:
             )
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
-        if self.kv_connector is not None and self.waiting:
-            prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
-            if prefetch is not None:
-                # Includes requests whose lookup will be detached: the lookup
-                # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
-                prefetch(
-                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
-                )
-
         # Start tier loads for waiting requests whose lookup answered, on this
         # tick whatever the delayer decides. Before the delayer so a request
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
-        # nothing is scheduled for prefill here.
-        self._early_load_tier_prefixes()
+        # nothing is scheduled for prefill here. Skipped, with the lookup
+        # prefetch before it, when this tick's pass already ran ahead of
+        # `schedule()` (`EarlyLoadState.take_tick_pass`), so the per-tick bounds
+        # stay per step.
+        if self._early_load.take_tick_pass():
+            self._prefetch_waiting_lookups()
+            self._early_load_tier_prefixes()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -5039,6 +5039,18 @@ class Scheduler:
         if parked:
             logger.debug("[EARLY-LOAD] parked %d tier load(s)", parked)
         return parked
+
+    def _prefetch_waiting_lookups(self) -> None:
+        """Submit the async tier lookups of the head of `waiting`, once per
+        tick, with that tick's early tier load (`_schedule`, unless the pass
+        already ran ahead of it: `EarlyLoadState.take_tick_pass`)."""
+        if self.kv_connector is None or not self.waiting:
+            return
+        prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
+        if prefetch is not None:
+            # Includes requests whose lookup will be detached: the lookup
+            # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
+            prefetch(itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH))
 
     def _early_load_admit(
         self,

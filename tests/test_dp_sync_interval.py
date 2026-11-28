@@ -166,6 +166,7 @@ def _run(intervals, work, commands=None, shutdown_at=32, startup_error=None):
         engine.scheduler = SimpleNamespace(
             heartbeat_throughput=lambda now, e=engine: setattr(e, "tick", e.tick + 1),
             is_finished=lambda e=engine: not work(e.rank, e.tick),
+            has_running_decode=lambda: False,
             engine_stats=SimpleNamespace(
                 note_busy=lambda now: None,
                 note_idle=lambda now: None,

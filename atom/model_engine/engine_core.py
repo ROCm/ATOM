@@ -16,6 +16,7 @@ from atom.distributed.group_agreement import group_max_each
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+from atom.kv_transfer.engine_step_hooks import kv_transfer_step_hooks
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.dp_sync_gate import MAX_DP_SYNC_INTERVAL, DPSyncGate
@@ -135,6 +136,10 @@ class EngineCore:
     # Whether the engine reports its prefill backlog to the CoreManager
     # (`share_cache` routing); the data-parallel engine turns it on.
     _report_backlog = False
+    # Objects called around every step: `before_schedule()` ahead of
+    # `schedule()`, `on_forward_done(seconds)` after a real forward or a DP
+    # dummy forward (`atom.kv_transfer.engine_step_hooks`). None by default.
+    step_hooks: tuple = ()
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -310,6 +315,7 @@ class EngineCore:
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
         if self.kv_transfer_enabled:
+            self.step_hooks = kv_transfer_step_hooks(self, config)
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
 
@@ -672,6 +678,8 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._wake_event.clear()
+        for hook in self.step_hooks:
+            hook.before_schedule()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -707,9 +715,12 @@ class EngineCore:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
+            fwd_start = time.monotonic()
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            for hook in self.step_hooks:
+                hook.on_forward_done(time.monotonic() - fwd_start)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -856,6 +867,12 @@ class EngineCore:
     def _poll_kv_transfer_progress(self) -> bool:
         if not self.kv_transfer_enabled:
             return False
+        kvoutput = self._collect_kv_transfer_progress()
+        return kvoutput is not None and not kvoutput.is_empty()
+
+    def _collect_kv_transfer_progress(self):
+        """Apply the workers' completion answer if every rank has given it
+        (and request the next); None while it is still out."""
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
         # Reclaim any offload save whose completion report never came (LMCache
@@ -864,7 +881,7 @@ class EngineCore:
         reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
-        return kvoutput is not None and not kvoutput.is_empty()
+        return kvoutput
 
     def _poll_dynamic_chunking_calibration(self) -> None:
         """Install a freshly calibrated chunk latency model, if one is ready.
@@ -1159,6 +1176,8 @@ class DPEngineCoreProc(EngineCore):
         self._idle_when_blocked = self._resolve_idle_when_blocked(config)
         # Reduced by `_sync_dp_state`: some rank's vote hid unfinished work.
         self._dp_group_hidden_work = False
+        # Reduced by `_sync_dp_state`: some rank of the group has a running decode.
+        self.dp_group_decoding = False
 
     def _resolve_idle_when_blocked(self, config: Config) -> bool:
         """`ATOM_DP_IDLE_WHEN_BLOCKED`: whether this rank reports work to its DP
@@ -1385,7 +1404,12 @@ class DPEngineCoreProc(EngineCore):
         return value
 
     def _execute_dummy_batch(self):
+        fwd_start = time.monotonic()
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        # The dummy is paired with the peers' forwards: its wall time is the
+        # group's step, which is what a step hook measures against.
+        for hook in self.step_hooks:
+            hook.on_forward_done(time.monotonic() - fwd_start)
         if self.scheduler.running:
             # The tokens this rank's last real step sampled come back with this
             # forward (deferred output), and land like any step's.
@@ -1401,8 +1425,14 @@ class DPEngineCoreProc(EngineCore):
         """MAX-reduce this rank's flags over the DP group. `local_hidden`
         (ATOM_DP_IDLE_WHEN_BLOCKED: unfinished work the vote left out) is
         reduced too, into `_dp_group_hidden_work`; every rank sends it, so the
-        collective is the same whatever each rank's setting."""
+        collective is the same whatever each rank's setting. So is whether
+        this rank has a running decode (`Scheduler.has_running_decode`), into
+        `dp_group_decoding`: some rank of the group decodes, so anything that
+        delays this rank's next forward delays those decodes at the collective
+        too (a step hook reads it). Kept until the next sync."""
+        local_decoding = self.scheduler.has_running_decode()
         self._dp_group_hidden_work = local_hidden
+        self.dp_group_decoding = local_decoding
         if self._shutting_down:
             return local_has_unfinished, True, local_held
 
@@ -1413,6 +1443,7 @@ class DPEngineCoreProc(EngineCore):
                     int(local_shutdown),
                     int(local_held),
                     int(local_hidden),
+                    int(local_decoding),
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1420,9 +1451,10 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
-            # One decode for the four flags.
-            unfinished, shutdown, held, hidden = state_tensor.tolist()
+            # One decode for the five flags.
+            unfinished, shutdown, held, hidden, decoding = state_tensor.tolist()
             self._dp_group_hidden_work = hidden == 1
+            self.dp_group_decoding = decoding == 1
             return unfinished == 1, shutdown == 1, held == 1
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
