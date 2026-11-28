@@ -44,6 +44,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
     batched_gemm_a8w8_mxscale,
     batched_gemm_a8w8_mxscale_bpreshuffle,
+    batched_gemm_a8w8_mxscale_bpreshuffle_quant,
 )
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -2246,6 +2247,42 @@ class DeepseekV4Attention(nn.Module):
             *paged,
         )
 
+    def _wo_a_quant_input(
+        self, o: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """wo_a's fp8 input [M, G, D] and its row-major e8m0 scales [M, G, D/128].
+
+        `inverse_rope_group_quant` fuses the output inverse RoPE into the
+        per-token e8m0 group-quant, saving a bf16 round trip.
+        """
+        num_tokens = o.size(0)
+        H = self.n_local_heads
+        G = self.n_local_groups
+        D = H * self.head_dim // G
+        o = o.view(num_tokens, H, self.head_dim)  # [S, H, head_dim] pre-rope
+        x_fp8 = torch.empty(
+            (num_tokens, G, D), dtype=self._wo_a_fp8_dtype, device=o.device
+        )
+        x_scale = torch.empty(
+            (num_tokens, G, D // 128), dtype=torch.uint8, device=o.device
+        )
+        cos, sin = self.rotary_emb.cos_sin_2d()
+        inverse_rope_group_quant(
+            o,
+            positions.to(torch.int64),
+            cos,
+            sin,
+            num_groups=G,
+            quant_group_size=128,
+            # Row-major [S, G, Ks], which is how `x_scale` is allocated
+            # above and how the mxscale GEMM reads it. The other
+            # layouts fill the same bytes in a shuffled order.
+            scale_layout="row",
+            x_fp8=x_fp8,
+            x_scale=x_scale,
+        )
+        return x_fp8, x_scale
+
     @mark_trace
     def _wo_a_grouped_lora(
         self,
@@ -2261,35 +2298,9 @@ class DeepseekV4Attention(nn.Module):
         """
         num_tokens = o.size(0)
         if self._wo_a_mxscale:
-            # `inverse_rope_group_quant` fuses the output inverse RoPE into the
-            # per-token e8m0 group-quant, saving a bf16 round trip. The output
-            # is token-major [M, G, N] with N contiguous, so the `.flatten(1)`
-            # this branch ends with is a free view.
-            H = self.n_local_heads
-            G = self.n_local_groups
-            D = H * self.head_dim // G
-            o = o.view(num_tokens, H, self.head_dim)  # [S, H, head_dim] pre-rope
-            x_fp8 = torch.empty(
-                (num_tokens, G, D), dtype=self._wo_a_fp8_dtype, device=o.device
-            )
-            x_scale = torch.empty(
-                (num_tokens, G, D // 128), dtype=torch.uint8, device=o.device
-            )
-            cos, sin = self.rotary_emb.cos_sin_2d()
-            inverse_rope_group_quant(
-                o,
-                positions.to(torch.int64),
-                cos,
-                sin,
-                num_groups=G,
-                quant_group_size=128,
-                # Row-major [S, G, Ks], which is how `x_scale` is allocated
-                # above and how the mxscale GEMM below reads it. The other
-                # layouts fill the same bytes in a shuffled order.
-                scale_layout="row",
-                x_fp8=x_fp8,
-                x_scale=x_scale,
-            )
+            # The output is token-major [M, G, N] with N contiguous, so the
+            # `.flatten(1)` this branch ends with is a free view.
+            x_fp8, x_scale = self._wo_a_quant_input(o, positions)
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
             # flatten below is a free view.
@@ -2343,8 +2354,43 @@ class DeepseekV4Attention(nn.Module):
         # The AITER BMM entry is itself compile-guarded, so only its tuned-CSV
         # lookup/kernel dispatch stays opaque; quantization and surrounding
         # tensor work remain visible to the compiled graph.
+        if o.dtype == torch.bfloat16 and self._fuse_wo_b_quant_into_wo_a():
+            # wo_a returns wo_b's input already quantized: the bytes of wo_b's
+            # own per-1x128 e8m0 quant of the bf16 wo_a output. On gfx1250 rows
+            # that run the gluon BMM, the quant is in the GEMM epilogue.
+            x_fp8, x_scale = self._wo_a_quant_input(o, positions)
+            y, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_quant(
+                x_fp8,
+                self._wo_a_w_fp8,
+                x_scale,
+                self._wo_a_w_scale,
+                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+            )
+            return self.wo_b(y, x_scale=y_scale)
         o = self._wo_a_grouped_lora(o, positions, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o)
+
+    def _fuse_wo_b_quant_into_wo_a(self) -> bool:
+        """True when wo_a can write wo_b's input already quantized.
+
+        Both must hold:
+        - wo_a runs `batched_gemm_a8w8_mxscale_bpreshuffle` (fp8 weight,
+          preshuffled), the only wo_a GEMM with a `_quant` version;
+        - wo_b, given bf16, would quantize it to exactly what that version
+          writes: per-1x128 fp8 e4m3 with dynamic e8m0 scales
+          (`per_1x128_e8m0_quant` in LinearBase.forward). So skipping wo_b's
+          own quant changes no bytes.
+        """
+        wo_b = self.wo_b
+        return (
+            self._wo_a_mxscale
+            and self._is_preshuffle
+            and wo_b.native_a8_group_rows is None
+            and wo_b.quant_type.value == QuantType.per_1x128.value
+            and wo_b.blockscale_e8m0_scale
+            and wo_b.params_dtype == torch.float8_e4m3fn
+            and getattr(wo_b, "input_scale", None) is None
+        )
 
     def forward_impl(
         self,
