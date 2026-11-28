@@ -1264,6 +1264,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
+    # MiniMax-M3.1 as a TP1 P/D prefill producer on gfx950: decoder layers on fused
+    # kernels, same bits (atom/model_ops/minimax_m3/tp1_prefill.py). 0: generic.
+    "ATOM_M3_TP1_PREFILL": lambda: _flag_env("ATOM_M3_TP1_PREFILL", "1"),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
     # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.

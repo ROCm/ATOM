@@ -3995,6 +3995,11 @@ class Config:
         # shared_experts() and how many experts it routes over (129 / top-5 vs
         # 128 / top-4), so it changes the compiled graph the same way.
         factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        # The MiniMax-M3.1 TP1 prefill path traces other ops; keyed as resolved, so
+        # an aiter that gains or loses its ops does not reuse the other graph.
+        from atom.model_ops.minimax_m3.tp1_prefill import path_enabled
+
+        factors.append(path_enabled(self))
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.
