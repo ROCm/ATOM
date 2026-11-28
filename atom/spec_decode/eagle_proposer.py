@@ -861,6 +861,10 @@ class EagleProposer(Drafter):
             draft_presence.begin(
                 getattr(self.runner, "_presence_step", None), context.scheduled_bs
             )
+        if draft_presence is not None:
+            # ATOM_MTP_DRAFT_VOCAB: the staged rows' masks onto the draft columns
+            # (a no-op without a draft vocabulary or where its mask is a view).
+            draft_presence.stage_vocab(context.scheduled_bs)
         # A mid-step's token split (ATOM_MTP_ADVANCE_TOKEN_SPLIT) is installed by
         # the advance that precedes it; none may reach step 0 from a last step.
         if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:

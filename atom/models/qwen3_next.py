@@ -12,6 +12,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.rotary_embedding import get_rope
 from einops import rearrange
 from torch import nn
@@ -77,7 +78,10 @@ from atom.model_ops.sigmoid_gate import (
     shared_expert_gate_add,
 )
 from atom.model_ops.topK import (
+    init_aiter_topK_meta_data,
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+    rocm_aiter_topk_softmax,
+    topk_meta_rows,
 )
 from atom.model_ops.triton_mrope import (
     gfx1250_fused_qk_norm_mrope_cache_applies,
@@ -96,6 +100,7 @@ from atom.models.utils import (
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import pass_scheduled_tokens_gpu
 from atom.utils.region_graph import token_graph
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
@@ -229,6 +234,72 @@ class Qwen3NextMLP(nn.Module):
 
 
 _SHARED_EXPERT_STREAM: torch.cuda.Stream | None = None
+# ATOM_QWEN_FHMOE: one zero [tokens, hidden] buffer every block's MoEGatedSum
+# hands the next norm as its (already summed) shared part, and whether the
+# top-k buffer with the prefilled shared column is set up.
+_FHMOE_ZEROS: torch.Tensor | None = None
+_FHMOE_TOPK_READY = False
+
+
+def _fhmoe_setup(block) -> None:
+    """The shared-column top-k buffer (topk_softmax writes the routed columns
+    and scores the shared one) and the zero shared rows, sized to the MoE's
+    token capacity. Once for every block."""
+    global _FHMOE_ZEROS, _FHMOE_TOPK_READY
+    from atom.model_ops.moe import moe_kernel_token_capacity
+
+    cfg = block.experts.moe_parallel_config
+    capacity = moe_kernel_token_capacity(
+        get_current_atom_config(),
+        dp_size=cfg.dp_size,
+        use_all2all=cfg.use_all2all_kernels,
+        dp_logical_ratio=cfg.dp_logical_ratio,
+    )
+    if not _FHMOE_TOPK_READY:
+        init_aiter_topK_meta_data(
+            n_routed_experts=block.n_routed_experts,
+            n_shared_experts=1,
+            top_k=block.experts.top_k,
+            tp_rank=0,
+            tp_size=1,
+            max_num_tokens=capacity,
+        )
+        _FHMOE_TOPK_READY = True
+    hidden = block.experts.hidden_size
+    if _FHMOE_ZEROS is None or _FHMOE_ZEROS.shape[1] != hidden:
+        _FHMOE_ZEROS = torch.zeros(
+            (capacity, hidden), dtype=torch.bfloat16, device="cuda"
+        )
+
+
+_FHMOE_DEFER: bool | None = None
+
+
+def _fhmoe_defer_topk() -> bool:
+    """Whether FHMoE leaves its top-k to aiter's fused top-k + route + quant
+    (ATOM_MOE_FUSED_TOPK_ROUTE_QUANT and an aiter whose deferral takes the
+    shared column); never under micro-batching (one deferral at a time)."""
+    global _FHMOE_DEFER
+    if _FHMOE_DEFER is None:
+        ok = False
+        if envs.ATOM_MOE_FUSED_TOPK_ROUTE_QUANT:
+            try:
+                import inspect
+
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_topk_softmax
+
+                ok = (
+                    "num_fused_shared_experts"
+                    in inspect.signature(defer_topk_softmax).parameters
+                )
+            except ImportError:
+                ok = False
+        _FHMOE_DEFER = ok
+    if not _FHMOE_DEFER:
+        return False
+    from atom.utils.tbo.ubatching import tbo_active
+
+    return not tbo_active()
 
 
 def _shared_expert_stream() -> torch.cuda.Stream:
@@ -264,6 +335,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # ATOM_FUSED_ROUTER_SHARED_EXPERT: the router weight padded to whole 16-row
     # groups (gate.weight is a view of its first rows), set at load.
     router_padded = None
+    # ATOM_QWEN_FHMOE: set in __init__ (a block built without it runs the base
+    # path).
+    fhmoe = False
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -370,6 +444,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # ATOM_QWEN_MOE_A8W4: MXFP8 activations into the MXFP4 experts.
+            mxfp4_fp8_activations=envs.ATOM_QWEN_MOE_A8W4,
             # The MXFP4 default pads each rank's experts to 256 columns: at TP4
             # (512 / 4 = 128) half of every expert the grouped GEMMs stream is zeros.
             pad_align=(
@@ -379,6 +455,28 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 else None
             ),
         )
+        if envs.ATOM_QWEN_MOE_A8W4:
+            m = self.experts.quant_method
+            logger.info(
+                "ATOM_QWEN_MOE_A8W4: %s experts %s fp8_activations=%s",
+                prefix,
+                type(m).__name__,
+                getattr(m, "fp8_activations", None),
+            )
+        # ATOM_QWEN_FHMOE (gfx1250, TP1): decode-size steps run the shared expert
+        # inside the routed grouped MoE (see `fhmoe_forward`); the experts' quant
+        # method builds its operands at load from the shared expert handed here.
+        self.fhmoe = bool(
+            envs.ATOM_QWEN_FHMOE
+            and self.shared_expert is not None
+            and self.tp_size == 1
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+            and get_gfx() == "gfx1250"
+        )
+        if self.fhmoe:
+            # Not a submodule: the shared expert stays this block's.
+            object.__setattr__(self.experts, "fhmoe_shared_mlp", self.shared_expert)
+            _fhmoe_setup(self)
         # The same padding for experts quantized online at load: the MTP layer's
         # experts are unquantized in the checkpoint and become MXFP4 there.
         # ATOM_QWEN_MONO_MOE's kernel needs 128 (TP4) either way.
@@ -462,6 +560,55 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefill=m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS,
         )
 
+    def fhmoe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor | MoEGatedSum:
+        """ATOM_QWEN_FHMOE: the router GEMM, the top-k that also scores the
+        shared column (route id E, weight sigmoid of its logit; deferred to the
+        MoE's fused top-k + route + quant where it can) and one aiter FHMoE
+        grouped MoE over the routed experts and the shared expert. The next
+        norm still takes the sum (MoEGatedSum, its shared part zero)."""
+        ex = self.experts
+        logits = self.gate(hidden_states)
+        nvt = pass_scheduled_tokens_gpu(hidden_states.shape[0])
+        if _fhmoe_defer_topk():
+            # ATOM_MOE_FUSED_TOPK_ROUTE_QUANT: the top-k (shared column too) is
+            # left to aiter's grouped MoE, which computes it with the routing
+            # and the routed activation quant in one fused kernel (two above
+            # 512 rows). The buffers are the prefilled shared-column rows.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_topk_softmax
+
+            weights, ids = topk_meta_rows(hidden_states.shape[0])
+            defer_topk_softmax(
+                weights, ids, logits, ex.renormalize, nvt, num_fused_shared_experts=1
+            )
+        else:
+            weights, ids = rocm_aiter_topk_softmax(
+                logits,
+                ex.top_k,
+                ex.renormalize,
+                num_fused_shared_experts=1,
+                num_routing_experts=self.n_routed_experts,
+                fused_shared_experts_scoring_func="sigmoid",
+                num_valid_rows=nvt,
+            )
+        apply = ex.quant_method.apply_fhmoe
+        if self.defer_gather and not torch.compiler.is_compiling():
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_gather_reduce
+
+            with defer_gather_reduce() as req:
+                out = apply(ex, hidden_states, weights, ids, nvt)
+            if req.taken:
+                out = GatheredRouted(
+                    req.grouped, req.route_rows, req.weights, req.num_valid_tokens
+                )
+        else:
+            out = apply(ex, hidden_states, weights, ids, nvt)
+        if self.defer_gated_sum:
+            zeros = _FHMOE_ZEROS[: hidden_states.shape[0]]
+            return MoEGatedSum(out, zeros, None)
+        if isinstance(out, GatheredRouted):
+            out = out.materialize()
+        return out
+
     def _fold_topk_router(
         self,
         hidden_states: torch.Tensor,
@@ -471,7 +618,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """ATOM_FOLD_TOPK_ROUTER: (router logits, shared expert output) from the
         router + shared expert kernel that also computes this block's MoE top-k,
-        routing and MXFP4 activation quant, handed to the experts' deferred top-k
+        routing and activation quant (MXFP4, or MXFP8 for A8W4 experts: the v2
+        kernel only), handed to the experts' deferred top-k
         (the grouped MoE then skips moe_topk_route_quant). None where it does not
         apply: then the plain kernel runs, and the routing as usual. The geometry
         of the routing is aiter's, learned from an unfused call at this row count
@@ -498,7 +646,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             or self.n_routed_experts != 256
         ):
             return None
-        geometry = topk_route_quant_decode_geometry(m, k, 8)
+        # the experts' activation format on this step (MXFP8 under ATOM_QWEN_MOE_A8W4)
+        quant_mode = getattr(
+            self.experts.quant_method, "routed_quant_mode", lambda: "fp4"
+        )()
+        geometry = topk_route_quant_decode_geometry(m, k, 8, quant_mode)
         mlp = self.shared_expert
         if envs.ATOM_ROUTER_SHARED_V2 and geometry is not None:
             # the decode rewrite of the same kernel (bitwise the same outputs), where it applies
@@ -526,29 +678,32 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 fused_gemm_a16w16_router_shared_expert_topk_supported = (
                     fused_gemm_a16w16_router_shared_expert_topk_v2_supported
                 )
-        prenorm_kw = {}
+        is_v2 = (
+            fused_gemm_a16w16_router_shared_expert_topk.__name__
+            == "fused_gemm_a16w16_router_shared_expert_topk_v2"
+        )
+        kernel_kw = {}
+        if quant_mode != "fp4":
+            # only the v2 kernel writes MXFP8 rows
+            if not is_v2:
+                return None
+            kernel_kw["quant_mode"] = quant_mode
         w_gate_up = mlp.gate_up_proj.weight
         if prenorm is not None:
             # ATOM_FOLD_POSTNORM: only the v2 kernel's narrow variant takes the norm
             from atom.model_ops import fold_postnorm
 
-            if (
-                fused_gemm_a16w16_router_shared_expert_topk.__name__
-                != "fused_gemm_a16w16_router_shared_expert_topk_v2"
-                or m > 16
-            ):
+            if not is_v2 or m > 16:
                 return None
             pw = fold_postnorm.prescaled(self, prenorm.norm)
             if pw is None:
                 return None
             w_router_padded, w_gate_up = pw
-            prenorm_kw = {
-                "prenorm": (
-                    prenorm.ssq,
-                    prenorm.norm.weight,
-                    prenorm.norm.variance_epsilon,
-                )
-            }
+            kernel_kw["prenorm"] = (
+                prenorm.ssq,
+                prenorm.norm.weight,
+                prenorm.norm.variance_epsilon,
+            )
         if geometry is None or not fused_gemm_a16w16_router_shared_expert_topk_supported(
             hidden_states,
             w_router_padded,
@@ -569,7 +724,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             contiguous_m=geometry[1],
             wmma_rep=geometry[2],
             num_valid_rows=nvr,
-            **prenorm_kw,
+            **kernel_kw,
         )
         set_prepared_routing(logits, geometry, routed, nvr, required=prenorm is not None)
         return logits, shared
@@ -598,7 +753,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         fold_postnorm._stats["folded"] += 1
         logits, shared_output = fused
         router_logits = logits[:, : self.n_routed_experts]
-        # x is not the experts' input: the routing prepared above (MXFP4 rows of the normalized x) must be the
+        # x is not the experts' input: the routing prepared above (quantized rows of the normalized x) must be the
         # one consumed (try_defer_topk_route_quant raises otherwise)
         if self.defer_gather and not torch.compiler.is_compiling():
             routed_output = self._experts_deferred_gather(x, router_logits)
@@ -850,6 +1005,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if (
+            self.fhmoe
+            and residual is None
+            and hidden_states.shape[0] <= envs.ATOM_QWEN_FHMOE_MAX_TOKENS
+            and not torch.compiler.is_compiling()
+        ):
+            out = self.fhmoe_forward(hidden_states)
+            return out if isinstance(out, MoEGatedSum) else out.view(orig_shape)
+        if (
             residual is not None
             and self.combine_tail_norm is not None
             and hidden_states.shape[0] <= envs.ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS
@@ -960,6 +1123,8 @@ class Qwen3NextAttention(nn.Module):
     fused_output_gate = False
     # ATOM_MXFP8_1X32's gate + quant into o_proj, set in __init__ (likewise).
     mx32_output_gate = False
+    # ATOM_UA_REDUCE_GATE_MX32: that gate + quant in the attention's split reduce.
+    reduce_gate_mx32 = False
 
     def __init__(
         self,
@@ -1121,11 +1286,27 @@ class Qwen3NextAttention(nn.Module):
             and not is_plugin_mode()
             and getattr(getattr(self.attn, "impl", None), "accepts_output_gate", False)
         )
+        # ATOM_UA_REDUCE_GATE_MX32: the mx32 gate + quant done by the unified
+        # attention's split-KV reduce (it writes o_proj's 1x32 MXFP8 input), on the
+        # paths that end on it (decode / verify); `_gated_mx32_kernel` elsewhere.
+        self.reduce_gate_mx32 = (
+            envs.ATOM_UA_REDUCE_GATE_MX32
+            and self.mx32_output_gate
+            and not is_plugin_mode()
+        )
 
-    def _attend(self, gate, select_rows, *args, **kwargs) -> tuple[torch.Tensor, bool]:
+    def _attend(
+        self, gate, select_rows, *args, mx32: bool = False, **kwargs
+    ) -> tuple[torch.Tensor, bool]:
         """`self.attn(*args, **kwargs)`, handing it the output gate and the row
         selection (ATOM_MTP_ATTN_GATE_IN_REDUCE) where they go. Returns the
-        output and whether the attention applied both."""
+        output and whether the attention applied both. With `mx32`
+        (ATOM_UA_REDUCE_GATE_MX32) the request is the gate and o_proj's 1x32
+        MXFP8 input instead: the output is then `(x_fp8, x_scale)` when applied."""
+        if mx32:
+            with AttentionOutputEpilogue(gate, None, mx32=True) as req:
+                out = self.attn(*args, **kwargs)
+            return (req.mx32_out, True) if req.applied else (out, False)
         if not self.gate_in_attention or gate is None:
             return self.attn(*args, **kwargs), False
         with AttentionOutputEpilogue(gate, select_rows) as req:
@@ -1178,13 +1359,26 @@ class Qwen3NextAttention(nn.Module):
         # gate + quant kernel (mx32_output_gate, excluded from fused_output_gate).
         fused_output_gate = self.fused_output_gate and not self.gate_in_attention
         attn_gate = {"output_gate": gate} if fused_output_gate else {}
+        # ATOM_UA_REDUCE_GATE_MX32: every row to o_proj (no selection), eager / graphs.
+        mx32_reduce = (
+            self.reduce_gate_mx32
+            and gate is not None
+            and select_rows is None
+            and not self.skip_out_proj
+            and not self.gate_in_attention
+            and gate.dtype == torch.bfloat16
+            and gate.stride(-1) == 1
+            and not torch.compiler.is_compiling()
+        )
+        if mx32_reduce:
+            attn_gate["mx32"] = True
         # ATOM_FOLD_ATTN_GATE: the output gate and o_proj's 1x32 MXFP8 quant in the epilogue of the
         # attention's split-KV reduce (no separate gate + quant launch)
         from atom.model_ops import fold_attn_gate as _fag
 
         fold_req = (
             _fag.open_request(gate)
-            if self.mx32_output_gate and _fag.can_fold(self, gate, select_rows)
+            if not mx32_reduce and self.mx32_output_gate and _fag.can_fold(self, gate, select_rows)
             else None
         )
         if fold_req is not None:
@@ -1234,6 +1428,10 @@ class Qwen3NextAttention(nn.Module):
                 gate, select_rows, q, k, v, **attn_gate
             )
 
+        if epilogue_done and mx32_reduce:
+            # The reduce wrote the gated output as o_proj's 1x32 MXFP8 input.
+            x_fp8, x_scale = attn_output
+            return self.o_proj(x_fp8, x_scale=x_scale)
         if fold_req is not None:
             x_fp8, x_scale = _fag.finish(fold_req, attn_output)
             return self.o_proj(x_fp8, x_scale=x_scale)

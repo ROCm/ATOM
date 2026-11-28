@@ -537,6 +537,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (atom/model_ops/qwen_mono_moe/integration.py) for decode steps of up to
     # 128 rows; others run the native chain. Off by default.
     "ATOM_QWEN_MONO_MOE": lambda: (os.getenv("ATOM_QWEN_MONO_MOE", "0") == "1"),
+    # Qwen3-Next / Qwen3.5 on gfx1250 (TP1, MXFP4 routed experts, bf16 shared
+    # expert): steps of at most ATOM_QWEN_FHMOE_MAX_TOKENS rows run the shared
+    # expert inside the routed grouped MoE (aiter FHMoE: MXFP8 weights, bf16
+    # activations). With ATOM_MOE_FUSED_TOPK_ROUTE_QUANT the top-k (shared
+    # column included) runs in aiter's fused top-k + route + quant kernels.
+    "ATOM_QWEN_FHMOE": lambda: (os.getenv("ATOM_QWEN_FHMOE", "0") == "1"),
+    "ATOM_QWEN_FHMOE_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_FHMOE_MAX_TOKENS", "1024")
+    ),
     # Steps above this many rows a rank keep the separate tail kernel: aiter's
     # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
     # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
@@ -567,9 +576,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ATOM_FOLD_TOPK_ROUTER (with ATOM_FUSED_ROUTER_SHARED_EXPERT and
     # ATOM_MOE_FUSED_TOPK_ROUTE_QUANT): at decode sizes (<= 16 rows) the router +
-    # shared expert kernel also computes the MoE top-k, routing and MXFP4
-    # activation quant (aiter's fused_gemm_a16w16_router_shared_expert_topk), so
-    # the grouped MoE skips its moe_topk_route_quant launch. Bitwise the same.
+    # shared expert kernel also computes the MoE top-k, routing and activation
+    # quant (aiter's fused_gemm_a16w16_router_shared_expert_topk; MXFP4, or MXFP8
+    # for ATOM_QWEN_MOE_A8W4 experts on the v2 kernel), so the grouped MoE skips
+    # its moe_topk_route_quant launch. Bitwise the same.
     "ATOM_FOLD_TOPK_ROUTER": lambda: (
         os.getenv("ATOM_FOLD_TOPK_ROUTER", "0") == "1"
     ),
@@ -662,6 +672,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output gate) in flight at once instead of a chain of dependent round trips.
     # No-op on an aiter without it. Off by default.
     "ATOM_UA_SPLIT_REDUCE_ONESHOT": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE_ONESHOT"),
+    # With ATOM_MXFP8_1X32 (its fused act quant) and the one-shot split reduce: the
+    # target's full-attention layers hand the output gate and o_proj's 1x32 MXFP8 input
+    # to aiter's split-KV reduce (unified_attention(output_mx32=...)), which writes the
+    # fp8 codes and e8m0 scales directly: the bf16 attention output and the separate
+    # gate + quant kernel (_gated_mx32_kernel) go away, bitwise. Unified-attention
+    # decode / verify only (else the separate kernel); eager / CUDA graphs. No-op on
+    # an aiter without it. Off by default.
+    "ATOM_UA_REDUCE_GATE_MX32": lambda: _flag_env("ATOM_UA_REDUCE_GATE_MX32"),
     # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
     # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
     # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to
@@ -1599,6 +1617,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the head (TP1): half the bytes a pass. The verify rows keep the bf16 head, so
     # only how often drafts are accepted can change, not the output distribution.
     "ATOM_MTP_DRAFT_LM_HEAD_FP8": lambda: _flag_env("ATOM_MTP_DRAFT_LM_HEAD_FP8", "0"),
+    # The MTP draft passes' LM head over a subset of the vocabulary: half-open id
+    # ranges, "a:b,c:d" (e.g. "0:98790,248044:248070", Qwen3.6's lowest ids and its
+    # special tokens; model_ops/draft_vocab.py). Drafts outside are never proposed;
+    # the verify keeps the whole head. With ATOM_MTP_DRAFT_LM_HEAD_FP8 the subset
+    # head is FP8 (the full FP8 copy is not made) and its size a multiple of 128;
+    # untuned on gfx1250, an odd multiple of 512 (98816 above) gets aiter's x512
+    # FlyDSL tile, a multiple of 1024 (98304) an x1024 one with half the
+    # workgroups (~12 us slower a pass at 24-56 rows on MI455X). TP1. "": off.
+    "ATOM_MTP_DRAFT_VOCAB": lambda: os.getenv("ATOM_MTP_DRAFT_VOCAB", ""),
     # The MTP draft layer's attention over its last N positions only (0: full).
     # A mask, the KV cache is unchanged; the verify keeps full attention.
     "ATOM_MTP_DRAFT_ATTN_WINDOW": lambda: int(
@@ -1632,6 +1659,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Qwen3-Next / Qwen3.5: pad each rank's MXFP4 experts to 128 columns instead
     # of 256 when the shard is a multiple of 128 (TP4: 128 rather than 256).
+    # Qwen3.5/3.6: the MXFP4 routed experts take MXFP8 activations (A8W4) rather
+    # than MXFP4 (FusedMoE mxfp4_fp8_activations). Same weights.
+    "ATOM_QWEN_MOE_A8W4": lambda: os.getenv("ATOM_QWEN_MOE_A8W4", "0") == "1",
+    # With fp8_activations (ATOM_QWEN_MOE_A8W4): A8W4 on decode steps only;
+    # prefill steps keep MXFP4 activations (A4W4) and their fused fp4 route quant.
+    "ATOM_MOE_A8W4_PREFILL_A4W4": lambda: (
+        os.getenv("ATOM_MOE_A8W4_PREFILL_A4W4", "0") == "1"
+    ),
     "ATOM_QWEN_MOE_PAD_ALIGN_128": lambda: (
         os.getenv("ATOM_QWEN_MOE_PAD_ALIGN_128", "0").lower() in ("1", "true")
     ),

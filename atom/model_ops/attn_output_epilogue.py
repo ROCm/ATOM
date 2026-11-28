@@ -31,11 +31,21 @@ class AttentionOutputEpilogue:
     (`out[i]` is token `rows[i]`), for the next attention call in its scope.
 
     `gate` is `[tokens, heads * head_dim]` (may be a strided column slice).
-    `applied` tells the caller whether the attention did it."""
+    `applied` tells the caller whether the attention did it.
 
-    def __init__(self, gate: Tensor | None, rows: Tensor | None = None):
+    `mx32` (ATOM_UA_REDUCE_GATE_MX32, no `rows`): the gated output as the next
+    projection's 1x32 MXFP8 input instead of bf16. An attention that applies it
+    sets `mx32_out` to `(x_fp8 [tokens, heads * head_dim], flat uint8 x_scale)`
+    (mxfp8_1x32's producer contract); one that cannot leaves the request whole."""
+
+    def __init__(
+        self, gate: Tensor | None, rows: Tensor | None = None, mx32: bool = False
+    ):
+        assert not (mx32 and rows is not None), "mx32: every row"
         self.gate = gate
         self.rows = rows
+        self.mx32 = mx32
+        self.mx32_out: tuple[Tensor, Tensor] | None = None
         self.applied = False
         self._prev = None
 
@@ -87,3 +97,13 @@ def unified_attention_takes_split_reduce_oneshot() -> bool:
     from aiter.ops.triton.unified_attention import unified_attention
 
     return "split_reduce_oneshot" in inspect.signature(unified_attention).parameters
+
+
+@functools.lru_cache(maxsize=1)
+def unified_attention_takes_output_mx32() -> bool:
+    """Whether aiter's unified_attention has `output_mx32`."""
+    import inspect
+
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    return "output_mx32" in inspect.signature(unified_attention).parameters

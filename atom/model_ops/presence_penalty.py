@@ -204,6 +204,52 @@ class DraftPresencePenalty:
         self.pos = torch.zeros(self.max_rows, dtype=torch.int32, device=device)
         self.row_seq = torch.arange(self.max_rows, dtype=torch.int32, device=device)
         self.seq_start = self.row_seq * self.ctx_width
+        # ATOM_MTP_DRAFT_VOCAB: the draft logits' columns are a subset of the
+        # vocabulary (`set_vocab`); None: the whole vocabulary.
+        self.vocab = None
+        self._draft_mask = self._draft_slots = self.mask_vocab = None
+
+    def set_vocab(self, vocab) -> None:
+        """Penalize draft logits over `vocab`'s columns (`draft_vocab.DraftVocab`),
+        recorded drafts kept as column ids. The mask is read through
+        `vocab.presence_view` when it serves (no per-step work), else each step's
+        rows are gathered onto the columns (`stage_vocab`)."""
+        self.vocab = vocab
+        view = vocab.presence_view(self.state.mask)
+        if view is not None:
+            self._draft_mask, self._draft_slots = view, self.slots
+            return
+        dev = self.slots.device
+        self.mask_vocab = torch.zeros(
+            self.max_rows, vocab.size, dtype=torch.uint8, device=dev
+        )
+        # the gathered mask is indexed by row, so a row's slot is itself
+        self._draft_mask = self.mask_vocab
+        self._draft_slots = torch.arange(self.max_rows, dtype=torch.int32, device=dev)
+
+    def stage_vocab(self, scheduled_bs: int) -> None:
+        """With a draft vocabulary the presence view does not serve: after a step's
+        slots are staged and its tokens marked (by `begin` or the fused verify
+        epilogue) and before its draft passes, the step's rows' masks gathered onto
+        the draft vocabulary's columns. A no-op otherwise."""
+        if self.mask_vocab is None:
+            return
+        n = min(int(scheduled_bs), self.max_rows)
+        if n > 0:
+            self.vocab.gather_columns(
+                self.state.mask, self.slots[:n], self.mask_vocab[:n]
+            )
+
+    @property
+    def draft_mask(self) -> torch.Tensor:
+        """The mask the draft logits' columns index (with a draft vocabulary: the
+        presence view, or the step's gathered rows)."""
+        return self.state.mask if self.vocab is None else self._draft_mask
+
+    @property
+    def draft_slots(self) -> torch.Tensor:
+        """Each draft row's row of `draft_mask`."""
+        return self.slots if self.vocab is None else self._draft_slots
 
     def begin(self, step: "PresencePenaltyStep | None", scheduled_bs: int):
         """A step's requests (`step`'s slots and penalties, rows in batch order)
@@ -218,9 +264,11 @@ class DraftPresencePenalty:
         self.penalties[:n].copy_(step.penalties[:n])
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        """Subtract the penalties in place from a draft pass's `[rows, V]` logits."""
+        """Subtract the penalties in place from a draft pass's `[rows, V]` logits
+        (`[rows, size]` over a draft vocabulary's columns)."""
         rows = logits.shape[0]
         assert rows <= self.max_rows and logits.stride(1) == 1
+        mask = self.draft_mask
         block = 4096
         _apply_presence_penalty_kernel[(rows, triton.cdiv(logits.shape[1], block))](
             logits,
@@ -229,10 +277,10 @@ class DraftPresencePenalty:
             self.row_seq,
             self.pos,
             self.seq_start,
-            self.slots,
+            self.draft_slots,
             self.penalties,
-            self.state.mask,
-            self.state.mask.stride(0),
+            mask,
+            mask.stride(0),
             0,
             logits.shape[1],
             MAX_EXTRA=self.state.max_extra,
@@ -241,7 +289,8 @@ class DraftPresencePenalty:
         return logits
 
     def record(self, ids: torch.Tensor):
-        """A draft pass's `[rows]` ids: they count for the passes after it."""
+        """A draft pass's `[rows]` ids: they count for the passes after it. With a
+        draft vocabulary, its column ids (the draft logits' columns)."""
         rows = ids.numel()
         _record_draft_kernel[(1,)](
             ids.view(-1),

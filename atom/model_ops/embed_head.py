@@ -307,9 +307,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
-        # The TP1 argmax's row lengths (see compute_argmax_token). Every buffer
-        # made stays referenced: a recorded draft pass reads it by address.
-        self._argmax_row_lens: list[torch.Tensor] = []
+        # The TP1 argmax's row lengths (see compute_argmax_token), by logits width
+        # (ATOM_MTP_DRAFT_VOCAB narrows the draft's). Every buffer made stays
+        # referenced: a recorded draft pass reads it by address.
+        self._argmax_row_lens: dict[int, list[torch.Tensor]] = {}
         # ATOM_LM_HEAD_ARGMAX_EXCHANGE's inboxes: collective, so made here, as
         # every rank builds the same heads in the same order.
         self._argmax_exchange = (
@@ -435,12 +436,20 @@ class ParallelLMHead(VocabParallelEmbedding):
         draft_fp8 = getattr(self, "draft_fp8", None)
         # ATOM_MTP_REJECTION_SAMPLING: the draft is drawn from q, not its argmax.
         draft_rs = getattr(self, "spec_rs", None)
+        # ATOM_MTP_DRAFT_VOCAB: draft logits over a subset of the vocabulary.
+        draft_vocab = getattr(self, "draft_vocab", None)
         if (
-            draft_presence is not None or draft_fp8 is not None or draft_rs is not None
+            draft_presence is not None
+            or draft_fp8 is not None
+            or draft_rs is not None
+            or draft_vocab is not None
         ) and not getattr(get_forward_context().context, "is_draft", False):
-            draft_presence = draft_fp8 = draft_rs = None
+            draft_presence = draft_fp8 = draft_rs = draft_vocab = None
         draft_options_off = (
-            draft_presence is None and draft_fp8 is None and draft_rs is None
+            draft_presence is None
+            and draft_fp8 is None
+            and draft_rs is None
+            and draft_vocab is None
         )
         # Pure-DP draft: shard the vocab across the DP group instead of a
         # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
@@ -491,7 +500,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             lm_head_argmax_pick(units, self.tp_size, out.view(-1))
             return out
         stats = None
-        if draft_fp8 is not None:
+        if draft_vocab is not None:
+            logits = draft_vocab.mm(x)  # [N, size] over the subset, TP1 only
+        elif draft_fp8 is not None:
             # ATOM_MTP_DRAFT_LMHEAD_STATS: the sampler's stats from the GEMM's
             # epilogue (spec_rejection.lmhead_stats_args), no stats kernel
             sargs = (
@@ -526,17 +537,23 @@ class ParallelLMHead(VocabParallelEmbedding):
                 if stats is not None:
                     draft_rs.sample_draft(logits, out, draft_presence, stats=stats)
                 else:
-                    draft_rs.sample_draft(logits, out, draft_presence)
-                # ATOM_MTP_DRAFT_FUSED_SELECT: recorded in the sampler's kernel
+                    draft_rs.sample_draft(logits, out, draft_presence, vocab=draft_vocab)
+                # ATOM_MTP_DRAFT_FUSED_SELECT: recorded in the sampler's kernel; under a draft
+                # vocabulary (ATOM_MTP_DRAFT_VOCAB) the presence state keeps columns
                 if draft_presence is not None and not getattr(
                     draft_rs, "recorded_presence", False
                 ):
-                    draft_presence.record(out)
+                    draft_presence.record(
+                        out if draft_vocab is None else draft_rs.draft_columns(rows)
+                    )
                 return out
             if draft_presence is not None:
                 draft_presence.apply(logits)
-            if not self._argmax_row_lens or self._argmax_row_lens[-1].numel() < rows:
-                self._argmax_row_lens.append(
+            # Row lengths are the logits' width, which a draft vocabulary narrows:
+            # buffers per width, older ones kept (a capture may read them).
+            row_lens = self._argmax_row_lens.setdefault(width, [])
+            if not row_lens or row_lens[-1].numel() < rows:
+                row_lens.append(
                     torch.full(
                         (max(rows, 1024),), width, dtype=torch.int32, device=x.device
                     )
@@ -544,16 +561,18 @@ class ParallelLMHead(VocabParallelEmbedding):
             topk_select(
                 logits,
                 1,
-                end=self._argmax_row_lens[-1][:rows],
+                end=row_lens[-1][:rows],
                 tie="low",
                 output_idx=out.view(-1, 1),
             )
             if draft_presence is not None:
-                draft_presence.record(out)
+                draft_presence.record(out)  # columns under a draft vocabulary
+            if draft_vocab is not None:
+                draft_vocab.to_vocab(out.view(-1), out=out.view(-1))
             return out
         assert draft_options_off, (
-            "ATOM_MTP_DRAFT_PRESENCE_PENALTY / _LM_HEAD_FP8 / ATOM_MTP_REJECTION_SAMPLING"
-            " serve the TP1 LM head only"
+            "ATOM_MTP_DRAFT_PRESENCE_PENALTY / _LM_HEAD_FP8 / _VOCAB /"
+            " ATOM_MTP_REJECTION_SAMPLING serve the TP1 LM head only"
         )
         if envs.ATOM_ARGMAX_HEAD_AR_GATHER and out.is_contiguous():
             # The packs' all-gather as an exact all-reduce of their byte images

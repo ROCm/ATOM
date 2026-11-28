@@ -14,7 +14,7 @@ def _tp1_head(logits: torch.Tensor, monkeypatch) -> embed_head.ParallelLMHead:
     head.tp_size = 1
     head.weight = torch.nn.Parameter(torch.empty(1), requires_grad=False)
     head.bias = None
-    head._argmax_row_lens = []
+    head._argmax_row_lens = {}
     monkeypatch.setattr(embed_head.tgemm, "mm", lambda *_args, **_kwargs: logits)
     monkeypatch.setattr(embed_head, "topk_select", _torch_topk_select)
     return head

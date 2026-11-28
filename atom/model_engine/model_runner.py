@@ -1054,7 +1054,12 @@ class ModelRunner:
             self.drafter.load_model(self.model)
             if envs.ATOM_MTP_DRAFT_PRESENCE_PENALTY:
                 self._install_draft_presence_penalty()
-            if envs.ATOM_MTP_DRAFT_LM_HEAD_FP8:
+            # ATOM_MTP_DRAFT_VOCAB: the subset head (FP8 with
+            # ATOM_MTP_DRAFT_LM_HEAD_FP8) instead of the full FP8 copy.
+            if (
+                not (envs.ATOM_MTP_DRAFT_VOCAB and self._install_draft_vocab())
+                and envs.ATOM_MTP_DRAFT_LM_HEAD_FP8
+            ):
                 self._install_draft_lm_head_fp8()
             if os.environ.get("ATOM_VERIFY_LM_HEAD_FP8", "0") == "1":
                 self._install_verify_lm_head_fp8()
@@ -3579,6 +3584,48 @@ class ModelRunner:
             tuple(head.draft_fp8.weight_scale.shape),
         )
 
+    def _install_draft_vocab(self) -> bool:
+        """ATOM_MTP_DRAFT_VOCAB: the draft passes' logits over a subset of the
+        vocabulary (`draft_vocab.DraftVocab`), FP8 with ATOM_MTP_DRAFT_LM_HEAD_FP8;
+        TP1 unbiased heads only. After the draft presence penalty (whose mask it
+        maps) and before rejection sampling (whose warm-up draws over it). Whether
+        it was installed."""
+        from atom.model_ops.draft_vocab import DraftVocab, parse_vocab_ranges
+
+        drafter = getattr(self, "drafter", None)
+        head = getattr(getattr(drafter, "model", None), "lm_head", None)
+        if head is None or not hasattr(head, "compute_argmax_token"):
+            logger.warning("ATOM_MTP_DRAFT_VOCAB: no MTP draft LM head; not applied")
+            return False
+        if getattr(head, "tp_size", 1) != 1 or head.bias is not None:
+            logger.warning(
+                "ATOM_MTP_DRAFT_VOCAB: TP %d / biased draft LM head; not applied",
+                getattr(head, "tp_size", 1),
+            )
+            return False
+        weight = head.weight.data
+        ranges = parse_vocab_ranges(envs.ATOM_MTP_DRAFT_VOCAB, weight.shape[0])
+        head.draft_vocab = DraftVocab(
+            weight, ranges, fp8=envs.ATOM_MTP_DRAFT_LM_HEAD_FP8
+        )
+        presence = getattr(head, "draft_presence", None)
+        if presence is not None:
+            presence.set_vocab(head.draft_vocab)
+        logger.info(
+            "ATOM_MTP_DRAFT_VOCAB: draft logits over %d of %d ids (%s), %s head, "
+            "draft presence mask %s",
+            head.draft_vocab.size,
+            weight.shape[0],
+            envs.ATOM_MTP_DRAFT_VOCAB,
+            "FP8" if head.draft_vocab.fp8 is not None else "bf16",
+            (
+                "-"
+                if presence is None
+                else "staged a step" if presence.mask_vocab is not None else "a view"
+            ),
+        )
+        return True
+
     def _install_draft_presence_penalty(self) -> None:
         """ATOM_MTP_DRAFT_PRESENCE_PENALTY: the draft LM head penalizes its argmax
         as the verifier will (`presence_penalty.DraftPresencePenalty`)."""
@@ -3638,7 +3685,11 @@ class ModelRunner:
             draft_k=envs.ATOM_MTP_RS_DRAFT_TOPK,
             max_k=envs.ATOM_MTP_RS_MAX_TOPK,
         )
-        rs.warm(vocab, draft_presence=getattr(head, "draft_presence", None))
+        rs.warm(
+            vocab,
+            draft_presence=getattr(head, "draft_presence", None),
+            draft_vocab=getattr(head, "draft_vocab", None),
+        )
         head.spec_rs = rs
         drafter.spec_rs = rs
         self._spec_rs = rs
