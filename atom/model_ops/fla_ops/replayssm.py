@@ -51,6 +51,7 @@ __all__ = [
     "replayssm_flush_wait",
     "replayssm_gated_delta_rule",
     "replayssm_materialize",
+    "replayssm_materialize_batch",
     "replayssm_sigmoid_gating_delta_rule",
 ]
 
@@ -558,10 +559,18 @@ def _replayssm_materialize_kernel(
     stride_bufg_hv: tl.constexpr,
     DOT_MODE: tl.constexpr,
     IS_KDA: tl.constexpr,
+    layer_ptrs,
 ):
     # Rows on axis 0: layers x sequences x heads outgrows axis 1's limit.
     i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
+    if layer_ptrs is not None:
+        layer = i_n // N
+        i_n = i_n % N
+        ckpt = tl.load(layer_ptrs + layer * 4).to(ckpt.dtype)
+        buf_k = tl.load(layer_ptrs + layer * 4 + 1).to(buf_k.dtype)
+        buf_u = tl.load(layer_ptrs + layer * 4 + 2).to(buf_u.dtype)
+        buf_g = tl.load(layer_ptrs + layer * 4 + 3).to(buf_g.dtype)
     if i_n >= N:
         return
     step = tl.load(step_idx + i_n).to(tl.int32)
@@ -659,6 +668,71 @@ def replayssm_materialize(
     n = slot_idx.numel()
     if n == 0:
         return
+    config = _materialize_launch_config(ckpt, buf_k, buf_u, buf_g, max_query_len)
+    _replayssm_materialize_kernel[
+        (n * config["HV"], triton.cdiv(config["V"], config["BV"]))
+    ](
+        ckpt=ckpt,
+        buf_k=buf_k,
+        buf_u=buf_u,
+        buf_g=buf_g,
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        dst_idx=dst_idx,
+        step_idx=step_idx,
+        N=n,
+        layer_ptrs=None,
+        **config,
+    )
+
+
+def replayssm_materialize_batch(
+    layer_ptrs: torch.Tensor,
+    ckpt: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    dst_idx: torch.Tensor,
+    step_idx: torch.Tensor,
+    max_query_len: int,
+) -> None:
+    """Materialize layers with identical layouts in one launch.
+
+    ``layer_ptrs`` is an int64 ``[layers, 4]`` table of checkpoint, k, u and g
+    addresses. The four tensors describe the first row's layout. The caller
+    owns every row's backing tensors and orders their readiness and lifetime
+    on the consumer stream. Cursor and slot arguments are shared by all rows.
+    """
+    n = slot_idx.numel()
+    if n == 0:
+        return
+    assert layer_ptrs.ndim == 2 and layer_ptrs.shape[1] == 4
+    assert layer_ptrs.dtype == torch.int64 and layer_ptrs.is_contiguous()
+    assert layer_ptrs.device == ckpt.device
+    layers = layer_ptrs.shape[0]
+    if layers == 0:
+        return
+    config = _materialize_launch_config(ckpt, buf_k, buf_u, buf_g, max_query_len)
+    _replayssm_materialize_kernel[
+        (n * config["HV"] * layers, triton.cdiv(config["V"], config["BV"]))
+    ](
+        ckpt=ckpt,
+        buf_k=buf_k,
+        buf_u=buf_u,
+        buf_g=buf_g,
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        dst_idx=dst_idx,
+        step_idx=step_idx,
+        N=n,
+        layer_ptrs=layer_ptrs,
+        **config,
+    )
+
+
+def _materialize_launch_config(ckpt, buf_k, buf_u, buf_g, max_query_len):
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
     is_kda = buf_g.ndim == 4
@@ -670,43 +744,33 @@ def replayssm_materialize(
     BK = triton.next_power_of_2(K)
     assert triton.cdiv(K, BK) == 1, "K must fit one block"
     BV = min(triton.next_power_of_2(V), 64)
-    NV = triton.cdiv(V, BV)
     # The forward's replay tile: `base + step + 1` never exceeds
     # `cap - max_query_len` (see the flush policy above).
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
-    _replayssm_materialize_kernel[(n * HV, NV)](
-        ckpt=ckpt,
-        buf_k=buf_k,
-        buf_u=buf_u,
-        buf_g=buf_g,
-        write_pos=write_pos,
-        slot_idx=slot_idx,
-        dst_idx=dst_idx,
-        step_idx=step_idx,
-        N=n,
-        T_MAX=max_query_len,
-        CAP=cap,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        BH=BH,
-        stride_ckpt_slot=ckpt.stride(0),
-        stride_bufk_slot=buf_k.stride(0),
-        stride_bufk_pos=buf_k.stride(2),
-        stride_bufk_hv=buf_k.stride(1),
-        stride_bufu_slot=buf_u.stride(0),
-        stride_bufu_pos=buf_u.stride(2),
-        stride_bufu_hv=buf_u.stride(1),
-        stride_bufg_slot=buf_g.stride(0),
-        stride_bufg_pos=buf_g.stride(2),
-        stride_bufg_hv=buf_g.stride(1),
-        DOT_MODE=_replay_dot_mode(buf_u.dtype),
-        IS_KDA=is_kda,
-        num_warps=1,
-        num_stages=3,
-    )
+    return {
+        "T_MAX": max_query_len,
+        "CAP": cap,
+        "HV": HV,
+        "K": K,
+        "V": V,
+        "BK": BK,
+        "BV": BV,
+        "BH": BH,
+        "stride_ckpt_slot": ckpt.stride(0),
+        "stride_bufk_slot": buf_k.stride(0),
+        "stride_bufk_pos": buf_k.stride(2),
+        "stride_bufk_hv": buf_k.stride(1),
+        "stride_bufu_slot": buf_u.stride(0),
+        "stride_bufu_pos": buf_u.stride(2),
+        "stride_bufu_hv": buf_u.stride(1),
+        "stride_bufg_slot": buf_g.stride(0),
+        "stride_bufg_pos": buf_g.stride(2),
+        "stride_bufg_hv": buf_g.stride(1),
+        "DOT_MODE": _replay_dot_mode(buf_u.dtype),
+        "IS_KDA": is_kda,
+        "num_warps": 1,
+        "num_stages": 3,
+    }
 
 
 # --------------------------------------------------------------------------- #
