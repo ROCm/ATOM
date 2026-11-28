@@ -1261,6 +1261,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
     # default: the shared expert, which every token uses, then carries MXFP4
     # rounding error. Without it the shared expert stays an MXFP8 MLP.
+    # MiniMax-M3.1 decode MoE (8-128 rows) through aiter's FlyDSL mega_moe_tp decode
+    # ops (atom/models/minimax_m3/decode_moe.py). Off by default; needs the unfused
+    # MXFP8 shared expert and an aiter that has the ops (otherwise the default path).
+    "ATOM_M3_DECODE_MOE": lambda: os.getenv("ATOM_M3_DECODE_MOE", "0") == "1",
     "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
