@@ -256,6 +256,7 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
     sched.update_state_after_alloc(seq)
     worker = MooncakeConnector.__new__(MooncakeConnector)
     worker.is_producer = True
+    worker._gather_slot = None  # No staged state slot: nothing to order.
     worker._completed_prefills = {}
     worker._completed_prefills_lock = threading.Lock()
     worker._completed_prefills_cv = threading.Condition(worker._completed_prefills_lock)
@@ -296,4 +297,5 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
             "block_ids": [10, 11],
             "swa_block_ids": [5],
             "slot_index": 5,
+            "published": None,
         }

@@ -1836,6 +1836,7 @@ class MooncakeConnector(KVConnectorBase):
                         else:
                             self._chunked_local_ids[req_id] = transfer_id
                             self._chunked_admissions[req_id] = transfer_id
+            published = None
             for req_id, meta in metadata.reqs_to_save.items():
                 if meta.chunked_transfer:
                     with self._completed_prefills_cv:
@@ -1878,11 +1879,14 @@ class MooncakeConnector(KVConnectorBase):
                             )
                         self._completed_prefills_cv.notify_all()
                     continue
+                if published is None and self._gather_slot is not None:
+                    published = self._record_publication()
                 with self._completed_prefills_cv:
                     self._completed_prefills[req_id] = {
                         "block_ids": meta.local_block_ids,
                         "swa_block_ids": meta.local_swa_block_ids,
                         "slot_index": meta.local_slot_index,
+                        "published": published,
                     }
                     self._completed_prefills_cv.notify_all()
                 logger.debug(
@@ -4025,11 +4029,9 @@ class MooncakeConnector(KVConnectorBase):
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._staging_slots.acquire()
-            self._gather_slot(src_slot, producer_pool_idx)
-            # Synchronize on the gather kernel before NIC starts reading the
-            # staging buffer. Without this, the RDMA can race the still-in-flight
-            # gather kernel on TBO prefill (page fault under high concurrency).
-            torch.cuda.current_stream().synchronize()
+            self._gather_staged_slot(
+                src_slot, producer_pool_idx, prefill_data.get("published")
+            )
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )
@@ -4062,6 +4064,49 @@ class MooncakeConnector(KVConnectorBase):
         if producer_pool_idx >= 0:
             self._staging_slots.release(producer_pool_idx)
         return bool(slot_ok)
+
+    def _record_publication(self) -> torch.cuda.Event:
+        """An event after every forward launched so far on this device.
+
+        Recorded where the engine publishes a finished prefill, before the
+        next forward launches: every forward that writes the request's state
+        slot precedes it, the one that decodes its first token under deferred
+        output included, and the slot is not handed out again before its
+        transfer ends.
+        """
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self._cuda_device))
+        return event
+
+    def _gather_staged_slot(
+        self, src_slot: int, pool_idx: int, published: torch.cuda.Event | None
+    ) -> None:
+        """Gather state slot ``src_slot`` into staging row ``pool_idx``, done
+        on the device when this returns, so the NIC never reads a row the
+        gather is still writing (a page fault under TBO prefill and high
+        concurrency) and the direct slot writes that follow see the slot as
+        its last forward left it.
+
+        On this send worker's own stream, ordered after ``published``
+        (`_record_publication`), it waits for no forward launched after the
+        publication. On the device's default stream, this thread's current one
+        and the stream every forward runs on, its synchronize waited for every
+        forward queued when the consumer's write request arrived; that order is
+        kept where no publication was recorded (PP, chunked transfer).
+        """
+        if published is None:
+            self._gather_slot(src_slot, pool_idx)
+            torch.cuda.current_stream().synchronize()
+            return
+        stream = self._send_worker_stream()
+        stream.wait_event(published)
+        try:
+            with torch.cuda.stream(stream):
+                self._gather_slot(src_slot, pool_idx)
+        finally:
+            # Even a gather that raised must be done with the row before
+            # anything reads or reuses it.
+            stream.synchronize()
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
         """Wait until prefill data is available for this request.
