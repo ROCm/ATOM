@@ -208,8 +208,14 @@ def test_runner_model_height_and_sampling_rows(
 def test_pa_preserves_complete_padded_layout(query_lens, capture):
     """Zero-context rows belong to the output; the guard starts after them."""
     import aiter
+    from aiter.ops.attention import pa_fwd_asm_supports_arch
 
     from atom.model_ops.base_attention import run_pa_fwd_asm
+
+    if not pa_fwd_asm_supports_arch():
+        # aiter has no pa_fwd_asm kernel for this GPU (gfx1250): the call aborts
+        # the process instead of raising, and MHA decode never makes it there
+        pytest.skip("aiter's pa_fwd_asm has no kernel for this GPU")
 
     padded = 4
     scheduled = sum(query_lens)

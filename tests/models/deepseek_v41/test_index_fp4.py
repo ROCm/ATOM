@@ -11,6 +11,18 @@ pytestmark = pytest.mark.skipif(
 DIM, HEADS, PAGE = 128, 32, 8
 
 
+@pytest.fixture
+def gfx950():
+    """The preshuffle and mfma planes are gfx950's (`fp4_index_layout_for_arch`;
+    gfx1250 scores the natural plane): their scorers are gfx950 kernels, and the
+    FlyDSL one compiled for another target fails LLVM's instruction selection
+    (`llvm.amdgcn.permlane32.swap`), which aborts the process."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip(f"the preshuffle and mfma scorers are gfx950's, not {get_gfx()}")
+
+
 def _norm(monkeypatch, eps=1e-20):
     """The indexer's `k_norm` as the model builds it, bf16 weight."""
     from atom.model_ops import layernorm
@@ -107,6 +119,7 @@ def test_fp4_writer_stores_the_quantized_key_in_the_selected_layout(
     assert torch.equal(scales.flatten(), packed_s.flatten())
 
 
+@pytest.mark.usefixtures("gfx950")
 @pytest.mark.parametrize(
     "layout,far", [("preshuffle", False), ("preshuffle", True), ("mfma", False)]
 )
@@ -173,6 +186,7 @@ def test_fp4_scorer_selects_the_official_top_k(monkeypatch, far, layout):
             assert abs(row[i] - threshold) <= tol, (r, i, row[i], threshold)
 
 
+@pytest.mark.usefixtures("gfx950")
 @pytest.mark.parametrize("layout", ["preshuffle", "mfma"])
 @pytest.mark.parametrize("band", [None, 3])
 @pytest.mark.parametrize("lengths", [(3, 2), (20, 1)])
@@ -290,6 +304,7 @@ def _plan_step(workspace, seen):
     return score_layout(step, 1)
 
 
+@pytest.mark.usefixtures("gfx950")
 @pytest.mark.parametrize("layout", ["preshuffle", "mfma"])
 @pytest.mark.parametrize("capacity", [1 << 16, 640])
 def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity, layout):
@@ -366,6 +381,7 @@ def test_only_a_full_layers_fp4_rows_score_by_sequence(ratio):
     assert ragged(fp4=False) is None
 
 
+@pytest.mark.usefixtures("gfx950")
 def test_fp4_scorer_builds_one_kernel_for_every_band_length():
     """Bands of different lengths share one row-group build: its batch is a
     runtime argument, as Triton's is. A build per batch size was a JIT stall
@@ -398,6 +414,7 @@ def test_fp4_scorer_builds_one_kernel_for_every_band_length():
     assert rg.compile_pa_mqa_logits_fp4_rowgroup.cache_info().misses == 1
 
 
+@pytest.mark.usefixtures("gfx950")
 @pytest.mark.parametrize("per_page", [64, 128])
 def test_mfma_candidates_cross_groups_and_replay(per_page):
     """Candidate IDs stay page-8 IDs across 64-row groups and PAGE boundaries."""
