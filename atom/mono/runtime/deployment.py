@@ -97,6 +97,7 @@ def common_refusals(
     *,
     refuse_tr_hybrid: bool = True,
     refuse_decode_cp: bool = True,
+    refuse_prefill_tbo: bool = True,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
@@ -121,7 +122,19 @@ def common_refusals(
     (its attention layers stay on the production path, which handles the
     split) or are written for that split and refuse any other themselves
     (the shared DSA indexer, ``dsa_indexer.bind``) passes
-    ``refuse_decode_cp=False``."""
+    ``refuse_decode_cp=False``.
+
+    ``refuse_prefill_tbo`` keeps prefill-only TBO refused. That splits only
+    prefill steps of the target model, which every mono dispatcher declines,
+    and never the drafter. But ``model_runner`` wraps the model in
+    ``UBatchWrapper`` before it installs mono, so a dispatcher that wraps the
+    model calls ``UBatchWrapper.forward`` on the steps it declines, and that
+    takes ``(input_ids, positions)`` only: Kimi-K3's, Qwen3.8's and the
+    gfx1250 DeepSeek-V4.1's dispatchers pass ``intermediate_tensors`` /
+    ``inputs_embeds`` too, and the DSA indexer's does on every step.
+    MiniMax-M3 routes inside the model, under ``UBatchWrapper`` (its
+    ``install_mono_decode`` returns the model), so it passes
+    ``refuse_prefill_tbo=False``."""
     tp = atom_config.tensor_parallel_size
     dpa = dp_attention_ranks(atom_config)
     if dpa not in (0, *supported_dpa):
@@ -151,7 +164,8 @@ def common_refusals(
         ),
         (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
         *peer_memory_refusals(atom_config),
-        (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
+        (not atom_config.enable_tbo_decode, "decode TBO"),
+        (not (refuse_prefill_tbo and atom_config.enable_tbo), "prefill TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
             not _takes_weight_updates(atom_config),

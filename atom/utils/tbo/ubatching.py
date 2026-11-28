@@ -523,9 +523,12 @@ def tbo_on_comm(fn: Callable, *args, hold: bool = True):
     returns (a tensor, or a list / tuple of them) for the compute stream.
     Outside TBO, just `fn(*args)`.
 
-    `hold=False` skips the hold and keeps the reuse race it closes. The TP
-    all-reduce and DP gather / scatter use it: held there, V4-Pro TP / DP TBO
-    hits a GPU fault (HSA_STATUS_ERROR_OUT_OF_RESOURCES)."""
+    `hold=False` skips the hold. Holding the outputs of the TP all-reduce and
+    the DP gather / scatter, V4-Pro TP / DP TBO hits a GPU fault
+    (HSA_STATUS_ERROR_OUT_OF_RESOURCES). The DP gather / scatter keep the
+    reuse race the hold closes. The TP all-reduce's comm phase returns
+    nothing: it writes into memory allocated on the compute stream before the
+    phase, which closes the race without a hold."""
     if not tbo_active():
         return fn(*args)
     _tbo_yield_and_switch_from_compute_to_comm()

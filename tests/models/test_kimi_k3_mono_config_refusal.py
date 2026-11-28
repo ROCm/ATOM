@@ -149,6 +149,42 @@ def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     assert deployment.first_refusal(checks) == "decode CP"
 
 
+@pytest.mark.parametrize(
+    "tbo, tbo_decode, refuse_prefill_tbo, refusal",
+    [
+        (False, False, True, None),
+        (True, False, True, "prefill TBO"),
+        # a model whose mono routes under UBatchWrapper (MiniMax-M3) opts out
+        (True, False, False, None),
+        # decode TBO splits decode steps, with or without the opt-out
+        (True, True, True, "decode TBO"),
+        (True, True, False, "decode TBO"),
+    ],
+    ids=[
+        "no TBO",
+        "prefill-only TBO",
+        "prefill-only TBO, opted out",
+        "decode TBO",
+        "decode TBO, opted out",
+    ],
+)
+def test_prefill_tbo_is_refused_unless_the_model_opts_out(
+    servable, tbo, tbo_decode, refuse_prefill_tbo, refusal
+):
+    from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
+
+    atom_config = _atom_config()
+    atom_config.enable_tbo = tbo
+    atom_config.enable_tbo_decode = tbo_decode
+    checks = deployment.common_refusals(
+        atom_config, Dims, SUPPORTED_TP, refuse_prefill_tbo=refuse_prefill_tbo
+    )
+    assert deployment.first_refusal(checks) == refusal
+    # K3 keeps the default: its dispatcher passes UBatchWrapper four arguments.
+    expected = "decode TBO" if tbo_decode else "prefill TBO" if tbo else None
+    assert config_refusal(atom_config) == expected
+
+
 _MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
 
 

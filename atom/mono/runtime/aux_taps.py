@@ -50,8 +50,10 @@ class AuxTaps:
         ``tap`` is ``None`` where the layer has nothing settled to report; the
         drafter's own hook treats that the same way, by leaving the buffer as
         it was. Rows start at 0 like the hook's (its only offset is the TBO
-        one, and every mono path refuses TBO), and the write is in place so a
-        captured graph keeps replaying into the same buffer."""
+        one, and no mono step is a TBO micro-batch: decode TBO refuses mono,
+        and mono declines the prefill steps prefill-only TBO splits), and the
+        write is in place so a captured graph keeps replaying into the same
+        buffer."""
         if tap is None or layer_id not in self.layer_ids:
             return
         self.buffers[self.layer_ids.index(layer_id)][: tap.shape[0]].copy_(tap)

@@ -3,11 +3,10 @@
 
 """`tbo_on_comm`: by default a collective a TBO ubatch runs on the comm stream
 holds what it returns for the compute stream that reads it (why:
-test_tbo_mark_used_on_compute.py); the TP all-reduce and the DP gather /
-scatter opt out. CPU only: the TBO hooks and `record_stream` are
-monkeypatched."""
+test_tbo_mark_used_on_compute.py); the DP gather / scatter opt out, and the TP
+all-reduce, which reduces into compute-stream memory, has nothing to hold.
+CPU only: the TBO hooks and `record_stream` are monkeypatched."""
 
-import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -83,31 +82,52 @@ def test_without_hold_nothing_is_held(tbo):
     assert tbo == ["comm", "compute"]
 
 
-def test_tp_all_reduce_output_is_not_held(tbo, monkeypatch):
-    """KNOWN GAP: the reuse race is still open here. Holding the TP all-reduce
-    output faulted V4-Pro TBO (HSA_STATUS_ERROR_OUT_OF_RESOURCES), so it is not
-    held until a fix that avoids that lands; that fix should flip this."""
+@pytest.fixture
+def tp_all_reduce(tbo, monkeypatch):
+    """`tbo_all_reduce` in an overlapping ubatch, its communicator's calls and
+    every `torch.empty_like` logged into `tbo`."""
     mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
-    # Imported inside, ahead of the TBO branch; CI's aiter lacks it.
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.dist.communication_op",
-        SimpleNamespace(tensor_model_parallel_all_reduce=lambda x: pytest.fail()),
-    )
     monkeypatch.setenv("ATOM_TBO_TP_AR_MODE", "overlap")
     monkeypatch.setattr(ub, "tbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(ub, "tbo_get_comm_stream", lambda: "comm stream")
-    reduced = torch.ones(3)
+    empty_like = torch.empty_like
 
-    def all_reduce(x, stream):
-        tbo.append(("all_reduce", stream))
-        return reduced
+    def logged_empty_like(t, **kwargs):
+        out = empty_like(t, **kwargs)
+        tbo.append(("alloc", id(out)))
+        return out
 
-    monkeypatch.setattr(
-        ub, "tbo_get_ubatch_tp_comm", lambda i: SimpleNamespace(all_reduce=all_reduce)
-    )
-    assert mdo.tbo_all_reduce(torch.zeros(3)) is reduced
-    assert tbo == ["comm", ("all_reduce", "comm stream"), "compute"]
+    def all_reduce(x, out_tensor, stream):
+        tbo.append(("all_reduce", id(out_tensor), stream))
+        out_tensor.copy_(4 * x)
+
+    comm = SimpleNamespace(all_reduce=all_reduce, disabled=False)
+    monkeypatch.setattr(ub, "tbo_get_ubatch_tp_comm", lambda i: comm)
+    monkeypatch.setattr(torch, "empty_like", logged_empty_like)
+    return SimpleNamespace(op=mdo.tbo_all_reduce, comm=comm)
+
+
+def test_tp_all_reduce_reduces_into_compute_stream_memory(tbo, tp_all_reduce):
+    """Allocated on the comm stream and not held, the output could be given to
+    the partner's next hand-off while this ubatch still reads it; held, it
+    faulted V4-Pro TBO (HSA_STATUS_ERROR_OUT_OF_RESOURCES). Allocated on the
+    compute stream before the hand-off instead, it needs no hold."""
+    out = tp_all_reduce.op(torch.ones(3))
+    assert out.tolist() == [4.0, 4.0, 4.0]
+    assert tbo == [
+        ("alloc", id(out)),
+        "comm",
+        ("all_reduce", id(out), "comm stream"),
+        "compute",
+    ]
+
+
+def test_tp_all_reduce_refuses_a_disabled_communicator(tbo, tp_all_reduce):
+    # A disabled pynccl communicator returns without writing `out_tensor`.
+    tp_all_reduce.comm.disabled = True
+    with pytest.raises(RuntimeError, match="ATOM_TBO_TP_AR_MODE=inline"):
+        tp_all_reduce.op(torch.ones(3))
+    assert tbo == []
 
 
 def test_only_tp_and_dp_collectives_opt_out_of_the_hold():
@@ -124,7 +144,7 @@ def test_only_tp_and_dp_collectives_opt_out_of_the_hold():
         if "hold=False" in p.read_text()
     }
     assert opt_outs == {
-        "model_ops/module_dispatch_ops.py": 1,  # TP all-reduce
+        "model_ops/module_dispatch_ops.py": 1,  # TP all-reduce: nothing to hold
         "model_ops/moe.py": 3,  # DP gather, reduce_scatterv, unpadded RS
         "utils/tbo/ubatching.py": 1,  # the docstring
     }, opt_outs

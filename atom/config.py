@@ -2079,7 +2079,7 @@ def indexer_cp_unsupported_reason(
     num_kv_heads: int,
     sparse_block_size: int,
     dcp_size: int,
-    enable_tbo: bool,
+    enable_tbo_decode: bool,
     plugin_mode: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
@@ -2140,10 +2140,11 @@ def indexer_cp_unsupported_reason(
     # TP's N is 16 for every qlen <= 16 (flat: 90.2/92.2/90.8us at q=1/4/8)
     # while CP's doubles at q=5 (20.3/20.4/24.0us). q=4 is CP's exact fill point
     # and free; q=8 costs it 17% for nothing. Pair this flag with MTP3.
-    if enable_tbo:
+    if enable_tbo_decode:
         # Two ubatch threads issuing all-to-alls on one group with no ordering
-        # discipline deadlock.
-        return "TBO (two-batch overlap)"
+        # discipline deadlock. The exchange runs in decode top-k only, so
+        # prefill-only TBO keeps it.
+        return "decode TBO (two-batch overlap)"
     return None
 
 
@@ -3294,7 +3295,7 @@ class Config:
                 getattr(text_cfg, "num_key_value_heads", 0),
                 sparse_cfg.get("sparse_block_size", 0),
                 self.decode_context_parallel_size,
-                self.enable_tbo or self.enable_tbo_decode,
+                self.enable_tbo_decode,
                 is_plugin_mode(),
             )
             if indexer_cp_off is not None:

@@ -32,9 +32,10 @@ M3 = ["MiniMaxM3SparseForCausalLM"]
 
 
 @pytest.mark.parametrize(
-    "arches, tp, kv_heads, block, dcp, tbo, expected",
+    "arches, tp, kv_heads, block, dcp, tbo_decode, expected",
     [
-        # The supported case: TP4 on M3's 4 KV heads, 128-block, no DCP, no TBO.
+        # The supported case: TP4 on M3's 4 KV heads, 128-block, no DCP, no
+        # decode TBO.
         (M3, 4, 4, 128, 1, False, None),
         (["LlamaForCausalLM"], 4, 4, 128, 1, False, "not a MiniMax-M3 model"),
         # DCP is EXCLUSIVE with this feature, not a prerequisite: real DCP
@@ -48,15 +49,47 @@ M3 = ["MiniMaxM3SparseForCausalLM"]
         (M3, 4, 4, 64, 1, False, "sparse_block_size 64 != 128"),
         # Two ubatch threads issuing all-to-alls on one group with no ordering
         # discipline deadlock.
-        (M3, 4, 4, 128, 1, True, "TBO"),
+        (M3, 4, 4, 128, 1, True, "decode TBO"),
     ],
 )
-def test_topology_gate_truth_table(arches, tp, kv_heads, block, dcp, tbo, expected):
-    reason = indexer_cp_unsupported_reason(arches, tp, kv_heads, block, dcp, tbo)
+def test_topology_gate_truth_table(
+    arches, tp, kv_heads, block, dcp, tbo_decode, expected
+):
+    reason = indexer_cp_unsupported_reason(arches, tp, kv_heads, block, dcp, tbo_decode)
     if expected is None:
         assert reason is None
     else:
         assert reason is not None and expected in reason
+
+
+@pytest.mark.parametrize(
+    "tbo, kept",
+    [
+        ({"enable_tbo": True}, True),
+        ({"enable_tbo": True, "enable_tbo_decode": True}, False),
+    ],
+    ids=["prefill-only TBO", "decode TBO"],
+)
+def test_config_asks_the_gate_about_decode_tbo_only(monkeypatch, caplog, tbo, kept):
+    """The CP all-to-alls run in decode top-k, which prefill-only TBO never
+    splits: a real `Config` keeps the flag under it and clears it under
+    decode TBO."""
+    from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
+
+    with caplog.at_level("INFO", logger="atom"):
+        config = _m3(
+            monkeypatch,
+            tensor_parallel_size=4,
+            hf={**sparse_hf(), "num_key_value_heads": 4},
+            dcp_config=DCPConfig(indexer_dcp_only=True),
+            **tbo,
+        )
+
+    assert config.enable_tbo is True
+    assert config.enable_tbo_decode is not kept
+    assert config.dcp_config.indexer_dcp_only is kept
+    if not kept:
+        assert "decode TBO (two-batch overlap)" in caplog.text
 
 
 def test_topology_gate_does_not_reject_speculative_decode():
