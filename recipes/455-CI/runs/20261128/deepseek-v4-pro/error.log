@@ -1,0 +1,242 @@
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/app/ATOM/atom/model_engine/async_proc.py", line 229, in __init__
+    self.runners = [runner_class(rank, *args, **kwargs)]
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 1132, in __init__
+    self._maybe_warmup()
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 1241, in _maybe_warmup
+    self.warmup_model()
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 1603, in warmup_model
+    self.forward(dummy_batch)
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 856, in wrapped
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/eplb.py", line 2482, in wrapper
+    return fn(self, batch, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 4080, in forward
+    hidden_states = self.run_model(input_ids, batch)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 856, in wrapped
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/metrics/gpu.py", line 163, in wrapped
+    return func(self, input_ids, batch)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/model_runner.py", line 3546, in run_model
+    model_output = self.model(input_ids, positions)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/region_graph.py", line 620, in __call__
+    return _run_token_graph(
+           ^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/region_graph.py", line 651, in _run_token_graph
+    return forward(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 4135, in forward
+    h = self.model(input_ids, positions)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/decorators.py", line 580, in __call__
+    output = self.compiled_callable(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1261, in compile_wrapper
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 3939, in forward
+    def forward(
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 563, in __call__
+    return super().__call__(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1548, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 1007, in call_wrapped
+    return self._wrapped_call(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 514, in __call__
+    raise e
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 500, in __call__
+    return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<eval_with_key>.312", line 502, in forward
+    submod_2 = self.submod_2(submod_1, s72, getitem_1, getitem_2, getitem_3, l_self_modules_layers_modules_0_parameters_hc_ffn_fn_, l_self_modules_layers_modules_0_parameters_hc_ffn_scale_, l_self_modules_layers_modules_0_parameters_hc_ffn_base_, l_self_modules_layers_modules_0_modules_ffn_norm_parameters_weight_, l_self_modules_layers_modules_1_parameters_hc_attn_fn_, l_self_modules_layers_modules_1_parameters_hc_attn_scale_, l_self_modules_layers_modules_1_parameters_hc_attn_base_, l_self_modules_layers_modules_1_modules_attn_norm_parameters_weight_);  submod_1 = getitem_1 = getitem_2 = getitem_3 = l_self_modules_layers_modules_0_parameters_hc_ffn_fn_ = l_self_modules_layers_modules_0_parameters_hc_ffn_scale_ = l_self_modules_layers_modules_0_parameters_hc_ffn_base_ = l_self_modules_layers_modules_0_modules_ffn_norm_parameters_weight_ = l_self_modules_layers_modules_1_parameters_hc_attn_fn_ = l_self_modules_layers_modules_1_parameters_hc_attn_scale_ = l_self_modules_layers_modules_1_parameters_hc_attn_base_ = l_self_modules_layers_modules_1_modules_attn_norm_parameters_weight_ = None
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/cuda_piecewise_backend.py", line 87, in __call__
+    return self.compiled_graph_for_general_shape(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_inductor/standalone_compile.py", line 140, in __call__
+    return self._compiled_fn(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1548, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1289, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 1189, in runtime_wrapper
+    result = _codegen_runtime_wrapper(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/codegen.py:codegen(runtime_wrapper_orchestration)", line 8, in _runtime_wrapper
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2594, in __call__
+    return self.compiled_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 828, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_root/35/c35zvibgv2g7sc5yxdw3gzosjxcwl5mnfwwmo76xykgjk2qupwu5.py", line 119, in call
+    buf5 = torch.ops.aiter.maybe_dual_stream_forward.default(buf3, 'layers.0.ffn')
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_ops.py", line 916, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_ops.py", line 916, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_compile.py", line 54, in inner
+    return disable_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1548, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 477, in __torch_dispatch__
+    res = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_ops.py", line 916, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/module_dispatch_ops.py", line 95, in maybe_dual_stream_forward
+    return self.single_stream_moe_forward(hidden_states)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 3311, in single_stream_moe_forward
+    return self._routed_with_shared_in_combine(x, shared, shared_ready)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 3281, in _routed_with_shared_in_combine
+    routed, is_complete = self.routed_expert_forward(
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/models/deepseek_v4/__init__.py", line 3232, in routed_expert_forward
+    return self.experts.forward_maybe_comm_fused(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/moe.py", line 5769, in forward_maybe_comm_fused
+    self.forward_impl(
+  File "/app/ATOM/atom/model_ops/moe.py", line 5972, in forward_impl
+    return self.forward_impl_graph(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/moe.py", line 5920, in forward_impl_graph
+    final_hidden_states = self._run_experts(
+                          ^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/moe.py", line 5834, in _run_experts
+    output = self.quant_method.apply(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/decorators.py", line 214, in wrapped
+    return record_wrapped(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/utils/decorators.py", line 88, in _wrapped
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/moe.py", line 2612, in apply
+    return self.fused_experts(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_ops/fused_moe/mori_v2_prepare_finalize.py", line 797, in forward
+    return mega(
+           ^^^^^
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py", line 401, in forward
+    expert_out = self._compute(
+                 ^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py", line 532, in _compute
+    return fused_moe(
+           ^^^^^^^^^^
+  File "/app/aiter/aiter/presorted_moe.py", line 250, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/fused_moe.py", line 806, in fused_moe
+    return fused_moe_(
+           ^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 346, in wrapper_custom
+    getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
+  File "/root/venv/rocm-venv/lib/python3.12/site-packages/torch/_ops.py", line 1350, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 377, in outer_wrapper
+    wrapper(*args, **kwargs)
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 259, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/plugin/__init__.py", line 730, in routed
+    return _dispatch(operation, canonicalize, native, args, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/plugin/__init__.py", line 763, in _dispatch
+    return native(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/fused_moe.py", line 1204, in fused_moe_
+    return _fused_moe_impl(
+           ^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/fused_moe.py", line 1474, in _fused_moe_impl
+    grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/grouped_moe_gfx1250.py", line 2188, in grouped_gemm_gfx1250_a8w4
+    return _grouped_a8w4_tdm_moe(
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/grouped_moe_gfx1250.py", line 1446, in _grouped_a8w4_tdm_moe
+    (_stage1_gemm1 or flydsl_grouped_gemm_a8w4_masked)(
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_ctl.py", line 733, in gemm1
+    self._precompile(
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_ctl.py", line 590, in _precompile
+    launch = self._launcher(
+             ^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_ctl.py", line 511, in _launcher
+    launch = make_s1f_stage1(
+             ^^^^^^^^^^^^^^^^
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_stage1.py", line 667, in make_s1f_stage1
+    raise ValueError("an op's stores overflow the storecnt wait field")
+ValueError: an op's stores overflow the storecnt wait field
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 4203, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1128, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 106, in __init__
+    self.core_mgr = CoreManager(config)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 755, in __init__
+    self._wait_for_all_ready_signals()
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 843, in _wait_for_all_ready_signals
+    raise RuntimeError(
+RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization
